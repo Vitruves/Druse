@@ -93,6 +93,7 @@ temp/
 
 # === Claude Code ===
 .claude/
+CLAUDE.md
 
 # === Misc ===
 *.log
