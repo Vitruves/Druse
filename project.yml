@@ -1,0 +1,107 @@
+name: Druse
+options:
+  bundleIdPrefix: com.druse
+  deploymentTarget:
+    macOS: "26.0"
+  xcodeVersion: "26.0"
+  minimumXcodeGenVersion: "2.35"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  Druse:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      - path: Models
+      - path: Renderer
+      - path: Metal
+        buildPhase: sources
+      - path: Views
+      - path: ViewModels
+      - path: Chemistry
+      - path: Docking
+      - path: ML
+      - path: Services
+      - path: Utils
+    resources:
+      - path: Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.druse.app
+        PRODUCT_NAME: Druse
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.medical"
+        INFOPLIST_KEY_CFBundleDisplayName: Druse
+        SWIFT_OBJC_BRIDGING_HEADER: Metal/Druse-Bridging-Header.h
+        CODE_SIGN_ENTITLEMENTS: Druse.entitlements
+        GENERATE_INFOPLIST_FILE: YES
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: "0.1.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        MTL_FAST_MATH: YES
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/CppCore"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/CppCore/build"
+          - "/opt/homebrew/lib"
+        OTHER_LDFLAGS:
+          - "-ldruse_core"
+          - "-lRDKitSmilesParse"
+          - "-lRDKitGraphMol"
+          - "-lRDKitRDGeneral"
+          - "-lRDKitDistGeomHelpers"
+          - "-lRDKitDistGeometry"
+          - "-lRDKitForceFieldHelpers"
+          - "-lRDKitForceField"
+          - "-lRDKitPartialCharges"
+          - "-lRDKitDescriptors"
+          - "-lRDKitMolTransforms"
+          - "-lRDKitSubstructMatch"
+          - "-lRDKitEigenSolvers"
+          - "-lRDKitAlignment"
+          - "-lRDKitRDGeometryLib"
+          - "-lRDKitDataStructs"
+          - "-lRDKitDepictor"
+          - "-lcoordgen"
+          - "-lRDKitFileParsers"
+          - "-lRDKitChemTransforms"
+          - "-lRDKitFingerprints"
+          - "-lRDKitGenericGroups"
+          - "-lRDKitMolDraw2D"
+          - "-lRDKitCIPLabeler"
+          - "-lRDKitRingDecomposerLib"
+          - "-lRDKitOptimizer"
+          - "-lRDKitRDStreams"
+          - "-lRDKitCatalogs"
+          - "-lRDKitSubgraphs"
+          - "-lRDKitMMPA"
+          - "-lRDKitMolChemicalFeatures"
+          - "-ltbb"
+          - "-lc++"
+          - "-rpath"
+          - "/opt/homebrew/lib"
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: -Onone
+          MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: -O
+          MTL_ENABLE_DEBUG_INFO: NO
+
+  DruseTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Druse
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.druse.tests
+        GENERATE_INFOPLIST_FILE: YES
