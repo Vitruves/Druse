@@ -3,6 +3,7 @@ import AppKit
 
 struct ResultsTabView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.openWindow) private var openWindow
 
     // Screening hit filters (stored in viewModel to persist across tab switches)
 
@@ -16,7 +17,17 @@ struct ResultsTabView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Show docking results section when available
+            // Results Database button always on top when results exist
+            if !viewModel.dockingResults.isEmpty || !viewModel.batchResults.isEmpty {
+                Button(action: { openWindow(id: "results-database") }) {
+                    Label("Open Results Database", systemImage: "tablecells")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Divider()
+            }
+
             // Batch docking progress
             if viewModel.isBatchDocking {
                 batchProgressSection
@@ -89,8 +100,18 @@ struct ResultsTabView: View {
     @ViewBuilder
     private var dockingResultsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Docking Results", systemImage: "chart.bar.xaxis")
-                .font(.system(size: 12, weight: .semibold))
+            HStack {
+                Label("Docking Results", systemImage: "chart.bar.xaxis")
+                    .font(.system(size: 12, weight: .semibold))
+                if let ligandName = viewModel.ligand?.name, !ligandName.isEmpty {
+                    Text(ligandName)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.1)))
+                }
+            }
 
             // Summary card
             if let best = viewModel.dockingResults.first {
@@ -99,6 +120,27 @@ struct ResultsTabView: View {
                     poseCount: viewModel.dockingResults.count,
                     clusterCount: Set(viewModel.dockingResults.map(\.clusterID)).count
                 )
+            }
+
+            // Multi-pose action bar
+            if viewModel.selectedPoseIndices.count > 1 {
+                HStack {
+                    Text("\(viewModel.selectedPoseIndices.count) poses selected")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("View Selected") {
+                        viewModel.showSelectedPoses()
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.borderedProminent)
+                    Button("Clear") {
+                        viewModel.selectedPoseIndices.removeAll()
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.bordered)
+                }
+                .padding(.vertical, 2)
             }
 
             // Scrollable pose list (up to 50)
@@ -138,6 +180,16 @@ struct ResultsTabView: View {
     @ViewBuilder
     private func dockingPoseRow(index: Int, result: DockingResult) -> some View {
         HStack(spacing: 6) {
+            // Multi-pose selection toggle
+            Button(action: { viewModel.togglePoseSelection(at: index) }) {
+                Image(systemName: viewModel.selectedPoseIndices.contains(index)
+                      ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(viewModel.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.3))
+            }
+            .buttonStyle(.plain)
+            .help("Select for multi-pose overlay")
+
             Text("#\(index + 1)")
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .frame(width: 24, alignment: .trailing)
@@ -558,10 +610,25 @@ struct ResultsTabView: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.cyan.opacity(0.15), lineWidth: 1))
             }
 
-            // Ranked ligand list
-            ForEach(Array(viewModel.batchResults.enumerated()), id: \.offset) { rank, entry in
+            // Ranked ligand list (top 10)
+            ForEach(Array(viewModel.batchResults.prefix(10).enumerated()), id: \.offset) { rank, entry in
                 batchResultRow(rank: rank, ligandName: entry.ligandName, results: entry.results)
             }
+
+            if viewModel.batchResults.count > 10 {
+                Text("+ \(viewModel.batchResults.count - 10) more ligands")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+
+            // Open Results Database for full analysis
+            Button(action: { openWindow(id: "results-database") }) {
+                Label("Open Results Database", systemImage: "tablecells")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
         }
     }
 

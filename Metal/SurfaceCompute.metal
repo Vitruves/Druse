@@ -17,9 +17,9 @@ struct SurfaceAtom {
     packed_float3 position;
     float         vdwRadius;
     float         charge;
+    uint          atomicNum;
+    uint          isAromatic;  // 1 if aromatic ring member
     float         _pad0;
-    float         _pad1;
-    float         _pad2;
 };
 
 struct SurfaceGridParams {
@@ -642,6 +642,139 @@ kernel void computeSurfaceESP(
         // Positive potential (electron-poor): white -> blue
         float t = normalized;
         color = mix(float3(1.0f, 1.0f, 1.0f), float3(0.12f, 0.22f, 0.92f), t);
+    }
+
+    vertices[tid].color = float4(color, 0.85f);
+}
+
+// ============================================================================
+// MARK: - Hydrophobicity Surface Coloring
+// ============================================================================
+
+/// Color surface by hydrophobicity: brown/tan for hydrophobic (C, S), blue for
+/// polar (N, O with charge), white for neutral. Each thread processes one vertex.
+kernel void computeSurfaceHydrophobicity(
+    device SurfaceVertex       *vertices    [[buffer(0)]],
+    constant SurfaceAtom       *atoms       [[buffer(1)]],
+    constant SurfaceGridParams &params      [[buffer(2)]],
+    device const uint          *vertexCount [[buffer(3)]],
+    uint                        tid         [[thread_position_in_grid]])
+{
+    uint numVerts = vertexCount[0];
+    if (tid >= numVerts) return;
+
+    float3 vertPos = float3(vertices[tid].position);
+
+    // Find nearest atom
+    float minDistSq = 1e20f;
+    uint nearestIdx = 0;
+    for (uint i = 0; i < params.numAtoms; i++) {
+        float3 diff = vertPos - float3(atoms[i].position);
+        float dSq = dot(diff, diff);
+        if (dSq < minDistSq) {
+            minDistSq = dSq;
+            nearestIdx = i;
+        }
+    }
+
+    uint anum = atoms[nearestIdx].atomicNum;
+    float q = atoms[nearestIdx].charge;
+
+    // Hydrophobicity classification
+    // C(6), S(16) without large charge => hydrophobic
+    // N(7), O(8) or any atom with |charge| > 0.3 => polar/hydrophilic
+    // Others => intermediate
+    float3 color;
+    if ((anum == 6 || anum == 16) && abs(q) < 0.3f) {
+        // Hydrophobic: golden brown
+        color = float3(0.82f, 0.62f, 0.18f);
+    } else if (anum == 7 || anum == 8 || abs(q) > 0.3f) {
+        // Hydrophilic/polar: blue-teal
+        color = float3(0.15f, 0.45f, 0.82f);
+    } else if (anum == 9 || anum == 17 || anum == 35 || anum == 53) {
+        // Halogens: slightly hydrophobic, pale green
+        color = float3(0.45f, 0.72f, 0.35f);
+    } else if (anum == 15) {
+        // Phosphorus: orange
+        color = float3(0.85f, 0.55f, 0.15f);
+    } else {
+        // Default: neutral gray-white
+        color = float3(0.85f, 0.85f, 0.85f);
+    }
+
+    vertices[tid].color = float4(color, 0.85f);
+}
+
+// ============================================================================
+// MARK: - Pharmacophore Surface Coloring
+// ============================================================================
+
+/// Color surface by pharmacophoric features:
+///   H-bond donor (N-H, O-H): blue
+///   H-bond acceptor (N, O lone pairs): red
+///   Hydrophobic (C, halogen): yellow
+///   Aromatic ring: purple
+///   Charged positive: deep blue
+///   Charged negative: deep red
+kernel void computeSurfacePharmacophore(
+    device SurfaceVertex       *vertices    [[buffer(0)]],
+    constant SurfaceAtom       *atoms       [[buffer(1)]],
+    constant SurfaceGridParams &params      [[buffer(2)]],
+    device const uint          *vertexCount [[buffer(3)]],
+    uint                        tid         [[thread_position_in_grid]])
+{
+    uint numVerts = vertexCount[0];
+    if (tid >= numVerts) return;
+
+    float3 vertPos = float3(vertices[tid].position);
+
+    // Find nearest atom
+    float minDistSq = 1e20f;
+    uint nearestIdx = 0;
+    for (uint i = 0; i < params.numAtoms; i++) {
+        float3 diff = vertPos - float3(atoms[i].position);
+        float dSq = dot(diff, diff);
+        if (dSq < minDistSq) {
+            minDistSq = dSq;
+            nearestIdx = i;
+        }
+    }
+
+    uint anum = atoms[nearestIdx].atomicNum;
+    float q = atoms[nearestIdx].charge;
+    uint aromatic = atoms[nearestIdx].isAromatic;
+
+    float3 color;
+    if (aromatic == 1) {
+        // Aromatic: purple
+        color = float3(0.62f, 0.28f, 0.82f);
+    } else if (q > 0.3f && (anum == 7)) {
+        // Positive charge (e.g., protonated amine): deep blue
+        color = float3(0.10f, 0.25f, 0.90f);
+    } else if (q < -0.3f && (anum == 8)) {
+        // Negative charge (e.g., carboxylate): deep red
+        color = float3(0.90f, 0.10f, 0.10f);
+    } else if (anum == 7 && q > 0.0f) {
+        // N-H donor: sky blue
+        color = float3(0.30f, 0.60f, 0.95f);
+    } else if (anum == 8 && q > 0.0f) {
+        // O-H donor: sky blue
+        color = float3(0.30f, 0.60f, 0.95f);
+    } else if (anum == 7 || anum == 8) {
+        // N/O acceptor: red-pink
+        color = float3(0.92f, 0.35f, 0.35f);
+    } else if (anum == 16) {
+        // Sulfur: dark yellow
+        color = float3(0.80f, 0.72f, 0.20f);
+    } else if (anum == 9 || anum == 17 || anum == 35 || anum == 53) {
+        // Halogens: green
+        color = float3(0.35f, 0.75f, 0.30f);
+    } else if (anum == 6) {
+        // Carbon: hydrophobic yellow
+        color = float3(0.92f, 0.82f, 0.30f);
+    } else {
+        // Default: light gray
+        color = float3(0.80f, 0.80f, 0.80f);
     }
 
     vertices[tid].color = float4(color, 0.85f);

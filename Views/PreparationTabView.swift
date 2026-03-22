@@ -86,6 +86,44 @@ struct PreparationTabView: View {
                     }
                 }
             }
+
+            if !report.chainBreaks.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Chain Breaks", systemImage: "scissors")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.orange)
+
+                    ForEach(Array(report.chainBreaks.enumerated()), id: \.offset) { _, chainBreak in
+                        Text(
+                            "Chain \(chainBreak.chainID): \(chainBreak.previousResidueSeq)->\(chainBreak.nextResidueSeq)" +
+                            (chainBreak.isCapped ? " (capped)" : " (uncapped)")
+                        )
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if !report.residueCompleteness.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Residue Completeness", systemImage: "checklist")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.orange)
+
+                    ForEach(Array(report.residueCompleteness.prefix(6)), id: \.self) { residue in
+                        Text("Chain \(residue.chainID) \(residue.residueName) \(residue.residueSeq): \(residue.summary)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+
+                    if report.residueCompleteness.count > 6 {
+                        Text("+\(report.residueCompleteness.count - 6) more incomplete residue(s)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
         }
 
         Divider()
@@ -98,6 +136,13 @@ struct PreparationTabView: View {
             // Remove waters
             Button(action: { viewModel.removeWaters() }) {
                 Label("Remove Waters", systemImage: "drop.triangle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button(action: { viewModel.removeNonStandardResidues() }) {
+                Label("Remove Non-standard Residues", systemImage: "trash.slash")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.bordered)
@@ -162,6 +207,14 @@ struct PreparationTabView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .help("Detect gaps in residue numbering and report them in the console. Actual loop modeling requires external tools.")
+
+            Button(action: { viewModel.analyzeMissingAtoms() }) {
+                Label("Analyze Missing Atoms", systemImage: "checklist")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Compare standard residues against bundled templates and report missing heavy atoms, missing hydrogens, and extra atoms.")
 
             // Solvation Shell
             Button(action: { viewModel.addSolvationShell() }) {

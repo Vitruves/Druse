@@ -5,14 +5,7 @@ struct DockingTabView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var showPreDockSheet = false
 
-    // Grid box manual adjustment state
-    @State private var gridCenterX: Float = 0
-    @State private var gridCenterY: Float = 0
-    @State private var gridCenterZ: Float = 0
-    @State private var gridHalfX: Float = 10
-    @State private var gridHalfY: Float = 10
-    @State private var gridHalfZ: Float = 10
-    @State private var gridInitialized = false
+    // Grid box state is in viewModel so it persists across tab switches
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -54,12 +47,13 @@ struct DockingTabView: View {
             }
         }
         .onAppear {
-            if !gridInitialized, let prot = viewModel.protein {
+            if !viewModel.gridInitialized, let prot = viewModel.protein {
                 initializeGridAtProteinCenter(prot)
             }
         }
         .onChange(of: viewModel.protein?.name) { _, _ in
-            if let prot = viewModel.protein {
+            // Only reset grid to protein center if no pocket or docking results exist
+            if let prot = viewModel.protein, viewModel.selectedPocket == nil, viewModel.dockingResults.isEmpty {
                 initializeGridAtProteinCenter(prot)
             }
         }
@@ -85,56 +79,52 @@ struct DockingTabView: View {
             }
 
             if viewModel.batchQueue.count > 1 {
-                // Batch mode: show queued ligands
-                HStack(spacing: 6) {
-                    Image(systemName: "tray.full.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.cyan)
-                    Text("\(viewModel.batchQueue.count) ligands queued")
-                        .font(.system(size: 11, weight: .medium))
-                    Spacer()
-                    Button(action: {
-                        viewModel.batchQueue = []
-                        viewModel.clearLigand()
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
+                // Batch mode: show general docking info
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "tray.full.fill")
                             .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.cyan)
+                        Text("\(viewModel.batchQueue.count) ligands to dock")
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer()
+                        Button(action: {
+                            viewModel.batchQueue = []
+                            viewModel.clearLigand()
+                        }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear batch queue")
                     }
-                    .buttonStyle(.plain)
-                    .help("Clear batch queue")
+
+                    // MW range summary
+                    let mws = viewModel.batchQueue.compactMap { $0.descriptors?.molecularWeight }
+                    if let minMW = mws.min(), let maxMW = mws.max() {
+                        Text(String(format: "MW range: %.0f – %.0f", minMW, maxMW))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+
+                    let prepCount = viewModel.batchQueue.filter(\.isPrepared).count
+                    Text("\(prepCount)/\(viewModel.batchQueue.count) prepared")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(prepCount == viewModel.batchQueue.count ? .green : .orange)
                 }
                 .padding(6)
                 .background(Color.cyan.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 5))
 
-                // Scrollable list of queued ligands
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(Array(viewModel.batchQueue.enumerated()), id: \.element.id) { idx, entry in
-                            HStack(spacing: 4) {
-                                Text("\(idx + 1).")
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                                    .frame(width: 20, alignment: .trailing)
-                                Text(entry.name)
-                                    .font(.system(size: 10))
-                                    .lineLimit(1)
-                                Spacer()
-                                if let d = entry.descriptors {
-                                    Text(String(format: "%.0f", d.molecularWeight))
-                                        .font(.system(size: 8, design: .monospaced))
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                        }
-                    }
+                // Reopen Ligand Database button
+                Button(action: { openWindow(id: "ligand-database") }) {
+                    Label("Open Ligand Database", systemImage: "tablecells")
+                        .font(.system(size: 10))
+                        .frame(maxWidth: .infinity)
                 }
-                .frame(maxHeight: 120)
-                .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
             } else if let lig = viewModel.ligand {
                 // Single ligand mode
                 HStack(spacing: 6) {
@@ -301,9 +291,9 @@ struct DockingTabView: View {
                 Text("Center")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
-                gridAxisRow("X", value: $gridCenterX, range: -200...200)
-                gridAxisRow("Y", value: $gridCenterY, range: -200...200)
-                gridAxisRow("Z", value: $gridCenterZ, range: -200...200)
+                gridAxisRow("X", value: gridCenterBinding(\.x), range: -200...200)
+                gridAxisRow("Y", value: gridCenterBinding(\.y), range: -200...200)
+                gridAxisRow("Z", value: gridCenterBinding(\.z), range: -200...200)
             }
 
             // Half-size controls
@@ -311,9 +301,9 @@ struct DockingTabView: View {
                 Text("Half-size")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
-                gridAxisRow("X", value: $gridHalfX, range: 2...50)
-                gridAxisRow("Y", value: $gridHalfY, range: 2...50)
-                gridAxisRow("Z", value: $gridHalfZ, range: 2...50)
+                gridAxisRow("X", value: gridHalfBinding(\.x), range: 2...50)
+                gridAxisRow("Y", value: gridHalfBinding(\.y), range: 2...50)
+                gridAxisRow("Z", value: gridHalfBinding(\.z), range: 2...50)
             }
 
             // Quick placement buttons
@@ -479,16 +469,16 @@ struct DockingTabView: View {
     private func applyPreset(_ preset: String) {
         switch preset {
         case "Fast":
-            viewModel.dockingConfig.populationSize = 25
-            viewModel.dockingConfig.generationsPerRun = 15
-            viewModel.dockingConfig.numRuns = 3
-        case "Standard":
             viewModel.dockingConfig.populationSize = 50
             viewModel.dockingConfig.generationsPerRun = 30
+            viewModel.dockingConfig.numRuns = 3
+        case "Standard":
+            viewModel.dockingConfig.populationSize = 150
+            viewModel.dockingConfig.generationsPerRun = 80
             viewModel.dockingConfig.numRuns = 5
         case "Thorough":
-            viewModel.dockingConfig.populationSize = 100
-            viewModel.dockingConfig.generationsPerRun = 50
+            viewModel.dockingConfig.populationSize = 300
+            viewModel.dockingConfig.generationsPerRun = 200
             viewModel.dockingConfig.numRuns = 10
         default: break
         }
@@ -497,9 +487,9 @@ struct DockingTabView: View {
     private func isPresetActive(_ preset: String) -> Bool {
         let c = viewModel.dockingConfig
         switch preset {
-        case "Fast":     return c.populationSize == 25 && c.generationsPerRun == 15 && c.numRuns == 3
-        case "Standard": return c.populationSize == 50 && c.generationsPerRun == 30 && c.numRuns == 5
-        case "Thorough": return c.populationSize == 100 && c.generationsPerRun == 50 && c.numRuns == 10
+        case "Fast":     return c.populationSize == 50 && c.generationsPerRun == 30 && c.numRuns == 3
+        case "Standard": return c.populationSize == 150 && c.generationsPerRun == 80 && c.numRuns == 5
+        case "Thorough": return c.populationSize == 300 && c.generationsPerRun == 200 && c.numRuns == 10
         default: return false
         }
     }
@@ -529,7 +519,7 @@ struct DockingTabView: View {
     private var dockingControlSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             let hasGrid = viewModel.selectedPocket != nil ||
-                          (gridHalfX > 2 && gridHalfY > 2 && gridHalfZ > 2)
+                          (viewModel.gridHalfSize.x > 2 && viewModel.gridHalfSize.y > 2 && viewModel.gridHalfSize.z > 2)
             let canDock = hasGrid
                 && viewModel.ligand != nil
                 && viewModel.protein != nil
@@ -609,8 +599,24 @@ struct DockingTabView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.yellow)
 
+            // Overall batch progress bar (ligand X/Y)
+            if viewModel.isBatchDocking {
+                let (current, total) = viewModel.batchProgress
+                ProgressView(
+                    value: total > 0 ? Double(current) / Double(total) : 0
+                )
+                .progressViewStyle(.linear)
+                .tint(.cyan)
+
+                Text("Ligand \(current + 1)/\(total)")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.cyan)
+            }
+
+            // Per-ligand generation progress
             ProgressView(
-                value: Double(viewModel.dockingGeneration),
+                value: min(Double(viewModel.dockingGeneration),
+                           Double(max(viewModel.dockingTotalGenerations, 1))),
                 total: Double(max(viewModel.dockingTotalGenerations, 1))
             )
             .progressViewStyle(.linear)
@@ -625,8 +631,14 @@ struct DockingTabView: View {
                     .foregroundStyle(viewModel.dockingBestEnergy < 0 ? .green : .orange)
             }
 
-            Button(action: { viewModel.stopDocking() }) {
-                Label("Stop", systemImage: "stop.fill")
+            Button(action: {
+                if viewModel.isBatchDocking {
+                    viewModel.cancelBatchDocking()
+                } else {
+                    viewModel.stopDocking()
+                }
+            }) {
+                Label(viewModel.isBatchDocking ? "Stop All" : "Stop", systemImage: "stop.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
@@ -635,75 +647,128 @@ struct DockingTabView: View {
         }
     }
 
-    // MARK: - Docking Results
+    // MARK: - Docking Statistics (replaces results preview)
 
     @ViewBuilder
     private var dockingResultsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("Results", systemImage: "chart.bar.xaxis")
+                Label("Docking Statistics", systemImage: "chart.bar.xaxis")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text("\(viewModel.dockingResults.count) poses")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                if viewModel.dockingDuration > 0 {
+                    Text(formatDuration(viewModel.dockingDuration))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            ForEach(Array(viewModel.dockingResults.prefix(10).enumerated()), id: \.offset) { idx, result in
-                resultCard(index: idx, result: result)
+            // Key statistics grid
+            let results = viewModel.dockingResults
+            let energies = results.map(\.energy)
+            let clusterIDs = Set(results.map(\.clusterID))
+
+            HStack(spacing: 8) {
+                statCell("Best", String(format: "%.1f", energies.min() ?? 0),
+                         color: (energies.min() ?? 0) < -6 ? .green : .yellow)
+                statCell("Mean", String(format: "%.1f", energies.isEmpty ? 0 : energies.reduce(0, +) / Float(energies.count)),
+                         color: .secondary)
+                statCell("Poses", "\(results.count)", color: .blue)
+                statCell("Clusters", "\(clusterIDs.count)", color: .cyan)
             }
+            .padding(6)
+            .frame(maxWidth: .infinity)
+            .background(RoundedRectangle(cornerRadius: 5).fill(Color.green.opacity(0.06)))
 
-            if viewModel.dockingResults.count > 10 {
-                Text("+ \(viewModel.dockingResults.count - 10) more poses")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func resultCard(index: Int, result: DockingResult) -> some View {
-        HStack(spacing: 6) {
-            Text("#\(index + 1)")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .frame(width: 24, alignment: .trailing)
-                .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 4) {
-                    Text(String(format: "%.2f", result.energy))
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(result.energy < 0 ? .green : .red)
-                    Text("kcal/mol")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.tertiary)
+            // Best pose scoring breakdown
+            if let best = results.first {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Best Pose Breakdown")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        scoreItem("vdW", best.vdwEnergy)
+                        scoreItem("Elec", best.elecEnergy)
+                        scoreItem("H-bond", best.hbondEnergy)
+                        scoreItem("Torsion", best.torsionPenalty)
+                    }
                 }
 
-                HStack(spacing: 6) {
-                    Text(String(format: "vdW:%.1f", result.vdwEnergy))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                    Text(String(format: "elec:%.1f", result.elecEnergy))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                    if result.clusterID >= 0 {
-                        Text("C\(result.clusterID)")
-                            .font(.system(size: 8, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.cyan)
+                // Quick action
+                Button(action: { viewModel.showDockingPose(at: 0) }) {
+                    Label("View Best Pose", systemImage: "eye")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            // GA/search statistics
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Search Summary")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    statMini("Generations", "\(viewModel.dockingTotalGenerations)")
+                    statMini("Pop. Size", "\(viewModel.dockingConfig.populationSize)")
+                    if let maxGen = results.map(\.generation).max() {
+                        statMini("Last Improv.", "Gen \(maxGen)")
                     }
                 }
             }
 
-            Spacer()
-
-            Button("View") {
-                viewModel.showDockingPose(at: index)
+            // Open Results Database button
+            Button(action: { openWindow(id: "results-database") }) {
+                Label("Open Results Database", systemImage: "tablecells")
+                    .frame(maxWidth: .infinity)
             }
-            .controlSize(.mini)
             .buttonStyle(.bordered)
+            .controlSize(.small)
         }
-        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func statCell(_ label: String, _ value: String, color: Color) -> some View {
+        VStack(spacing: 1) {
+            Text(value)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(color)
+            Text(label)
+                .font(.system(size: 8))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private func scoreItem(_ label: String, _ value: Float) -> some View {
+        VStack(spacing: 0) {
+            Text(String(format: "%.1f", value))
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(value < 0 ? .green : .red)
+            Text(label)
+                .font(.system(size: 7))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    @ViewBuilder
+    private func statMini(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 2) {
+            Text(label + ":")
+                .font(.system(size: 8))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        if seconds < 60 { return String(format: "%.1fs", seconds) }
+        let m = Int(seconds) / 60
+        let s = Int(seconds) % 60
+        return "\(m)m \(s)s"
     }
 
     // MARK: - Helpers
@@ -770,38 +835,50 @@ struct DockingTabView: View {
     // MARK: - Grid Box Actions
 
     private func initializeGridAtProteinCenter(_ prot: Molecule) {
-        let positions = prot.atoms.map(\.position)
+        // Only use visible chains for center computation
+        let positions: [SIMD3<Float>]
+        if viewModel.hiddenChainIDs.isEmpty {
+            positions = prot.atoms.map(\.position)
+        } else {
+            positions = prot.atoms.filter { !viewModel.hiddenChainIDs.contains($0.chainID) }.map(\.position)
+        }
         guard !positions.isEmpty else { return }
         let center = positions.reduce(SIMD3<Float>.zero, +) / Float(positions.count)
-        gridCenterX = center.x
-        gridCenterY = center.y
-        gridCenterZ = center.z
-        gridHalfX = 10
-        gridHalfY = 10
-        gridHalfZ = 10
-        gridInitialized = true
+        viewModel.gridCenter = center
+        viewModel.gridHalfSize = SIMD3<Float>(repeating: 10)
+        viewModel.gridInitialized = true
     }
 
     private func syncGridFromPocket(_ pocket: BindingPocket) {
-        gridCenterX = pocket.center.x
-        gridCenterY = pocket.center.y
-        gridCenterZ = pocket.center.z
-        gridHalfX = pocket.size.x
-        gridHalfY = pocket.size.y
-        gridHalfZ = pocket.size.z
+        viewModel.gridCenter = pocket.center
+        viewModel.gridHalfSize = pocket.size
     }
 
     private func applyGridBoxFromSliders() {
-        let center = SIMD3<Float>(gridCenterX, gridCenterY, gridCenterZ)
-        let halfSize = SIMD3<Float>(gridHalfX, gridHalfY, gridHalfZ)
-        viewModel.updateGridBoxVisualization(center: center, halfSize: halfSize)
+        viewModel.updateGridBoxVisualization(center: viewModel.gridCenter, halfSize: viewModel.gridHalfSize)
 
         // Keep selected pocket in sync if one exists
         if var pocket = viewModel.selectedPocket {
-            pocket.center = center
-            pocket.size = halfSize
+            pocket.center = viewModel.gridCenter
+            pocket.size = viewModel.gridHalfSize
             viewModel.selectedPocket = pocket
         }
+    }
+
+    // Bindings to individual components of viewModel.gridCenter
+    private func gridCenterBinding(_ keyPath: WritableKeyPath<SIMD3<Float>, Float>) -> Binding<Float> {
+        Binding(
+            get: { viewModel.gridCenter[keyPath: keyPath] },
+            set: { viewModel.gridCenter[keyPath: keyPath] = $0 }
+        )
+    }
+
+    // Bindings to individual components of viewModel.gridHalfSize
+    private func gridHalfBinding(_ keyPath: WritableKeyPath<SIMD3<Float>, Float>) -> Binding<Float> {
+        Binding(
+            get: { viewModel.gridHalfSize[keyPath: keyPath] },
+            set: { viewModel.gridHalfSize[keyPath: keyPath] = $0 }
+        )
     }
 
     private func placeGridAtProteinCenter() {
@@ -823,8 +900,8 @@ struct DockingTabView: View {
         let margin: Float = 4.0
         let halfSize = SIMD3<Float>(repeating: maxDist + margin)
 
-        gridCenterX = center.x; gridCenterY = center.y; gridCenterZ = center.z
-        gridHalfX = halfSize.x; gridHalfY = halfSize.y; gridHalfZ = halfSize.z
+        viewModel.gridCenter = center
+        viewModel.gridHalfSize = halfSize
         applyGridBoxFromSliders()
     }
 
@@ -850,8 +927,8 @@ struct DockingTabView: View {
         for pos in positions { let d = abs(pos - center); maxDist = max(maxDist, max(d.x, max(d.y, d.z))) }
         let halfSize = SIMD3<Float>(repeating: maxDist + 4.0)
 
-        gridCenterX = center.x; gridCenterY = center.y; gridCenterZ = center.z
-        gridHalfX = halfSize.x; gridHalfY = halfSize.y; gridHalfZ = halfSize.z
+        viewModel.gridCenter = center
+        viewModel.gridHalfSize = halfSize
         applyGridBoxFromSliders()
     }
 
@@ -864,8 +941,8 @@ struct DockingTabView: View {
     /// Create a pocket from current grid sliders so the docking engine has what it needs.
     private func ensurePocketFromGrid() {
         if viewModel.selectedPocket != nil { return }
-        let center = SIMD3<Float>(gridCenterX, gridCenterY, gridCenterZ)
-        let size = SIMD3<Float>(gridHalfX, gridHalfY, gridHalfZ)
+        let center = viewModel.gridCenter
+        let size = viewModel.gridHalfSize
         let pocket = BindingPocket(
             id: 0, center: center, size: size,
             volume: size.x * size.y * size.z * 8,

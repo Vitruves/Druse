@@ -7,9 +7,9 @@ private struct GPUSurfaceAtom {
     var position: (Float, Float, Float) = (0, 0, 0) // packed_float3
     var vdwRadius: Float = 0
     var charge: Float = 0
+    var atomicNum: UInt32 = 0
+    var isAromatic: UInt32 = 0
     var _pad0: Float = 0
-    var _pad1: Float = 0
-    var _pad2: Float = 0
 }
 
 // MARK: - GPU Surface Grid Params (must match SurfaceGridParams in SurfaceCompute.metal)
@@ -44,6 +44,13 @@ enum SurfaceFieldType {
     case gaussian   // Gaussian blob surface
 }
 
+enum SurfaceColorMode: String, CaseIterable {
+    case uniform       = "Uniform"
+    case esp           = "Electrostatic"
+    case hydrophobicity = "Hydrophobicity"
+    case pharmacophore = "Pharmacophore"
+}
+
 // MARK: - Surface Generation Result
 
 struct SurfaceResult {
@@ -70,6 +77,8 @@ final class SurfaceGenerator {
     private let gaussianFieldPipeline: MTLComputePipelineState
     private let marchingCubesPipeline: MTLComputePipelineState
     private let espColoringPipeline: MTLComputePipelineState
+    private let hydrophobicityPipeline: MTLComputePipelineState
+    private let pharmacophorePipeline: MTLComputePipelineState
 
     // Configuration
     var gridSpacing: Float = 0.5       // Angstroms per grid cell
@@ -77,7 +86,7 @@ final class SurfaceGenerator {
     var probeRadius: Float = 1.4       // Water probe radius in Angstroms
     var isovalue: Float = 0.5          // Gaussian field isovalue (only for gaussian mode)
     var fieldType: SurfaceFieldType = .connolly
-    var colorByESP: Bool = false
+    var colorMode: SurfaceColorMode = .uniform
 
     // Buffer limits
     private let maxVertices: UInt32 = 4_000_000
@@ -112,6 +121,16 @@ final class SurfaceGenerator {
             throw SurfaceGeneratorError.kernelNotFound("computeSurfaceESP")
         }
         self.espColoringPipeline = try device.makeComputePipelineState(function: espFn)
+
+        guard let hydroFn = lib.makeFunction(name: "computeSurfaceHydrophobicity") else {
+            throw SurfaceGeneratorError.kernelNotFound("computeSurfaceHydrophobicity")
+        }
+        self.hydrophobicityPipeline = try device.makeComputePipelineState(function: hydroFn)
+
+        guard let pharmacoFn = lib.makeFunction(name: "computeSurfacePharmacophore") else {
+            throw SurfaceGeneratorError.kernelNotFound("computeSurfacePharmacophore")
+        }
+        self.pharmacophorePipeline = try device.makeComputePipelineState(function: pharmacoFn)
     }
 
     // MARK: - Public API
@@ -129,7 +148,9 @@ final class SurfaceGenerator {
                 position: (atom.position.x, atom.position.y, atom.position.z),
                 vdwRadius: atom.element.vdwRadius,
                 charge: abs(atom.charge) > 0.0001 ? atom.charge : Float(atom.formalCharge),
-                _pad0: 0, _pad1: 0, _pad2: 0
+                atomicNum: UInt32(atom.element.rawValue),
+                isAromatic: 0,
+                _pad0: 0
             )
         }
 
@@ -159,7 +180,9 @@ final class SurfaceGenerator {
                 position: (positions[i].x, positions[i].y, positions[i].z),
                 vdwRadius: radii[i],
                 charge: charges[i],
-                _pad0: 0, _pad1: 0, _pad2: 0
+                atomicNum: 6, // default to carbon for raw arrays
+                isAromatic: 0,
+                _pad0: 0
             )
         }
 
@@ -308,20 +331,35 @@ final class SurfaceGenerator {
             encoder.endEncoding()
         }
 
-        // Pass 3: ESP coloring (optional)
-        if colorByESP {
+        // Pass 3: Surface coloring (optional, based on colorMode)
+        if colorMode != .uniform {
+            let colorPipeline: MTLComputePipelineState
+            let label: String
+            switch colorMode {
+            case .esp:
+                colorPipeline = espColoringPipeline
+                label = "ESPColoring"
+            case .hydrophobicity:
+                colorPipeline = hydrophobicityPipeline
+                label = "HydrophobicityColoring"
+            case .pharmacophore:
+                colorPipeline = pharmacophorePipeline
+                label = "PharmacophoreColoring"
+            case .uniform:
+                fatalError("unreachable")
+            }
+
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "ESPColoring"
-                encoder.setComputePipelineState(espColoringPipeline)
+                encoder.label = label
+                encoder.setComputePipelineState(colorPipeline)
                 encoder.setBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setBuffer(atomBuffer, offset: 0, index: 1)
                 encoder.setBuffer(paramsBuffer, offset: 0, index: 2)
                 encoder.setBuffer(vertexCounterBuffer, offset: 0, index: 3)
 
-                // Dispatch enough threads for max vertices; kernel checks actual count
                 let dispatchCount = Int(maxVertices)
                 let threadGroupSize = min(
-                    espColoringPipeline.maxTotalThreadsPerThreadgroup,
+                    colorPipeline.maxTotalThreadsPerThreadgroup,
                     dispatchCount
                 )
                 let threadGroups = MTLSize(

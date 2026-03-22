@@ -59,6 +59,13 @@ final class Renderer: NSObject {
     private var ghostBondCount: Int = 0
     private var depthStateReadOnly: MTLDepthStencilState!
 
+    // GPU object-ID picking (renders atom IDs to an off-screen R32Uint texture)
+    private var pickPipeline: MTLRenderPipelineState!
+    private var pickTexture: MTLTexture?
+    private var pickDepthTexture: MTLTexture?
+    private var pickTextureWidth: Int = 0
+    private var pickTextureHeight: Int = 0
+
     // State
     private var startTime = CFAbsoluteTimeGetCurrent()
     var selectedAtomIndex: Int = -1
@@ -249,6 +256,20 @@ final class Renderer: NSObject {
         } catch {
             fatalError("Failed to create ghost bond pipeline: \(error)")
         }
+
+        // GPU pick pipeline (non-MSAA, writes atom ID to R32Uint texture)
+        do {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.label = "AtomPick"
+            desc.vertexFunction = library.makeFunction(name: "atomVertex")
+            desc.fragmentFunction = library.makeFunction(name: "atomPickFragment")
+            desc.colorAttachments[0].pixelFormat = .r32Uint
+            desc.depthAttachmentPixelFormat = .depth32Float
+            desc.rasterSampleCount = 1  // no MSAA for pick buffer
+            pickPipeline = try device.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            fatalError("Failed to create pick pipeline: \(error)")
+        }
     }
 
     private func buildDepthStencilStates() {
@@ -432,7 +453,7 @@ final class Renderer: NSObject {
     func updateGhostPose(atoms: [Atom], bonds: [Bond]) {
         guard !atoms.isEmpty else { clearGhostPose(); return }
 
-        let ghostAlpha: Float = 0.45
+        let ghostAlpha: Float = 0.9
         let atomScale: Float = RenderMode.ballAndStick.atomRadiusScale
 
         var atomInstances: [AtomInstance] = atoms.map { atom in
@@ -600,14 +621,14 @@ final class Renderer: NSObject {
             encoder.setCullMode(.back) // Restore
         }
 
-        // 5. Interaction lines (dashed, between ligand and protein atoms)
+        // 5. Interaction lines (dashed billboard quads, between ligand and protein atoms)
         if interactionLineCount > 0, let lineBuf = interactionLineBuffer {
             encoder.setRenderPipelineState(interactionLinePipeline)
             encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(lineBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
             encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
             encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-            encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 2, instanceCount: interactionLineCount)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: interactionLineCount)
         }
 
         // 6. Grid box wireframe (docking pocket visualization)
@@ -637,10 +658,10 @@ final class Renderer: NSObject {
             encoder.setCullMode(.back) // Restore
         }
 
-        // 8. Ghost ligand (translucent docking preview — depth read only, no write)
+        // 8. Ghost ligand (docking preview — depth read+write so it properly occludes)
         if ghostAtomCount > 0, let ghostAtomBuf = ghostAtomBuffer {
             encoder.setRenderPipelineState(ghostAtomPipeline)
-            encoder.setDepthStencilState(depthStateReadOnly)
+            encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(ghostAtomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
             encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
             encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
@@ -648,7 +669,7 @@ final class Renderer: NSObject {
         }
         if ghostBondCount > 0, let ghostBondBuf = ghostBondBuffer {
             encoder.setRenderPipelineState(ghostBondPipeline)
-            encoder.setDepthStencilState(depthStateReadOnly)
+            encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(ghostBondBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
             encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
             encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
@@ -687,26 +708,90 @@ final class Renderer: NSObject {
         uniformBuffer?.contents().copyMemory(from: &uniforms, byteCount: MemoryLayout<Uniforms>.stride)
     }
 
-    // MARK: - Atom Picking (CPU ray-sphere)
+    // MARK: - Atom Picking (GPU object-ID buffer)
 
+    /// Pick an atom by rendering atom IDs to an off-screen R32Uint texture and
+    /// reading back the pixel at the click location. O(1) on the CPU, pixel-perfect.
     func pickAtom(at screenPoint: SIMD2<Float>, viewportSize: SIMD2<Float>) -> Int? {
-        let (rayOrigin, rayDir) = camera.screenToWorldRay(screenPoint: screenPoint, viewportSize: viewportSize)
+        guard atomInstanceCount > 0, let atomBuf = atomInstanceBuffer else { return nil }
 
-        var closestT: Float = .infinity
-        var closestIdx: Int? = nil
-        let scale = renderMode.atomRadiusScale
+        let width = Int(viewportSize.x)
+        let height = Int(viewportSize.y)
+        guard width > 0, height > 0 else { return nil }
 
-        for atom in currentAtoms {
-            let radius = atom.element.vdwRadius * scale
-            if let t = raySphereIntersect(rayOrigin: rayOrigin, rayDir: rayDir,
-                                           sphereCenter: atom.position, sphereRadius: radius) {
-                if t < closestT {
-                    closestT = t
-                    closestIdx = atom.id
-                }
-            }
+        // Recreate pick textures if viewport size changed
+        if width != pickTextureWidth || height != pickTextureHeight {
+            rebuildPickTextures(width: width, height: height)
         }
-        return closestIdx
+        guard let pickTex = pickTexture, let pickDepthTex = pickDepthTexture else { return nil }
+
+        // Render atom IDs into the pick texture (non-MSAA, single pass, on-demand)
+        let passDesc = MTLRenderPassDescriptor()
+        passDesc.colorAttachments[0].texture = pickTex
+        passDesc.colorAttachments[0].loadAction = .clear
+        passDesc.colorAttachments[0].storeAction = .store
+        passDesc.colorAttachments[0].clearColor = MTLClearColor(red: Double(0xFFFFFFFF), green: 0, blue: 0, alpha: 0)
+        passDesc.depthAttachment.texture = pickDepthTex
+        passDesc.depthAttachment.loadAction = .clear
+        passDesc.depthAttachment.storeAction = .dontCare
+        passDesc.depthAttachment.clearDepth = 1.0
+
+        guard let cmdBuf = commandQueue.makeCommandBuffer(),
+              let encoder = cmdBuf.makeRenderCommandEncoder(descriptor: passDesc)
+        else { return nil }
+
+        encoder.setRenderPipelineState(pickPipeline)
+        encoder.setDepthStencilState(depthStateReadWrite)
+        encoder.setVertexBuffer(atomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
+        encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+        encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: atomInstanceCount)
+        encoder.endEncoding()
+
+        // Synchronize for CPU readback (macOS managed storage)
+        if let blit = cmdBuf.makeBlitCommandEncoder() {
+            blit.synchronize(resource: pickTex)
+            blit.endEncoding()
+        }
+
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        // Read back the single pixel at the click location
+        let px = Int(screenPoint.x)
+        let py = Int(screenPoint.y)
+        guard px >= 0, px < width, py >= 0, py < height else { return nil }
+
+        var pixelValue: UInt32 = 0xFFFFFFFF
+        pickTex.getBytes(&pixelValue,
+                         bytesPerRow: width * MemoryLayout<UInt32>.stride,
+                         from: MTLRegion(origin: MTLOrigin(x: px, y: py, z: 0),
+                                         size: MTLSize(width: 1, height: 1, depth: 1)),
+                         mipmapLevel: 0)
+
+        // 0xFFFFFFFF = background (no hit)
+        guard pixelValue != 0xFFFFFFFF else { return nil }
+        return Int(pixelValue)
+    }
+
+    /// Create or resize the off-screen pick textures.
+    private func rebuildPickTextures(width: Int, height: Int) {
+        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Uint, width: width, height: height, mipmapped: false)
+        colorDesc.usage = [.renderTarget, .shaderRead]
+        colorDesc.storageMode = .managed
+        pickTexture = device.makeTexture(descriptor: colorDesc)
+        pickTexture?.label = "PickBuffer"
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
+        depthDesc.usage = .renderTarget
+        depthDesc.storageMode = .private
+        pickDepthTexture = device.makeTexture(descriptor: depthDesc)
+        pickDepthTexture?.label = "PickDepth"
+
+        pickTextureWidth = width
+        pickTextureHeight = height
     }
 
     // MARK: - Ribbon Residue Picking (via CA control points)

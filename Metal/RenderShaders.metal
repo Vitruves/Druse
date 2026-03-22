@@ -184,6 +184,51 @@ fragment AtomFragmentOut atomFragment(
 }
 
 // ============================================================================
+// MARK: - GPU Object-ID Picking (Atom)
+// ============================================================================
+
+/// Fragment output for the pick pass: writes atom ID to a R32Uint texture.
+struct AtomPickFragmentOut {
+    uint   objectID [[color(0)]];
+    float  depth    [[depth(any)]];
+};
+
+/// Pick-pass fragment shader: same ray-sphere test as atomFragment,
+/// but outputs the atom index instead of a shaded color.
+/// 0xFFFFFFFF = background (no hit).
+fragment AtomPickFragmentOut atomPickFragment(
+    AtomVertexOut in [[stage_in]],
+    constant Uniforms &uniforms [[buffer(BufferIndexUniforms)]]
+) {
+    float3 rayOrigin = float3(in.viewCenter.xy + in.quadCoord * in.expandedRadius, in.viewCenter.z);
+    float3 oc = rayOrigin - in.viewCenter;
+    float r = in.radius;
+    float b = -oc.z;
+    float c = dot(oc, oc) - r * r;
+    float disc = b * b - c;
+
+    if (disc < 0.0) {
+        discard_fragment();
+    }
+
+    float t = b - sqrt(disc);
+    float3 hitPoint = rayOrigin + float3(0.0, 0.0, -1.0) * t;
+
+    if (uniforms.enableClipping) {
+        float viewZ = -hitPoint.z;
+        if (viewZ < uniforms.clipNearZ || viewZ > uniforms.clipFarZ)
+            discard_fragment();
+    }
+
+    float4 clipPos = uniforms.projectionMatrix * float4(hitPoint, 1.0);
+
+    AtomPickFragmentOut out;
+    out.objectID = uint(in.atomIndex);
+    out.depth = clipPos.z / clipPos.w;
+    return out;
+}
+
+// ============================================================================
 // MARK: - Bond Impostor Cylinder
 // ============================================================================
 
@@ -459,6 +504,8 @@ struct InteractionVertexOut {
     float  dashParam; // 0..1 along the line, for dash pattern
 };
 
+/// Renders interaction lines as screen-space billboard quads (triangle strip,
+/// 4 vertices per instance) so they have visible thickness regardless of zoom.
 vertex InteractionVertexOut interactionLineVertex(
     uint vertexID [[vertex_id]],
     uint instanceID [[instance_id]],
@@ -468,14 +515,35 @@ vertex InteractionVertexOut interactionLineVertex(
     InteractionVertexOut out;
     InteractionLineVertex line = lines[instanceID];
 
-    // Two vertices per line: vertexID 0 = A, vertexID 1 = B
-    float3 worldPos = (vertexID == 0) ? line.positionA : line.positionB;
-    float4x4 mv = uniforms.viewMatrix * uniforms.modelMatrix;
-    float4 viewPos = mv * float4(worldPos, 1.0);
+    float4x4 mvp = uniforms.projectionMatrix * uniforms.viewMatrix * uniforms.modelMatrix;
 
-    out.position = uniforms.projectionMatrix * viewPos;
+    // Project both endpoints to clip space
+    float4 clipA = mvp * float4(line.positionA, 1.0);
+    float4 clipB = mvp * float4(line.positionB, 1.0);
+
+    // NDC positions
+    float2 ndcA = clipA.xy / clipA.w;
+    float2 ndcB = clipB.xy / clipB.w;
+
+    // Screen-space perpendicular for billboard expansion
+    float2 dir = ndcB - ndcA;
+    float len = length(dir);
+    dir = len > 1e-6 ? dir / len : float2(1.0, 0.0);
+    float2 perp = float2(-dir.y, dir.x);
+
+    // Line half-width in NDC (roughly 2 pixels on a 1000px viewport)
+    float halfWidth = 0.004;
+
+    // Triangle strip: 0=A-perp, 1=A+perp, 2=B-perp, 3=B+perp
+    bool isB = (vertexID >= 2);
+    float side = (vertexID % 2 == 0) ? -1.0 : 1.0;
+
+    float4 clipPos = isB ? clipB : clipA;
+    clipPos.xy += side * perp * halfWidth * clipPos.w;
+
+    out.position = clipPos;
     out.color = line.color;
-    out.dashParam = (vertexID == 0) ? 0.0 : 1.0;
+    out.dashParam = isB ? 1.0 : 0.0;
 
     return out;
 }

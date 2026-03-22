@@ -75,11 +75,33 @@ final class ActivityLog {
     private(set) var entries: [LogEntry] = []
     private let maxEntries = 500
 
+    // Throttling: buffer logs and flush at most 10x/sec
+    private var pendingEntries: [LogEntry] = []
+    private var flushTask: Task<Void, Never>?
+    private let flushInterval: Duration = .milliseconds(100)
+
     private init() {}
 
     func log(_ message: String, level: LogLevel = .info, category: LogCategory = .system) {
         let entry = LogEntry(timestamp: Date(), level: level, category: category, message: message)
-        entries.append(entry)
+        pendingEntries.append(entry)
+        scheduleFlush()
+    }
+
+    private func scheduleFlush() {
+        guard flushTask == nil else { return }
+        flushTask = Task { [weak self] in
+            try? await Task.sleep(for: self?.flushInterval ?? .milliseconds(100))
+            guard !Task.isCancelled else { return }
+            self?.flush()
+        }
+    }
+
+    private func flush() {
+        flushTask = nil
+        guard !pendingEntries.isEmpty else { return }
+        entries.append(contentsOf: pendingEntries)
+        pendingEntries.removeAll()
         if entries.count > maxEntries {
             entries.removeFirst(entries.count - maxEntries)
         }
@@ -107,5 +129,8 @@ final class ActivityLog {
 
     func clear() {
         entries.removeAll()
+        pendingEntries.removeAll()
+        flushTask?.cancel()
+        flushTask = nil
     }
 }

@@ -292,6 +292,9 @@ struct LigandDatabaseWindow: View {
                 headerCell("TPSA", width: 50, field: .tpsa)
                 headerCell("RotB", width: 36, field: .rotB)
                 headerCell("Lip.", width: 30, field: nil)
+                headerCell("Ki", width: 55, field: nil)
+                headerCell("pKi", width: 45, field: nil)
+                headerCell("IC50", width: 55, field: nil)
                 headerCell("Prep", width: 36, field: nil)
                 headerCell("Atoms", width: 44, field: .atoms)
             }
@@ -411,6 +414,32 @@ struct LigandDatabaseWindow: View {
                 Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 30, alignment: .center)
             }
 
+            // Affinity data (Ki, pKi, IC50)
+            if let ki = entry.ki {
+                Text(String(format: "%.1f", ki))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.purple)
+                    .frame(width: 55, alignment: .trailing)
+            } else {
+                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 55, alignment: .trailing)
+            }
+            if let pKi = entry.pKi ?? entry.effectivePKi {
+                Text(String(format: "%.2f", pKi))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.purple)
+                    .frame(width: 45, alignment: .trailing)
+            } else {
+                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 45, alignment: .trailing)
+            }
+            if let ic50 = entry.ic50 {
+                Text(String(format: "%.1f", ic50))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.purple)
+                    .frame(width: 55, alignment: .trailing)
+            } else {
+                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 55, alignment: .trailing)
+            }
+
             // Prepared status
             Image(systemName: entry.isPrepared ? "checkmark.circle.fill" : "circle")
                 .font(.system(size: 9))
@@ -493,6 +522,10 @@ struct LigandDatabaseWindow: View {
                     descriptorCard(d)
                     Divider()
                 }
+
+                // Binding Affinity Data
+                affinitySection(entry)
+                Divider()
 
                 // Preparation options & action
                 if !entry.smiles.isEmpty {
@@ -653,6 +686,81 @@ struct LigandDatabaseWindow: View {
             .padding(8)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
             .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    // MARK: - Affinity Section
+
+    @ViewBuilder
+    private func affinitySection(_ entry: LigandEntry) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Binding Affinity", systemImage: "chart.line.uptrend.xyaxis")
+                .font(.system(size: 11, weight: .medium))
+
+            VStack(alignment: .leading, spacing: 4) {
+                affinityField("Ki (nM)", value: entry.ki, entryId: entry.id) { newVal in
+                    if let idx = db.entries.firstIndex(where: { $0.id == entry.id }) {
+                        db.entries[idx].ki = newVal
+                        inspectedEntry = db.entries[idx]
+                    }
+                }
+                affinityField("pKi", value: entry.pKi, entryId: entry.id) { newVal in
+                    if let idx = db.entries.firstIndex(where: { $0.id == entry.id }) {
+                        db.entries[idx].pKi = newVal
+                        inspectedEntry = db.entries[idx]
+                    }
+                }
+                affinityField("IC50 (nM)", value: entry.ic50, entryId: entry.id) { newVal in
+                    if let idx = db.entries.firstIndex(where: { $0.id == entry.id }) {
+                        db.entries[idx].ic50 = newVal
+                        inspectedEntry = db.entries[idx]
+                    }
+                }
+            }
+            .padding(8)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            if let ePKi = entry.effectivePKi {
+                HStack(spacing: 4) {
+                    Text("Effective pKi:")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Text(String(format: "%.2f", ePKi))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.purple)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func affinityField(_ label: String, value: Float?, entryId: UUID, onUpdate: @escaping (Float?) -> Void) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 10))
+                .frame(width: 65, alignment: .leading)
+
+            let textBinding = Binding<String>(
+                get: { value.map { String(format: "%.2f", $0) } ?? "" },
+                set: { newText in
+                    let trimmed = newText.trimmingCharacters(in: .whitespaces)
+                    onUpdate(trimmed.isEmpty ? nil : Float(trimmed))
+                }
+            )
+            TextField("—", text: textBinding)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 10, design: .monospaced))
+                .frame(width: 90)
+
+            if value != nil {
+                Button(action: { onUpdate(nil) }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
         }
     }
 

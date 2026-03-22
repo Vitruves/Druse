@@ -61,6 +61,12 @@ struct SequenceView: View {
     @State private var hoveredResIdx: Int?
     @State private var collapsedChains: Set<String> = []
 
+    /// Cached secondary structure lookup: (chainID, seqNum) → SecondaryStructure.
+    /// Rebuilt when protein changes (via .id on the outer view).
+    @State private var ssCache: [String: SecondaryStructure] = [:]
+    /// Protein identity token to detect when cache must be rebuilt.
+    @State private var cachedProteinID: UUID?
+
     // Rename chain sheet
     @State private var showRenameSheet = false
     @State private var renameChainID: String = ""
@@ -87,6 +93,16 @@ struct SequenceView: View {
             }
         }
         .padding(12)
+        .onAppear {
+            if let prot = viewModel.protein, cachedProteinID != prot.id {
+                rebuildSSCache(prot: prot)
+            }
+        }
+        .onChange(of: viewModel.protein?.id) { _, newID in
+            if let prot = viewModel.protein, let newID, cachedProteinID != newID {
+                rebuildSSCache(prot: prot)
+            }
+        }
         .sheet(isPresented: $showRenameSheet) { renameSheet }
         .sheet(isPresented: $showMergeSheet) { mergeSheet }
         .alert("Delete \(viewModel.selectedResidueIndices.count) residues?",
@@ -145,7 +161,7 @@ struct SequenceView: View {
             // Hover info
             if let hIdx = hoveredResIdx, let prot = viewModel.protein, hIdx < prot.residues.count {
                 let res = prot.residues[hIdx]
-                let ss = secondaryStructure(for: res, in: prot)
+                let ss = cachedSS(chainID: res.chainID, seqNum: res.sequenceNumber)
                 HStack(spacing: 4) {
                     Text(res.name)
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
@@ -293,18 +309,17 @@ struct SequenceView: View {
             .padding(.horizontal, 2)
 
             if !isCollapsed {
-                // Sequence grid with gaps
-                FlowLayout(spacing: 1) {
-                    ForEach(cells) { cell in
-                        switch cell {
-                        case .residue(let entry):
-                            residueCell(entry)
-                                .contextMenu { residueContextMenu(entry, chainID: chain.id, prot: prot) }
-                        case .gap(_, let count, let after, let before):
-                            gapCell(count: count, after: after, before: before)
-                        }
-                    }
-                }
+                // Canvas-based sequence rendering: draws all residues directly
+                // instead of creating 1000+ individual SwiftUI views
+                SequenceCanvas(
+                    cells: cells,
+                    selectedResidueIndices: viewModel.selectedResidueIndices,
+                    hoveredResIdx: hoveredResIdx,
+                    ssCache: ssCache,
+                    onTapCell: { entry in handleResidueClick(entry) },
+                    onHoverCell: { resIdx in hoveredResIdx = resIdx },
+                    contextMenuBuilder: { entry in residueContextMenu(entry, chainID: chain.id, prot: prot) }
+                )
             }
         }
         .padding(.vertical, 2)
@@ -347,7 +362,7 @@ struct SequenceView: View {
             let res = prot.residues[idx]
             guard res.isStandard else { return nil }
             let code = threeToOne[res.name] ?? "?"
-            let ss = secondaryStructure(for: res, in: prot)
+            let ss = cachedSS(chainID: res.chainID, seqNum: res.sequenceNumber)
             return ResidueEntry(
                 resIdx: idx, name: res.name, oneLetterCode: code,
                 seqNum: res.sequenceNumber, chainID: res.chainID, ss: ss
@@ -356,81 +371,23 @@ struct SequenceView: View {
         .sorted { $0.seqNum < $1.seqNum }
     }
 
-    private func secondaryStructure(for res: Residue, in prot: Molecule) -> SecondaryStructure {
+    private func cachedSS(chainID: String, seqNum: Int) -> SecondaryStructure {
+        ssCache["\(chainID)_\(seqNum)"] ?? .coil
+    }
+
+    /// Rebuild the secondary structure cache from scratch.
+    private func rebuildSSCache(prot: Molecule) {
+        var cache: [String: SecondaryStructure] = [:]
         for ssa in prot.secondaryStructureAssignments {
-            if ssa.chain == res.chainID && res.sequenceNumber >= ssa.start && res.sequenceNumber <= ssa.end {
-                return ssa.type
+            for seq in ssa.start...ssa.end {
+                cache["\(ssa.chain)_\(seq)"] = ssa.type
             }
         }
-        return .coil
+        ssCache = cache
+        cachedProteinID = prot.id
     }
 
-    // MARK: - Gap Cell
-
-    @ViewBuilder
-    private func gapCell(count: Int, after: Int, before: Int) -> some View {
-        HStack(spacing: 0) {
-            Text("···\(count)···")
-                .font(.system(size: 8, weight: .medium, design: .monospaced))
-                .foregroundStyle(.orange.opacity(0.8))
-        }
-        .padding(.horizontal, 2)
-        .frame(height: 16)
-        .background(
-            RoundedRectangle(cornerRadius: 2)
-                .fill(.orange.opacity(0.1))
-                .strokeBorder(.orange.opacity(0.3), lineWidth: 0.5)
-        )
-        .help("Gap: \(count) missing residues (\(after + 1)–\(before - 1))")
-    }
-
-    // MARK: - Residue Cell
-
-    @ViewBuilder
-    private func residueCell(_ entry: ResidueEntry) -> some View {
-        let isSelected = viewModel.selectedResidueIndices.contains(entry.resIdx)
-        let isHovered = hoveredResIdx == entry.resIdx
-
-        // Show residue number every 10 residues
-        let showNumber = entry.seqNum % 10 == 0
-
-        VStack(spacing: 0) {
-            if showNumber {
-                Text("\(entry.seqNum)")
-                    .font(.system(size: 6, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .frame(height: 8)
-            }
-
-            Text(entry.oneLetterCode)
-                .font(.system(size: 10, weight: isSelected ? .bold : .medium, design: .monospaced))
-                .frame(width: 14, height: 16)
-                .background(cellBackground(isSelected: isSelected, isHovered: isHovered, ss: entry.ss))
-                .border(cellBorder(isSelected: isSelected, isHovered: isHovered), width: 1)
-                .foregroundStyle(isSelected ? .white : .secondary)
-        }
-        .help("\(entry.name) \(entry.seqNum) (Chain \(entry.chainID))")
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) {
-                hoveredResIdx = hovering ? entry.resIdx : nil
-            }
-        }
-        .onTapGesture {
-            handleResidueClick(entry)
-        }
-    }
-
-    private func cellBackground(isSelected: Bool, isHovered: Bool, ss: SecondaryStructure) -> Color {
-        if isSelected { return .cyan.opacity(0.6) }
-        if isHovered { return ssColor(ss).opacity(0.5) }
-        return ssColor(ss)
-    }
-
-    private func cellBorder(isSelected: Bool, isHovered: Bool) -> Color {
-        if isSelected { return .cyan }
-        if isHovered { return .white.opacity(0.3) }
-        return .clear
-    }
+    // Residue cells are now rendered by SequenceCanvas (Canvas-based).
 
     // MARK: - Context Menu
 
@@ -693,42 +650,229 @@ struct SequenceView: View {
     }
 }
 
-// MARK: - Flow Layout (wrapping grid)
+// MARK: - SequenceCanvas (high-performance Canvas-based sequence rendering)
 
-struct FlowLayout: Layout {
-    var spacing: CGFloat = 2
+/// Renders the entire residue sequence into a single Canvas view instead of
+/// creating 1000+ individual SwiftUI Text views. This eliminates the layout
+/// and diffing overhead that caused tab-switching lag for large proteins.
+private struct SequenceCanvas<MenuContent: View>: View {
+    let cells: [SequenceCell]
+    let selectedResidueIndices: Set<Int>
+    let hoveredResIdx: Int?
+    let ssCache: [String: SecondaryStructure]
+    let onTapCell: (ResidueEntry) -> Void
+    let onHoverCell: (Int?) -> Void
+    @ViewBuilder let contextMenuBuilder: (ResidueEntry) -> MenuContent
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let result = layout(in: proposal.width ?? 250, subviews: subviews)
-        return result.size
-    }
+    // Layout constants
+    private let cellW: CGFloat = 14
+    private let cellH: CGFloat = 16
+    private let numberH: CGFloat = 8
+    private let gapW: CGFloat = 40
+    private let spacing: CGFloat = 1
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let result = layout(in: bounds.width, subviews: subviews)
-        for (index, pos) in result.positions.enumerated() {
-            subviews[index].place(at: CGPoint(x: bounds.minX + pos.x, y: bounds.minY + pos.y),
-                                   proposal: .unspecified)
+    // Precomputed layout: (cellIndex, origin) pairs
+    @State private var cellRects: [CGRect] = []
+    @State private var canvasHeight: CGFloat = 20
+    @State private var containerWidth: CGFloat = 250
+
+    // Track which residue the cursor is over for the context menu
+    @State private var contextHitEntry: ResidueEntry?
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            Canvas { context, size in
+                drawCells(context: context, size: size, containerWidth: width)
+            }
+            .frame(height: canvasHeight)
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    if let hitIdx = hitTest(location), case .residue(let entry) = cells[hitIdx] {
+                        onHoverCell(entry.resIdx)
+                        contextHitEntry = entry
+                    } else {
+                        onHoverCell(nil)
+                    }
+                case .ended:
+                    onHoverCell(nil)
+                }
+            }
+            .onTapGesture { location in
+                if let hitIdx = hitTest(location), case .residue(let entry) = cells[hitIdx] {
+                    onTapCell(entry)
+                }
+            }
+            .contextMenu {
+                if let entry = contextHitEntry {
+                    contextMenuBuilder(entry)
+                }
+            }
+            .onChange(of: width) { _, newWidth in
+                if abs(newWidth - containerWidth) > 1 {
+                    containerWidth = newWidth
+                    recomputeLayout(width: newWidth)
+                }
+            }
+            .onAppear {
+                containerWidth = width
+                recomputeLayout(width: width)
+            }
+            .onChange(of: cells.count) { _, _ in
+                recomputeLayout(width: containerWidth)
+            }
         }
+        .frame(height: canvasHeight)
     }
 
-    private func layout(in width: CGFloat, subviews: Subviews) -> (size: CGSize, positions: [CGPoint]) {
-        var positions: [CGPoint] = []
+    // MARK: - Layout
+
+    private func recomputeLayout(width: CGFloat) {
+        var rects: [CGRect] = []
+        rects.reserveCapacity(cells.count)
         var x: CGFloat = 0
         var y: CGFloat = 0
-        var rowHeight: CGFloat = 0
+        let rowH = cellH + numberH
 
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x + size.width > width && x > 0 {
-                x = 0
-                y += rowHeight + spacing
-                rowHeight = 0
+        for cell in cells {
+            let w: CGFloat
+            switch cell {
+            case .residue: w = cellW
+            case .gap: w = gapW
             }
-            positions.append(CGPoint(x: x, y: y))
-            rowHeight = max(rowHeight, size.height)
-            x += size.width + spacing
+
+            if x + w > width && x > 0 {
+                x = 0
+                y += rowH + spacing
+            }
+            rects.append(CGRect(x: x, y: y, width: w, height: rowH))
+            x += w + spacing
         }
 
-        return (CGSize(width: width, height: y + rowHeight), positions)
+        cellRects = rects
+        canvasHeight = max(y + rowH + 2, 20)
+    }
+
+    // MARK: - Hit Testing
+
+    private func hitTest(_ point: CGPoint) -> Int? {
+        for (i, rect) in cellRects.enumerated() {
+            if rect.contains(point) { return i }
+        }
+        return nil
+    }
+
+    // MARK: - Drawing
+
+    private func drawCells(context: GraphicsContext, size: CGSize, containerWidth: CGFloat) {
+        // Recompute layout inline if rects are stale
+        let rects: [CGRect]
+        if cellRects.count == cells.count {
+            rects = cellRects
+        } else {
+            // Fallback: compute synchronously
+            var computed: [CGRect] = []
+            var x: CGFloat = 0
+            var y: CGFloat = 0
+            let rowH = cellH + numberH
+            for cell in cells {
+                let w: CGFloat = (cell.isResidue ? cellW : gapW)
+                if x + w > containerWidth && x > 0 { x = 0; y += rowH + spacing }
+                computed.append(CGRect(x: x, y: y, width: w, height: rowH))
+                x += w + spacing
+            }
+            rects = computed
+        }
+
+        let residueFont = Font.system(size: 10, weight: .medium, design: .monospaced)
+        let residueFontBold = Font.system(size: 10, weight: .bold, design: .monospaced)
+        let numberFont = Font.system(size: 6, design: .monospaced)
+        let gapFont = Font.system(size: 8, weight: .medium, design: .monospaced)
+
+        for (i, cell) in cells.enumerated() {
+            guard i < rects.count else { break }
+            let rect = rects[i]
+
+            switch cell {
+            case .residue(let entry):
+                let isSelected = selectedResidueIndices.contains(entry.resIdx)
+                let isHovered = hoveredResIdx == entry.resIdx
+
+                // Background
+                let bgColor: Color
+                if isSelected {
+                    bgColor = .cyan.opacity(0.6)
+                } else if isHovered {
+                    bgColor = ssColor(entry.ss).opacity(0.5)
+                } else {
+                    bgColor = ssColor(entry.ss)
+                }
+
+                let cellRect = CGRect(x: rect.minX, y: rect.minY + numberH, width: cellW, height: cellH)
+                context.fill(Path(cellRect), with: .color(bgColor))
+
+                // Selection/hover border
+                if isSelected {
+                    context.stroke(Path(cellRect), with: .color(.cyan), lineWidth: 1)
+                } else if isHovered {
+                    context.stroke(Path(cellRect), with: .color(.white.opacity(0.3)), lineWidth: 1)
+                }
+
+                // Residue number every 10
+                if entry.seqNum % 10 == 0 {
+                    let numText = Text("\(entry.seqNum)")
+                        .font(numberFont)
+                        .foregroundColor(.gray.opacity(0.5))
+                    context.draw(context.resolve(numText),
+                                 at: CGPoint(x: rect.minX + cellW / 2, y: rect.minY + numberH / 2),
+                                 anchor: .center)
+                }
+
+                // One-letter code
+                let letterText = Text(entry.oneLetterCode)
+                    .font(isSelected ? residueFontBold : residueFont)
+                    .foregroundColor(isSelected ? .white : .secondary)
+                context.draw(context.resolve(letterText),
+                             at: CGPoint(x: cellRect.midX, y: cellRect.midY),
+                             anchor: .center)
+
+            case .gap(_, let count, _, _):
+                let gapRect = CGRect(x: rect.minX, y: rect.minY + numberH, width: gapW, height: cellH)
+                // Gap background
+                context.fill(
+                    Path(RoundedRect(rect: gapRect, cornerSize: CGSize(width: 2, height: 2))),
+                    with: .color(.orange.opacity(0.1))
+                )
+                context.stroke(
+                    Path(RoundedRect(rect: gapRect, cornerSize: CGSize(width: 2, height: 2))),
+                    with: .color(.orange.opacity(0.3)),
+                    lineWidth: 0.5
+                )
+                // Gap label
+                let gapText = Text("···\(count)···")
+                    .font(gapFont)
+                    .foregroundColor(.orange.opacity(0.8))
+                context.draw(context.resolve(gapText),
+                             at: CGPoint(x: gapRect.midX, y: gapRect.midY),
+                             anchor: .center)
+            }
+        }
+    }
+}
+
+// Helper for rounded rect path in Canvas
+private struct RoundedRect: Shape {
+    let rect: CGRect
+    let cornerSize: CGSize
+    func path(in bounds: CGRect) -> Path {
+        Path(roundedRect: rect, cornerSize: cornerSize)
+    }
+}
+
+private extension SequenceCell {
+    var isResidue: Bool {
+        if case .residue = self { return true }
+        return false
     }
 }

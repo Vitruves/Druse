@@ -292,6 +292,28 @@ struct ResidueSubset: Identifiable, Sendable {
     }
 }
 
+// MARK: - Side Chain Display (ribbon mode)
+
+/// Controls which residue side chains are shown as ball-and-stick in ribbon mode.
+enum SideChainDisplay: String, CaseIterable, Sendable {
+    case none        = "None"
+    case interacting = "Interacting"   // Only residues with detected interactions
+    case selected    = "Selected"       // Only user-selected residues
+    case all         = "All"
+
+    var icon: String {
+        switch self {
+        case .none:        "eye.slash"
+        case .interacting: "link"
+        case .selected:    "hand.tap"
+        case .all:         "eye"
+        }
+    }
+
+    /// Backbone atom names to EXCLUDE when showing side chains.
+    static let backboneAtomNames: Set<String> = ["N", "CA", "C", "O", "OXT", "H", "HA"]
+}
+
 // MARK: - Render Mode
 
 enum RenderMode: String, CaseIterable, Sendable {

@@ -51,6 +51,7 @@ targets:
           - "/opt/homebrew/lib"
         OTHER_LDFLAGS:
           - "-ldruse_core"
+          - "-lgemmi_cpp"
           - "-lRDKitSmilesParse"
           - "-lRDKitGraphMol"
           - "-lRDKitRDGeneral"

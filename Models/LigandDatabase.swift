@@ -15,9 +15,22 @@ struct LigandEntry: Identifiable, Sendable {
     var preparationDate: Date?
     var conformerCount: Int
 
+    // Experimental binding affinity data (optional)
+    var ki: Float?       // Ki in nM
+    var pKi: Float?      // -log10(Ki in M)
+    var ic50: Float?     // IC50 in nM
+
+    /// Computed pKi from whatever affinity data is available (pKi > Ki > IC50).
+    var effectivePKi: Float? {
+        if let pk = pKi { return pk }
+        if let k = ki, k > 0 { return -log10(k * 1e-9) }
+        if let ic = ic50, ic > 0 { return -log10(ic * 1e-9) }
+        return nil
+    }
+
     init(name: String, smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
          descriptors: LigandDescriptors? = nil, isPrepared: Bool = false,
-         conformerCount: Int = 0) {
+         conformerCount: Int = 0, ki: Float? = nil, pKi: Float? = nil, ic50: Float? = nil) {
         self.id = UUID()
         self.name = name
         self.smiles = smiles
@@ -27,6 +40,9 @@ struct LigandEntry: Identifiable, Sendable {
         self.isPrepared = isPrepared
         self.preparationDate = isPrepared ? Date() : nil
         self.conformerCount = conformerCount
+        self.ki = ki
+        self.pKi = pKi
+        self.ic50 = ic50
     }
 }
 
@@ -208,11 +224,15 @@ final class LigandDatabase {
         // Detect header and column indices
         let header = rows[0].lowercased()
         let hasHeader = header.contains("smiles") || header.contains("name") || header.contains("molecule")
+            || header.contains("ki") || header.contains("ic50") || header.contains("pki")
         let dataRows = hasHeader ? Array(rows.dropFirst()) : rows
 
         // Auto-detect SMILES column if not specified
         let detectedSmilesCol: Int
         let detectedNameCol: Int
+        var kiCol: Int? = nil
+        var pKiCol: Int? = nil
+        var ic50Col: Int? = nil
 
         if let sc = smilesColumn {
             detectedSmilesCol = sc
@@ -221,12 +241,19 @@ final class LigandDatabase {
             let headerCols = rows[0].components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
             detectedSmilesCol = headerCols.firstIndex(where: { $0.contains("smiles") || $0.contains("molecule") || $0.contains("structure") }) ?? 0
             detectedNameCol = nameColumn ?? headerCols.firstIndex(where: { $0.contains("name") || $0.contains("id") || $0.contains("title") }) ?? (detectedSmilesCol == 0 ? 1 : 0)
+
+            // Detect affinity columns
+            kiCol = headerCols.firstIndex(where: { $0 == "ki" || $0 == "ki_nm" || $0 == "ki (nm)" })
+            pKiCol = headerCols.firstIndex(where: { $0 == "pki" || $0 == "p_ki" || $0 == "pki_value" })
+            ic50Col = headerCols.firstIndex(where: { $0 == "ic50" || $0 == "ic50_nm" || $0 == "ic50 (nm)" })
         } else {
             // No header: auto-detect by checking which column looks like SMILES
             let firstRow = dataRows.first.map { $0.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) } } ?? []
             detectedSmilesCol = firstRow.firstIndex(where: { Self.looksLikeSMILES($0) }) ?? 0
             detectedNameCol = nameColumn ?? (detectedSmilesCol == 0 ? 1 : 0)
         }
+
+        let hasAffinity = kiCol != nil || pKiCol != nil || ic50Col != nil
 
         let baseIndex = entries.count
         let lines = dataRows.enumerated().compactMap { offset, row -> (smiles: String, name: String)? in
@@ -237,7 +264,42 @@ final class LigandDatabase {
             return (smi, name)
         }
 
+        // Parse affinity data per row before importing SMILES
+        var affinityMap: [String: (ki: Float?, pKi: Float?, ic50: Float?)] = [:]
+        if hasAffinity {
+            for (offset, row) in dataRows.enumerated() {
+                let cols = row.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                guard detectedSmilesCol < cols.count else { continue }
+                let name: String
+                if detectedNameCol < cols.count {
+                    name = cols[detectedNameCol]
+                } else {
+                    name = "Mol_\(baseIndex + offset + 1)"
+                }
+                let ki = kiCol.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                let pKi = pKiCol.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                let ic50 = ic50Col.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                if ki != nil || pKi != nil || ic50 != nil {
+                    affinityMap[name] = (ki: ki, pKi: pKi, ic50: ic50)
+                }
+            }
+        }
+
         importSMILES(lines, prepare: prepare)
+
+        // Apply affinity data to imported entries
+        if !affinityMap.isEmpty {
+            for i in (entries.count - lines.count)..<entries.count {
+                guard i >= 0, i < entries.count else { continue }
+                if let aff = affinityMap[entries[i].name] {
+                    entries[i].ki = aff.ki
+                    entries[i].pKi = aff.pKi
+                    entries[i].ic50 = aff.ic50
+                }
+            }
+            let affCount = affinityMap.count
+            ActivityLog.shared.info("Imported affinity data for \(affCount) ligands (Ki/pKi/IC50)", category: .molecule)
+        }
     }
 
     /// Heuristic: does this string look like a SMILES notation?
@@ -346,6 +408,10 @@ final class LigandDatabase {
         let fractionCSP3: Float?
         let lipinski: Bool?
         let veber: Bool?
+        // Experimental binding affinity
+        let ki: Float?       // nM
+        let pKi: Float?
+        let ic50: Float?     // nM
         // Atom coordinates stored as flat [x,y,z,x,y,z,...] for compactness
         let atomData: [Float]?
         let atomElements: [Int]?
@@ -369,6 +435,7 @@ final class LigandDatabase {
                 aromaticRings: entry.descriptors?.aromaticRings, heavyAtomCount: entry.descriptors?.heavyAtomCount,
                 fractionCSP3: entry.descriptors?.fractionCSP3, lipinski: entry.descriptors?.lipinski,
                 veber: entry.descriptors?.veber,
+                ki: entry.ki, pKi: entry.pKi, ic50: entry.ic50,
                 atomData: atomData, atomElements: atomElements, atomNames: atomNames, bondData: bondData
             )
         }
@@ -408,7 +475,8 @@ final class LigandDatabase {
             ) : nil
             return LigandEntry(name: s.name, smiles: s.smiles, atoms: atoms, bonds: bonds,
                               descriptors: desc, isPrepared: s.isPrepared,
-                              conformerCount: s.conformerCount ?? 0)
+                              conformerCount: s.conformerCount ?? 0,
+                              ki: s.ki, pKi: s.pKi, ic50: s.ic50)
         }
         entries = loaded
     }

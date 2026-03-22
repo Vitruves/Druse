@@ -404,6 +404,51 @@ final class DruseTests: XCTestCase {
     }
 
     @MainActor
+    func testPDBParserSelectsHighestOccupancyAltLoc() throws {
+        let pdb = """
+        HEADER    ALTLOC TEST
+        ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 10.00           N
+        ATOM      2  CA AALA A   1       1.000   0.000   0.000  0.40 20.00           C
+        ATOM      3  CA BALA A   1       5.000   0.000   0.000  0.60 40.00           C
+        ATOM      4  C   ALA A   1       2.200   0.000   0.000  1.00 10.00           C
+        END
+        """
+
+        let result = PDBParser.parse(pdb)
+        guard let protein = result.protein else {
+            XCTFail("Expected protein to parse")
+            return
+        }
+
+        let alphaCarbons = protein.atoms.filter { $0.name.trimmingCharacters(in: .whitespaces) == "CA" }
+        XCTAssertEqual(alphaCarbons.count, 1)
+        XCTAssertEqual(alphaCarbons[0].position.x, 5.0, accuracy: 0.001)
+        XCTAssertTrue(alphaCarbons[0].altLoc.isEmpty, "Selected altloc should be normalized away after cleanup")
+    }
+
+    @MainActor
+    func testPDBParserBreaksAltLocTiesByBFactor() throws {
+        let pdb = """
+        HEADER    ALTLOC B-FACTOR TEST
+        ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 10.00           N
+        ATOM      2  CA AALA A   1       1.000   0.000   0.000  0.50 30.00           C
+        ATOM      3  CA BALA A   1       4.000   0.000   0.000  0.50 12.00           C
+        ATOM      4  C   ALA A   1       2.200   0.000   0.000  1.00 10.00           C
+        END
+        """
+
+        let result = PDBParser.parse(pdb)
+        guard let protein = result.protein,
+              let alphaCarbon = protein.atoms.first(where: { $0.name.trimmingCharacters(in: .whitespaces) == "CA" }) else {
+            XCTFail("Expected preferred alpha carbon")
+            return
+        }
+
+        XCTAssertEqual(alphaCarbon.position.x, 4.0, accuracy: 0.001)
+        XCTAssertTrue(result.warnings.contains { $0.contains("alternate conformations") })
+    }
+
+    @MainActor
     func testMMCIFParserPreservesResidueMetadata() throws {
         let mmcif = """
         data_test
@@ -432,6 +477,323 @@ final class DruseTests: XCTestCase {
         XCTAssertEqual(parsed.atoms[0].chainID, "A")
         XCTAssertFalse(parsed.atoms[0].isHetAtom)
         XCTAssertGreaterThanOrEqual(parsed.bonds.count, 3)
+    }
+
+    func testGemmiChemCompParsesResidueTopology() throws {
+        let chemComp = """
+        data_ALA
+        _chem_comp.id ALA
+        _chem_comp.name ALANINE
+        _chem_comp.type "L-PEPTIDE LINKING"
+        loop_
+        _chem_comp_atom.comp_id
+        _chem_comp_atom.atom_id
+        _chem_comp_atom.alt_atom_id
+        _chem_comp_atom.type_symbol
+        _chem_comp_atom.charge
+        _chem_comp_atom.pdbx_align
+        _chem_comp_atom.pdbx_aromatic_flag
+        _chem_comp_atom.pdbx_leaving_atom_flag
+        _chem_comp_atom.pdbx_stereo_config
+        _chem_comp_atom.pdbx_backbone_atom_flag
+        _chem_comp_atom.pdbx_n_terminal_atom_flag
+        _chem_comp_atom.pdbx_c_terminal_atom_flag
+        _chem_comp_atom.model_Cartn_x
+        _chem_comp_atom.model_Cartn_y
+        _chem_comp_atom.model_Cartn_z
+        _chem_comp_atom.pdbx_model_Cartn_x_ideal
+        _chem_comp_atom.pdbx_model_Cartn_y_ideal
+        _chem_comp_atom.pdbx_model_Cartn_z_ideal
+        _chem_comp_atom.pdbx_component_atom_id
+        _chem_comp_atom.pdbx_component_comp_id
+        _chem_comp_atom.pdbx_ordinal
+        ALA N N N 0 1 N N N Y Y N 2.281 26.213 12.804 -0.966 0.493 1.500 N ALA 1
+        ALA CA CA C 0 1 N N S Y N N 1.169 26.942 13.411 0.257 0.418 0.692 CA ALA 2
+        ALA C C C 0 1 N N N Y N Y 1.539 28.344 13.874 -0.094 0.017 -0.716 C ALA 3
+        ALA O O O 0 1 N N N Y N Y 2.709 28.647 14.114 -1.056 -0.682 -0.923 O ALA 4
+        loop_
+        _chem_comp_bond.comp_id
+        _chem_comp_bond.atom_id_1
+        _chem_comp_bond.atom_id_2
+        _chem_comp_bond.value_order
+        _chem_comp_bond.pdbx_aromatic_flag
+        _chem_comp_bond.pdbx_stereo_config
+        _chem_comp_bond.pdbx_ordinal
+        ALA N CA SING N N 1
+        ALA CA C SING N N 2
+        ALA C O DOUB N N 3
+        """
+
+        let topology = try GemmiBridge.parseChemCompCIF(chemComp)
+        XCTAssertEqual(topology.residueName, "ALA")
+        XCTAssertEqual(topology.atoms.count, 4)
+        XCTAssertEqual(topology.bonds.count, 3)
+        XCTAssertFalse(topology.angles.isEmpty)
+        XCTAssertEqual(topology.bonds[2].order, .double)
+        XCTAssertGreaterThan(topology.bonds[0].idealLength, 1.0)
+    }
+
+    func testGemmiNeighborSearchFindsNearbyAtoms() {
+        let pdb = """
+        ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 10.00           N
+        ATOM      2  CA  ALA A   1       1.450   0.000   0.000  1.00 10.00           C
+        ATOM      3  C   ALA A   1       4.200   0.000   0.000  1.00 10.00           C
+        END
+        """
+
+        let indices = GemmiBridge.neighborIndices(
+            content: pdb,
+            queryPoint: SIMD3<Float>(0, 0, 0),
+            radius: 1.6,
+            includeHydrogens: true,
+            maxResults: 8
+        )
+
+        XCTAssertEqual(Set(indices), Set([0, 1]))
+        XCTAssertEqual(indices.first, 0)
+    }
+
+    func testProteinPreparationDetectsChainBreaks() {
+        let atoms = [
+            Atom(id: 0, element: .N, position: SIMD3<Float>(0, 0, 0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .C, position: SIMD3<Float>(1.2, 0, 0), name: "CA", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 2, element: .C, position: SIMD3<Float>(2.4, 0, 0), name: "C", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 3, element: .N, position: SIMD3<Float>(6.2, 0, 0), name: "N", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 4, element: .C, position: SIMD3<Float>(7.4, 0, 0), name: "CA", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 5, element: .C, position: SIMD3<Float>(8.6, 0, 0), name: "C", residueName: "GLY", residueSeq: 2, chainID: "A")
+        ]
+
+        let breaks = ProteinPreparation.detectChainBreaks(in: atoms)
+        XCTAssertEqual(breaks.count, 1)
+        XCTAssertEqual(breaks[0].chainID, "A")
+        XCTAssertEqual(breaks[0].previousResidueSeq, 1)
+        XCTAssertEqual(breaks[0].nextResidueSeq, 2)
+        XCTAssertGreaterThan(breaks[0].carbonNitrogenDistance, 1.8)
+    }
+
+    func testProteinPreparationRetainsNearbyWaters() {
+        let atoms = [
+            Atom(id: 0, element: .N, position: SIMD3<Float>(0, 0, 0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .O, position: SIMD3<Float>(1.2, 0, 0), name: "O", residueName: "HOH", residueSeq: 100, chainID: "A", isHetAtom: true),
+            Atom(id: 2, element: .O, position: SIMD3<Float>(8.0, 0, 0), name: "O", residueName: "HOH", residueSeq: 101, chainID: "A", isHetAtom: true)
+        ]
+
+        let retained = ProteinPreparation.removeWaters(
+            atoms: atoms,
+            bonds: [],
+            keepingNearby: [SIMD3<Float>(0, 0, 0)],
+            within: 2.0
+        )
+
+        let retainedWaters = retained.atoms.filter { $0.residueName == "HOH" }
+        XCTAssertEqual(retainedWaters.count, 1)
+        XCTAssertEqual(retained.removedCount, 1)
+        XCTAssertEqual(retainedWaters[0].residueSeq, 100)
+    }
+
+    func testProteinPreparationRemovesNonStandardResiduesButKeepsWatersAndCaps() {
+        let atoms = [
+            Atom(id: 0, element: .N, position: SIMD3<Float>(0, 0, 0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .O, position: SIMD3<Float>(2, 0, 0), name: "O", residueName: "HOH", residueSeq: 100, chainID: "A", isHetAtom: true),
+            Atom(id: 2, element: .C, position: SIMD3<Float>(4, 0, 0), name: "C1", residueName: "GOL", residueSeq: 200, chainID: "A", isHetAtom: true),
+            Atom(id: 3, element: .C, position: SIMD3<Float>(6, 0, 0), name: "C", residueName: "ACE", residueSeq: 1, chainID: "A", isHetAtom: true),
+            Atom(id: 4, element: .N, position: SIMD3<Float>(8, 0, 0), name: "N", residueName: "NME", residueSeq: 2, chainID: "A", isHetAtom: true)
+        ]
+
+        let filtered = ProteinPreparation.removeNonStandardResidues(
+            atoms: atoms,
+            bonds: [],
+            keepingWaters: true,
+            keepingExistingCaps: true
+        )
+
+        XCTAssertEqual(filtered.removedResidueCount, 1)
+        XCTAssertEqual(filtered.removedAtomCount, 1)
+        XCTAssertFalse(filtered.atoms.contains { $0.residueName == "GOL" })
+        XCTAssertTrue(filtered.atoms.contains { $0.residueName == "HOH" })
+        XCTAssertTrue(filtered.atoms.contains { $0.residueName == "ACE" })
+        XCTAssertTrue(filtered.atoms.contains { $0.residueName == "NME" })
+    }
+
+    func testProteinPreparationCapsChainBreaksWithAceAndNme() {
+        let atoms = [
+            Atom(id: 0, element: .N, position: SIMD3<Float>(0.0, 0.0, 0.0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .C, position: SIMD3<Float>(1.45, 0.0, 0.0), name: "CA", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 2, element: .C, position: SIMD3<Float>(2.55, 0.0, 0.0), name: "C", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 3, element: .O, position: SIMD3<Float>(3.30, 0.85, 0.0), name: "O", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 4, element: .N, position: SIMD3<Float>(6.20, 0.0, 0.0), name: "N", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 5, element: .C, position: SIMD3<Float>(7.45, 0.0, 0.0), name: "CA", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 6, element: .C, position: SIMD3<Float>(8.55, 0.0, 0.0), name: "C", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 7, element: .O, position: SIMD3<Float>(9.30, 0.85, 0.0), name: "O", residueName: "GLY", residueSeq: 2, chainID: "A")
+        ]
+        let bonds = [
+            Bond(id: 0, atomIndex1: 0, atomIndex2: 1, order: .single),
+            Bond(id: 1, atomIndex1: 1, atomIndex2: 2, order: .single),
+            Bond(id: 2, atomIndex1: 2, atomIndex2: 3, order: .double),
+            Bond(id: 3, atomIndex1: 4, atomIndex2: 5, order: .single),
+            Bond(id: 4, atomIndex1: 5, atomIndex2: 6, order: .single),
+            Bond(id: 5, atomIndex1: 6, atomIndex2: 7, order: .double)
+        ]
+
+        let cleaned = ProteinPreparation.cleanupStructure(atoms: atoms, bonds: bonds)
+
+        XCTAssertEqual(cleaned.report.addedCappingResidues, 2)
+        XCTAssertEqual(cleaned.report.chainBreaks.count, 1)
+        XCTAssertTrue(cleaned.report.chainBreaks[0].isCapped)
+        XCTAssertEqual(cleaned.atoms.count, atoms.count + 5)
+        XCTAssertTrue(cleaned.atoms.contains { $0.residueName == "ACE" && $0.name == "C" })
+        XCTAssertTrue(cleaned.atoms.contains { $0.residueName == "NME" && $0.name == "N" })
+
+        let previousCarbonIndex = cleaned.atoms.firstIndex {
+            $0.residueName == "ALA" && $0.residueSeq == 1 && $0.name == "C"
+        }
+        let nmeNitrogenIndex = cleaned.atoms.firstIndex {
+            $0.residueName == "NME" && $0.name == "N"
+        }
+        let aceCarbonIndex = cleaned.atoms.firstIndex {
+            $0.residueName == "ACE" && $0.name == "C"
+        }
+        let nextNitrogenIndex = cleaned.atoms.firstIndex {
+            $0.residueName == "GLY" && $0.residueSeq == 2 && $0.name == "N"
+        }
+
+        XCTAssertNotNil(previousCarbonIndex)
+        XCTAssertNotNil(nmeNitrogenIndex)
+        XCTAssertNotNil(aceCarbonIndex)
+        XCTAssertNotNil(nextNitrogenIndex)
+
+        guard let previousCarbonIndex,
+              let nmeNitrogenIndex,
+              let aceCarbonIndex,
+              let nextNitrogenIndex else {
+            XCTFail("Expected capping atoms and anchors to exist")
+            return
+        }
+
+        XCTAssertTrue(cleaned.bonds.contains {
+            ($0.atomIndex1 == previousCarbonIndex && $0.atomIndex2 == nmeNitrogenIndex) ||
+            ($0.atomIndex2 == previousCarbonIndex && $0.atomIndex1 == nmeNitrogenIndex)
+        })
+        XCTAssertTrue(cleaned.bonds.contains {
+            ($0.atomIndex1 == aceCarbonIndex && $0.atomIndex2 == nextNitrogenIndex) ||
+            ($0.atomIndex2 == aceCarbonIndex && $0.atomIndex1 == nextNitrogenIndex)
+        })
+    }
+
+    func testPrepareForDockingRunsPhase12CleanupBeforeCharges() {
+        let atoms = [
+            Atom(id: 0, element: .N, position: SIMD3<Float>(0.0, 0.0, 0.0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .C, position: SIMD3<Float>(1.45, 0.0, 0.0), name: "CA", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 2, element: .C, position: SIMD3<Float>(2.55, 0.0, 0.0), name: "C", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 3, element: .O, position: SIMD3<Float>(3.30, 0.85, 0.0), name: "O", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            Atom(id: 4, element: .N, position: SIMD3<Float>(6.20, 0.0, 0.0), name: "N", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 5, element: .C, position: SIMD3<Float>(7.45, 0.0, 0.0), name: "CA", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 6, element: .C, position: SIMD3<Float>(8.55, 0.0, 0.0), name: "C", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 7, element: .O, position: SIMD3<Float>(9.30, 0.85, 0.0), name: "O", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            Atom(id: 8, element: .C, position: SIMD3<Float>(11.0, 0.0, 0.0), name: "C1", residueName: "GOL", residueSeq: 100, chainID: "A", isHetAtom: true)
+        ]
+        let bonds = [
+            Bond(id: 0, atomIndex1: 0, atomIndex2: 1, order: .single),
+            Bond(id: 1, atomIndex1: 1, atomIndex2: 2, order: .single),
+            Bond(id: 2, atomIndex1: 2, atomIndex2: 3, order: .double),
+            Bond(id: 3, atomIndex1: 4, atomIndex2: 5, order: .single),
+            Bond(id: 4, atomIndex1: 5, atomIndex2: 6, order: .single),
+            Bond(id: 5, atomIndex1: 6, atomIndex2: 7, order: .double)
+        ]
+
+        let prepared = ProteinPreparation.prepareForDocking(atoms: atoms, bonds: bonds, rawPDBContent: nil, pH: 7.4)
+
+        XCTAssertEqual(prepared.report.heterogenResiduesRemoved, 1)
+        XCTAssertEqual(prepared.report.cappingResiduesAdded, 2)
+        XCTAssertEqual(prepared.report.chainBreaksDetected, 1)
+        XCTAssertEqual(prepared.report.chainBreaksCapped, 1)
+        XCTAssertFalse(prepared.atoms.contains { $0.residueName == "GOL" })
+        XCTAssertTrue(prepared.atoms.contains { $0.residueName == "ACE" })
+        XCTAssertTrue(prepared.atoms.contains { $0.residueName == "NME" })
+    }
+
+    @MainActor
+    func testProteinPreparationResidueCompletenessFlagsMissingHeavyAtomsAndExtraAtoms() {
+        let molecule = TestMolecules.alanineDipeptide()
+        var atoms = molecule.atoms.filter {
+            !($0.residueName == "ALA" && $0.residueSeq == 2 && $0.name == "CB")
+        }
+        atoms.append(Atom(
+            id: atoms.count,
+            element: .C,
+            position: SIMD3<Float>(2.4, -1.8, 1.4),
+            name: "QX",
+            residueName: "ALA",
+            residueSeq: 2,
+            chainID: "A"
+        ))
+
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: atoms)
+        guard let alanine = completeness.first(where: {
+            $0.chainID == "A" && $0.residueSeq == 2 && $0.residueName == "ALA"
+        }) else {
+            XCTFail("Expected alanine completeness issue")
+            return
+        }
+
+        XCTAssertEqual(alanine.missingHeavyAtoms, ["CB"])
+        XCTAssertEqual(alanine.extraAtoms, ["QX"])
+        XCTAssertTrue(alanine.missingHydrogens.isEmpty)
+    }
+
+    @MainActor
+    func testProteinPreparationResidueCompletenessFlagsMissingHydrogenGroups() {
+        let molecule = TestMolecules.alanineDipeptide()
+        let atoms = molecule.atoms.filter {
+            !($0.residueName == "ALA" && $0.residueSeq == 2 && $0.name == "HB1")
+        }
+
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: atoms)
+        guard let alanine = completeness.first(where: {
+            $0.chainID == "A" && $0.residueSeq == 2 && $0.residueName == "ALA"
+        }) else {
+            XCTFail("Expected alanine completeness issue")
+            return
+        }
+
+        XCTAssertTrue(alanine.missingHeavyAtoms.isEmpty)
+        XCTAssertTrue(alanine.missingHydrogens.contains("HB"))
+        XCTAssertTrue(alanine.extraAtoms.isEmpty)
+    }
+
+    @MainActor
+    func testProteinPreparationResidueCompletenessSuppressesHydrogenGapsInHeavyAtomOnlyStructures() {
+        let molecule = TestMolecules.alanineDipeptide()
+        let heavyAtomOnly = molecule.atoms.filter { $0.element != .H }
+
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: heavyAtomOnly)
+        XCTAssertTrue(completeness.isEmpty)
+    }
+
+    @MainActor
+    func testProteinPreparationResidueCompletenessAcceptsAlternateHydrogenNamingSchemes() {
+        let molecule = TestMolecules.alanineDipeptide()
+        let atoms = molecule.atoms.map { atom -> Atom in
+            guard atom.residueName == "ALA", atom.residueSeq == 2 else { return atom }
+
+            var renamed = atom
+            switch atom.name {
+            case "HB1":
+                renamed.name = "1HB"
+            case "HB2":
+                renamed.name = "2HB"
+            case "HB3":
+                renamed.name = "3HB"
+            default:
+                break
+            }
+            return renamed
+        }
+
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: atoms)
+        XCTAssertFalse(completeness.contains(where: {
+            $0.chainID == "A" && $0.residueSeq == 2 && $0.residueName == "ALA"
+        }))
     }
 
     @MainActor

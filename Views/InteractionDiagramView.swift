@@ -13,6 +13,7 @@ struct InteractionDiagramView: View {
     let poseEnergy: Float
     let poseIndex: Int
 
+    @Environment(\.dismiss) private var dismiss
     @State private var coords2D: RDKitBridge.Coords2D?
     @State private var isLoading = true
 
@@ -38,7 +39,10 @@ struct InteractionDiagramView: View {
         .frame(minWidth: 600, minHeight: 500)
         .task {
             if let smiles = ligandSmiles, !smiles.isEmpty {
-                coords2D = RDKitBridge.compute2DCoords(smiles: smiles)
+                let result = await Task.detached {
+                    RDKitBridge.compute2DCoords(smiles: smiles)
+                }.value
+                coords2D = result
             }
             isLoading = false
         }
@@ -57,6 +61,13 @@ struct InteractionDiagramView: View {
             Text(String(format: "%.2f kcal/mol", poseEnergy))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(poseEnergy < -6 ? .green : poseEnergy < 0 ? .orange : .red)
+            Button(action: { dismiss() }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Close diagram")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -141,7 +152,7 @@ struct InteractionDiagramView: View {
     // MARK: - Main Drawing
 
     private func drawDiagram(context: GraphicsContext, size: CGSize, coords: RDKitBridge.Coords2D) {
-        let padding: CGFloat = 100  // space around ligand for residue bubbles
+        let padding: CGFloat = 120  // space around ligand for residue bubbles
 
         // 1. Compute ligand 2D bounding box and scale
         let positions = coords.positions
@@ -219,7 +230,7 @@ struct InteractionDiagramView: View {
             let dx = avgLigandPos.x - ligandCenter.x
             let dy = avgLigandPos.y - ligandCenter.y
             let dist = max(sqrt(dx * dx + dy * dy), 1)
-            let pushDist: CGFloat = min(size.width, size.height) * 0.35
+            let pushDist: CGFloat = min(size.width, size.height) * 0.40
             let residueCenter = CGPoint(
                 x: ligandCenter.x + dx / dist * pushDist,
                 y: ligandCenter.y + dy / dist * pushDist
@@ -230,7 +241,7 @@ struct InteractionDiagramView: View {
 
         // Resolve overlapping residue bubbles by angular redistribution
         resolveOverlaps(&residuePlacements, around: ligandCenter,
-                        radius: min(size.width, size.height) * 0.35)
+                        radius: min(size.width, size.height) * 0.40)
 
         // 6. Draw interactions and residue bubbles
         for (key, residueCenter, ixns) in residuePlacements {
@@ -241,7 +252,7 @@ struct InteractionDiagramView: View {
                 let ligPos = project(positions[ligIdx])
 
                 // Shorten line so it stops at bubble edge and atom edge
-                let toResidue = shorten(from: ligPos, to: residueCenter, fromInset: 6, toInset: 28)
+                let toResidue = shorten(from: ligPos, to: residueCenter, fromInset: 6, toInset: 36)
                 drawInteractionLine(context: context, from: toResidue.0, to: toResidue.1,
                                     type: ixn.type, distance: ixn.distance)
             }
@@ -327,9 +338,19 @@ struct InteractionDiagramView: View {
     }
 
     private func drawLigandAtom(context: GraphicsContext, at point: CGPoint, atomicNum: Int, index: Int) {
-        // Carbon: just a dot. Heteroatoms: colored circle with label.
+        // Pharmacophoric halo: check if this atom is involved in any interaction
+        let pharmaColor = pharmacophoreColor(forLigandAtomIndex: index)
+
         if atomicNum == 6 {
+            // Carbon: small dot, optionally with pharmacophoric halo
             let r: CGFloat = 2
+            if let haloColor = pharmaColor {
+                let hr: CGFloat = 7
+                context.fill(Path(ellipseIn: CGRect(x: point.x - hr, y: point.y - hr, width: hr * 2, height: hr * 2)),
+                             with: .color(haloColor.opacity(0.2)))
+                context.stroke(Path(ellipseIn: CGRect(x: point.x - hr, y: point.y - hr, width: hr * 2, height: hr * 2)),
+                               with: .color(haloColor.opacity(0.6)), lineWidth: 1)
+            }
             context.fill(Path(ellipseIn: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2)),
                          with: .color(.primary.opacity(0.6)))
             return
@@ -337,6 +358,15 @@ struct InteractionDiagramView: View {
 
         let (symbol, color) = atomDisplay(atomicNum)
         let r: CGFloat = 9
+
+        // Pharmacophoric halo (larger ring behind the atom)
+        if let haloColor = pharmaColor {
+            let hr: CGFloat = 13
+            context.fill(Path(ellipseIn: CGRect(x: point.x - hr, y: point.y - hr, width: hr * 2, height: hr * 2)),
+                         with: .color(haloColor.opacity(0.15)))
+            context.stroke(Path(ellipseIn: CGRect(x: point.x - hr, y: point.y - hr, width: hr * 2, height: hr * 2)),
+                           with: .color(haloColor.opacity(0.5)), lineWidth: 1.5)
+        }
 
         // Background circle
         context.fill(Path(ellipseIn: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2)),
@@ -349,31 +379,121 @@ struct InteractionDiagramView: View {
         context.draw(context.resolve(text), at: point, anchor: .center)
     }
 
+    /// Get pharmacophoric halo color for a ligand atom based on its interaction types.
+    private func pharmacophoreColor(forLigandAtomIndex index: Int) -> Color? {
+        let types = interactions.filter { $0.ligandAtomIndex == index }.map(\.type)
+        guard !types.isEmpty else { return nil }
+
+        // Priority: H-bond > salt bridge > pi-stack > hydrophobic
+        if types.contains(.hbond) || types.contains(.halogen) {
+            return Color(red: 0.2, green: 0.6, blue: 1.0)       // H-bond: blue
+        }
+        if types.contains(.saltBridge) {
+            return Color(red: 1.0, green: 0.5, blue: 0.1)       // Salt bridge: orange
+        }
+        if types.contains(.piStack) || types.contains(.piCation) {
+            return Color(red: 0.6, green: 0.3, blue: 0.9)       // Aromatic: purple
+        }
+        if types.contains(.metalCoord) {
+            return Color(red: 1.0, green: 0.85, blue: 0.0)      // Metal: gold
+        }
+        if types.contains(.hydrophobic) || types.contains(.chPi) {
+            return Color(red: 0.9, green: 0.8, blue: 0.2)       // Hydrophobic: yellow
+        }
+        return Color.gray.opacity(0.5)
+    }
+
     private func drawResidueBubble(context: GraphicsContext, at center: CGPoint,
                                     key: ResidueKey, interactions: [MolecularInteraction]) {
-        let hasHydrophobic = interactions.contains { $0.type == .hydrophobic || $0.type == .chPi }
-        let bubbleW: CGFloat = 54
-        let bubbleH: CGFloat = 28
+        let bubbleW: CGFloat = 66
+        let bubbleH: CGFloat = 44
 
         let rect = CGRect(x: center.x - bubbleW / 2, y: center.y - bubbleH / 2,
                           width: bubbleW, height: bubbleH)
 
-        // Background fill: green tint for hydrophobic, blue for polar
-        let fillColor: Color = hasHydrophobic
-            ? Color.green.opacity(0.1)
-            : Color.blue.opacity(0.08)
-        let borderColor: Color = hasHydrophobic
-            ? Color.green.opacity(0.4)
-            : Color.blue.opacity(0.3)
+        // Pharmacophoric coloring based on dominant interaction type
+        let dominantType = dominantInteractionType(interactions)
+        let (fillColor, borderColor) = residueBubbleColors(dominantType)
 
-        context.fill(Path(roundedRect: rect, cornerRadius: 6), with: .color(fillColor))
-        context.stroke(Path(roundedRect: rect, cornerRadius: 6), with: .color(borderColor), lineWidth: 1.2)
+        context.fill(Path(roundedRect: rect, cornerRadius: 8), with: .color(fillColor))
+        context.stroke(Path(roundedRect: rect, cornerRadius: 8), with: .color(borderColor), lineWidth: 1.5)
 
-        // Residue label
-        let label = Text(key.label)
-            .font(.system(size: 10, weight: .semibold))
+        // Small pharmacophoric indicator dot (top-right corner)
+        let dotR: CGFloat = 4
+        let dotCenter = CGPoint(x: center.x + bubbleW / 2 - 8, y: center.y - bubbleH / 2 + 8)
+        context.fill(Path(ellipseIn: CGRect(x: dotCenter.x - dotR, y: dotCenter.y - dotR,
+                                            width: dotR * 2, height: dotR * 2)),
+                     with: .color(borderColor))
+
+        // Residue label (e.g., "ASP25")
+        let resLabel = Text(key.label)
+            .font(.system(size: 10, weight: .bold))
             .foregroundColor(.primary)
-        context.draw(context.resolve(label), at: center, anchor: .center)
+        context.draw(context.resolve(resLabel), at: CGPoint(x: center.x, y: center.y - 8), anchor: .center)
+
+        // Interacting protein atom names (e.g., "OD1, N") with chain
+        let atomNames = uniqueProteinAtomNames(for: interactions)
+        let detailText = atomNames.isEmpty ? key.chain : "\(key.chain): \(atomNames)"
+        let detailLabel = Text(detailText)
+            .font(.system(size: 7, weight: .medium, design: .monospaced))
+            .foregroundColor(borderColor)
+        context.draw(context.resolve(detailLabel), at: CGPoint(x: center.x, y: center.y + 6), anchor: .center)
+
+        // Interaction type label (e.g., "H-bond", "Hydrophobic")
+        let typeLabel = Text(dominantType.label)
+            .font(.system(size: 6, weight: .medium))
+            .foregroundColor(.secondary)
+        context.draw(context.resolve(typeLabel), at: CGPoint(x: center.x, y: center.y + 15), anchor: .center)
+    }
+
+    /// Find the dominant interaction type for a set of interactions.
+    private func dominantInteractionType(_ interactions: [MolecularInteraction]) -> MolecularInteraction.InteractionType {
+        // Priority: H-bond > salt bridge > metal > pi-stack > halogen > hydrophobic
+        let types = Set(interactions.map(\.type))
+        if types.contains(.hbond) { return .hbond }
+        if types.contains(.saltBridge) { return .saltBridge }
+        if types.contains(.metalCoord) { return .metalCoord }
+        if types.contains(.piStack) { return .piStack }
+        if types.contains(.piCation) { return .piCation }
+        if types.contains(.halogen) { return .halogen }
+        if types.contains(.chPi) { return .chPi }
+        return .hydrophobic
+    }
+
+    /// Get fill and border colors for a residue bubble based on pharmacophoric type.
+    private func residueBubbleColors(_ type: MolecularInteraction.InteractionType) -> (fill: Color, border: Color) {
+        switch type {
+        case .hbond:
+            return (Color.cyan.opacity(0.1), Color.cyan.opacity(0.6))
+        case .hydrophobic, .chPi:
+            return (Color.green.opacity(0.1), Color.green.opacity(0.5))
+        case .saltBridge:
+            return (Color.orange.opacity(0.1), Color.orange.opacity(0.5))
+        case .piStack, .piCation:
+            return (Color.purple.opacity(0.1), Color.purple.opacity(0.5))
+        case .halogen:
+            return (Color.green.opacity(0.08), Color.green.opacity(0.4))
+        case .metalCoord:
+            return (Color.yellow.opacity(0.1), Color.yellow.opacity(0.6))
+        }
+    }
+
+    /// Extract unique protein atom names involved in interactions for a residue bubble.
+    private func uniqueProteinAtomNames(for interactions: [MolecularInteraction]) -> String {
+        var names: [String] = []
+        var seen = Set<Int>()
+        for ixn in interactions {
+            let pIdx = ixn.proteinAtomIndex
+            guard pIdx < proteinAtoms.count, !seen.contains(pIdx) else { continue }
+            seen.insert(pIdx)
+            let name = proteinAtoms[pIdx].name.trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty { names.append(name) }
+        }
+        // Limit to 3 atom names to keep bubble readable
+        if names.count > 3 {
+            return names.prefix(3).joined(separator: ",") + "..."
+        }
+        return names.joined(separator: ", ")
     }
 
     private func drawInteractionLine(context: GraphicsContext, from: CGPoint, to: CGPoint,
@@ -516,7 +636,6 @@ struct InteractionDiagramView: View {
     ) {
         guard placements.count > 1 else { return }
 
-        // Convert to polar, sort by angle, enforce minimum angular spacing
         struct PolarEntry {
             var angle: CGFloat
             var originalIndex: Int
@@ -529,20 +648,38 @@ struct InteractionDiagramView: View {
         }
         polar.sort { $0.angle < $1.angle }
 
-        let minSpacing: CGFloat = 0.35  // ~20 degrees in radians
-        for i in 1..<polar.count {
-            let gap = polar[i].angle - polar[i - 1].angle
-            if gap < minSpacing {
-                polar[i].angle = polar[i - 1].angle + minSpacing
+        // Larger bubbles need more angular spacing (~25-30 degrees)
+        let minSpacing: CGFloat = 0.45
+
+        // Multi-pass relaxation for better distribution
+        for _ in 0..<3 {
+            // Forward pass
+            for i in 1..<polar.count {
+                let gap = polar[i].angle - polar[i - 1].angle
+                if gap < minSpacing {
+                    polar[i].angle = polar[i - 1].angle + minSpacing
+                }
+            }
+            // Wrap-around check: last vs first
+            if polar.count > 1 {
+                let wrapGap = (polar[0].angle + 2 * .pi) - polar[polar.count - 1].angle
+                if wrapGap < minSpacing {
+                    // Push the last element back slightly
+                    polar[polar.count - 1].angle = (polar[0].angle + 2 * .pi) - minSpacing
+                }
             }
         }
+
+        // If total angular span exceeds 2*pi, scale radius outward
+        let totalSpan = polar.last!.angle - polar.first!.angle
+        let effectiveRadius = totalSpan > 1.8 * .pi ? radius * 1.15 : radius
 
         // Apply corrected positions
         for entry in polar {
             let idx = entry.originalIndex
             placements[idx].center = CGPoint(
-                x: origin.x + cos(entry.angle) * radius,
-                y: origin.y + sin(entry.angle) * radius
+                x: origin.x + cos(entry.angle) * effectiveRadius,
+                y: origin.y + sin(entry.angle) * effectiveRadius
             )
         }
     }

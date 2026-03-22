@@ -36,6 +36,8 @@ Three-layer stack:
 brew install rdkit boost eigen nanoflann tbb
 ```
 
+The repository vendors gemmi under `third_parties_deps/gemmi` for offline builds. To test against a different local checkout during development, configure CMake with `-DGEMMI_SOURCE_DIR=/path/to/gemmi`.
+
 ## Build
 
 ```bash

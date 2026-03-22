@@ -261,8 +261,67 @@ DruseMoleculeResult* druse_minimize_lbfgs(const char *smiles, const char *name, 
 // MARK: - mmCIF Parser
 // ============================================================================
 
+/// Parse macromolecular structure content (PDB/mmCIF/mmJSON auto-detected by gemmi).
+DruseMoleculeResult* druse_parse_structure(const char *content);
+
 /// Parse mmCIF format content. Returns same structure as PDB parsing.
 DruseMoleculeResult* druse_parse_mmcif(const char *content);
+
+// ============================================================================
+// MARK: - Residue Topology (gemmi chemcomp)
+// ============================================================================
+
+typedef struct {
+    char atomName[8];
+    int32_t atomicNum;
+    int32_t formalCharge;
+    bool isHydrogen;
+} DruseResidueTopologyAtom;
+
+typedef struct {
+    char atom1[8];
+    char atom2[8];
+    int32_t order;          // 1=single, 2=double, 3=triple, 4=aromatic/delocalized
+    float idealLength;      // derived from ideal CCD coordinates when available
+} DruseResidueTopologyBond;
+
+typedef struct {
+    char atom1[8];
+    char atom2[8];          // central atom
+    char atom3[8];
+    float idealAngleDegrees; // derived from ideal CCD coordinates when available
+} DruseResidueTopologyAngle;
+
+typedef struct {
+    DruseResidueTopologyAtom *atoms;
+    int32_t atomCount;
+    DruseResidueTopologyBond *bonds;
+    int32_t bondCount;
+    DruseResidueTopologyAngle *angles;
+    int32_t angleCount;
+    char residueName[16];
+    bool success;
+    char errorMessage[512];
+} DruseResidueTopologyResult;
+
+/// Parse a CCD/chemcomp CIF block and expose atom/bond/angle template data.
+DruseResidueTopologyResult* druse_parse_chemcomp_cif(const char *content);
+void druse_free_residue_topology_result(DruseResidueTopologyResult *result);
+
+// ============================================================================
+// MARK: - Protein Spatial Queries (gemmi neighbor search)
+// ============================================================================
+
+/// Query atom indices within `radius` of `queryPoint` in structure content.
+/// Returns the number of indices written, or -1 on parse/query failure.
+int32_t druse_find_structure_neighbors(
+    const char *content,
+    const float *queryPoint,
+    float radius,
+    bool includeHydrogens,
+    int32_t *outIndices,
+    int32_t maxResults
+);
 
 // ============================================================================
 // MARK: - Electrostatic Potential

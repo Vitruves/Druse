@@ -25,7 +25,7 @@ struct DockingConfig: Sendable {
     // Local search (Vina-like basin hopping: refine every MC step by default)
     var localSearchFrequency: Int = 1   // every N generations
     var localSearchSteps: Int = 30      // gradient descent steps per refinement
-    var liveUpdateFrequency: Int = 5    // visual update every N generations
+    var liveUpdateFrequency: Int = 3    // visual update every N generations (lower = smoother animation)
 
     // Flexibility
     var enableFlexibility: Bool = true  // torsion flexibility during docking
@@ -34,6 +34,13 @@ struct DockingConfig: Sendable {
     // Clash handling
     var maxClashOverlap: Float = 0.4    // Angstroms of VdW overlap allowed
     var clashPenaltyScale: Float = 5.0  // kcal/mol per Angstrom of excess overlap
+
+    // Exploration: broader initial search with higher translation/rotation steps
+    // before switching to fine-grained local refinement
+    var explorationPhaseRatio: Float = 0.4  // first 40% of generations use broader search
+    var explorationTranslationStep: Float = 4.0  // wider initial translation (vs 2.0 during refinement)
+    var explorationRotationStep: Float = 0.6     // wider initial rotation (vs 0.3)
+    var explorationMutationRate: Float = 0.15    // higher mutation during exploration
 
     // Legacy flat-generation count (for backward compatibility)
     var numGenerations: Int { numRuns * generationsPerRun }
@@ -172,6 +179,8 @@ final class DockingEngine {
     private(set) var bestEnergy: Float = .infinity
     private var gridParams = GridParams()
     private var config = DockingConfig()
+    /// Tracks the last allocated population buffer capacity to avoid redundant reallocation.
+    private var lastPopulationBufferCapacity: Int = 0
 
     /// Diagnostics from the last completed docking run.
     private(set) var lastDiagnostics: DockingDiagnostics?
@@ -1022,9 +1031,13 @@ final class DockingEngine {
 
         let popSize = config.populationSize
         let poseSize = popSize * MemoryLayout<DockPose>.stride
-        populationBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
-        offspringBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
-        bestPopulationBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
+        // Reuse population buffers if they're already large enough
+        if poseSize > lastPopulationBufferCapacity {
+            populationBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
+            offspringBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
+            bestPopulationBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
+            lastPopulationBufferCapacity = poseSize
+        }
 
         var gaParams = GAParams(
             populationSize: UInt32(popSize),
@@ -1083,6 +1096,8 @@ final class DockingEngine {
 
             let generationBase = runIndex * config.generationsPerRun
 
+            let explorationCutoff = Int(Float(config.generationsPerRun) * config.explorationPhaseRatio)
+
             for step in 0..<config.generationsPerRun {
                 guard isRunning else {
                     aggregatedResults.append(contentsOf: extractAllResults(
@@ -1096,6 +1111,21 @@ final class DockingEngine {
                 let globalGeneration = generationBase + step
                 currentGeneration = globalGeneration
                 gaParams.generation = UInt32(globalGeneration)
+
+                // Two-phase search: exploration phase uses wider steps for broader grid coverage,
+                // refinement phase uses tighter steps for precise local optimization
+                if step < explorationCutoff {
+                    // Exploration phase: broader search
+                    gaParams.translationStep = config.explorationTranslationStep
+                    gaParams.rotationStep = config.explorationRotationStep
+                    gaParams.mutationRate = config.explorationMutationRate
+                } else if step == explorationCutoff {
+                    // Switch to refinement phase
+                    gaParams.translationStep = config.translationStep
+                    gaParams.rotationStep = config.rotationStep
+                    gaParams.mutationRate = config.mutationRate
+                }
+
                 gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
 
                 let perturbBuffers: [(MTLBuffer, Int)] = [
@@ -1123,7 +1153,12 @@ final class DockingEngine {
                 dispatches.append((pipeline: metropolisAcceptPipeline, buffers: acceptBuffers))
                 dispatchBatch(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
 
-                if step % liveUpdateFrequency == 0 || step == config.generationsPerRun - 1 {
+                // Update more frequently during exploration phase for smoother visualization
+                // of ligand moving through the binding site, less during refinement
+                let updateFreq = step < explorationCutoff
+                    ? max(liveUpdateFrequency / 2, 1)  // 2x more frequent during exploration
+                    : liveUpdateFrequency
+                if step % updateFreq == 0 || step == config.generationsPerRun - 1 {
                     emitLiveUpdate(generation: globalGeneration)
                 }
 

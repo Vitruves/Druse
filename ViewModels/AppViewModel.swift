@@ -16,6 +16,9 @@ final class AppViewModel {
     var hiddenChainIDs: Set<String> = []
     var useDirectionalLighting: Bool = false
 
+    /// Which residue side chains to show as ball-and-stick in ribbon mode.
+    var sideChainDisplay: SideChainDisplay = .none
+
     // Z-slab clipping
     var enableClipping: Bool = false
     var clipNearZ: Float = 0
@@ -24,7 +27,7 @@ final class AppViewModel {
     // Molecular surface
     var showSurface: Bool = false
     var surfaceType: SurfaceFieldType = .connolly
-    var surfaceColorByESP: Bool = false
+    var surfaceColorMode: SurfaceColorMode = .uniform
     var isGeneratingSurface: Bool = false
     private var surfaceGenerator: SurfaceGenerator?
 
@@ -66,6 +69,18 @@ final class AppViewModel {
     var currentInteractions: [MolecularInteraction] = []
     var showInteractionDiagram: Bool = false
     var interactionDiagramPoseIndex: Int = 0
+
+    // Grid box state (persisted here so tab switches don't reset it)
+    var gridCenter: SIMD3<Float> = .zero
+    var gridHalfSize: SIMD3<Float> = SIMD3<Float>(repeating: 10)
+    var gridInitialized: Bool = false
+
+    // Docking timing
+    var dockingDuration: TimeInterval = 0
+    private var dockingStartTime: Date?
+
+    // Multi-pose selection
+    var selectedPoseIndices: Set<Int> = []
 
     /// Original ligand preserved before docking mutates self.ligand with pose transforms.
     /// Used by showDockingPose to always apply transforms from the original coordinates.
@@ -201,15 +216,50 @@ final class AppViewModel {
         statusMessage = "Both molecules loaded"
     }
 
+    // MARK: - Side Chain Helpers
+
+    /// Compute the set of residue indices whose side chains should be displayed.
+    private func sideChainResidueSet(protein prot: Molecule) -> Set<Int> {
+        switch sideChainDisplay {
+        case .none:
+            return []
+        case .interacting:
+            // Residues involved in current ligand-protein interactions
+            var indices = Set<Int>()
+            let protHeavy = prot.atoms.filter { $0.element != .H }
+            for ixn in currentInteractions {
+                let pIdx = ixn.proteinAtomIndex
+                guard pIdx < protHeavy.count else { continue }
+                let atom = protHeavy[pIdx]
+                // Find the residue index by matching seq + chain
+                if let resIdx = prot.residues.firstIndex(where: {
+                    $0.sequenceNumber == atom.residueSeq && $0.chainID == atom.chainID
+                }) {
+                    indices.insert(resIdx)
+                }
+            }
+            return indices
+        case .selected:
+            return selectedResidueIndices
+        case .all:
+            return Set(prot.residues.indices.filter { prot.residues[$0].isStandard && !prot.residues[$0].isWater })
+        }
+    }
+
     // MARK: - Push Data to Renderer
 
     func pushToRenderer() {
         guard let renderer else { return }
 
         // Always provide full molecule positions for camera fitting (independent of render mode)
+        // Exclude hidden chains so camera and bounding box match what the user sees
         var allPositions: [SIMD3<Float>] = []
         if showProtein, let prot = protein {
-            allPositions.append(contentsOf: prot.atoms.map(\.position))
+            if hiddenChainIDs.isEmpty {
+                allPositions.append(contentsOf: prot.atoms.map(\.position))
+            } else {
+                allPositions.append(contentsOf: prot.atoms.filter { !hiddenChainIDs.contains($0.chainID) }.map(\.position))
+            }
         }
         if showLigand, let lig = ligand {
             allPositions.append(contentsOf: lig.atoms.map(\.position))
@@ -283,9 +333,43 @@ final class AppViewModel {
                 }
             }
 
+            // Side chain display: overlay selected/interacting residue side chains
+            if sideChainDisplay != .none, showProtein {
+                let sideChainResidueIndices = sideChainResidueSet(protein: prot)
+                if !sideChainResidueIndices.isEmpty {
+                    var scIdMap: [Int: Int] = [:]
+                    for residueIdx in sideChainResidueIndices {
+                        guard residueIdx < prot.residues.count else { continue }
+                        let residue = prot.residues[residueIdx]
+                        for atomIdx in residue.atomIndices {
+                            guard atomIdx < prot.atoms.count else { continue }
+                            let atom = prot.atoms[atomIdx]
+                            if hiddenChainIDs.contains(atom.chainID) { continue }
+                            if !showHydrogens && atom.element == .H { continue }
+                            // Skip backbone atoms — only show side chain
+                            let trimmedName = atom.name.trimmingCharacters(in: .whitespaces)
+                            if SideChainDisplay.backboneAtomNames.contains(trimmedName) { continue }
+                            scIdMap[atom.id] = allAtoms.count
+                            allAtoms.append(Atom(
+                                id: allAtoms.count, element: atom.element, position: atom.position,
+                                name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                                chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                                isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
+                            ))
+                        }
+                    }
+                    // Add bonds between side chain atoms
+                    for bond in prot.bonds {
+                        if let a = scIdMap[bond.atomIndex1], let b = scIdMap[bond.atomIndex2] {
+                            allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+                        }
+                    }
+                }
+            }
+
             renderer.selectedAtomIndex = selectedAtomIndex ?? -1
             renderer.selectedResidueAtomIndices = []
-            // Force ball-and-stick for the ligand atoms overlaid on ribbon
+            // Force ball-and-stick for the ligand + side chain atoms overlaid on ribbon
             renderer.renderMode = .ballAndStick
             renderer.updateMoleculeData(atoms: allAtoms, bonds: allBonds)
             return
@@ -605,6 +689,10 @@ final class AppViewModel {
                         let mol = Molecule(name: mmcifResult.name, atoms: mmcifResult.atoms,
                                            bonds: mmcifResult.bonds, title: mmcifResult.title)
                         protein = mol
+                        preparationReport = ProteinPreparation.analyze(
+                            atoms: mmcifResult.atoms,
+                            bonds: mmcifResult.bonds
+                        )
                     } catch {
                         // Fallback to PDB parser for compatibility
                         let result = await Task.detached { PDBParser.parse(content) }.value
@@ -616,6 +704,11 @@ final class AppViewModel {
                             }
                             protein = mol
                         }
+                        preparationReport = ProteinPreparation.analyze(
+                            atoms: result.protein?.atoms ?? [],
+                            bonds: result.protein?.bonds ?? [],
+                            waterCount: result.waterCount
+                        )
                     }
                     log.success("Loaded mmCIF: \(protein?.atomCount ?? 0) atoms", category: .pdb)
                 }
@@ -680,41 +773,50 @@ final class AppViewModel {
         )
     }
 
+    func removeNonStandardResidues() {
+        guard let prot = protein else { return }
+        let result = ProteinPreparation.removeNonStandardResidues(
+            atoms: prot.atoms,
+            bonds: prot.bonds,
+            keepingWaters: true,
+            keepingExistingCaps: true
+        )
+
+        if result.removedResidueCount == 0 {
+            log.info("No non-standard residues found to remove", category: .prep)
+            statusMessage = "No non-standard residues"
+            return
+        }
+
+        let updated = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
+        updated.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        protein = updated
+        pushToRenderer()
+        renderer?.fitToContent()
+        log.success(
+            "Removed \(result.removedResidueCount) non-standard residue(s) (\(result.removedAtomCount) atoms)",
+            category: .prep
+        )
+        statusMessage = "\(result.removedResidueCount) non-standard residue(s) removed"
+        preparationReport = ProteinPreparation.analyze(atoms: result.atoms, bonds: result.bonds)
+    }
+
     func removeAltConfs() {
         guard let prot = protein else { return }
-        let filtered = prot.atoms.filter { $0.altLoc.isEmpty || $0.altLoc == "A" }
-        let removed = prot.atoms.count - filtered.count
-        if removed == 0 {
+        let resolved = ProteinPreparation.selectPreferredAltConformers(atoms: prot.atoms, bonds: prot.bonds)
+        if resolved.removedAtomCount == 0 {
             log.info("No alternate conformations found", category: .prep)
             return
         }
 
-        // Reindex
-        var newAtoms: [Atom] = []
-        var indexMap: [Int: Int] = [:]
-        for (_, atom) in filtered.enumerated() {
-            indexMap[atom.id] = newAtoms.count
-            newAtoms.append(Atom(
-                id: newAtoms.count, element: atom.element, position: atom.position,
-                name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
-                chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
-                isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
-            ))
-        }
-
-        var newBonds: [Bond] = []
-        for bond in prot.bonds {
-            if let a = indexMap[bond.atomIndex1], let b = indexMap[bond.atomIndex2] {
-                newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
-            }
-        }
-
-        protein = Molecule(name: prot.name, atoms: newAtoms, bonds: newBonds, title: prot.title)
+        let updated = Molecule(name: prot.name, atoms: resolved.atoms, bonds: resolved.bonds, title: prot.title)
+        updated.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        protein = updated
         pushToRenderer()
-        log.success("Removed \(removed) alternate conformation atoms", category: .prep)
-        statusMessage = "\(removed) alt confs removed"
+        log.success("Removed \(resolved.removedAtomCount) alternate conformation atoms", category: .prep)
+        statusMessage = "\(resolved.removedAtomCount) alt confs removed"
 
-        preparationReport = ProteinPreparation.analyze(atoms: newAtoms, bonds: newBonds)
+        preparationReport = ProteinPreparation.analyze(atoms: resolved.atoms, bonds: resolved.bonds)
     }
 
     func assignProtonation() {
@@ -743,8 +845,10 @@ final class AppViewModel {
         statusMessage = "Protein cleanup..."
 
         Task {
-            let protonated = Protonation.applyProtonation(atoms: prot.atoms, pH: protonationPH)
+            let cleanup = ProteinPreparation.cleanupStructure(atoms: prot.atoms, bonds: prot.bonds)
+            let protonated = Protonation.applyProtonation(atoms: cleanup.atoms, pH: protonationPH)
             var charged = protonated
+            let preparedBonds = cleanup.bonds
             var rdkitMatchedAtoms = 0
 
             if let pdbContent = rawPDBContent,
@@ -760,18 +864,32 @@ final class AppViewModel {
 
             charged = applyElectrostaticFallback(to: charged)
 
-            let mol = Molecule(name: prot.name, atoms: charged, bonds: prot.bonds, title: prot.title)
+            let mol = Molecule(name: prot.name, atoms: charged, bonds: preparedBonds, title: prot.title)
             mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
             protein = mol
             pushToRenderer()
             renderer?.fitToContent()
-            preparationReport = ProteinPreparation.analyze(atoms: charged, bonds: prot.bonds)
+            preparationReport = ProteinPreparation.analyze(atoms: charged, bonds: preparedBonds)
 
-            let chargedCount = zip(prot.atoms, charged).filter { $0.formalCharge != $1.formalCharge }.count
+            let chargedCount = zip(cleanup.atoms, charged).filter { $0.formalCharge != $1.formalCharge }.count
+            let cleanupSummary = [
+                cleanup.report.removedAltConformerAtoms > 0 ? "\(cleanup.report.removedAltConformerAtoms) altloc atoms removed" : nil,
+                cleanup.report.removedHeterogenResidues > 0 ? "\(cleanup.report.removedHeterogenResidues) non-standard residues removed" : nil,
+                cleanup.report.addedCappingResidues > 0 ? "\(cleanup.report.addedCappingResidues) cap residues added" : nil
+            ].compactMap { $0 }.joined(separator: ", ")
             if rdkitMatchedAtoms > 0 {
-                log.success("Structure cleanup complete (pH \(String(format: "%.1f", protonationPH)), \(chargedCount) ionization updates, RDKit charges merged onto \(rdkitMatchedAtoms) atoms)", category: .prep)
+                log.success(
+                    "Structure cleanup complete (\(cleanupSummary.isEmpty ? "no structural edits" : cleanupSummary), " +
+                    "pH \(String(format: "%.1f", protonationPH)), \(chargedCount) ionization updates, " +
+                    "RDKit charges merged onto \(rdkitMatchedAtoms) atoms)",
+                    category: .prep
+                )
             } else {
-                log.success("Structure cleanup complete (pH \(String(format: "%.1f", protonationPH)), \(chargedCount) ionization updates, formal-charge fallback applied)", category: .prep)
+                log.success(
+                    "Structure cleanup complete (\(cleanupSummary.isEmpty ? "no structural edits" : cleanupSummary), " +
+                    "pH \(String(format: "%.1f", protonationPH)), \(chargedCount) ionization updates, formal-charge fallback applied)",
+                    category: .prep
+                )
             }
             statusMessage = "Cleanup complete"
             isMinimizing = false
@@ -801,6 +919,44 @@ final class AppViewModel {
         if preparationReport != nil {
             preparationReport?.missingResidues = gaps
         }
+    }
+
+    func analyzeMissingAtoms() {
+        guard let prot = protein else { return }
+
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: prot.atoms)
+        if preparationReport != nil {
+            preparationReport?.residueCompleteness = completeness
+        } else {
+            preparationReport = ProteinPreparation.analyze(atoms: prot.atoms, bonds: prot.bonds)
+        }
+
+        if completeness.isEmpty {
+            log.success("No missing or extra atoms detected in templated protein residues", category: .prep)
+            statusMessage = "No missing atoms"
+            return
+        }
+
+        let heavyIssues = completeness.filter { !$0.missingHeavyAtoms.isEmpty }.count
+        let hydrogenIssues = completeness.filter { !$0.missingHydrogens.isEmpty }.count
+        let extraIssues = completeness.filter { !$0.extraAtoms.isEmpty }.count
+
+        log.warn(
+            "Residue completeness issues: \(completeness.count) residue(s), " +
+            "\(heavyIssues) with missing heavy atoms, \(hydrogenIssues) with missing hydrogens, " +
+            "\(extraIssues) with extra atoms",
+            category: .prep
+        )
+        for residue in completeness.prefix(8) {
+            log.warn(
+                "  Chain \(residue.chainID) \(residue.residueName) \(residue.residueSeq): \(residue.summary)",
+                category: .prep
+            )
+        }
+        if completeness.count > 8 {
+            log.info("... plus \(completeness.count - 8) more incomplete residue(s)", category: .prep)
+        }
+        statusMessage = "\(completeness.count) residue issue(s)"
     }
 
     // MARK: - Solvation Shell
@@ -978,6 +1134,9 @@ final class AppViewModel {
         dockingResults = []
         currentInteractions = []
         dockingBestEnergy = .infinity
+        dockingStartTime = Date()
+        dockingDuration = 0
+        selectedPoseIndices = []
         log.info("Starting docking: \(dockingConfig.populationSize) pop, \(dockingConfig.numGenerations) gen", category: .dock)
 
         Task {
@@ -1028,13 +1187,19 @@ final class AppViewModel {
             // Capture the original ligand for all callbacks (not self.ligand which gets mutated)
             let origLig = self.originalDockingLigand ?? lig
 
-            // Live visualization callbacks
+            // Live visualization callbacks — show ghost of previous pose for smooth transitions
             engine.onPoseUpdate = { [weak self] result, interactions in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    // Show current ligand position as ghost before updating to new pose
+                    // This creates MOE-like visual continuity where you see the ligand
+                    // exploring different positions
+                    if let currentLig = self.ligand, !currentLig.atoms.isEmpty {
+                        self.renderer?.updateGhostPose(atoms: currentLig.atoms, bonds: currentLig.bonds)
+                    }
                     self.dockingBestEnergy = result.energy
                     self.currentInteractions = interactions
-                    self.applyDockingPose(result, originalLigand: origLig)
+                    self.applyLiveDockingPose(result, originalLigand: origLig)
                 }
             }
 
@@ -1084,6 +1249,7 @@ final class AppViewModel {
 
             dockingResults = rankedResults
             isDocking = false
+            dockingDuration = Date().timeIntervalSince(dockingStartTime ?? Date())
 
             // Apply best pose from final results
             if let best = dockingResults.first {
@@ -1103,6 +1269,12 @@ final class AppViewModel {
                 }
             }
 
+            // Restore grid box visualization after docking (it may have been lost
+            // during protein replacement from OpenMM refinement or pushToRenderer calls)
+            if let pocket = selectedPocket {
+                showGridBoxForPocket(pocket)
+            }
+
             let clusterCount = Set(results.map(\.clusterID)).count
             if let best = results.first {
                 log.success(String(format: "Docking complete: best %.1f kcal/mol, %d clusters",
@@ -1115,7 +1287,6 @@ final class AppViewModel {
     func stopDocking() {
         dockingEngine?.stopDocking()
         isDocking = false
-        renderer?.clearGhostPose()
         log.info("Docking stopped", category: .dock)
     }
 
@@ -1138,9 +1309,88 @@ final class AppViewModel {
                 ligandBonds: heavyBonds
             )
             renderer?.updateInteractionLines(currentInteractions)
+
+            // Refresh side chains if showing interacting residues in ribbon mode
+            if renderMode == .ribbon && sideChainDisplay == .interacting {
+                pushToRenderer()
+            }
         }
 
         statusMessage = String(format: "Pose #%d: %.1f kcal/mol", index + 1, result.energy)
+    }
+
+    /// Toggle a pose index in the multi-selection set.
+    func togglePoseSelection(at index: Int) {
+        if selectedPoseIndices.contains(index) {
+            selectedPoseIndices.remove(index)
+        } else {
+            selectedPoseIndices.insert(index)
+        }
+    }
+
+    /// Display all selected poses simultaneously: the best-energy one as the primary
+    /// ligand, and the rest as ghost overlays.
+    func showSelectedPoses() {
+        guard !selectedPoseIndices.isEmpty else { return }
+        guard let origLig = originalDockingLigand ?? ligand else { return }
+
+        // Sort by energy; primary = lowest energy
+        let sortedIndices = selectedPoseIndices.sorted { a, b in
+            guard a < dockingResults.count, b < dockingResults.count else { return a < b }
+            return dockingResults[a].energy < dockingResults[b].energy
+        }
+
+        // Apply primary pose (lowest energy)
+        if let primaryIdx = sortedIndices.first, primaryIdx < dockingResults.count {
+            let result = dockingResults[primaryIdx]
+            applyDockingPose(result, originalLigand: origLig)
+
+            // Detect interactions for primary pose
+            if let prot = protein {
+                let heavyAtoms = origLig.atoms.filter { $0.element != .H }
+                let heavyBonds = buildHeavyBonds(from: origLig)
+                currentInteractions = InteractionDetector.detect(
+                    ligandAtoms: heavyAtoms,
+                    ligandPositions: result.transformedAtomPositions,
+                    proteinAtoms: prot.atoms.filter { $0.element != .H },
+                    ligandBonds: heavyBonds
+                )
+                renderer?.updateInteractionLines(currentInteractions)
+            }
+        }
+
+        // Build ghost overlays for remaining poses
+        var ghostAtoms: [Atom] = []
+        var ghostBonds: [Bond] = []
+        for idx in sortedIndices.dropFirst() {
+            guard idx < dockingResults.count else { continue }
+            let result = dockingResults[idx]
+            if let (atoms, bonds) = buildTransformedLigand(result: result, originalLigand: origLig) {
+                let offset = ghostAtoms.count
+                for atom in atoms {
+                    ghostAtoms.append(Atom(
+                        id: offset + atom.id, element: atom.element, position: atom.position,
+                        name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                        chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                        isHetAtom: atom.isHetAtom
+                    ))
+                }
+                for bond in bonds {
+                    ghostBonds.append(Bond(
+                        id: ghostBonds.count,
+                        atomIndex1: bond.atomIndex1 + offset,
+                        atomIndex2: bond.atomIndex2 + offset,
+                        order: bond.order
+                    ))
+                }
+            }
+        }
+
+        if !ghostAtoms.isEmpty {
+            renderer?.updateGhostPose(atoms: ghostAtoms, bonds: ghostBonds)
+        }
+
+        statusMessage = "\(selectedPoseIndices.count) poses displayed"
     }
 
     private func refineTopDockingResultsWithOpenMM(
@@ -1186,11 +1436,9 @@ final class AppViewModel {
         return (refinedResults, bestProteinHeavyPositions)
     }
 
-    /// Apply a docking pose for display.
-    /// During live docking (isDocking == true), renders as a translucent ghost overlay
-    /// without mutating the active ligand. On final pose display, snaps the ligand.
-    private func applyDockingPose(_ result: DockingResult, originalLigand: Molecule) {
-        guard !result.transformedAtomPositions.isEmpty else { return }
+    /// Build transformed ligand atoms + bonds from a docking result.
+    private func buildTransformedLigand(result: DockingResult, originalLigand: Molecule) -> (atoms: [Atom], bonds: [Bond])? {
+        guard !result.transformedAtomPositions.isEmpty else { return nil }
         let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
 
         var newAtoms: [Atom] = []
@@ -1204,7 +1452,6 @@ final class AppViewModel {
             ))
         }
 
-        // Rebuild bonds for heavy atoms only
         var oldToNew: [Int: Int] = [:]
         for (newIdx, atom) in heavyAtoms.enumerated() {
             oldToNew[atom.id] = newIdx
@@ -1215,18 +1462,33 @@ final class AppViewModel {
                 newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
             }
         }
+        return (newAtoms, newBonds)
+    }
 
-        if isDocking {
-            // During live docking: render as translucent ghost, don't mutate self.ligand
-            renderer?.updateGhostPose(atoms: newAtoms, bonds: newBonds)
-        } else {
-            // Final pose display: snap the ligand and clear ghost
-            renderer?.clearGhostPose()
-            ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
-            pushToRenderer()
-        }
+    /// Apply a docking pose for display (final pose or pose browsing).
+    /// Clears ghost overlay and updates the actual ligand.
+    private func applyDockingPose(_ result: DockingResult, originalLigand: Molecule) {
+        guard let (newAtoms, newBonds) = buildTransformedLigand(result: result, originalLigand: originalLigand) else { return }
+
+        renderer?.clearGhostPose()
+        ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
+        pushToRenderer()
 
         // Update interaction lines
+        if !currentInteractions.isEmpty {
+            renderer?.updateInteractionLines(currentInteractions)
+        }
+    }
+
+    /// Apply a docking pose during live docking. Preserves ghost overlay of previous
+    /// pose so the user sees smooth visual transitions as the ligand explores space.
+    private func applyLiveDockingPose(_ result: DockingResult, originalLigand: Molecule) {
+        guard let (newAtoms, newBonds) = buildTransformedLigand(result: result, originalLigand: originalLigand) else { return }
+
+        // Don't clear ghost — it was set by the callback to show the previous best position
+        ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
+        pushToRenderer()
+
         if !currentInteractions.isEmpty {
             renderer?.updateInteractionLines(currentInteractions)
         }
@@ -1304,8 +1566,8 @@ final class AppViewModel {
         }
     }
 
-    func toggleESPColoring() {
-        surfaceColorByESP.toggle()
+    func setSurfaceColorMode(_ mode: SurfaceColorMode) {
+        surfaceColorMode = mode
         if showSurface {
             generateSurface()
         }
@@ -1330,7 +1592,7 @@ final class AppViewModel {
             }
 
             gen.fieldType = surfaceType
-            gen.colorByESP = surfaceColorByESP
+            gen.colorMode = surfaceColorMode
 
             let atoms = prot.atoms.filter { $0.element != .H }
             if let result = gen.generateSurface(atoms: atoms) {
@@ -2003,6 +2265,11 @@ final class AppViewModel {
                 dockingResults = bestBatch.results
             }
 
+            // Restore grid box visualization after batch docking
+            if let pocket = selectedPocket {
+                showGridBoxForPocket(pocket)
+            }
+
             log.success("Batch complete: \(batchResults.count) ligands, best: \(batchResults.first?.ligandName ?? "?") (\(String(format: "%.1f", batchResults.first?.results.first?.energy ?? 0)) kcal/mol)", category: .dock)
             statusMessage = "Batch complete — \(batchResults.count) ligands ranked"
         }
@@ -2085,6 +2352,7 @@ final class AppViewModel {
     func cancelBatchDocking() {
         batchDockingTask?.cancel()
         dockingEngine?.stopDocking()
+        isDocking = false
         isBatchDocking = false
         log.info("Batch docking cancelled", category: .dock)
         statusMessage = "Batch docking cancelled"

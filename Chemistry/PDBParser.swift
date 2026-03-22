@@ -41,6 +41,15 @@ struct MoleculeData: Sendable {
 enum PDBParser {
 
     static func parse(_ content: String) -> PDBParseResult {
+        let metadata = parseHeaderMetadata(from: content)
+        do {
+            return try parseWithGemmi(content, header: metadata.header, ssRanges: metadata.ssRanges)
+        } catch {
+            return parseLegacy(content)
+        }
+    }
+
+    private static func parseLegacy(_ content: String) -> PDBParseResult {
         var header = PDBHeader()
         var proteinAtoms: [Atom] = []
         var hetAtoms: [Atom] = [] // non-water HETATM
@@ -170,6 +179,132 @@ enum PDBParser {
     static func parse(url: URL) throws -> PDBParseResult {
         let content = try String(contentsOf: url, encoding: .utf8)
         return parse(content)
+    }
+
+    private static func parseWithGemmi(
+        _ content: String,
+        header: PDBHeader,
+        ssRanges: [SecondaryStructureRange]
+    ) throws -> PDBParseResult {
+        let structure = try GemmiBridge.parseStructure(
+            content: content,
+            fileName: header.pdbID.isEmpty ? "Protein" : header.pdbID
+        )
+        let resolved = ProteinPreparation.selectPreferredAltConformers(
+            atoms: structure.atoms,
+            bonds: structure.bonds
+        )
+
+        let proteinSubstructure = buildSubstructure(atoms: resolved.atoms, bonds: resolved.bonds) { atom in
+            !atom.isHetAtom || isWaterResidueName(atom.residueName)
+        }
+        let proteinBonds = proteinSubstructure.bonds.isEmpty
+            ? BondPerception.perceiveBonds(in: proteinSubstructure.atoms)
+            : proteinSubstructure.bonds
+
+        let heterogenSubstructure = buildSubstructure(atoms: resolved.atoms, bonds: resolved.bonds) { atom in
+            atom.isHetAtom && !isWaterResidueName(atom.residueName)
+        }
+        let heterogenBonds = heterogenSubstructure.bonds.isEmpty
+            ? BondPerception.perceiveBonds(in: heterogenSubstructure.atoms)
+            : heterogenSubstructure.bonds
+
+        let ligands = groupLigands(hetAtoms: heterogenSubstructure.atoms, hetBonds: heterogenBonds)
+        let proteinName = header.pdbID.isEmpty ? structure.name : header.pdbID
+        let proteinData = proteinSubstructure.atoms.isEmpty ? nil : MoleculeData(
+            name: proteinName.isEmpty ? "Protein" : proteinName,
+            title: header.title,
+            atoms: proteinSubstructure.atoms,
+            bonds: proteinBonds,
+            ssRanges: ssRanges
+        )
+
+        var warnings: [String] = []
+        if resolved.removedAtomCount > 0 {
+            warnings.append("Selected preferred alternate conformations (\(resolved.removedAtomCount) atoms removed)")
+        }
+
+        return PDBParseResult(
+            protein: proteinData,
+            ligands: ligands,
+            waterCount: countWaterResidues(in: resolved.atoms),
+            header: header,
+            warnings: warnings
+        )
+    }
+
+    private static func parseHeaderMetadata(from content: String) -> (header: PDBHeader, ssRanges: [SecondaryStructureRange]) {
+        var header = PDBHeader()
+        var ssRanges: [SecondaryStructureRange] = []
+
+        for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            guard line.count >= 6 else { continue }
+            let record = substr(line, 0, 6).trimmingCharacters(in: .whitespaces)
+
+            switch record {
+            case "HEADER":
+                header.classification = substr(line, 10, 40).trimmingCharacters(in: .whitespaces)
+                header.date = substr(line, 50, 9).trimmingCharacters(in: .whitespaces)
+                header.pdbID = substr(line, 62, 4).trimmingCharacters(in: .whitespaces)
+
+            case "TITLE":
+                let text = substr(line, 10, 70).trimmingCharacters(in: .whitespaces)
+                header.title = header.title.isEmpty ? text : header.title + " " + text
+
+            case "REMARK":
+                parseRemark(line, header: &header)
+
+            case "HELIX":
+                let chainID = substr(line, 19, 1).trimmingCharacters(in: .whitespaces)
+                if let startSeq = Int(substr(line, 21, 4).trimmingCharacters(in: .whitespaces)),
+                   let endSeq = Int(substr(line, 33, 4).trimmingCharacters(in: .whitespaces)) {
+                    ssRanges.append(.init(start: startSeq, end: endSeq, type: .helix, chain: chainID))
+                }
+
+            case "SHEET":
+                let chainID = substr(line, 21, 1).trimmingCharacters(in: .whitespaces)
+                if let startSeq = Int(substr(line, 22, 4).trimmingCharacters(in: .whitespaces)),
+                   let endSeq = Int(substr(line, 33, 4).trimmingCharacters(in: .whitespaces)) {
+                    ssRanges.append(.init(start: startSeq, end: endSeq, type: .sheet, chain: chainID))
+                }
+
+            default:
+                break
+            }
+        }
+
+        return (header, ssRanges)
+    }
+
+    private static func buildSubstructure(
+        atoms: [Atom],
+        bonds: [Bond],
+        include: (Atom) -> Bool
+    ) -> (atoms: [Atom], bonds: [Bond]) {
+        let selectedIndices = atoms.indices.filter { include(atoms[$0]) }
+        return ProteinPreparation.remapSubstructure(
+            atoms: atoms,
+            bonds: bonds,
+            selectedIndices: selectedIndices
+        )
+    }
+
+    private static func isWaterResidueName(_ residueName: String) -> Bool {
+        ["HOH", "WAT", "DOD", "H2O"].contains(residueName.uppercased())
+    }
+
+    private static func countWaterResidues(in atoms: [Atom]) -> Int {
+        struct WaterKey: Hashable {
+            let chainID: String
+            let residueSeq: Int
+            let residueName: String
+        }
+
+        return Set(atoms.compactMap { atom -> WaterKey? in
+            guard isWaterResidueName(atom.residueName) else { return nil }
+            return WaterKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: atom.residueName)
+        }).count
     }
 
     // MARK: - ATOM/HETATM Line Parsing

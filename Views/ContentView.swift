@@ -204,6 +204,35 @@ struct ContentView: View {
                 .help(mode.rawValue)
             }
 
+            // Side chain display in ribbon mode
+            if viewModel.renderMode == .ribbon {
+                Menu {
+                    ForEach(SideChainDisplay.allCases, id: \.self) { mode in
+                        Button(action: {
+                            viewModel.sideChainDisplay = mode
+                            viewModel.pushToRenderer()
+                        }) {
+                            HStack {
+                                Text(mode.rawValue)
+                                if viewModel.sideChainDisplay == mode {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: viewModel.sideChainDisplay.icon)
+                        .font(.system(size: 12))
+                        .frame(width: 28, height: 28)
+                        .background(viewModel.sideChainDisplay != .none ? Color.purple.opacity(0.3) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 28)
+                .foregroundStyle(viewModel.sideChainDisplay != .none ? .purple : .secondary)
+                .help("Side chains: \(viewModel.sideChainDisplay.rawValue)")
+            }
+
             Divider()
                 .frame(height: 20)
 
@@ -232,18 +261,30 @@ struct ContentView: View {
             .disabled(viewModel.protein == nil || viewModel.isGeneratingSurface)
             .help(viewModel.showSurface ? "Hide molecular surface" : "Show molecular surface")
 
-            // ESP coloring toggle (only when surface is visible)
+            // Surface color mode picker (only when surface is visible)
             if viewModel.showSurface {
-                Button(action: { viewModel.toggleESPColoring() }) {
-                    Image(systemName: "bolt.fill")
+                Menu {
+                    ForEach(SurfaceColorMode.allCases, id: \.self) { mode in
+                        Button(action: { viewModel.setSurfaceColorMode(mode) }) {
+                            HStack {
+                                Text(mode.rawValue)
+                                if viewModel.surfaceColorMode == mode {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: surfaceColorIcon)
                         .font(.system(size: 12))
                         .frame(width: 28, height: 28)
-                        .background(viewModel.surfaceColorByESP ? Color.yellow.opacity(0.3) : Color.clear)
+                        .background(viewModel.surfaceColorMode != .uniform ? Color.yellow.opacity(0.3) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(viewModel.surfaceColorByESP ? .yellow : .secondary)
-                .help(viewModel.surfaceColorByESP ? "Uniform surface color" : "Color by electrostatic potential")
+                .menuStyle(.borderlessButton)
+                .frame(width: 28)
+                .foregroundStyle(viewModel.surfaceColorMode != .uniform ? .yellow : .secondary)
+                .help("Surface coloring: \(viewModel.surfaceColorMode.rawValue)")
             }
 
             // Lighting toggle
@@ -333,5 +374,14 @@ struct ContentView: View {
         .background(color.opacity(0.15))
         .foregroundStyle(color)
         .clipShape(Capsule())
+    }
+
+    private var surfaceColorIcon: String {
+        switch viewModel.surfaceColorMode {
+        case .uniform: "paintpalette"
+        case .esp: "bolt.fill"
+        case .hydrophobicity: "drop.fill"
+        case .pharmacophore: "circle.hexagongrid"
+        }
     }
 }

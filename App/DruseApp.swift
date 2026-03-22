@@ -62,6 +62,10 @@ struct DruseApp: App {
                     openWindow(id: "ligand-database")
                 }
                 .keyboardShortcut("l", modifiers: .command)
+                Button("Results Database") {
+                    openWindow(id: "results-database")
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
             }
         }
 
@@ -72,6 +76,15 @@ struct DruseApp: App {
                 .preferredColorScheme(.dark)
         }
         .defaultSize(width: 1200, height: 700)
+        .windowStyle(.titleBar)
+
+        // Results Database window — full pose analysis, interaction diagrams, correlation
+        Window("Results Database", id: "results-database") {
+            ResultsDatabaseWindow()
+                .environment(viewModel)
+                .preferredColorScheme(.dark)
+        }
+        .defaultSize(width: 1300, height: 800)
         .windowStyle(.titleBar)
 
     }
