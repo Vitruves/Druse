@@ -40,7 +40,7 @@ struct PreparationTabView: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
                         Text(chain.type)
-                            .font(.system(size: 9))
+                            .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -156,23 +156,40 @@ struct PreparationTabView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            // Protonation at pH with slider
-            protonationSection
-
             Divider()
 
-            // C++ RDKit-powered preparation
-            Label("RDKit Preparation", systemImage: "cpu")
-                .font(.system(size: 10, weight: .medium))
+            // Hydrogen addition
+            Label("Hydrogens", systemImage: "atom")
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
 
             Button(action: { viewModel.addHydrogens() }) {
-                Label("Add Hydrogens", systemImage: "plus.circle")
+                Label("Add All Hydrogens", systemImage: "plus.circle")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
             .disabled(viewModel.protein == nil)
+            .help("Add all hydrogens (polar + nonpolar) from residue templates.")
+
+            // Polar hydrogens at pH with slider
+            protonationSection
+
+            Button(action: { viewModel.removeHydrogens() }) {
+                Label("Remove All Hydrogens", systemImage: "minus.circle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!viewModel.proteinHasHydrogens)
+            .help("Strip all hydrogen atoms from the protein.")
+
+            Divider()
+
+            // Native / RDKit-backed preparation
+            Label("Preparation Pipeline", systemImage: "cpu")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
 
             Button(action: { viewModel.assignGasteigerCharges() }) {
                 Label("Assign Gasteiger Charges", systemImage: "bolt.circle")
@@ -216,14 +233,22 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .help("Compare standard residues against bundled templates and report missing heavy atoms, missing hydrogens, and extra atoms.")
 
+            Button(action: { viewModel.repairMissingAtoms() }) {
+                Label("Repair Missing Atoms", systemImage: "wrench.and.screwdriver")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Rebuild missing standard-residue heavy atoms from bundled geometry templates.")
+
             // Solvation Shell
             Button(action: { viewModel.addSolvationShell() }) {
                 HStack {
                     Label("Solvation Shell", systemImage: "drop.circle")
                     Spacer()
                     Text("Beta")
-                        .font(.system(size: 8, weight: .medium))
-                        .padding(.horizontal, 4)
+                        .font(.system(size: 9, weight: .medium))
+                        .padding(.horizontal, 5)
                         .padding(.vertical, 2)
                         .background(Color.blue.opacity(0.2))
                         .foregroundStyle(.blue)
@@ -262,11 +287,19 @@ struct PreparationTabView: View {
 
         VStack(alignment: .leading, spacing: 4) {
             Button(action: { viewModel.assignProtonation() }) {
-                Label("Assign Protonation at pH \(String(format: "%.1f", viewModel.protonationPH))", systemImage: "flask")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    Label("Add Polar Hydrogens", systemImage: "flask")
+                    Spacer()
+                    Text("pH \(String(format: "%.1f", viewModel.protonationPH))")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .disabled(viewModel.protein == nil)
+            .help("Add polar hydrogens (N-H, O-H, S-H) with pH-dependent protonation states.")
 
             HStack(spacing: 6) {
                 Text("pH")
@@ -311,16 +344,16 @@ struct PreparationTabView: View {
         }
         let color: Color = chargeState.contains("+") ? .blue : chargeState.contains("-") ? .red : .secondary
 
-        return HStack(spacing: 4) {
+        return HStack(spacing: 6) {
             Text(residue)
-                .font(.system(size: 8, weight: .medium, design: .monospaced))
-                .frame(width: 28, alignment: .leading)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .frame(width: 32, alignment: .leading)
             Text(String(format: "%.2f", pKa))
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .frame(width: 32, alignment: .trailing)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .trailing)
             Text(chargeState)
-                .font(.system(size: 8, weight: .medium))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(color)
         }
     }

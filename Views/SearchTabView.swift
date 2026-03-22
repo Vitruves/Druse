@@ -30,38 +30,46 @@ struct SearchTabView: View {
 
                 // Loaded molecules
                 if let prot = viewModel.protein {
-                    HStack {
-                        Circle().fill(.cyan).frame(width: 6, height: 6)
+                    HStack(spacing: 6) {
+                        Circle().fill(.cyan).frame(width: 8, height: 8)
                         Text(prot.name)
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                         Text("\(prot.atomCount) atoms")
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button(action: { viewModel.protein = nil; viewModel.pushToRenderer() }) {
                             Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 10))
+                                .font(.system(size: 14))
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .contentShape(Rectangle().size(width: 24, height: 24))
                     }
+                    .padding(6)
+                    .background(Color.cyan.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
                 if let lig = viewModel.ligand {
-                    HStack {
-                        Circle().fill(.green).frame(width: 6, height: 6)
+                    HStack(spacing: 6) {
+                        Circle().fill(.green).frame(width: 8, height: 8)
                         Text(lig.name)
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                         Text("\(lig.atomCount) atoms")
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button(action: { viewModel.clearLigand() }) {
                             Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 10))
+                                .font(.system(size: 14))
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .contentShape(Rectangle().size(width: 24, height: 24))
                     }
+                    .padding(6)
+                    .background(Color.green.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
 
@@ -175,16 +183,16 @@ struct SearchTabView: View {
             HStack(spacing: 8) {
                 if let method = result.experimentMethod {
                     Text(method)
-                        .font(.system(size: 9, weight: .medium))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
                         .background(Color.accentColor.opacity(0.12))
                         .clipShape(Capsule())
                 }
 
                 if let date = result.releaseDate {
                     Text(date)
-                        .font(.system(size: 9))
+                        .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                 }
 

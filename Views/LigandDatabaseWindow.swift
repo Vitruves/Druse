@@ -333,7 +333,7 @@ struct LigandDatabaseWindow: View {
                         Text(title)
                         if isSorted {
                             Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                                .font(.system(size: 7))
+                                .font(.system(size: 9))
                         }
                     }
                 }
@@ -401,8 +401,8 @@ struct LigandDatabaseWindow: View {
                     .font(.system(size: 9, design: .monospaced))
                     .frame(width: 36, alignment: .trailing)
                 Image(systemName: d.lipinski ? "checkmark" : "xmark")
-                    .font(.system(size: 8))
-                    .foregroundStyle(d.lipinski ? .green : .red.opacity(0.6))
+                    .font(.system(size: 10))
+                    .foregroundStyle(d.lipinski ? .green : .red.opacity(0.7))
                     .frame(width: 30)
             } else {
                 Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 60, alignment: .trailing)
@@ -756,7 +756,7 @@ struct LigandDatabaseWindow: View {
             if value != nil {
                 Button(action: { onUpdate(nil) }) {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 8))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
@@ -895,12 +895,12 @@ struct LigandDatabaseWindow: View {
                 .frame(width: 60, alignment: .trailing)
 
             Text("kcal/mol")
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
 
             if isBest {
                 Text("Best")
-                    .font(.system(size: 8, weight: .bold))
+                    .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(.green)
             }
         }
@@ -1326,25 +1326,25 @@ struct LigandDatabaseWindow: View {
             Text(value)
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
             Text(label)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 
     private func propBadge(_ label: String, _ value: String) -> some View {
-        VStack(spacing: 1) {
+        VStack(spacing: 2) {
             Text(value)
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
             Text(label)
-                .font(.system(size: 7))
-                .foregroundStyle(.quaternary)
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
         }
     }
 
     private func ruleTag(_ name: String, _ passes: Bool) -> some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 3) {
             Image(systemName: passes ? "checkmark.circle.fill" : "xmark.circle")
-                .font(.system(size: 9))
+                .font(.system(size: 10))
                 .foregroundStyle(passes ? .green : .red)
             Text(name)
                 .font(.system(size: 10))

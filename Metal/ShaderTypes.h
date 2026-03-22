@@ -246,4 +246,126 @@ struct PocketProbe {
     float       buriedness;
 };
 
+// ============================================================================
+// Interaction detection compute types
+// ============================================================================
+
+// Element/property flags for GPU interaction detection
+#define IDET_FLAG_N         (1u << 0)
+#define IDET_FLAG_O         (1u << 1)
+#define IDET_FLAG_S         (1u << 2)
+#define IDET_FLAG_C         (1u << 3)
+#define IDET_FLAG_F         (1u << 4)
+#define IDET_FLAG_CL        (1u << 5)
+#define IDET_FLAG_BR        (1u << 6)
+#define IDET_FLAG_METAL     (1u << 7)   // Fe, Zn, Ca, Mg, Mn, Cu
+#define IDET_FLAG_POS_RES   (1u << 8)   // positive residue atoms (NZ, NH1, NH2, NE)
+#define IDET_FLAG_NEG_RES   (1u << 9)   // negative residue atoms (OD1, OD2, OE1, OE2)
+#define IDET_FLAG_HALOGEN   (1u << 10)  // F, Cl, or Br
+
+// Packed atom for GPU interaction detection
+struct InteractionAtomGPU {
+    simd_float3 position;
+    uint32_t    flags;          // element + property bit flags
+    int32_t     formalCharge;
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+    uint32_t    _pad2;
+};
+
+// GPU-detected interaction result
+struct GPUInteraction {
+    uint32_t    ligandAtomIndex;
+    uint32_t    proteinAtomIndex;
+    uint32_t    type;           // MolecularInteraction.InteractionType raw value
+    float       distance;
+    simd_float3 ligandPosition;
+    simd_float3 proteinPosition;
+};
+
+// Parameters for interaction detection kernel
+struct InteractionDetectParams {
+    uint32_t numLigandAtoms;
+    uint32_t numProteinAtoms;
+    uint32_t maxInteractions;   // output buffer capacity
+    uint32_t _pad0;
+};
+
+// ============================================================================
+// ML Feature compute types
+// ============================================================================
+
+struct RBFParams {
+    uint32_t nProt;
+    uint32_t nLig;
+    uint32_t numBins;       // 50
+    float    gamma;         // 10.0
+    float    binSpacing;    // 0.2
+    uint32_t _pad0;
+};
+
+// Pairwise RMSD compute types
+struct RMSDParams {
+    uint32_t numPoses;
+    uint32_t numAtoms;
+    uint32_t _pad0;
+    uint32_t _pad1;
+};
+
+// ============================================================================
+// H-Bond Network Scoring types (Phase 4)
+// ============================================================================
+
+// An atom in the H-bond scoring environment (protein background atoms)
+struct HBondEnvAtom {
+    simd_float3 position;
+    float       vdwRadius;
+    uint32_t    flags;          // HBNET_FLAG_* below
+    int32_t     formalCharge;
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+};
+
+// H-bond network scoring flags
+enum {
+    HBNET_FLAG_DONOR    = (1u << 0),   // Can donate H-bond (N-H, O-H)
+    HBNET_FLAG_ACCEPTOR = (1u << 1),   // Can accept H-bond (N, O lone pair)
+    HBNET_FLAG_HYDROGEN = (1u << 2),   // This is a hydrogen atom
+    HBNET_FLAG_CHARGED  = (1u << 3),   // Atom belongs to a charged group
+};
+
+// One candidate atom position within a group state
+struct HBondCandidateAtom {
+    simd_float3 position;
+    float       vdwRadius;
+    uint32_t    flags;          // HBNET_FLAG_*
+    int32_t     formalCharge;
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+};
+
+// Parameters for the scoring kernel
+struct HBondScoringParams {
+    uint32_t numCandidates;       // Total candidate atoms across all group-state combos
+    uint32_t numEnvAtoms;         // Number of environment (background) atoms
+    float    bumpWeight;          // 10.0 (Reduce default)
+    float    hbondWeight;         // 4.0  (Reduce default)
+    float    minRegHBGap;         // 0.6 Å
+    float    minChargedHBGap;     // 0.8 Å
+    float    badBumpGapCut;       // 0.4 Å
+    float    gapScale;            // 0.25 Å
+};
+
+// Output: per-candidate-atom score
+struct HBondAtomScore {
+    float totalScore;
+    float bumpScore;
+    float hbondScore;
+    float contactScore;
+    uint32_t hasBadBump;
+    uint32_t _pad0;
+    uint32_t _pad1;
+    uint32_t _pad2;
+};
+
 #endif /* ShaderTypes_h */

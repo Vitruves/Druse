@@ -71,7 +71,10 @@ struct DockingTabView: View {
                 Spacer()
                 Button(action: { openWindow(id: "ligand-database") }) {
                     Image(systemName: "tablecells")
-                        .font(.system(size: 10))
+                        .font(.system(size: 12))
+                        .padding(4)
+                        .background(Color.accentColor.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -93,7 +96,7 @@ struct DockingTabView: View {
                             viewModel.clearLigand()
                         }) {
                             Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 10))
+                                .font(.system(size: 14))
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
@@ -103,14 +106,14 @@ struct DockingTabView: View {
                     // MW range summary
                     let mws = viewModel.batchQueue.compactMap { $0.descriptors?.molecularWeight }
                     if let minMW = mws.min(), let maxMW = mws.max() {
-                        Text(String(format: "MW range: %.0f – %.0f", minMW, maxMW))
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                        Text(String(format: "MW range: %.0f \u{2013} %.0f", minMW, maxMW))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
 
                     let prepCount = viewModel.batchQueue.filter(\.isPrepared).count
                     Text("\(prepCount)/\(viewModel.batchQueue.count) prepared")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(prepCount == viewModel.batchQueue.count ? .green : .orange)
                 }
                 .padding(6)
@@ -120,11 +123,10 @@ struct DockingTabView: View {
                 // Reopen Ligand Database button
                 Button(action: { openWindow(id: "ligand-database") }) {
                     Label("Open Ligand Database", systemImage: "tablecells")
-                        .font(.system(size: 10))
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
             } else if let lig = viewModel.ligand {
                 // Single ligand mode
                 HStack(spacing: 6) {
@@ -152,16 +154,11 @@ struct DockingTabView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 5))
             } else {
                 Button(action: { openWindow(id: "ligand-database") }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "plus.circle")
-                            .font(.system(size: 9))
-                        Text("Open Database to select ligand")
-                            .font(.system(size: 10))
-                    }
-                    .frame(maxWidth: .infinity)
+                    Label("Open Database to select ligand", systemImage: "plus.circle")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
             }
         }
     }
@@ -181,7 +178,7 @@ struct DockingTabView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(viewModel.protein == nil)
                 .help("Alpha-sphere + DBSCAN pocket detection")
 
@@ -190,7 +187,7 @@ struct DockingTabView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(viewModel.protein == nil || !viewModel.pocketDetectorML.isAvailable)
                 .help("ML-based pocket detection (GNN)")
 
@@ -199,7 +196,7 @@ struct DockingTabView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(viewModel.protein == nil || viewModel.ligand == nil)
                 .help("Define pocket around current ligand")
             }
@@ -209,7 +206,7 @@ struct DockingTabView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(viewModel.protein == nil || viewModel.selectedResidueIndices.isEmpty)
                 .help("Define pocket from selected residues")
             }
@@ -241,12 +238,12 @@ struct DockingTabView: View {
 
             Spacer()
 
-            Text(String(format: "%.0f A\u{00B3}", pocket.volume))
-                .font(.system(size: 9, design: .monospaced))
+            Text(String(format: "%.0f \u{00C5}\u{00B3}", pocket.volume))
+                .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
 
             Text("\(pocket.residueIndices.count) res")
-                .font(.system(size: 9, design: .monospaced))
+                .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
         .padding(4)
@@ -280,7 +277,10 @@ struct DockingTabView: View {
                 // Show grid toggle
                 Button(action: { applyGridBoxFromSliders() }) {
                     Image(systemName: "arrow.right.circle")
-                        .font(.system(size: 10))
+                        .font(.system(size: 12))
+                        .padding(3)
+                        .background(Color.accentColor.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
                 }
                 .buttonStyle(.plain)
                 .help("Apply grid box to viewport")
@@ -307,45 +307,45 @@ struct DockingTabView: View {
             }
 
             // Quick placement buttons
-            HStack(spacing: 3) {
+            Text("Center on")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 4) {
                 Button(action: { placeGridAtProteinCenter() }) {
                     Label("Protein", systemImage: "building.2")
-                        .font(.system(size: 9))
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(viewModel.protein == nil)
                 .help("Center grid on protein centroid")
 
                 if viewModel.ligand != nil {
                     Button(action: { placeGridAtLigand() }) {
                         Label("Ligand", systemImage: "hexagon")
-                            .font(.system(size: 9))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.mini)
+                    .controlSize(.small)
                 }
 
                 if !viewModel.selectedResidueIndices.isEmpty {
                     Button(action: { placeGridAtSelection() }) {
                         Label("Selection", systemImage: "hand.tap")
-                            .font(.system(size: 9))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.mini)
+                    .controlSize(.small)
                 }
 
                 if viewModel.selectedPocket != nil {
                     Button(action: { resetGridToPocket() }) {
                         Label("Pocket", systemImage: "arrow.counterclockwise")
-                            .font(.system(size: 9))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.mini)
+                    .controlSize(.small)
                 }
             }
         }
@@ -580,12 +580,12 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private func requirementLabel(_ text: String) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
             Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 8))
-                .foregroundStyle(.red.opacity(0.6))
+                .font(.system(size: 10))
+                .foregroundStyle(.red.opacity(0.7))
             Text(text)
-                .font(.system(size: 9))
+                .font(.system(size: 10))
                 .foregroundStyle(.secondary)
         }
     }
@@ -729,38 +729,38 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private func statCell(_ label: String, _ value: String, color: Color) -> some View {
-        VStack(spacing: 1) {
+        VStack(spacing: 2) {
             Text(value)
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(color)
             Text(label)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
     private func scoreItem(_ label: String, _ value: Float) -> some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 1) {
             Text(String(format: "%.1f", value))
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(value < 0 ? .green : .red)
             Text(label)
-                .font(.system(size: 7))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 
     @ViewBuilder
     private func statMini(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 3) {
             Text(label + ":")
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
-            Text(value)
-                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                .font(.system(size: 9))
                 .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(.primary)
         }
     }
 
@@ -775,19 +775,19 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private func statBadge(_ label: String, _ value: String, unit: String = "") -> some View {
-        VStack(spacing: 1) {
-            HStack(spacing: 1) {
+        VStack(spacing: 2) {
+            HStack(spacing: 2) {
                 Text(value)
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                 if !unit.isEmpty {
                     Text(unit)
-                        .font(.system(size: 7))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
                 }
             }
             Text(label)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 

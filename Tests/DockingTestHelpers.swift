@@ -7,6 +7,41 @@ import MetalKit
 /// Every helper prints exhaustive diagnostics so a single test run reveals root cause.
 class DockingTestCase: XCTestCase {
 
+    // MARK: - Shared Engine & PDB Cache
+
+    /// Single DockingEngine shared across all tests in a class — avoids recompiling
+    /// Metal pipelines (~2-3s) for every test method.
+    @MainActor private static var _sharedEngine: DockingEngine?
+
+    @MainActor
+    func sharedDockingEngine() throws -> DockingEngine {
+        if let engine = Self._sharedEngine { return engine }
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU available")
+        }
+        guard let engine = DockingEngine(device: device) else {
+            throw XCTSkip("Failed to create DockingEngine")
+        }
+        print("  [Engine] Compiled Metal pipelines (shared): \(device.name)")
+        Self._sharedEngine = engine
+        return engine
+    }
+
+    /// PDB download cache — avoids re-downloading the same PDB file across tests.
+    private static var pdbCache: [String: String] = [:]
+
+    func cachedPDBContent(id: String) async throws -> String {
+        if let cached = Self.pdbCache[id] { return cached }
+        let content: String
+        do {
+            content = try await PDBService.shared.fetchPDBFile(id: id)
+        } catch {
+            throw XCTSkip("Network unavailable for \(id): \(error.localizedDescription)")
+        }
+        Self.pdbCache[id] = content
+        return content
+    }
+
     // MARK: - RMSD
 
     /// RMSD between two equal-length position arrays.
@@ -186,12 +221,7 @@ class DockingTestCase: XCTestCase {
         ligandResidue: String? = nil
     ) async throws -> (protein: Molecule, ligand: Molecule, crystalHeavyPositions: [SIMD3<Float>]) {
         print("  [\(id)] Fetching PDB from RCSB...")
-        let pdbContent: String
-        do {
-            pdbContent = try await PDBService.shared.fetchPDBFile(id: id)
-        } catch {
-            throw XCTSkip("Network unavailable for \(id): \(error.localizedDescription)")
-        }
+        let pdbContent = try await cachedPDBContent(id: id)
         print("  [\(id)] PDB content: \(pdbContent.count) chars")
 
         let result = PDBParser.parse(pdbContent)

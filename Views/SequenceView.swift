@@ -158,26 +158,6 @@ struct SequenceView: View {
                 }
             }
 
-            // Hover info
-            if let hIdx = hoveredResIdx, let prot = viewModel.protein, hIdx < prot.residues.count {
-                let res = prot.residues[hIdx]
-                let ss = cachedSS(chainID: res.chainID, seqNum: res.sequenceNumber)
-                HStack(spacing: 4) {
-                    Text(res.name)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    Text("#\(res.sequenceNumber)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    Text("Chain \(res.chainID)")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                    Text(ssLabel(ss))
-                        .font(.system(size: 9))
-                        .foregroundStyle(ssColor(ss))
-                }
-                .transition(.opacity)
-            }
-
             // Chain sections
             let proteinChains = prot.chains.filter { $0.type == .protein }
             if proteinChains.isEmpty {
@@ -258,8 +238,8 @@ struct SequenceView: View {
                     }
                 } label: {
                     Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 8))
-                        .frame(width: 10)
+                        .font(.system(size: 10))
+                        .frame(width: 12)
                 }
                 .buttonStyle(.plain)
 
@@ -516,13 +496,13 @@ struct SequenceView: View {
     // MARK: - SS Legend Dot
 
     private func ssLegendDot(_ ss: SecondaryStructure) -> some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 3) {
             Circle()
                 .fill(ssColor(ss))
-                .frame(width: 6, height: 6)
+                .frame(width: 7, height: 7)
             Text(ssLabel(ss))
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -678,6 +658,8 @@ private struct SequenceCanvas<MenuContent: View>: View {
 
     // Track which residue the cursor is over for the context menu
     @State private var contextHitEntry: ResidueEntry?
+    // Debounce hover: only update when the hit cell index changes
+    @State private var lastHitCellIndex: Int? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -689,13 +671,18 @@ private struct SequenceCanvas<MenuContent: View>: View {
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location):
-                    if let hitIdx = hitTest(location), case .residue(let entry) = cells[hitIdx] {
+                    let hitIdx = hitTest(location)
+                    // Only update state when the hovered cell actually changes
+                    guard hitIdx != lastHitCellIndex else { return }
+                    lastHitCellIndex = hitIdx
+                    if let hitIdx, case .residue(let entry) = cells[hitIdx] {
                         onHoverCell(entry.resIdx)
                         contextHitEntry = entry
                     } else {
                         onHoverCell(nil)
                     }
                 case .ended:
+                    lastHitCellIndex = nil
                     onHoverCell(nil)
                 }
             }
@@ -754,11 +741,22 @@ private struct SequenceCanvas<MenuContent: View>: View {
         canvasHeight = max(y + rowH + 2, 20)
     }
 
-    // MARK: - Hit Testing
+    // MARK: - Hit Testing (row-based for O(cols) instead of O(N))
 
     private func hitTest(_ point: CGPoint) -> Int? {
+        guard !cellRects.isEmpty else { return nil }
+        let rowH = cellH + numberH + spacing
+        // Find which row the point is in
+        let rowIdx = Int(point.y / rowH)
+        let rowMinY = CGFloat(rowIdx) * rowH
+        let rowMaxY = rowMinY + rowH
+        // Only scan cells in this row
         for (i, rect) in cellRects.enumerated() {
-            if rect.contains(point) { return i }
+            if rect.minY >= rowMinY && rect.minY < rowMaxY && rect.contains(point) {
+                return i
+            }
+            // Past this row — stop early
+            if rect.minY >= rowMaxY { break }
         }
         return nil
     }
@@ -788,7 +786,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
         let residueFont = Font.system(size: 10, weight: .medium, design: .monospaced)
         let residueFontBold = Font.system(size: 10, weight: .bold, design: .monospaced)
         let numberFont = Font.system(size: 6, design: .monospaced)
-        let gapFont = Font.system(size: 8, weight: .medium, design: .monospaced)
+        let gapFont = Font.system(size: 9, weight: .medium, design: .monospaced)
 
         for (i, cell) in cells.enumerated() {
             guard i < rects.count else { break }
@@ -839,13 +837,14 @@ private struct SequenceCanvas<MenuContent: View>: View {
 
             case .gap(_, let count, _, _):
                 let gapRect = CGRect(x: rect.minX, y: rect.minY + numberH, width: gapW, height: cellH)
+                let gapPath = RoundedRectangle(cornerRadius: 2).path(in: gapRect)
                 // Gap background
                 context.fill(
-                    Path(RoundedRect(rect: gapRect, cornerSize: CGSize(width: 2, height: 2))),
+                    gapPath,
                     with: .color(.orange.opacity(0.1))
                 )
                 context.stroke(
-                    Path(RoundedRect(rect: gapRect, cornerSize: CGSize(width: 2, height: 2))),
+                    gapPath,
                     with: .color(.orange.opacity(0.3)),
                     lineWidth: 0.5
                 )

@@ -12,9 +12,10 @@ enum RDKitBridge {
         defer { druse_free_molecule_result(result) }
 
         guard result.pointee.success else {
-            return (nil, String(cString: withUnsafePointer(to: result.pointee.errorMessage) {
-                $0.withMemoryRebound(to: CChar.self, capacity: 512) { $0 }
-            }))
+            let errMsg = withUnsafePointer(to: result.pointee.errorMessage) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 512) { String(cString: $0) }
+            }
+            return (nil, errMsg)
         }
 
         return (convertResult(result.pointee), nil)
@@ -118,6 +119,67 @@ enum RDKitBridge {
         defer { druse_free_molecule_result(result) }
         guard result.pointee.success, result.pointee.atomCount > 0 else { return nil }
         return convertResult(result.pointee)
+    }
+
+    /// Convert atoms+bonds (with 3D coordinates) to canonical SMILES.
+    /// Used for co-crystallized ligands extracted from PDB files.
+    static func atomsBondsToSMILES(atoms: [Atom], bonds: [Bond]) -> String? {
+        guard !atoms.isEmpty else { return nil }
+
+        var druseAtoms = [DruseAtom](repeating: DruseAtom(), count: atoms.count)
+        for i in 0..<atoms.count {
+            druseAtoms[i].x = atoms[i].position.x
+            druseAtoms[i].y = atoms[i].position.y
+            druseAtoms[i].z = atoms[i].position.z
+            druseAtoms[i].atomicNum = Int32(atoms[i].element.rawValue)
+            druseAtoms[i].formalCharge = Int32(atoms[i].formalCharge)
+            druseAtoms[i].charge = atoms[i].charge
+            let sym = atoms[i].element.symbol
+            for (j, c) in sym.utf8.prefix(3).enumerated() {
+                withUnsafeMutableBytes(of: &druseAtoms[i].symbol) { buf in
+                    buf[j] = c
+                }
+            }
+        }
+
+        var druseBonds = [DruseBond](repeating: DruseBond(), count: bonds.count)
+        for i in 0..<bonds.count {
+            druseBonds[i].atom1 = Int32(bonds[i].atomIndex1)
+            druseBonds[i].atom2 = Int32(bonds[i].atomIndex2)
+            druseBonds[i].order = Int32(bonds[i].order.rawValue)
+        }
+
+        let result: UnsafeMutablePointer<DruseMoleculeResult>?
+        if druseBonds.isEmpty {
+            result = druseAtoms.withUnsafeMutableBufferPointer { atomsBuf in
+                druse_atoms_bonds_to_smiles(
+                    atomsBuf.baseAddress,
+                    Int32(atoms.count),
+                    nil,
+                    0,
+                    "ligand"
+                )
+            }
+        } else {
+            result = druseAtoms.withUnsafeMutableBufferPointer { atomsBuf in
+                druseBonds.withUnsafeMutableBufferPointer { bondsBuf in
+                    druse_atoms_bonds_to_smiles(
+                        atomsBuf.baseAddress,
+                        Int32(atoms.count),
+                        bondsBuf.baseAddress,
+                        Int32(bonds.count),
+                        "ligand"
+                    )
+                }
+            }
+        }
+
+        guard let result else { return nil }
+        defer { druse_free_molecule_result(result) }
+        guard result.pointee.success else { return nil }
+
+        let smiles = fixedCString(result.pointee.smiles)
+        return smiles.isEmpty ? nil : smiles
     }
 
     /// Compute upstream Vina XS atom types for a ligand represented as an MDL mol block.

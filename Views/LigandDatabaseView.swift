@@ -28,39 +28,39 @@ struct LigandDatabaseView: View {
 
             // Active ligand badge
             if let lig = viewModel.ligand {
-                HStack(spacing: 4) {
+                HStack(spacing: 5) {
                     Image(systemName: "hexagon.fill")
-                        .font(.system(size: 8))
+                        .font(.system(size: 10))
                         .foregroundStyle(.green)
                     Text(lig.name)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .lineLimit(1)
                     Spacer()
                     Text("\(lig.atomCount) atoms")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                     Button(action: { viewModel.clearLigand() }) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 9))
+                            .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
                 }
-                .padding(5)
+                .padding(6)
                 .background(Color.green.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
-                HStack(spacing: 4) {
+                HStack(spacing: 5) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 8))
+                        .font(.system(size: 10))
                         .foregroundStyle(.orange)
                     Text("No active ligand")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
-                .padding(5)
+                .padding(6)
                 .background(Color.orange.opacity(0.06))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             }
 
             // Quick SMILES add
@@ -170,9 +170,9 @@ struct LigandDatabaseView: View {
             Spacer()
 
             if let d = entry.descriptors {
-                Text(String(format: "%.0f", d.molecularWeight))
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                Text(String(format: "%.0f Da", d.molecularWeight))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
 
             Button(action: { useAsLigand(entry) }) {

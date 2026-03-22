@@ -1,5 +1,5 @@
 import Foundation
-import MetalKit
+@preconcurrency import MetalKit
 import simd
 
 // MARK: - Docking Configuration
@@ -170,6 +170,8 @@ final class DockingEngine {
     private var bestPopulationBuffer: MTLBuffer?
     private var ligandAtomBuffer: MTLBuffer?
     private var gaParamsBuffer: MTLBuffer?
+    private var gaParamsRing: [MTLBuffer] = []  // Triple-buffer for async GA loop
+    private var pairwiseRMSDPipeline: MTLComputePipelineState?
     private var torsionEdgeBuffer: MTLBuffer?
     private var movingIndicesBuffer: MTLBuffer?
     private var exclusionMaskBuffer: MTLBuffer?
@@ -212,6 +214,9 @@ final class DockingEngine {
             mcPerturbPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "mcPerturb")!)
             metropolisAcceptPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "metropolisAccept")!)
             explicitScorePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "scorePosesExplicit")!)
+            if let rmsdFunction = library.makeFunction(name: "computePairwiseRMSD") {
+                pairwiseRMSDPipeline = try device.makeComputePipelineState(function: rmsdFunction)
+            }
         } catch {
             print("Failed to create docking pipelines: \(error)")
             return nil
@@ -941,6 +946,14 @@ final class DockingEngine {
         let centroid = preparedLigand.centroid
         var gpuLigAtoms = preparedLigand.gpuAtoms
 
+        // Metal shaders use fixed-size stack arrays of 128 atoms; reject oversized ligands
+        // to prevent silent truncation and exclusion mask index out-of-bounds
+        guard gpuLigAtoms.count <= 128 else {
+            print("⚠️ Ligand has \(gpuLigAtoms.count) heavy atoms, exceeding the 128-atom GPU limit")
+            isRunning = false
+            return []
+        }
+
         // Compute ligand bounding half-extent (centroid-subtracted coordinates)
         var ligMin = SIMD3<Float>(repeating: .infinity)
         var ligMax = SIMD3<Float>(repeating: -.infinity)
@@ -1057,6 +1070,11 @@ final class DockingEngine {
         )
         gaParamsBuffer = device.makeBuffer(bytes: &gaParams, length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
 
+        // Triple-buffer ring for async GA loop (avoids CPU/GPU sync stalls)
+        gaParamsRing = (0..<3).compactMap { _ in
+            device.makeBuffer(length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
+        }
+
         let tgSize = MTLSize(width: min(popSize, 256), height: 1, depth: 1)
         let tgCount = MTLSize(width: (popSize + 255) / 256, height: 1, depth: 1)
 
@@ -1098,8 +1116,11 @@ final class DockingEngine {
 
             let explorationCutoff = Int(Float(config.generationsPerRun) * config.explorationPhaseRatio)
 
+            var lastCmdBuf: (any MTLCommandBuffer)?
+
             for step in 0..<config.generationsPerRun {
                 guard isRunning else {
+                    if let buf = lastCmdBuf { await buf.completed() }
                     aggregatedResults.append(contentsOf: extractAllResults(
                         from: bestPopulationBuffer,
                         ligandAtoms: heavyAtoms,
@@ -1126,22 +1147,26 @@ final class DockingEngine {
                     gaParams.mutationRate = config.mutationRate
                 }
 
-                gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
+                // Triple-buffer gaParams to avoid CPU/GPU sync stalls:
+                // CPU writes to ring buffer N while GPU may still read ring buffer N-1/N-2.
+                // Metal command queue serialization ensures correct ordering.
+                let ringBuf = gaParamsRing[step % 3]
+                ringBuf.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
 
                 let perturbBuffers: [(MTLBuffer, Int)] = [
                     (offspringBuffer!, 0), (populationBuffer!, 1),
-                    (gaParamsBuffer!, 2), (gridParamsBuffer!, 3)
+                    (ringBuf, 2), (gridParamsBuffer!, 3)
                 ]
                 let scoreBuffers: [(MTLBuffer, Int)] = [
                     (offspringBuffer!, 0), (ligandAtomBuffer!, 1),
                     (vinaAffinityGridBuffer!, 2), (vinaTypeIndexBuffer!, 3),
-                    (gridParamsBuffer!, 4), (gaParamsBuffer!, 5),
+                    (gridParamsBuffer!, 4), (ringBuf, 5),
                     (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
                     (exclusionMaskBuffer!, 8)
                 ]
                 let acceptBuffers: [(MTLBuffer, Int)] = [
                     (populationBuffer!, 0), (offspringBuffer!, 1),
-                    (bestPopulationBuffer!, 2), (gaParamsBuffer!, 3)
+                    (bestPopulationBuffer!, 2), (ringBuf, 3)
                 ]
                 var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
                     (pipeline: mcPerturbPipeline, buffers: perturbBuffers)
@@ -1151,7 +1176,7 @@ final class DockingEngine {
                 }
                 dispatches.append((pipeline: scorePipeline, buffers: scoreBuffers))
                 dispatches.append((pipeline: metropolisAcceptPipeline, buffers: acceptBuffers))
-                dispatchBatch(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
+                lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
 
                 // Update more frequently during exploration phase for smoother visualization
                 // of ligand moving through the binding site, less during refinement
@@ -1159,11 +1184,15 @@ final class DockingEngine {
                     ? max(liveUpdateFrequency / 2, 1)  // 2x more frequent during exploration
                     : liveUpdateFrequency
                 if step % updateFreq == 0 || step == config.generationsPerRun - 1 {
+                    if let buf = lastCmdBuf { await buf.completed() }
                     emitLiveUpdate(generation: globalGeneration)
                 }
 
                 await Task.yield()
             }
+
+            // Ensure all GPU work completes before reading results
+            if let buf = lastCmdBuf { await buf.completed() }
 
             aggregatedResults.append(contentsOf: extractAllResults(
                 from: bestPopulationBuffer,
@@ -1216,6 +1245,8 @@ final class DockingEngine {
         let heavyBonds = preparedLigand.heavyBonds
         let centroid = preparedLigand.centroid
         var gpuLigAtoms = preparedLigand.gpuAtoms
+
+        guard gpuLigAtoms.count <= 128 else { return nil }
 
         ligandAtomBuffer = device.makeBuffer(
             bytes: &gpuLigAtoms,
@@ -1381,7 +1412,7 @@ final class DockingEngine {
         cmdBuf.waitUntilCompleted()
     }
 
-    /// Batch multiple GPU dispatches into a single command buffer (reduces CPU/GPU sync barriers).
+    /// Batch multiple GPU dispatches into a single command buffer (synchronous).
     private func dispatchBatch(_ dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])],
                                 threadGroups: MTLSize, threadGroupSize: MTLSize) {
         guard isRunning else { return }
@@ -1395,6 +1426,24 @@ final class DockingEngine {
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+    }
+
+    /// Async batch dispatch — commits work to GPU without blocking CPU.
+    /// Returns the command buffer so callers can wait only when they need results.
+    @discardableResult
+    private func dispatchBatchAsync(_ dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])],
+                                     threadGroups: MTLSize, threadGroupSize: MTLSize) -> MTLCommandBuffer? {
+        guard isRunning else { return nil }
+        guard let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder() else { return nil }
+        for d in dispatches {
+            enc.setComputePipelineState(d.pipeline)
+            for (buf, idx) in d.buffers { enc.setBuffer(buf, offset: 0, index: idx) }
+            enc.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        }
+        enc.endEncoding()
+        cmdBuf.commit()
+        return cmdBuf
     }
 
     private func copyPoseBuffer(from source: MTLBuffer, to destination: MTLBuffer, poseCount: Int) {
@@ -1544,16 +1593,22 @@ final class DockingEngine {
         guard !results.isEmpty else { return [] }
         let threshold: Float = 2.0
         var out = results
+        let n = out.count
 
+        // Precompute full pairwise RMSD matrix (GPU if available, CPU fallback)
+        let rmsdMatrix = computeRMSDMatrixGPU(out) ?? computeRMSDMatrixCPU(out)
+
+        // Greedy leader-based clustering using precomputed matrix
         var clusterID = 0
-        for i in 0..<out.count {
+        for i in 0..<n {
             guard out[i].clusterID == -1 else { continue }
             out[i].clusterID = clusterID
             out[i].clusterRank = 0
             var rank = 1
-            for j in (i+1)..<out.count {
+            for j in (i+1)..<n {
                 guard out[j].clusterID == -1 else { continue }
-                if rmsd(out[i].transformedAtomPositions, out[j].transformedAtomPositions) < threshold {
+                let idx = i * n - i * (i + 1) / 2 + j - i - 1
+                if rmsdMatrix[idx] < threshold {
                     out[j].clusterID = clusterID
                     out[j].clusterRank = rank
                     rank += 1
@@ -1568,6 +1623,73 @@ final class DockingEngine {
         guard a.count == b.count, !a.isEmpty else { return .infinity }
         let s = zip(a, b).reduce(Float(0)) { $0 + simd_distance_squared($1.0, $1.1) }
         return sqrt(s / Float(a.count))
+    }
+
+    /// Compute pairwise RMSD matrix on GPU using Metal compute.
+    private func computeRMSDMatrixGPU(_ results: [DockingResult]) -> [Float]? {
+        guard let pipeline = pairwiseRMSDPipeline,
+              let first = results.first,
+              !first.transformedAtomPositions.isEmpty else { return nil }
+
+        let n = results.count
+        let numAtoms = first.transformedAtomPositions.count
+        guard n > 1 else { return [] }
+
+        // Flatten all pose positions into contiguous array
+        var positions: [SIMD3<Float>] = []
+        positions.reserveCapacity(n * numAtoms)
+        for r in results {
+            guard r.transformedAtomPositions.count == numAtoms else { return nil }
+            positions.append(contentsOf: r.transformedAtomPositions)
+        }
+
+        let matrixSize = n * (n - 1) / 2
+        var params = RMSDParams(numPoses: UInt32(n), numAtoms: UInt32(numAtoms), _pad0: 0, _pad1: 0)
+
+        guard let posBuffer = device.makeBuffer(
+                    bytes: &positions,
+                    length: positions.count * MemoryLayout<SIMD3<Float>>.stride,
+                    options: .storageModeShared),
+              let matrixBuffer = device.makeBuffer(
+                    length: matrixSize * MemoryLayout<Float>.stride,
+                    options: .storageModeShared),
+              let paramsBuffer = device.makeBuffer(
+                    bytes: &params,
+                    length: MemoryLayout<RMSDParams>.stride,
+                    options: .storageModeShared),
+              let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder()
+        else { return nil }
+
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(posBuffer, offset: 0, index: 0)
+        enc.setBuffer(matrixBuffer, offset: 0, index: 1)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 2)
+
+        // 2D dispatch: each thread handles one (i, j) pair
+        let tgSize = MTLSize(width: 16, height: 16, depth: 1)
+        let tgCount = MTLSize(width: (n + 15) / 16, height: (n + 15) / 16, depth: 1)
+        enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        let ptr = matrixBuffer.contents().bindMemory(to: Float.self, capacity: matrixSize)
+        return Array(UnsafeBufferPointer(start: ptr, count: matrixSize))
+    }
+
+    /// CPU fallback for pairwise RMSD matrix.
+    private func computeRMSDMatrixCPU(_ results: [DockingResult]) -> [Float] {
+        let n = results.count
+        let matrixSize = n * (n - 1) / 2
+        var matrix = [Float](repeating: 0, count: matrixSize)
+        for i in 0..<n {
+            for j in (i+1)..<n {
+                let idx = i * n - i * (i + 1) / 2 + j - i - 1
+                matrix[idx] = rmsd(results[i].transformedAtomPositions, results[j].transformedAtomPositions)
+            }
+        }
+        return matrix
     }
 
     private func ligandWithDockingCharges(_ ligand: Molecule) -> Molecule {
@@ -2063,118 +2185,159 @@ enum InteractionDetector {
         var result: [MolecularInteraction] = []
         var idCounter = 0
 
-        // Pre-detect aromatic rings
-        let proteinRings = detectAromaticRings(atoms: proteinAtoms)
-        let ligandRings = detectAromaticRings(
-            atoms: ligandAtoms,
-            positions: ligandPositions,
-            bonds: ligandBonds.isEmpty ? nil : ligandBonds
-        )
-
-        // Track which ligand atoms already have a strong interaction (to limit hydrophobic clutter)
-        var ligandHasStrongInteraction: Set<Int> = []
-
         // Charged residue atoms for salt bridges
         let positiveResAtoms: Set<String> = ["NZ", "NH1", "NH2", "NE"]  // Lys, Arg
         let negativeResAtoms: Set<String> = ["OD1", "OD2", "OE1", "OE2"]  // Asp, Glu
-
-        // Metal atoms
         let metals: Set<Element> = [.Fe, .Zn, .Ca, .Mg, .Mn, .Cu]
 
-        for (li, ligAtom) in ligandAtoms.enumerated() {
-            guard li < ligandPositions.count else { continue }
-            let lp = ligandPositions[li]
-
+        // ---- GPU path: metal coord, salt bridges, H-bonds, halogen, hydrophobic ----
+        if let gpu = InteractionDetectorGPU.shared {
+            let gpuResults = gpu.detect(
+                ligandAtoms: ligandAtoms,
+                ligandPositions: ligandPositions,
+                proteinAtoms: proteinAtoms,
+                positiveResAtoms: positiveResAtoms,
+                negativeResAtoms: negativeResAtoms,
+                metals: metals
+            )
+            for gi in gpuResults {
+                result.append(MolecularInteraction(
+                    id: idCounter,
+                    ligandAtomIndex: Int(gi.ligandAtomIndex),
+                    proteinAtomIndex: Int(gi.proteinAtomIndex),
+                    type: MolecularInteraction.InteractionType(rawValue: Int(gi.type)) ?? .hbond,
+                    distance: gi.distance,
+                    ligandPosition: gi.ligandPosition,
+                    proteinPosition: gi.proteinPosition
+                ))
+                idCounter += 1
+            }
+        } else {
+            // ---- CPU fallback with spatial grid ----
+            var ligandHasStrongInteraction: Set<Int> = []
+            let cellSize: Float = 6.0
+            let invCell: Float = 1.0 / cellSize
+            struct CellKey: Hashable { let x, y, z: Int }
+            var proteinGrid: [CellKey: [Int]] = [:]
+            proteinGrid.reserveCapacity(proteinAtoms.count / 3)
             for (pi, protAtom) in proteinAtoms.enumerated() {
-                let d = simd_distance(lp, protAtom.position)
-                guard d < 6.0 else { continue }  // coarse distance cutoff
+                let ck = CellKey(x: Int(floor(protAtom.position.x * invCell)),
+                                 y: Int(floor(protAtom.position.y * invCell)),
+                                 z: Int(floor(protAtom.position.z * invCell)))
+                proteinGrid[ck, default: []].append(pi)
+            }
 
-                let protName = protAtom.name.trimmingCharacters(in: .whitespaces)
+            for (li, ligAtom) in ligandAtoms.enumerated() {
+                guard li < ligandPositions.count else { continue }
+                let lp = ligandPositions[li]
+                let lcx = Int(floor(lp.x * invCell))
+                let lcy = Int(floor(lp.y * invCell))
+                let lcz = Int(floor(lp.z * invCell))
 
-                // ---- Metal coordination: < 2.8 Å, metal ↔ N/O/S ----
-                if d < 2.8 {
-                    let ligCoord = ligAtom.element == .N || ligAtom.element == .O || ligAtom.element == .S
-                    let protMetal = metals.contains(protAtom.element)
-                    let ligMetal = metals.contains(ligAtom.element)
-                    let protCoord = protAtom.element == .N || protAtom.element == .O || protAtom.element == .S
+                for ndx in -1...1 { for ndy in -1...1 { for ndz in -1...1 {
+                let nkey = CellKey(x: lcx + ndx, y: lcy + ndy, z: lcz + ndz)
+                guard let cellIndices = proteinGrid[nkey] else { continue }
+                for pi in cellIndices {
+                    let protAtom = proteinAtoms[pi]
+                    let d = simd_distance(lp, protAtom.position)
+                    guard d < 6.0 else { continue }
+                    let protName = protAtom.name.trimmingCharacters(in: .whitespaces)
 
-                    if (protMetal && ligCoord) || (ligMetal && protCoord) {
-                        result.append(MolecularInteraction(
-                            id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                            type: .metalCoord, distance: d,
-                            ligandPosition: lp, proteinPosition: protAtom.position))
-                        idCounter += 1
-                        ligandHasStrongInteraction.insert(li)
-                        continue
+                    if d < 2.8 {
+                        let ligCoord = ligAtom.element == .N || ligAtom.element == .O || ligAtom.element == .S
+                        let protMetal = metals.contains(protAtom.element)
+                        let ligMetal = metals.contains(ligAtom.element)
+                        let protCoord = protAtom.element == .N || protAtom.element == .O || protAtom.element == .S
+                        if (protMetal && ligCoord) || (ligMetal && protCoord) {
+                            result.append(MolecularInteraction(
+                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
+                                type: .metalCoord, distance: d,
+                                ligandPosition: lp, proteinPosition: protAtom.position))
+                            idCounter += 1; ligandHasStrongInteraction.insert(li); continue
+                        }
+                    }
+                    if d < 4.0 {
+                        let protPositive = positiveResAtoms.contains(protName)
+                        let protNegative = negativeResAtoms.contains(protName)
+                        if (protPositive && ligAtom.formalCharge < 0) || (protNegative && ligAtom.formalCharge > 0) {
+                            result.append(MolecularInteraction(
+                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
+                                type: .saltBridge, distance: d,
+                                ligandPosition: lp, proteinPosition: protAtom.position))
+                            idCounter += 1; ligandHasStrongInteraction.insert(li); continue
+                        }
+                    }
+                    if d >= 2.2 && d <= 3.5 {
+                        let ligDA = ligAtom.element == .N || ligAtom.element == .O
+                        let proDA = protAtom.element == .N || protAtom.element == .O
+                        if ligDA && proDA {
+                            result.append(MolecularInteraction(
+                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
+                                type: .hbond, distance: d,
+                                ligandPosition: lp, proteinPosition: protAtom.position))
+                            idCounter += 1; ligandHasStrongInteraction.insert(li); continue
+                        }
+                    }
+                    if d >= 2.5 && d <= 3.5 {
+                        let halogen = ligAtom.element == .F || ligAtom.element == .Cl || ligAtom.element == .Br
+                        let acceptor = protAtom.element == .N || protAtom.element == .O
+                        if halogen && acceptor {
+                            result.append(MolecularInteraction(
+                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
+                                type: .halogen, distance: d,
+                                ligandPosition: lp, proteinPosition: protAtom.position))
+                            idCounter += 1; ligandHasStrongInteraction.insert(li)
+                        }
                     }
                 }
+                }}} // spatial grid
+            }
 
-                // ---- Salt bridge: < 4.0 Å, charged group ↔ charged group ----
-                if d < 4.0 {
-                    let protPositive = positiveResAtoms.contains(protName)
-                    let protNegative = negativeResAtoms.contains(protName)
-                    let ligPositive = ligAtom.formalCharge > 0
-                    let ligNegative = ligAtom.formalCharge < 0
-
-                    if (protPositive && ligNegative) || (protNegative && ligPositive) {
-                        result.append(MolecularInteraction(
-                            id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                            type: .saltBridge, distance: d,
-                            ligandPosition: lp, proteinPosition: protAtom.position))
-                        idCounter += 1
-                        ligandHasStrongInteraction.insert(li)
-                        continue
-                    }
+            // CPU hydrophobic contacts
+            let invCellH = invCell
+            var hydroCount: [Int: Int] = [:]
+            for (li, ligAtom) in ligandAtoms.enumerated() {
+                guard li < ligandPositions.count, !ligandHasStrongInteraction.contains(li) else { continue }
+                guard ligAtom.element == .C || ligAtom.element == .S else { continue }
+                let lp = ligandPositions[li]
+                let cx = Int(floor(lp.x * invCellH)), cy = Int(floor(lp.y * invCellH)), cz = Int(floor(lp.z * invCellH))
+                for ndx in -1...1 { for ndy in -1...1 { for ndz in -1...1 {
+                guard (hydroCount[li, default: 0]) < 3 else { continue }
+                let hk = CellKey(x: cx + ndx, y: cy + ndy, z: cz + ndz)
+                guard let hci = proteinGrid[hk] else { continue }
+                for pi in hci {
+                    let pa = proteinAtoms[pi]
+                    guard pa.element == .C || pa.element == .S else { continue }
+                    let d = simd_distance(lp, pa.position)
+                    guard d >= 3.3 && d <= 4.5, (hydroCount[li, default: 0]) < 3 else { continue }
+                    result.append(MolecularInteraction(
+                        id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
+                        type: .hydrophobic, distance: d,
+                        ligandPosition: lp, proteinPosition: pa.position))
+                    idCounter += 1; hydroCount[li, default: 0] += 1
                 }
-
-                // ---- H-Bond: 2.2-3.5 Å between donor/acceptor (N/O) ----
-                if d >= 2.2 && d <= 3.5 {
-                    let ligDA = ligAtom.element == .N || ligAtom.element == .O
-                    let proDA = protAtom.element == .N || protAtom.element == .O
-                    if ligDA && proDA {
-                        result.append(MolecularInteraction(
-                            id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                            type: .hbond, distance: d,
-                            ligandPosition: lp, proteinPosition: protAtom.position))
-                        idCounter += 1
-                        ligandHasStrongInteraction.insert(li)
-                        continue
-                    }
-                }
-
-                // ---- Halogen bond: 2.5-3.5 Å, halogen ↔ N/O ----
-                if d >= 2.5 && d <= 3.5 {
-                    let halogen = ligAtom.element == .F || ligAtom.element == .Cl || ligAtom.element == .Br
-                    let acceptor = protAtom.element == .N || protAtom.element == .O
-                    if halogen && acceptor {
-                        result.append(MolecularInteraction(
-                            id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                            type: .halogen, distance: d,
-                            ligandPosition: lp, proteinPosition: protAtom.position))
-                        idCounter += 1
-                        ligandHasStrongInteraction.insert(li)
-                    }
-                }
+                }}}
             }
         }
 
-        // ---- π-π stacking: ring centroid distance 3.3-5.5 Å ----
+        // ---- π-π stacking: ring centroid distance 3.3-5.5 Å (always CPU — few rings) ----
+        let proteinRings = detectAromaticRings(atoms: proteinAtoms)
+        let ligandRings = detectAromaticRings(
+            atoms: ligandAtoms, positions: ligandPositions,
+            bonds: ligandBonds.isEmpty ? nil : ligandBonds
+        )
+
         for ligRing in ligandRings {
             for protRing in proteinRings {
                 let d = simd_distance(ligRing.centroid, protRing.centroid)
                 guard d >= 3.3 && d <= 5.5 else { continue }
-
-                // Check angle between ring normals
                 let dotN = abs(simd_dot(ligRing.normal, protRing.normal))
-                // Face-to-face: angle < 30° (dot > 0.87) or edge-to-face: angle > 60° (dot < 0.5)
                 let isFaceToFace = dotN > 0.85 && d < 4.2
                 let isEdgeToFace = dotN < 0.5 && d >= 4.0 && d <= 5.5
-
                 if isFaceToFace || isEdgeToFace {
-                    let ligIdx = ligRing.atomIndices.first ?? 0
-                    let protIdx = protRing.atomIndices.first ?? 0
                     result.append(MolecularInteraction(
-                        id: idCounter, ligandAtomIndex: ligIdx, proteinAtomIndex: protIdx,
+                        id: idCounter, ligandAtomIndex: ligRing.atomIndices.first ?? 0,
+                        proteinAtomIndex: protRing.atomIndices.first ?? 0,
                         type: .piStack, distance: d,
                         ligandPosition: ligRing.centroid, proteinPosition: protRing.centroid))
                     idCounter += 1
@@ -2182,29 +2345,23 @@ enum InteractionDetector {
             }
         }
 
-        // ---- π-cation: ring centroid ↔ cation, < 6.0 Å ----
-        // Protein cations near ligand rings
+        // ---- π-cation (always CPU — few rings) ----
         for ligRing in ligandRings {
             for (pi, protAtom) in proteinAtoms.enumerated() {
                 let protName = protAtom.name.trimmingCharacters(in: .whitespaces)
                 guard positiveResAtoms.contains(protName) || protAtom.formalCharge > 0 else { continue }
                 let d = simd_distance(ligRing.centroid, protAtom.position)
                 guard d < 6.0 else { continue }
-
-                // Check angle: cation should be roughly above/below the ring
                 let toAtom = simd_normalize(protAtom.position - ligRing.centroid)
-                let dotN = abs(simd_dot(toAtom, ligRing.normal))
-                if dotN > 0.5 {  // within ~60° of ring normal
-                    let ligIdx = ligRing.atomIndices.first ?? 0
+                if abs(simd_dot(toAtom, ligRing.normal)) > 0.5 {
                     result.append(MolecularInteraction(
-                        id: idCounter, ligandAtomIndex: ligIdx, proteinAtomIndex: pi,
-                        type: .piCation, distance: d,
+                        id: idCounter, ligandAtomIndex: ligRing.atomIndices.first ?? 0,
+                        proteinAtomIndex: pi, type: .piCation, distance: d,
                         ligandPosition: ligRing.centroid, proteinPosition: protAtom.position))
                     idCounter += 1
                 }
             }
         }
-        // Ligand cations near protein rings
         for protRing in proteinRings {
             for (li, ligAtom) in ligandAtoms.enumerated() {
                 guard li < ligandPositions.count else { continue }
@@ -2212,13 +2369,11 @@ enum InteractionDetector {
                 let lp = ligandPositions[li]
                 let d = simd_distance(protRing.centroid, lp)
                 guard d < 6.0 else { continue }
-
                 let toAtom = simd_normalize(lp - protRing.centroid)
-                let dotN = abs(simd_dot(toAtom, protRing.normal))
-                if dotN > 0.5 {
-                    let protIdx = protRing.atomIndices.first ?? 0
+                if abs(simd_dot(toAtom, protRing.normal)) > 0.5 {
                     result.append(MolecularInteraction(
-                        id: idCounter, ligandAtomIndex: li, proteinAtomIndex: protIdx,
+                        id: idCounter, ligandAtomIndex: li,
+                        proteinAtomIndex: protRing.atomIndices.first ?? 0,
                         type: .piCation, distance: d,
                         ligandPosition: lp, proteinPosition: protRing.centroid))
                     idCounter += 1
@@ -2226,35 +2381,133 @@ enum InteractionDetector {
             }
         }
 
-        // ---- Hydrophobic contacts: C/S ↔ C/S, 3.3-4.5 Å ----
-        // Only for ligand atoms that don't already have a stronger interaction.
-        // Limit to max 3 per ligand atom to avoid visual clutter.
-        var hydroCountPerLigAtom: [Int: Int] = [:]
-        let maxHydroPerAtom = 3
+        return result
+    }
+}
 
-        for (li, ligAtom) in ligandAtoms.enumerated() {
-            guard li < ligandPositions.count else { continue }
-            guard !ligandHasStrongInteraction.contains(li) else { continue }
-            guard ligAtom.element == .C || ligAtom.element == .S else { continue }
-            let lp = ligandPositions[li]
+// MARK: - GPU Interaction Detection Accelerator
 
-            for (pi, protAtom) in proteinAtoms.enumerated() {
-                guard protAtom.element == .C || protAtom.element == .S else { continue }
-                let d = simd_distance(lp, protAtom.position)
-                guard d >= 3.3 && d <= 4.5 else { continue }
+/// Metal-accelerated interaction detection. One thread per ligand atom,
+/// each checking all protein atoms with atomic append to output buffer.
+/// Handles: metal coord, salt bridges, H-bonds, halogen bonds, hydrophobic.
+/// π-π stacking and π-cation remain on CPU (few rings, geometry-dependent).
+private final class InteractionDetectorGPU {
+    nonisolated(unsafe) static let shared: InteractionDetectorGPU? = {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue(),
+              let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "detectInteractions")
+        else { return nil }
 
-                let count = hydroCountPerLigAtom[li, default: 0]
-                guard count < maxHydroPerAtom else { break }
+        do {
+            let pipeline = try device.makeComputePipelineState(function: function)
+            return InteractionDetectorGPU(device: device, commandQueue: commandQueue, pipeline: pipeline)
+        } catch {
+            return nil
+        }
+    }()
 
-                result.append(MolecularInteraction(
-                    id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                    type: .hydrophobic, distance: d,
-                    ligandPosition: lp, proteinPosition: protAtom.position))
-                idCounter += 1
-                hydroCountPerLigAtom[li] = count + 1
-            }
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let pipeline: MTLComputePipelineState
+    private let maxInteractions = 2048
+
+    private init(device: MTLDevice, commandQueue: MTLCommandQueue, pipeline: MTLComputePipelineState) {
+        self.device = device
+        self.commandQueue = commandQueue
+        self.pipeline = pipeline
+    }
+
+    /// Build element/property flags for a single atom.
+    private func atomFlags(for atom: Atom, positiveResAtoms: Set<String>, negativeResAtoms: Set<String>, metals: Set<Element>) -> UInt32 {
+        var flags: UInt32 = 0
+        switch atom.element {
+        case .N:  flags |= UInt32(IDET_FLAG_N)
+        case .O:  flags |= UInt32(IDET_FLAG_O)
+        case .S:  flags |= UInt32(IDET_FLAG_S)
+        case .C:  flags |= UInt32(IDET_FLAG_C)
+        case .F:  flags |= UInt32(IDET_FLAG_F) | UInt32(IDET_FLAG_HALOGEN)
+        case .Cl: flags |= UInt32(IDET_FLAG_CL) | UInt32(IDET_FLAG_HALOGEN)
+        case .Br: flags |= UInt32(IDET_FLAG_BR) | UInt32(IDET_FLAG_HALOGEN)
+        default:  break
+        }
+        if metals.contains(atom.element) { flags |= UInt32(IDET_FLAG_METAL) }
+        let name = atom.name.trimmingCharacters(in: .whitespaces)
+        if positiveResAtoms.contains(name) { flags |= UInt32(IDET_FLAG_POS_RES) }
+        if negativeResAtoms.contains(name) { flags |= UInt32(IDET_FLAG_NEG_RES) }
+        return flags
+    }
+
+    func detect(
+        ligandAtoms: [Atom],
+        ligandPositions: [SIMD3<Float>],
+        proteinAtoms: [Atom],
+        positiveResAtoms: Set<String>,
+        negativeResAtoms: Set<String>,
+        metals: Set<Element>
+    ) -> [GPUInteraction] {
+        let nLig = ligandAtoms.count
+        let nProt = proteinAtoms.count
+        guard nLig > 0, nProt > 0, ligandPositions.count >= nLig else { return [] }
+
+        // Pack protein atoms
+        var protGPU = proteinAtoms.map { atom -> InteractionAtomGPU in
+            InteractionAtomGPU(
+                position: atom.position,
+                flags: atomFlags(for: atom, positiveResAtoms: positiveResAtoms, negativeResAtoms: negativeResAtoms, metals: metals),
+                formalCharge: Int32(atom.formalCharge),
+                _pad0: 0, _pad1: 0, _pad2: 0
+            )
         }
 
-        return result
+        // Pack ligand atoms
+        var ligGPU = ligandAtoms.map { atom -> InteractionAtomGPU in
+            InteractionAtomGPU(
+                position: atom.position,
+                flags: atomFlags(for: atom, positiveResAtoms: positiveResAtoms, negativeResAtoms: negativeResAtoms, metals: metals),
+                formalCharge: Int32(atom.formalCharge),
+                _pad0: 0, _pad1: 0, _pad2: 0
+            )
+        }
+
+        var positions = Array(ligandPositions.prefix(nLig))
+        var counter: UInt32 = 0
+        var params = InteractionDetectParams(
+            numLigandAtoms: UInt32(nLig),
+            numProteinAtoms: UInt32(nProt),
+            maxInteractions: UInt32(maxInteractions),
+            _pad0: 0
+        )
+
+        guard let protBuffer = device.makeBuffer(bytes: &protGPU, length: nProt * MemoryLayout<InteractionAtomGPU>.stride, options: .storageModeShared),
+              let ligBuffer = device.makeBuffer(bytes: &ligGPU, length: nLig * MemoryLayout<InteractionAtomGPU>.stride, options: .storageModeShared),
+              let posBuffer = device.makeBuffer(bytes: &positions, length: nLig * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared),
+              let outBuffer = device.makeBuffer(length: maxInteractions * MemoryLayout<GPUInteraction>.stride, options: .storageModeShared),
+              let ctrBuffer = device.makeBuffer(bytes: &counter, length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let paramBuffer = device.makeBuffer(bytes: &params, length: MemoryLayout<InteractionDetectParams>.stride, options: .storageModeShared),
+              let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder()
+        else { return [] }
+
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(protBuffer, offset: 0, index: 0)
+        enc.setBuffer(ligBuffer, offset: 0, index: 1)
+        enc.setBuffer(posBuffer, offset: 0, index: 2)
+        enc.setBuffer(outBuffer, offset: 0, index: 3)
+        enc.setBuffer(ctrBuffer, offset: 0, index: 4)
+        enc.setBuffer(paramBuffer, offset: 0, index: 5)
+
+        let tgSize = MTLSize(width: min(nLig, 256), height: 1, depth: 1)
+        let tgCount = MTLSize(width: (nLig + 255) / 256, height: 1, depth: 1)
+        enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        let count = min(Int(ctrBuffer.contents().load(as: UInt32.self)), maxInteractions)
+        guard count > 0 else { return [] }
+
+        let ptr = outBuffer.contents().bindMemory(to: GPUInteraction.self, capacity: count)
+        return Array(UnsafeBufferPointer(start: ptr, count: count))
     }
 }

@@ -143,30 +143,44 @@ inline float optimalDistanceXS(int t1, int t2) {
     return xsRadius(t1) + xsRadius(t2);
 }
 
-inline float vinaPairEnergy(int probeType, int proteinType, float r) {
+/// Decomposed Vina pair energy: steric (gauss1+gauss2+repulsion), hydrophobic, hbond.
+struct VinaTerms {
+    float steric;
+    float hydrophobic;
+    float hbond;
+    float total;
+};
+
+inline VinaTerms vinaPairEnergyDecomposed(int probeType, int proteinType, float r) {
+    VinaTerms t = {0.0f, 0.0f, 0.0f, 0.0f};
     if (!xsTypeSupported(probeType) || !xsTypeSupported(proteinType) || r >= 8.0f) {
-        return 0.0f;
+        return t;
     }
 
     float d = r - optimalDistanceXS(probeType, proteinType);
-    float total = 0.0f;
 
     float dOverHalf = d * 2.0f;
-    total += wGauss1 * exp(-(dOverHalf * dOverHalf));
+    t.steric += wGauss1 * exp(-(dOverHalf * dOverHalf));
 
     float dMinus3Over2 = (d - 3.0f) * 0.5f;
-    total += wGauss2 * exp(-(dMinus3Over2 * dMinus3Over2));
+    t.steric += wGauss2 * exp(-(dMinus3Over2 * dMinus3Over2));
 
     if (d < 0.0f) {
-        total += wRepulsion * d * d;
+        t.steric += wRepulsion * d * d;
     }
     if (xsIsHydrophobic(probeType) && xsIsHydrophobic(proteinType)) {
-        total += wHydrophobic * slopeStep(1.5f, 0.5f, d);
+        t.hydrophobic = wHydrophobic * slopeStep(1.5f, 0.5f, d);
     }
     if (xsHBondPossible(probeType, proteinType)) {
-        total += wHBond * slopeStep(0.0f, -0.7f, d);
+        t.hbond = wHBond * slopeStep(0.0f, -0.7f, d);
     }
-    return total;
+    t.total = t.steric + t.hydrophobic + t.hbond;
+    return t;
+}
+
+/// Combined Vina pair energy (backward-compatible, used by grid map computation and intramolecular).
+inline float vinaPairEnergy(int probeType, int proteinType, float r) {
+    return vinaPairEnergyDecomposed(probeType, proteinType, r).total;
 }
 
 inline float sampleTypedAffinityMap(
@@ -680,7 +694,9 @@ kernel void scorePosesExplicit(
     float3 gridMin = gridParams.origin;
     float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
 
-    float totalIntermolecular = 0.0f;
+    float totalSteric = 0.0f;
+    float totalHydrophobic = 0.0f;
+    float totalHBond = 0.0f;
     float penalty = 0.0f;
 
     for (uint a = 0; a < nAtoms; a++) {
@@ -695,20 +711,24 @@ kernel void scorePosesExplicit(
         for (uint p = 0; p < gridParams.numProteinAtoms; p++) {
             float dist = distance(r, proteinAtoms[p].position);
             if (dist < 8.0f) {
-                totalIntermolecular += vinaPairEnergy(ligandAtoms[a].vinaType, proteinAtoms[p].vinaType, dist);
+                VinaTerms terms = vinaPairEnergyDecomposed(ligandAtoms[a].vinaType, proteinAtoms[p].vinaType, dist);
+                totalSteric += terms.steric;
+                totalHydrophobic += terms.hydrophobic;
+                totalHBond += terms.hbond;
             }
         }
     }
 
+    float totalIntermolecular = totalSteric + totalHydrophobic + totalHBond;
     float intraDelta = intramolecularLigandEnergy(positions, ligandAtoms, nAtoms, exclusionMask, 128)
         - gaParams.referenceIntraEnergy;
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
     float normalizedE = totalIntermolecular * normFactor;
 
-    pose.stericEnergy      = totalIntermolecular;
-    pose.hydrophobicEnergy = 0.0f;
-    pose.hbondEnergy       = 0.0f;
+    pose.stericEnergy      = totalSteric;
+    pose.hydrophobicEnergy = totalHydrophobic;
+    pose.hbondEnergy       = totalHBond;
     pose.torsionPenalty    = normalizedE - totalIntermolecular;
     pose.clashPenalty      = wPenalty * penalty + intraDelta;
     pose.energy            = normalizedE + pose.clashPenalty;

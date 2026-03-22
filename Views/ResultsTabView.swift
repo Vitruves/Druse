@@ -122,25 +122,30 @@ struct ResultsTabView: View {
                 )
             }
 
+            // Energy landscape bar chart
+            if viewModel.dockingResults.count > 1 {
+                energyLandscapeChart
+            }
+
             // Multi-pose action bar
             if viewModel.selectedPoseIndices.count > 1 {
                 HStack {
                     Text("\(viewModel.selectedPoseIndices.count) poses selected")
-                        .font(.system(size: 9))
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button("View Selected") {
                         viewModel.showSelectedPoses()
                     }
-                    .controlSize(.mini)
+                    .controlSize(.small)
                     .buttonStyle(.borderedProminent)
                     Button("Clear") {
                         viewModel.selectedPoseIndices.removeAll()
                     }
-                    .controlSize(.mini)
+                    .controlSize(.small)
                     .buttonStyle(.bordered)
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, 4)
             }
 
             // Scrollable pose list (up to 50)
@@ -177,6 +182,99 @@ struct ResultsTabView: View {
         )
     }
 
+    // MARK: - Energy Landscape Bar Chart
+
+    @ViewBuilder
+    private var energyLandscapeChart: some View {
+        let results = viewModel.dockingResults
+        let energies = results.map(\.energy)
+        let minE = energies.min() ?? 0
+        let maxE = energies.max() ?? 0
+        let range = max(abs(maxE - minE), 0.1)
+        let selectedIdx = viewModel.selectedPoseIndices.count == 1 ? viewModel.selectedPoseIndices.first : nil
+
+        VStack(alignment: .leading, spacing: 4) {
+            // Axis labels
+            HStack {
+                Text("Energy Landscape")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let sel = selectedIdx, sel < results.count {
+                    Text(String(format: "Pose %d: %.2f kcal/mol", sel + 1, results[sel].energy))
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.primary)
+                }
+            }
+
+            // Bar chart
+            GeometryReader { geo in
+                let barCount = min(results.count, 50)
+                let spacing: CGFloat = 1
+                let totalSpacing = spacing * CGFloat(barCount - 1)
+                let barWidth = max(2, (geo.size.width - totalSpacing) / CGFloat(barCount))
+                let chartHeight = geo.size.height
+
+                HStack(alignment: .bottom, spacing: spacing) {
+                    ForEach(0..<barCount, id: \.self) { idx in
+                        let energy = results[idx].energy
+                        let normalized = CGFloat((energy - minE) / range)
+                        let barHeight = max(3, (1.0 - normalized) * (chartHeight - 4) + 4)
+                        let isSelected = selectedIdx == idx
+
+                        Rectangle()
+                            .fill(barColor(energy: energy, isSelected: isSelected))
+                            .frame(width: barWidth, height: barHeight)
+                            .clipShape(RoundedRectangle(cornerRadius: 1.5))
+                            .overlay(
+                                isSelected ?
+                                    RoundedRectangle(cornerRadius: 1.5)
+                                        .stroke(Color.white.opacity(0.8), lineWidth: 1.5)
+                                    : nil
+                            )
+                            .onTapGesture {
+                                viewModel.showDockingPose(at: idx)
+                            }
+                    }
+                }
+            }
+            .frame(height: 60)
+
+            // Scale
+            HStack {
+                Text(String(format: "%.1f", minE))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.green)
+                Spacer()
+                Text("kcal/mol")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Text(String(format: "%.1f", maxE))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(maxE > 0 ? .red : .yellow)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func barColor(energy: Float, isSelected: Bool) -> Color {
+        if isSelected { return .white }
+        if energy < -8 { return .green }
+        if energy < -6 { return .green.opacity(0.7) }
+        if energy < -4 { return .yellow.opacity(0.7) }
+        if energy < -2 { return .orange.opacity(0.7) }
+        return .red.opacity(0.7)
+    }
+
     @ViewBuilder
     private func dockingPoseRow(index: Int, result: DockingResult) -> some View {
         HStack(spacing: 6) {
@@ -184,8 +282,8 @@ struct ResultsTabView: View {
             Button(action: { viewModel.togglePoseSelection(at: index) }) {
                 Image(systemName: viewModel.selectedPoseIndices.contains(index)
                       ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(viewModel.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.3))
+                    .font(.system(size: 13))
+                    .foregroundStyle(viewModel.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.4))
             }
             .buttonStyle(.plain)
             .help("Select for multi-pose overlay")
@@ -201,25 +299,25 @@ struct ResultsTabView: View {
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundStyle(energyColor(result.energy))
                     Text("kcal/mol")
-                        .font(.system(size: 8))
+                        .font(.system(size: 9))
                         .foregroundStyle(.tertiary)
                 }
 
                 HStack(spacing: 6) {
                     Text(String(format: "vdW:%.1f", result.vdwEnergy))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
                     Text(String(format: "elec:%.1f", result.elecEnergy))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
                     Text(String(format: "hb:%.1f", result.hbondEnergy))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
                     if result.clusterID >= 0 {
                         Text("C\(result.clusterID)")
-                            .font(.system(size: 8, weight: .medium, design: .monospaced))
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
                             .background(Capsule().fill(Color.cyan.opacity(0.15)))
                             .foregroundStyle(.cyan)
                     }
@@ -234,16 +332,16 @@ struct ResultsTabView: View {
                 viewModel.showInteractionDiagram = true
             } label: {
                 Image(systemName: "circle.hexagongrid")
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
             }
-            .controlSize(.mini)
+            .controlSize(.small)
             .buttonStyle(.bordered)
             .help("2D Interaction Diagram")
 
             Button("View") {
                 viewModel.showDockingPose(at: index)
             }
-            .controlSize(.mini)
+            .controlSize(.small)
             .buttonStyle(.bordered)
         }
         .padding(.vertical, 2)
@@ -322,29 +420,29 @@ struct ResultsTabView: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text("#\(index + 1)")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .frame(width: 24, alignment: .trailing)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .frame(width: 26, alignment: .trailing)
                     .foregroundStyle(.secondary)
 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(hit.name)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .lineLimit(1)
                     Text(hit.smiles)
-                        .font(.system(size: 8, design: .monospaced))
+                        .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
 
                 Spacer()
 
-                VStack(alignment: .trailing, spacing: 1) {
+                VStack(alignment: .trailing, spacing: 2) {
                     Text(String(format: "%.1f", hit.compositeScore))
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundStyle(energyColor(hit.compositeScore))
                     if let ml = hit.mlScore {
                         Text(String(format: "ML:%.1f", ml))
-                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
                             .foregroundStyle(.purple)
                     }
                 }
@@ -354,16 +452,16 @@ struct ResultsTabView: View {
             if let desc = hit.descriptors {
                 HStack(spacing: 8) {
                     Text(String(format: "MW:%.0f", desc.molecularWeight))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
                     Text(String(format: "cLogP:%.1f", desc.logP))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
                     if desc.lipinski {
-                        Text("Lip")
-                            .font(.system(size: 7, weight: .semibold))
-                            .padding(.horizontal, 3)
-                            .padding(.vertical, 1)
+                        Text("Lipinski")
+                            .font(.system(size: 9, weight: .medium))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
                             .background(Capsule().fill(Color.green.opacity(0.15)))
                             .foregroundStyle(.green)
                     }
@@ -665,9 +763,9 @@ struct ResultsTabView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(energyColor(bestEnergy))
 
-                Text("\(poseCount)p")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                Text("\(poseCount) poses")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
             .padding(.vertical, 3)
             .padding(.horizontal, 6)
@@ -700,20 +798,20 @@ struct ResultsTabView: View {
 
     @ViewBuilder
     private func statBadge(_ label: String, _ value: String, unit: String = "", color: Color = .primary) -> some View {
-        VStack(spacing: 1) {
-            HStack(spacing: 1) {
+        VStack(spacing: 2) {
+            HStack(spacing: 2) {
                 Text(value)
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(color)
                 if !unit.isEmpty {
                     Text(unit)
-                        .font(.system(size: 7))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
                 }
             }
             Text(label)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 

@@ -694,6 +694,62 @@ DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock) {
     }
 }
 
+DruseMoleculeResult* druse_atoms_bonds_to_smiles(
+    const DruseAtom *atoms,
+    int32_t atomCount,
+    const DruseBond *bonds,
+    int32_t bondCount,
+    const char *name
+) {
+    if (!atoms || atomCount <= 0) return make_error("No atoms provided");
+    try {
+        auto mol = std::make_unique<RWMol>();
+
+        // Add atoms
+        for (int32_t i = 0; i < atomCount; i++) {
+            Atom atom(atoms[i].atomicNum);
+            atom.setFormalCharge(atoms[i].formalCharge);
+            mol->addAtom(&atom, true, true);
+        }
+
+        // Add bonds
+        for (int32_t i = 0; i < bondCount && bonds; i++) {
+            int a1 = bonds[i].atom1;
+            int a2 = bonds[i].atom2;
+            if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount) continue;
+            Bond::BondType bt;
+            switch (bonds[i].order) {
+                case 2:  bt = Bond::DOUBLE;   break;
+                case 3:  bt = Bond::TRIPLE;   break;
+                case 4:  bt = Bond::AROMATIC;  break;
+                default: bt = Bond::SINGLE;    break;
+            }
+            mol->addBond(a1, a2, bt);
+        }
+
+        // Add 3D conformer
+        auto *conf = new Conformer(atomCount);
+        for (int32_t i = 0; i < atomCount; i++) {
+            conf->setAtomPos(i, RDGeom::Point3D(atoms[i].x, atoms[i].y, atoms[i].z));
+        }
+        mol->addConformer(conf, true);
+
+        // Sanitize (compute aromaticity, ring info, etc.)
+        try {
+            unsigned int failedOp = 0;
+            MolOps::sanitizeMol(*mol, failedOp,
+                MolOps::SANITIZE_ALL ^ MolOps::SANITIZE_PROPERTIES);
+        } catch (...) {
+            // If full sanitize fails, try a lighter cleanup
+            try { MolOps::findSSSR(*mol); } catch (...) {}
+        }
+
+        return mol_to_result(*mol, name ? name : "ligand");
+    } catch (const std::exception &e) {
+        return make_error(e.what());
+    }
+}
+
 int32_t druse_compute_vina_types_molblock(const char *molBlock, int32_t *outTypes, int32_t maxAtoms) {
     if (!molBlock || !molBlock[0] || !outTypes || maxAtoms <= 0) {
         return -1;

@@ -40,9 +40,11 @@ enum ProteinPreparation {
         var cappingResiduesAdded: Int = 0
         var chainBreaksDetected: Int = 0
         var chainBreaksCapped: Int = 0
+        var missingHeavyAtomsAdded: Int = 0
         var protonationUpdates: Int = 0
         var hydrogensAdded: Int = 0
         var hydrogenMethod: String = "none"
+        var hbondNetworkReport: HBondNetworkOptimizer.NetworkReport?
         var rdkitChargeMatches: Int = 0
         var fallbackChargeAtoms: Int = 0
         var nonZeroChargeAtoms: Int = 0
@@ -403,7 +405,7 @@ enum ProteinPreparation {
         // Missing residues
         report.missingResidues = detectMissingResidues(in: atoms)
         report.chainBreaks = detectChainBreaks(in: atoms, bonds: bonds)
-        report.residueCompleteness = analyzeResidueCompleteness(atoms: atoms)
+        report.residueCompleteness = analyzeResidueCompleteness(atoms: atoms, bonds: bonds)
 
         return report
     }
@@ -483,10 +485,10 @@ enum ProteinPreparation {
     // MARK: - Shared Docking Preparation
 
     /// Prepare a receptor copy for docking without mutating the displayed model.
-    /// This is intentionally conservative: keep the heavy-atom geometry fixed,
-    /// add missing polar hydrogens, merge whatever RDKit heavy-atom charges we can
-    /// recover from the raw PDB, and fall back to protonation-derived formal charges
-    /// when no partial charge is available.
+    /// Full native protein-prep pass used before docking:
+    /// Phase 1 cleanup, Phase 2 residue completion, and Phase 3 protonation-aware
+    /// hydrogen/charge assignment, with RDKit partial charges merged afterward when
+    /// the raw PDB is available.
     static func prepareForDocking(
         atoms: [Atom],
         bonds: [Bond],
@@ -502,21 +504,30 @@ enum ProteinPreparation {
         report.chainBreaksDetected = cleanup.report.chainBreaks.count
         report.chainBreaksCapped = cleanup.report.chainBreaks.filter(\.isCapped).count
 
-        let protonated = Protonation.applyProtonation(atoms: cleanup.atoms, pH: pH)
-        report.protonationUpdates = zip(cleanup.atoms, protonated).filter { $0.formalCharge != $1.formalCharge }.count
+        let phase23 = completePhase23(atoms: cleanup.atoms, bonds: cleanup.bonds, pH: pH)
+        var workingAtoms = phase23.atoms
+        var workingBonds = phase23.bonds
 
-        var workingAtoms = protonated
-        var workingBonds = cleanup.bonds
-
-        if protonated.contains(where: { $0.element == .H }) {
-            report.hydrogenMethod = "existing"
-        } else {
-            let hydrogenated = addPolarHydrogens(atoms: protonated, bonds: cleanup.bonds)
-            workingAtoms = hydrogenated.atoms
-            workingBonds = hydrogenated.bonds
-            report.hydrogensAdded = max(workingAtoms.count - protonated.count, 0)
-            report.hydrogenMethod = "geometry fallback"
+        report.missingHeavyAtomsAdded = phase23.report.heavyAtomsAdded
+        report.hydrogensAdded = phase23.report.hydrogensAdded
+        report.protonationUpdates = phase23.protonation.reduce(into: 0) { partial, prediction in
+            partial += prediction.atomFormalCharges.count
         }
+        if phase23.report.hydrogensAdded > 0 {
+            report.hydrogenMethod = "template-driven"
+        } else if cleanup.atoms.contains(where: { $0.element == .H }) {
+            report.hydrogenMethod = "existing"
+        }
+
+        // Phase 4: H-bond network optimization (enumerate, score, optimize, apply)
+        let network = HBondNetworkOptimizer.optimizeNetwork(
+            atoms: workingAtoms,
+            bonds: workingBonds,
+            predictions: phase23.protonation
+        )
+        workingAtoms = network.atoms
+        workingBonds = network.bonds
+        report.hbondNetworkReport = network.report
 
         if let pdbContent = rawPDBContent,
            let chargeData = RDKitBridge.computeChargesPDB(pdbContent: pdbContent) {

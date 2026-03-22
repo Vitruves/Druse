@@ -172,6 +172,11 @@ private final class PocketDetectionMetalAccelerator {
     private let distancePipeline: MTLComputePipelineState
     private let buriednessPipeline: MTLComputePipelineState
 
+    // Cached GPU buffers to avoid per-run allocation churn
+    private var cachedDistanceBuffer: MTLBuffer?
+    private var cachedCandidateMaskBuffer: MTLBuffer?
+    private var cachedBufferCapacity: Int = 0  // in number of grid points
+
     private init(
         device: MTLDevice,
         commandQueue: MTLCommandQueue,
@@ -226,15 +231,23 @@ private final class PocketDetectionMetalAccelerator {
                 bytes: &params,
                 length: MemoryLayout<PocketGridParams>.stride,
                 options: .storageModeShared
-              ),
-              let distanceBuffer = device.makeBuffer(
+              )
+        else { return nil }
+
+        // Reuse distance/mask buffers if large enough, otherwise reallocate
+        if totalPoints > cachedBufferCapacity {
+            cachedDistanceBuffer = device.makeBuffer(
                 length: totalPoints * MemoryLayout<Float>.stride,
                 options: .storageModeShared
-              ),
-              let candidateMaskBuffer = device.makeBuffer(
+            )
+            cachedCandidateMaskBuffer = device.makeBuffer(
                 length: totalPoints * MemoryLayout<UInt32>.stride,
                 options: .storageModeShared
-              )
+            )
+            cachedBufferCapacity = totalPoints
+        }
+        guard let distanceBuffer = cachedDistanceBuffer,
+              let candidateMaskBuffer = cachedCandidateMaskBuffer
         else { return nil }
 
         let threadsPerThreadgroup = MTLSize(width: 128, height: 1, depth: 1)

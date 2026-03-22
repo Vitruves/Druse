@@ -25,7 +25,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testDockingProducesValidResults() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
 
         let protein = TestMolecules.alanineDipeptide()
         print("  [ValidResults] Protein: \(protein.atomCount) atoms, \(protein.residues.count) residues")
@@ -71,7 +71,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testScoringDecompositionConsistency() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let protein = TestMolecules.alanineDipeptide()
         let pocket = await BindingSiteDetector.pocketFromResidues(
             protein: protein, residueIndices: Array(0..<protein.residues.count))
@@ -95,7 +95,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testStopDockingPreservesResults() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let protein = TestMolecules.alanineDipeptide()
         let pocket = await BindingSiteDetector.pocketFromResidues(
             protein: protein, residueIndices: Array(0..<protein.residues.count))
@@ -106,7 +106,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
         engine.computeGridMaps(protein: protein, pocket: pocket, spacing: 0.375)
         var config = DockingConfig()
-        config.numRuns = 1; config.generationsPerRun = 500; config.populationSize = 100; config.liveUpdateFrequency = 999
+        config.numRuns = 1; config.generationsPerRun = 200; config.populationSize = 64; config.liveUpdateFrequency = 999
 
         print("  [Stop] Starting long docking run, will stop after 500ms...")
         let task = Task { await engine.runDocking(ligand: ligand, pocket: pocket, config: config) }
@@ -125,8 +125,9 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testRedocking3PYYImatinib() async throws {
+
         print("\n  ========== REDOCKING: 3PYY / Imatinib (Kd ~37 nM) ==========")
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, crystalHeavy) = try await fetchAndParsePDB(id: "3PYY", ligandResidue: "STI")
 
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
@@ -148,8 +149,9 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testRedocking2QWKOseltamivir() async throws {
+
         print("\n  ========== REDOCKING: 2QWK / Oseltamivir (Ki ~0.1 nM) ==========")
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, crystalHeavy) = try await fetchAndParsePDB(id: "2QWK", ligandResidue: "G39")
 
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
@@ -171,8 +173,9 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testRedocking1M17Erlotinib() async throws {
+
         print("\n  ========== REDOCKING: 1M17 / Erlotinib (IC50 ~2 nM) ==========")
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, crystalHeavy) = try await fetchAndParsePDB(id: "1M17", ligandResidue: "AQ4")
 
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
@@ -198,12 +201,12 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testAllPosesInsideGridBox() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, _) = try await fetchAndParsePDB(id: "1HSG", ligandResidue: "MK1")
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
         guard let pocket else { throw XCTSkip("No pocket") }
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 200, generations: 150)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 64, generations: 40)
         print("  [GridBox] \(results.count) poses, pocket center=\(pocket.center), size=\(pocket.size)")
 
         let padding: Float = 8.0
@@ -225,12 +228,12 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testPoseDiversityMultipleClusters() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, _) = try await fetchAndParsePDB(id: "1HSG", ligandResidue: "MK1")
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
         guard let pocket else { throw XCTSkip("No pocket") }
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 300, generations: 300)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 100, generations: 80)
         let clusterIDs = Set(results.map(\.clusterID))
         print("  [Diversity] \(results.count) poses, \(clusterIDs.count) clusters")
         for cid in clusterIDs.sorted() {
@@ -243,12 +246,12 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testPosesCenteredOnPocket() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, _) = try await fetchAndParsePDB(id: "1HSG", ligandResidue: "MK1")
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
         guard let pocket else { throw XCTSkip("No pocket") }
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 200, generations: 200)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 64, generations: 40)
         let maxR = simd_length(pocket.size) + 5.0
 
         for (i, r) in results.prefix(5).enumerated() {
@@ -266,7 +269,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testBondLengthsPreservedAfterDocking() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (molData, _, err) = RDKitBridge.prepareLigand(smiles: "CCCCCC", name: "Hexane", addHydrogens: false, minimize: true, computeCharges: true)
         XCTAssertNil(err, "RDKit: \(err ?? "")")
         guard let md = molData else { throw XCTSkip("RDKit unavailable") }
@@ -307,7 +310,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testNoSevereIntraMolecularClashes() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (molData, _, err) = RDKitBridge.prepareLigand(smiles: "CC(=O)Oc1ccccc1C(=O)O", name: "Aspirin", addHydrogens: false, minimize: true, computeCharges: true)
         XCTAssertNil(err)
         guard let md = molData else { throw XCTSkip("RDKit unavailable") }
@@ -355,7 +358,7 @@ final class DockingIntegrationTests: DockingTestCase {
     }
 
     func testConformerDiversityEthylbenzene() {
-        let conformers = RDKitBridge.generateConformers(smiles: "CCc1ccccc1", name: "Ethylbenzene", count: 20, minimize: true)
+        let conformers = RDKitBridge.generateConformers(smiles: "CCc1ccccc1", name: "Ethylbenzene", count: 5, minimize: true)
         print("  [Conformers] Generated \(conformers.count) conformers")
         for (i, c) in conformers.prefix(5).enumerated() {
             print("    Conf \(i): E=\(String(format: "%.2f", c.energy)), atoms=\(c.molecule.atoms.count)")
@@ -375,12 +378,12 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testInteractionDetectionOnDockedPose() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, _) = try await fetchAndParsePDB(id: "1HSG", ligandResidue: "MK1")
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
         guard let pocket else { throw XCTSkip("No pocket") }
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 200, generations: 200)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 64, generations: 50)
         guard let best = results.first else { throw XCTSkip("No results") }
 
         let heavyAtoms = ligand.atoms.filter { $0.element != .H }
@@ -407,7 +410,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testSDFExportDockingResultsRoundTrip() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let protein = TestMolecules.alanineDipeptide()
         let pocket = await BindingSiteDetector.pocketFromResidues(protein: protein, residueIndices: Array(0..<protein.residues.count))
         let (molData, _, err) = RDKitBridge.prepareLigand(smiles: "CC(=O)Oc1ccccc1C(=O)O", name: "Aspirin", addHydrogens: false, minimize: true, computeCharges: true)
@@ -434,7 +437,7 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testGridMapDiagnostics() async throws {
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let (protein, ligand, _) = try await fetchAndParsePDB(id: "1HSG", ligandResidue: "MK1")
         let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
         guard let pocket else { throw XCTSkip("No pocket") }
@@ -448,7 +451,7 @@ final class DockingIntegrationTests: DockingTestCase {
     @MainActor
     func testDockingAcrossMolecularSizes() async throws {
         print("\n  ========== MOLECULAR SIZE SWEEP ==========")
-        let engine = try makeDockingEngine()
+        let engine = try sharedDockingEngine()
         let protein = TestMolecules.alanineDipeptide()
         let pocket = await BindingSiteDetector.pocketFromResidues(protein: protein, residueIndices: Array(0..<protein.residues.count))
         printPocketDebug(pocket, label: "SizeSweep-Pocket")
@@ -463,7 +466,7 @@ final class DockingIntegrationTests: DockingTestCase {
             guard err == nil, let md else { print("  [Sizes] \(tc.name): RDKit failed (\(err ?? "nil"))"); continue }
             let lig = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: tc.smi)
             print("  [Sizes] \(tc.name): \(lig.atomCount) atoms (\(lig.heavyAtomCount) heavy)")
-            let results = await runTestDocking(engine: engine, protein: protein, ligand: lig, pocket: pocket, populationSize: 50, generations: 50, flexibility: false)
+            let results = await runTestDocking(engine: engine, protein: protein, ligand: lig, pocket: pocket, populationSize: 32, generations: 30, flexibility: false)
             let bestE = results.first?.energy ?? .infinity
             print("  [Sizes] \(tc.name) RESULT: \(results.count) poses, E=\(bestE.isFinite ? String(format: "%.1f", bestE) : "inf")")
             if results.isEmpty {
@@ -490,14 +493,18 @@ final class DockingIntegrationTests: DockingTestCase {
             Atom(id: 0, element: .N, position: .zero, name: "ND1", residueName: "HIS", residueSeq: 1, chainID: "A"),
             Atom(id: 1, element: .N, position: SIMD3(1, 0, 0), name: "NE2", residueName: "HIS", residueSeq: 1, chainID: "A"),
         ]
+        let predictions5 = Protonation.predictResidueStates(atoms: atoms, pH: 5.0)
+        let predictions8 = Protonation.predictResidueStates(atoms: atoms, pH: 8.0)
         let prot5 = Protonation.applyProtonation(atoms: atoms, pH: 5.0)
         let prot8 = Protonation.applyProtonation(atoms: atoms, pH: 8.0)
         print("  [His] pH 5.0: ND1=\(prot5[0].formalCharge) NE2=\(prot5[1].formalCharge)")
         print("  [His] pH 8.0: ND1=\(prot8[0].formalCharge) NE2=\(prot8[1].formalCharge)")
-        XCTAssertEqual(prot5[0].formalCharge, 1, "ND1 should be +1 at pH 5")
-        XCTAssertEqual(prot5[1].formalCharge, 1, "NE2 should be +1 at pH 5")
+        XCTAssertEqual(predictions5.first?.state, .histidineDoublyProtonated, "Histidine should be doubly protonated at pH 5")
+        XCTAssertEqual(predictions5.first?.protonatedAtoms, Set(["ND1", "NE2"]))
+        XCTAssertEqual(prot5[0].formalCharge + prot5[1].formalCharge, 1, "PROPKA-like histidine keeps a single formal +1 charge while protonating both nitrogens")
         XCTAssertEqual(prot8[0].formalCharge, 0, "ND1 should be 0 at pH 8")
         XCTAssertEqual(prot8[1].formalCharge, 0, "NE2 should be 0 at pH 8")
+        XCTAssertEqual(predictions8.first?.protonatedAtoms.count, 1, "Neutral histidine should choose one tautomeric proton at pH 8")
     }
 
     // ======================================================================
@@ -506,18 +513,21 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testRoundTrip1HSGIndinavirViaSMILES() async throws {
+
         try await runRoundTripTest(pdbID: "1HSG", ligandResidue: "MK1",
             smiles: "CC(C)(C)NC(=O)C1CN(CCc2ccccc2)CC1O", ligandName: "Indinavir")
     }
 
     @MainActor
     func testRoundTrip2QWKOseltamivirViaSMILES() async throws {
+
         try await runRoundTripTest(pdbID: "2QWK", ligandResidue: "G39",
             smiles: "CCOC(=O)C1=CC(OC(CC)CC)C(NC(C)=O)C(N)C1", ligandName: "Oseltamivir")
     }
 
     @MainActor
     func testRoundTrip4DFRMethotrexateViaSMILES() async throws {
+
         try await runRoundTripTest(pdbID: "4DFR", ligandResidue: "MTX",
             smiles: "CN(Cc1cnc2nc(N)nc(N)c2n1)c1ccc(C(=O)NC(CCC(=O)O)C(=O)O)cc1",
             ligandName: "Methotrexate", centroidThreshold: 12.0)

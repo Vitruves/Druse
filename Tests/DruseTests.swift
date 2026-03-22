@@ -11,6 +11,54 @@ final class DruseTests: XCTestCase {
         return value
     }
 
+    private func remappedSubstructure(
+        atoms: [Atom],
+        bonds: [Bond],
+        keeping keptIndices: [Int]
+    ) -> (atoms: [Atom], bonds: [Bond]) {
+        let sortedKeptIndices = keptIndices.sorted()
+        var indexMap: [Int: Int] = [:]
+        var remappedAtoms: [Atom] = []
+        remappedAtoms.reserveCapacity(sortedKeptIndices.count)
+
+        for (newIndex, oldIndex) in sortedKeptIndices.enumerated() {
+            indexMap[oldIndex] = newIndex
+            let atom = atoms[oldIndex]
+            remappedAtoms.append(Atom(
+                id: newIndex,
+                element: atom.element,
+                position: atom.position,
+                name: atom.name,
+                residueName: atom.residueName,
+                residueSeq: atom.residueSeq,
+                chainID: atom.chainID,
+                charge: atom.charge,
+                formalCharge: atom.formalCharge,
+                isHetAtom: atom.isHetAtom,
+                occupancy: atom.occupancy,
+                tempFactor: atom.tempFactor,
+                altLoc: atom.altLoc
+            ))
+        }
+
+        var remappedBonds: [Bond] = []
+        for bond in bonds {
+            guard let atomIndex1 = indexMap[bond.atomIndex1],
+                  let atomIndex2 = indexMap[bond.atomIndex2] else {
+                continue
+            }
+            remappedBonds.append(Bond(
+                id: remappedBonds.count,
+                atomIndex1: atomIndex1,
+                atomIndex2: atomIndex2,
+                order: bond.order,
+                isRotatable: bond.isRotatable
+            ))
+        }
+
+        return (remappedAtoms, remappedBonds)
+    }
+
     // MARK: - Element Tests
 
     func testElementProperties() {
@@ -301,6 +349,81 @@ final class DruseTests: XCTestCase {
         XCTAssertEqual(protonated[1].charge, 1, accuracy: 0.001)
         XCTAssertEqual(protonated[2].formalCharge, -1, "C-term OXT should be -1 at pH 7.4")
         XCTAssertEqual(protonated[2].charge, -1, accuracy: 0.001)
+    }
+
+    func testProtonationBackboneNHLowersAspPKa() {
+        let aspOnly = [
+            Atom(id: 0, element: .O, position: SIMD3<Float>(0.0, 0.0, 0.0), name: "OD1",
+                 residueName: "ASP", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .O, position: SIMD3<Float>(0.0, 1.25, 0.0), name: "OD2",
+                 residueName: "ASP", residueSeq: 1, chainID: "A"),
+        ]
+
+        let withBackbone = aspOnly + [
+            Atom(id: 2, element: .N, position: SIMD3<Float>(2.60, 0.0, 0.0), name: "N",
+                 residueName: "ALA", residueSeq: 2, chainID: "A"),
+            Atom(id: 3, element: .H, position: SIMD3<Float>(1.60, 0.0, 0.0), name: "H",
+                 residueName: "ALA", residueSeq: 2, chainID: "A"),
+        ]
+        let backboneBonds = [
+            Bond(id: 0, atomIndex1: 2, atomIndex2: 3, order: .single),
+        ]
+
+        guard let aspWithoutBackbone = Protonation.predictResidueStates(
+            atoms: aspOnly,
+            bonds: [],
+            pH: 7.4
+        ).first(where: { $0.residueName == "ASP" }),
+              let aspWithBackbone = Protonation.predictResidueStates(
+                atoms: withBackbone,
+                bonds: backboneBonds,
+                pH: 7.4
+              ).first(where: { $0.residueName == "ASP" }) else {
+            XCTFail("Expected ASP protonation prediction")
+            return
+        }
+
+        print("  [Protonation] ASP alone: hbond=\(String(format: "%.3f", aspWithoutBackbone.hydrogenBondContribution)) pKa=\(String(format: "%.3f", aspWithoutBackbone.shiftedPKa))")
+        print("  [Protonation] ASP + backbone NH: hbond=\(String(format: "%.3f", aspWithBackbone.hydrogenBondContribution)) pKa=\(String(format: "%.3f", aspWithBackbone.shiftedPKa))")
+
+        XCTAssertEqual(aspWithoutBackbone.hydrogenBondContribution, 0, accuracy: 0.001)
+        XCTAssertLessThan(aspWithBackbone.hydrogenBondContribution, -0.20)
+        XCTAssertLessThan(aspWithBackbone.shiftedPKa, aspWithoutBackbone.shiftedPKa)
+    }
+
+    func testProtonationCooArgExceptionUsesTwoClosestContacts() {
+        let atoms = [
+            Atom(id: 0, element: .O, position: SIMD3<Float>(0.0, 0.0, 0.0), name: "OD1",
+                 residueName: "ASP", residueSeq: 1, chainID: "A"),
+            Atom(id: 1, element: .O, position: SIMD3<Float>(0.0, 2.0, 0.0), name: "OD2",
+                 residueName: "ASP", residueSeq: 1, chainID: "A"),
+            Atom(id: 2, element: .N, position: SIMD3<Float>(3.6, 1.0, 0.0), name: "NE",
+                 residueName: "ARG", residueSeq: 2, chainID: "A"),
+            Atom(id: 3, element: .N, position: SIMD3<Float>(2.6, 0.0, 0.0), name: "NH1",
+                 residueName: "ARG", residueSeq: 2, chainID: "A"),
+            Atom(id: 4, element: .H, position: SIMD3<Float>(1.6, 0.0, 0.0), name: "HH11",
+                 residueName: "ARG", residueSeq: 2, chainID: "A"),
+            Atom(id: 5, element: .N, position: SIMD3<Float>(2.6, 2.0, 0.0), name: "NH2",
+                 residueName: "ARG", residueSeq: 2, chainID: "A"),
+            Atom(id: 6, element: .H, position: SIMD3<Float>(1.6, 2.0, 0.0), name: "HH21",
+                 residueName: "ARG", residueSeq: 2, chainID: "A"),
+        ]
+        let bonds = [
+            Bond(id: 0, atomIndex1: 3, atomIndex2: 4, order: .single),
+            Bond(id: 1, atomIndex1: 5, atomIndex2: 6, order: .single),
+        ]
+
+        let predictions = Protonation.predictResidueStates(atoms: atoms, bonds: bonds, pH: 7.4)
+        guard let asp = predictions.first(where: { $0.residueName == "ASP" }),
+              let arg = predictions.first(where: { $0.residueName == "ARG" }) else {
+            XCTFail("Expected ASP and ARG predictions")
+            return
+        }
+
+        print("  [Protonation] ASP-ARG exception: ASP hbond=\(String(format: "%.3f", asp.hydrogenBondContribution)) ARG hbond=\(String(format: "%.3f", arg.hydrogenBondContribution))")
+
+        XCTAssertLessThan(asp.hydrogenBondContribution, -1.0)
+        XCTAssertGreaterThan(arg.hydrogenBondContribution, 1.0)
     }
 
     func testConformerGeneration() {
@@ -794,6 +917,66 @@ final class DruseTests: XCTestCase {
         XCTAssertFalse(completeness.contains(where: {
             $0.chainID == "A" && $0.residueSeq == 2 && $0.residueName == "ALA"
         }))
+    }
+
+    @MainActor
+    func testProteinPreparationResidueCompletenessAcceptsReferenceCappedDipeptide() {
+        let molecule = TestMolecules.alanineDipeptide()
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(
+            atoms: molecule.atoms,
+            bonds: molecule.bonds
+        )
+        XCTAssertTrue(completeness.isEmpty)
+    }
+
+    @MainActor
+    func testProteinPreparationReconstructsMissingHeavyAtomsFromReferenceTemplate() {
+        let molecule = TestMolecules.alanineDipeptide()
+        let keptIndices = molecule.atoms.indices.filter { index in
+            let atom = molecule.atoms[index]
+            return atom.element != .H &&
+                !(atom.residueName == "ALA" && atom.residueSeq == 2 && atom.name == "CB")
+        }
+        let truncated = remappedSubstructure(atoms: molecule.atoms, bonds: molecule.bonds, keeping: keptIndices)
+
+        let reconstructed = ProteinPreparation.reconstructMissingHeavyAtoms(
+            atoms: truncated.atoms,
+            bonds: truncated.bonds
+        )
+
+        XCTAssertEqual(reconstructed.addedAtomCount, 1)
+        guard let cbIndex = reconstructed.atoms.firstIndex(where: {
+            $0.residueName == "ALA" && $0.residueSeq == 2 && $0.name == "CB"
+        }), let caIndex = reconstructed.atoms.firstIndex(where: {
+            $0.residueName == "ALA" && $0.residueSeq == 2 && $0.name == "CA"
+        }) else {
+            XCTFail("Expected reconstructed alanine sidechain")
+            return
+        }
+
+        XCTAssertTrue(reconstructed.bonds.contains(where: { bond in
+            (bond.atomIndex1 == cbIndex && bond.atomIndex2 == caIndex) ||
+            (bond.atomIndex1 == caIndex && bond.atomIndex2 == cbIndex)
+        }))
+    }
+
+    @MainActor
+    func testProteinPreparationTemplateHydrogensRespectCappedPeptideLinkages() {
+        let molecule = TestMolecules.alanineDipeptide()
+        let heavyAtomIndices = molecule.atoms.indices.filter { molecule.atoms[$0].element != .H }
+        let heavyOnly = remappedSubstructure(atoms: molecule.atoms, bonds: molecule.bonds, keeping: heavyAtomIndices)
+
+        let hydrogenated = ProteinPreparation.addTemplateHydrogens(
+            atoms: heavyOnly.atoms,
+            bonds: heavyOnly.bonds,
+            pH: 7.4
+        )
+
+        XCTAssertEqual(hydrogenated.addedAtomCount, 12)
+        XCTAssertEqual(hydrogenated.atoms.filter { $0.element == .H }.count, 12)
+        XCTAssertFalse(hydrogenated.atoms.contains { $0.residueName == "ACE" && $0.name == "H" })
+        XCTAssertTrue(hydrogenated.atoms.contains { $0.residueName == "ACE" && $0.name == "H1" })
+        XCTAssertTrue(hydrogenated.atoms.contains { $0.residueName == "NME" && $0.name == "HN2" })
     }
 
     @MainActor

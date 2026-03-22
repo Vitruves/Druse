@@ -218,11 +218,11 @@ struct ResultsDatabaseWindow: View {
                                         .font(.system(size: 9, design: .monospaced))
                                         .foregroundStyle(energyColor(bestEnergy))
                                     Text("\(entry.results.count)p")
-                                        .font(.system(size: 8, design: .monospaced))
-                                        .foregroundStyle(.tertiary)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(.secondary)
                                     if let ki = affinityData?.ki {
                                         Text(String(format: "Ki:%.1f", ki))
-                                            .font(.system(size: 8, design: .monospaced))
+                                            .font(.system(size: 9, design: .monospaced))
                                             .foregroundStyle(.purple)
                                     }
                                 }

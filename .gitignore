@@ -59,8 +59,6 @@ Package.resolved
 *.bin
 !Training/*.py
 
-# CoreML exported models
-Models/druse-models/
 
 # === Training data ===
 Training/data/
@@ -85,6 +83,7 @@ env/
 
 # === temp / vendored deps ===
 temp/
+third_parties_deps/
 
 # === IDE ===
 .vscode/
@@ -105,3 +104,10 @@ concept.txt
 PLAN.md
 ROADMAP.md
 SUMMARY.md
+
+
+CppCore/.cache/
+TODO.md
+
+CppCore/.cache/
+buildServer.json

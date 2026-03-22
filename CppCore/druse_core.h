@@ -127,6 +127,18 @@ DruseMoleculeResult* druse_compute_charges_pdb(const char *pdbContent);
 /// Preserves atom ordering so charges can be merged back onto an existing ligand.
 DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock);
 
+/// Convert atoms+bonds (with 3D coordinates) to SMILES.
+/// Builds an RWMol from the provided atom/bond arrays, sanitizes, and returns
+/// a result with the canonical SMILES string populated.
+/// Useful for co-crystallized ligands extracted from PDB.
+DruseMoleculeResult* druse_atoms_bonds_to_smiles(
+    const DruseAtom *atoms,
+    int32_t atomCount,
+    const DruseBond *bonds,
+    int32_t bondCount,
+    const char *name
+);
+
 /// Compute upstream Vina XS atom types for a molecule provided as an MDL mol block.
 /// Writes one type per atom into `outTypes` and returns the atom count, or -1 on error.
 int32_t druse_compute_vina_types_molblock(const char *molBlock, int32_t *outTypes, int32_t maxAtoms);

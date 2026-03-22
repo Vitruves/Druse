@@ -39,34 +39,19 @@ FetchContent_Declare(LBFGSpp
 )
 FetchContent_Populate(LBFGSpp)
 
-# gemmi
-set(GEMMI_VENDORED_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../third_parties_deps/gemmi")
-set(GEMMI_LEGACY_TEMP_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../temp/gemmi")
-set(GEMMI_SOURCE_DIR "" CACHE PATH "Path to a local gemmi checkout override")
-
+# gemmi — fetched at configure time, built as static lib
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_GEMMI_PROGRAM OFF CACHE BOOL "" FORCE)
 set(INSTALL_DEV_FILES OFF CACHE BOOL "" FORCE)
 set(USE_PYTHON OFF CACHE BOOL "" FORCE)
 set(INTERNAL_ZLIB ON CACHE BOOL "" FORCE)
 
-if (GEMMI_SOURCE_DIR STREQUAL "${GEMMI_LEGACY_TEMP_SOURCE_DIR}")
-    set(GEMMI_SOURCE_DIR "" CACHE PATH "Path to a local gemmi checkout override" FORCE)
-endif()
-
-set(GEMMI_ACTIVE_SOURCE_DIR "${GEMMI_VENDORED_SOURCE_DIR}")
-if (GEMMI_SOURCE_DIR)
-    set(GEMMI_ACTIVE_SOURCE_DIR "${GEMMI_SOURCE_DIR}")
-endif()
-
-if (NOT EXISTS "${GEMMI_ACTIVE_SOURCE_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR
-        "Gemmi source not found at ${GEMMI_ACTIVE_SOURCE_DIR}. "
-        "Vendor it under third_parties_deps/gemmi or pass -DGEMMI_SOURCE_DIR=/path/to/gemmi."
-    )
-endif()
-
-add_subdirectory("${GEMMI_ACTIVE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/gemmi-build-vendored" EXCLUDE_FROM_ALL)
+FetchContent_Declare(gemmi
+    GIT_REPOSITORY https://github.com/project-gemmi/gemmi.git
+    GIT_TAG        v0.7.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(gemmi)
 
 set_target_properties(gemmi_cpp PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"

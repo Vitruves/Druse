@@ -4,22 +4,26 @@ Export trained PyTorch models to CoreML (.mlmodel/.mlpackage) for deployment in 
 
 Exports:
   1. DruseScore → DruseScore.mlpackage (EGNN scoring model)
-  2. ADMET models → ADMET_*.mlpackage (fingerprint-based property predictors)
+  2. PocketDetector → PocketDetector.mlpackage (surface point pocket classifier)
+  3. ADMET models → ADMET_*.mlpackage (fingerprint-based property predictors)
 
 The exported models are placed in ../Resources/ for Xcode to bundle.
 
 Usage:
   python export_coreml.py --druse_score checkpoints/druse_score_best.pt
+  python export_coreml.py --pocket_detector checkpoints/pocket_detector_best.pt
   python export_coreml.py --admet checkpoints/
   python export_coreml.py --all checkpoints/
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     import coremltools as ct
@@ -132,6 +136,9 @@ class DruseScoreForExport(nn.Module):
         super().__init__()
         self.max_prot = max_prot
         self.max_lig = max_lig
+        self.num_heads = 4
+        self.head_dim = hidden_dim // self.num_heads
+        self.attn_scale = float(self.head_dim) ** 0.5
 
         # Simplified encoders (no EGNN, just MLPs — EGNN features pre-computed by Metal)
         self.prot_encoder = nn.Sequential(
@@ -149,7 +156,7 @@ class DruseScoreForExport(nn.Module):
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.rbf_proj = nn.Linear(50, 4)  # 4 heads
+        self.rbf_proj = nn.Linear(50, self.num_heads)
 
         # Heads
         self.affinity_head = nn.Sequential(
@@ -177,20 +184,23 @@ class DruseScoreForExport(nn.Module):
         ligand_positions: [1, L, 3]
         pair_rbf: [1, L, P, 50]
         """
+        P = self.max_prot
+        L = self.max_lig
+        H = self.num_heads
+        d = self.head_dim
+        D = H * d
+
         prot_h = self.prot_encoder(protein_features.squeeze(0))  # [P, D]
         lig_h = self.lig_encoder(ligand_features.squeeze(0))  # [L, D]
         rbf = pair_rbf.squeeze(0)  # [L, P, 50]
 
-        L, D = lig_h.shape
-        P = prot_h.shape[0]
+        # Cross-attention (all dims are pre-computed constants)
+        Q = self.q_proj(lig_h).reshape(L, H, d)
+        K = self.k_proj(prot_h).reshape(P, H, d)
+        V = self.v_proj(prot_h).reshape(P, H, d)
 
-        # Cross-attention
-        Q = self.q_proj(lig_h).view(L, 4, D // 4)
-        K = self.k_proj(prot_h).view(P, 4, D // 4)
-        V = self.v_proj(prot_h).view(P, 4, D // 4)
-
-        attn = torch.einsum("lhd,phd->lph", Q, K) / (D // 4) ** 0.5
-        dist_bias = self.rbf_proj(rbf)  # [L, P, 4]
+        attn = torch.einsum("lhd,phd->lph", Q, K) / self.attn_scale
+        dist_bias = self.rbf_proj(rbf)  # [L, P, H]
         attn = attn + dist_bias
         attn_weights = torch.softmax(attn, dim=1)
 
@@ -204,15 +214,15 @@ class DruseScoreForExport(nn.Module):
         pose_conf = torch.sigmoid(self.pose_head(complex_repr))
 
         # Interaction map
-        lig_exp = attended.unsqueeze(1).expand(-1, P, -1)
-        prot_exp = prot_h.unsqueeze(0).expand(L, -1, -1)
+        lig_exp = attended.unsqueeze(1).expand(L, P, D)
+        prot_exp = prot_h.unsqueeze(0).expand(L, P, D)
         pair_input = torch.cat([lig_exp, prot_exp, rbf], dim=-1)
         interaction_map = torch.sigmoid(self.interaction_head(pair_input))
 
         # Attention weights (mean over heads)
         attn_out = attn_weights.mean(dim=-1)  # [L, P]
 
-        return pkd, pose_conf, interaction_map.unsqueeze(0), attn_out.reshape(1, -1)
+        return pkd, pose_conf, interaction_map.unsqueeze(0), attn_out.reshape(1, L * P)
 
 
 def export_druse_score(checkpoint_path: Path, output_dir: Path,
@@ -280,6 +290,167 @@ def export_druse_score(checkpoint_path: Path, output_dir: Path,
 
 
 # ============================================================================
+# Pocket Detector Export
+# ============================================================================
+
+class PocketDetectorForExport(nn.Module):
+    """Pocket detector for CoreML export.
+
+    The training model uses GCNConv (dynamic radius graph), which CoreML can't
+    handle. Instead, Metal computes k-nearest neighbors on the surface point
+    cloud and passes a [N, K] index tensor. This model gathers neighbor features
+    via indexing, averages them, and applies the same linear transform as GCNConv.
+
+    Input from Metal compute shaders:
+      - surface_features: per-point chemical features (normals, hydrophobicity, etc.)
+      - knn_indices: k-nearest neighbor indices for each surface point
+      - point_mask: 1 for real points, 0 for padding
+
+    Output:
+      - pocket_probability: per-point probability of being a binding pocket
+    """
+
+    def __init__(self, in_dim: int = 11, hidden_dim: int = 64, num_layers: int = 3,
+                 max_points: int = 2048, k_neighbors: int = 16):
+        super().__init__()
+        self.max_points = max_points
+        self.k_neighbors = k_neighbors
+
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.conv_weights = nn.ModuleList([
+            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)
+        ])
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_layers)
+        ])
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, surface_features, knn_indices, point_mask):
+        """
+        surface_features: [1, N, 11]
+        knn_indices: [1, N, K] — k-nearest neighbor indices (from Metal)
+        point_mask: [1, N] — 1.0 for real points, 0.0 for padding
+        """
+        N = self.max_points
+        K = self.k_neighbors
+
+        x = self.input_proj(surface_features.squeeze(0))  # [N, D]
+        mask = point_mask.squeeze(0)  # [N]
+
+        flat_idx = knn_indices.squeeze(0).reshape(N * K)  # [N*K]
+
+        for conv_w, norm in zip(self.conv_weights, self.norms):
+            # Gather neighbor features using pre-computed flat indices
+            neighbor_feats = torch.index_select(x, 0, flat_idx)  # [N*K, D]
+            neighbor_feats = neighbor_feats.reshape(N, K, -1)  # [N, K, D]
+            agg = neighbor_feats.mean(dim=1)  # [N, D]
+
+            x = x + conv_w(agg)
+            x = norm(x)
+            x = F.relu(x)
+
+        probs = torch.sigmoid(self.head(x)).squeeze(-1)  # [N]
+        probs = probs * mask  # zero out padded points
+        return probs.unsqueeze(0)  # [1, N]
+
+
+def export_pocket_detector(checkpoint_path: Path, output_dir: Path,
+                            max_points: int = 2048, k_neighbors: int = 16):
+    """Export PocketDetector to CoreML."""
+    print(f"  Exporting PocketDetector...")
+
+    model = PocketDetectorForExport(
+        max_points=max_points, k_neighbors=k_neighbors
+    )
+
+    threshold = 0.5  # default
+
+    if checkpoint_path.exists():
+        raw = torch.load(checkpoint_path, map_location="cpu")
+
+        # Handle both old format (raw state_dict) and new format (dict with threshold)
+        if isinstance(raw, dict) and "model_state_dict" in raw:
+            state = raw["model_state_dict"]
+            threshold = raw.get("threshold", 0.5)
+            print(f"    Loaded threshold: {threshold:.4f}")
+        else:
+            state = raw
+
+        # Map training model weight names to export model weight names:
+        #   convs.{i}.lin.weight → conv_weights.{i}.weight
+        #   convs.{i}.bias       → conv_weights.{i}.bias
+        mapped = {}
+        for k, v in state.items():
+            export_key = k
+            if k.startswith("convs."):
+                parts = k.split(".")
+                layer_idx = parts[1]
+                if parts[2] == "lin":
+                    # convs.0.lin.weight → conv_weights.0.weight
+                    export_key = f"conv_weights.{layer_idx}.{parts[3]}"
+                elif parts[2] in ("weight", "bias"):
+                    # convs.0.bias → conv_weights.0.bias
+                    export_key = f"conv_weights.{layer_idx}.{parts[2]}"
+            mapped[export_key] = v
+
+        loaded_keys = model.load_state_dict(mapped, strict=False)
+        if loaded_keys.missing_keys:
+            print(f"    Note: missing keys (expected): {loaded_keys.missing_keys}")
+        if loaded_keys.unexpected_keys:
+            print(f"    Note: unexpected keys (ignored): {loaded_keys.unexpected_keys}")
+        print(f"    Loaded checkpoint: {checkpoint_path}")
+    else:
+        print(f"    No checkpoint found, exporting random weights (for testing)")
+
+    model.eval()
+
+    # Trace with example inputs
+    N, K = max_points, k_neighbors
+    surface_feat = torch.randn(1, N, 11)
+    knn_idx = torch.randint(0, N, (1, N, K))
+    mask = torch.ones(1, N)
+
+    traced = torch.jit.trace(model, (surface_feat, knn_idx, mask))
+
+    ml_model = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="surface_features", shape=(1, N, 11)),
+            ct.TensorType(name="knn_indices", shape=ct.Shape(shape=(1, N, K)),
+                          dtype=np.int32),
+            ct.TensorType(name="point_mask", shape=(1, N)),
+        ],
+        outputs=[
+            ct.TensorType(name="pocket_probability"),
+        ],
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.macOS14,
+    )
+
+    ml_model.author = "Druse"
+    ml_model.short_description = "Surface point pocket detection (GNN-based)"
+    ml_model.version = "1.0"
+    ml_model.user_defined_metadata["pocket_threshold"] = f"{threshold:.6f}"
+    ml_model.user_defined_metadata["max_points"] = str(max_points)
+    ml_model.user_defined_metadata["k_neighbors"] = str(k_neighbors)
+
+    out_path = output_dir / "PocketDetector.mlpackage"
+    ml_model.save(str(out_path))
+    print(f"    Saved: {out_path}")
+    print(f"    Threshold in metadata: {threshold:.4f}")
+
+    try:
+        compiled = ct.models.CompiledMLModel(str(out_path))
+        print(f"    Compiled model ready")
+    except Exception:
+        print(f"    Note: compile on target machine with `xcrun coremlcompiler compile`")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -287,6 +458,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export Druse models to CoreML")
     parser.add_argument("--druse_score", type=str, default=None,
                         help="Path to DruseScore checkpoint (.pt)")
+    parser.add_argument("--pocket_detector", type=str, default=None,
+                        help="Path to PocketDetector checkpoint (.pt)")
     parser.add_argument("--admet", type=str, default=None,
                         help="Directory containing ADMET checkpoints")
     parser.add_argument("--all", type=str, default=None,
@@ -295,6 +468,10 @@ def main():
                         help="Output directory (default: ../Resources/ for Xcode)")
     parser.add_argument("--max_prot", type=int, default=256)
     parser.add_argument("--max_lig", type=int, default=64)
+    parser.add_argument("--max_surface_points", type=int, default=2048,
+                        help="Max surface points for pocket detector export")
+    parser.add_argument("--k_neighbors", type=int, default=16,
+                        help="K nearest neighbors for pocket detector export")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -306,15 +483,20 @@ def main():
         checkpoint_dir = Path(args.all)
         export_druse_score(checkpoint_dir / "druse_score_best.pt", output_dir,
                            args.max_prot, args.max_lig)
+        export_pocket_detector(checkpoint_dir / "pocket_detector_best.pt", output_dir,
+                                args.max_surface_points, args.k_neighbors)
         export_admet(checkpoint_dir, output_dir)
     else:
         if args.druse_score:
             export_druse_score(Path(args.druse_score), output_dir,
                                args.max_prot, args.max_lig)
+        if args.pocket_detector:
+            export_pocket_detector(Path(args.pocket_detector), output_dir,
+                                    args.max_surface_points, args.k_neighbors)
         if args.admet:
             export_admet(Path(args.admet), output_dir)
 
-    if not args.all and not args.druse_score and not args.admet:
+    if not args.all and not args.druse_score and not args.pocket_detector and not args.admet:
         parser.print_help()
         return
 

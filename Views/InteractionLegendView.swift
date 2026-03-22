@@ -12,35 +12,35 @@ struct InteractionLegendView: View {
 
     var body: some View {
         if !presentTypes.isEmpty {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text("Interactions")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary)
 
                 ForEach(presentTypes, id: \.rawValue) { type in
                     let count = interactions.filter { $0.type == type }.count
-                    HStack(spacing: 5) {
-                        RoundedRectangle(cornerRadius: 1)
+                    HStack(spacing: 6) {
+                        RoundedRectangle(cornerRadius: 1.5)
                             .fill(Color(
                                 red: Double(type.color.x),
                                 green: Double(type.color.y),
                                 blue: Double(type.color.z)
                             ))
-                            .frame(width: 14, height: 3)
+                            .frame(width: 16, height: 4)
 
                         Text(type.label)
-                            .font(.system(size: 9))
+                            .font(.system(size: 10))
                             .foregroundStyle(.primary)
 
                         Text("(\(count))")
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
-            .padding(8)
+            .padding(10)
             .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
 }

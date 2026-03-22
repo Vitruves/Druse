@@ -18,6 +18,7 @@ struct DruseApp: App {
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 1400, height: 900)
+        .defaultLaunchBehavior(.automatic)
         .commands {
             // File menu
             CommandGroup(after: .newItem) {
@@ -77,6 +78,7 @@ struct DruseApp: App {
         }
         .defaultSize(width: 1200, height: 700)
         .windowStyle(.titleBar)
+        .defaultLaunchBehavior(.suppressed)
 
         // Results Database window — full pose analysis, interaction diagrams, correlation
         Window("Results Database", id: "results-database") {
@@ -86,6 +88,7 @@ struct DruseApp: App {
         }
         .defaultSize(width: 1300, height: 800)
         .windowStyle(.titleBar)
+        .defaultLaunchBehavior(.suppressed)
 
     }
 

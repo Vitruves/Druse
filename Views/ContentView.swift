@@ -5,7 +5,7 @@ struct ContentView: View {
     @Environment(AppViewModel.self) private var viewModel
     @State private var showInspector = true
     @State private var showConsole = true
-    @State private var consoleHeight: CGFloat = 140
+    @State private var consoleHeight: CGFloat = 54
     @State private var isDragTargeted = false
 
     var body: some View {
@@ -48,8 +48,8 @@ struct ContentView: View {
                 }
             }
 
-            // Bottom console
-            LogConsoleView(isExpanded: $showConsole, consoleHeight: $consoleHeight)
+            // Bottom status strip + expandable console
+            StatusStripView(showConsole: $showConsole, consoleHeight: $consoleHeight)
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -189,23 +189,29 @@ struct ContentView: View {
 
     @ViewBuilder
     private var renderControls: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 4) {
             // Render mode buttons
             ForEach(RenderMode.allCases, id: \.self) { mode in
+                let isActive = viewModel.renderMode == mode
                 Button(action: { viewModel.setRenderMode(mode) }) {
                     Image(systemName: mode.icon)
-                        .font(.system(size: 12))
-                        .frame(width: 28, height: 28)
-                        .background(viewModel.renderMode == mode ? Color.accentColor.opacity(0.3) : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .font(.system(size: 14))
+                        .frame(width: 34, height: 34)
+                        .background(isActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(isActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(viewModel.renderMode == mode ? .primary : .secondary)
+                .foregroundStyle(isActive ? .primary : .secondary)
                 .help(mode.rawValue)
             }
 
             // Side chain display in ribbon mode
             if viewModel.renderMode == .ribbon {
+                let scActive = viewModel.sideChainDisplay != .none
                 Menu {
                     ForEach(SideChainDisplay.allCases, id: \.self) { mode in
                         Button(action: {
@@ -222,47 +228,65 @@ struct ContentView: View {
                     }
                 } label: {
                     Image(systemName: viewModel.sideChainDisplay.icon)
-                        .font(.system(size: 12))
-                        .frame(width: 28, height: 28)
-                        .background(viewModel.sideChainDisplay != .none ? Color.purple.opacity(0.3) : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .font(.system(size: 14))
+                        .frame(width: 34, height: 34)
+                        .background(scActive ? Color.purple.opacity(0.5) : Color.white.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(scActive ? Color.purple.opacity(0.6) : Color.clear, lineWidth: 1)
+                        )
                 }
                 .menuStyle(.borderlessButton)
-                .frame(width: 28)
-                .foregroundStyle(viewModel.sideChainDisplay != .none ? .purple : .secondary)
+                .frame(width: 34)
+                .foregroundStyle(scActive ? .purple : .secondary)
                 .help("Side chains: \(viewModel.sideChainDisplay.rawValue)")
             }
 
             Divider()
-                .frame(height: 20)
+                .frame(height: 24)
+                .padding(.horizontal, 2)
 
             // Hydrogen toggle
+            let hActive = viewModel.showHydrogens
+            let hAvailable = viewModel.proteinHasHydrogens
             Button(action: { viewModel.toggleHydrogens() }) {
                 Text("H")
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .frame(width: 28, height: 28)
-                    .background(viewModel.showHydrogens ? Color.accentColor.opacity(0.3) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .frame(width: 34, height: 34)
+                    .background(hActive && hAvailable ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(hActive && hAvailable ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                    )
             }
             .buttonStyle(.plain)
-            .foregroundStyle(viewModel.showHydrogens ? .primary : .secondary)
-            .help(viewModel.showHydrogens ? "Hide hydrogens" : "Show hydrogens")
+            .foregroundStyle(hAvailable ? (hActive ? .primary : .secondary) : .tertiary)
+            .disabled(!hAvailable)
+            .help(hAvailable ? (hActive ? "Hide hydrogens" : "Show hydrogens") : "No hydrogens — add them in Preparation")
 
             // Molecular surface toggle
+            let surfActive = viewModel.showSurface
             Button(action: { viewModel.toggleSurface() }) {
                 Image(systemName: "drop.halffull")
-                    .font(.system(size: 12))
-                    .frame(width: 28, height: 28)
-                    .background(viewModel.showSurface ? Color.accentColor.opacity(0.3) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .font(.system(size: 14))
+                    .frame(width: 34, height: 34)
+                    .background(surfActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(surfActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                    )
             }
             .buttonStyle(.plain)
-            .foregroundStyle(viewModel.showSurface ? .primary : .secondary)
+            .foregroundStyle(surfActive ? .primary : .secondary)
             .disabled(viewModel.protein == nil || viewModel.isGeneratingSurface)
-            .help(viewModel.showSurface ? "Hide molecular surface" : "Show molecular surface")
+            .help(surfActive ? "Hide molecular surface" : "Show molecular surface")
 
             // Surface color mode picker (only when surface is visible)
             if viewModel.showSurface {
+                let scmActive = viewModel.surfaceColorMode != .uniform
                 Menu {
                     ForEach(SurfaceColorMode.allCases, id: \.self) { mode in
                         Button(action: { viewModel.setSurfaceColorMode(mode) }) {
@@ -276,81 +300,100 @@ struct ContentView: View {
                     }
                 } label: {
                     Image(systemName: surfaceColorIcon)
-                        .font(.system(size: 12))
-                        .frame(width: 28, height: 28)
-                        .background(viewModel.surfaceColorMode != .uniform ? Color.yellow.opacity(0.3) : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .font(.system(size: 14))
+                        .frame(width: 34, height: 34)
+                        .background(scmActive ? Color.yellow.opacity(0.5) : Color.white.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(scmActive ? Color.yellow.opacity(0.6) : Color.clear, lineWidth: 1)
+                        )
                 }
                 .menuStyle(.borderlessButton)
-                .frame(width: 28)
-                .foregroundStyle(viewModel.surfaceColorMode != .uniform ? .yellow : .secondary)
+                .frame(width: 34)
+                .foregroundStyle(scmActive ? .yellow : .secondary)
                 .help("Surface coloring: \(viewModel.surfaceColorMode.rawValue)")
             }
 
             // Lighting toggle
+            let lightActive = viewModel.useDirectionalLighting
             Button(action: { viewModel.toggleLighting() }) {
-                Image(systemName: viewModel.useDirectionalLighting ? "sun.max.fill" : "sun.min")
-                    .font(.system(size: 12))
-                    .frame(width: 28, height: 28)
-                    .background(viewModel.useDirectionalLighting ? Color.accentColor.opacity(0.3) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Image(systemName: lightActive ? "sun.max.fill" : "sun.min")
+                    .font(.system(size: 14))
+                    .frame(width: 34, height: 34)
+                    .background(lightActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(lightActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                    )
             }
             .buttonStyle(.plain)
-            .foregroundStyle(viewModel.useDirectionalLighting ? .primary : .secondary)
-            .help(viewModel.useDirectionalLighting ? "Uniform lighting" : "Directional lighting")
+            .foregroundStyle(lightActive ? .primary : .secondary)
+            .help(lightActive ? "Uniform lighting" : "Directional lighting")
 
             Divider()
-                .frame(height: 20)
+                .frame(height: 24)
+                .padding(.horizontal, 2)
 
             // Z-slab clipping toggle
+            let clipActive = viewModel.enableClipping
             Button(action: {
                 viewModel.enableClipping.toggle()
                 syncClipping()
             }) {
                 Image(systemName: "scissors")
-                    .font(.system(size: 12))
-                    .frame(width: 28, height: 28)
-                    .background(viewModel.enableClipping ? Color.orange.opacity(0.3) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .font(.system(size: 14))
+                    .frame(width: 34, height: 34)
+                    .background(clipActive ? Color.orange.opacity(0.5) : Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(clipActive ? Color.orange.opacity(0.6) : Color.clear, lineWidth: 1)
+                    )
             }
             .buttonStyle(.plain)
-            .foregroundStyle(viewModel.enableClipping ? .orange : .secondary)
+            .foregroundStyle(clipActive ? .orange : .secondary)
             .help("Z-slab clipping")
 
             if viewModel.enableClipping {
-                // Near/Far sliders (compact)
-                VStack(spacing: 1) {
+                // Near/Far sliders
+                VStack(spacing: 2) {
                     Slider(value: Binding(
                         get: { viewModel.clipNearZ },
                         set: { viewModel.clipNearZ = $0; syncClipping() }
                     ), in: 0...200)
-                    .frame(width: 80)
-                    .controlSize(.mini)
+                    .frame(width: 90)
+                    .controlSize(.small)
 
                     Slider(value: Binding(
                         get: { viewModel.clipFarZ },
                         set: { viewModel.clipFarZ = $0; syncClipping() }
                     ), in: 0...200)
-                    .frame(width: 80)
-                    .controlSize(.mini)
+                    .frame(width: 90)
+                    .controlSize(.small)
                 }
 
-                Text(String(format: "%.0f–%.0f", viewModel.clipNearZ, viewModel.clipFarZ))
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                Text(String(format: "%.0f\u{2013}%.0f \u{00C5}", viewModel.clipNearZ, viewModel.clipFarZ))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
 
             // Current mode label
             Text(viewModel.renderMode.rawValue)
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.05))
+                .clipShape(Capsule())
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
         .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private func syncClipping() {
@@ -360,17 +403,17 @@ struct ContentView: View {
     }
 
     private func badge(_ name: String, icon: String, color: Color, count: Int) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
             Image(systemName: icon)
-                .font(.system(size: 9))
+                .font(.system(size: 11))
             Text(name)
-                .font(.system(size: 10, weight: .medium))
-            Text("\(count)")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 12, weight: .medium))
+            Text("\(count) atoms")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(color.opacity(0.7))
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .background(color.opacity(0.15))
         .foregroundStyle(color)
         .clipShape(Capsule())

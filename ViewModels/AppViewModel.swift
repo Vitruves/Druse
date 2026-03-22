@@ -55,6 +55,8 @@ final class AppViewModel {
     var preparationReport: ProteinPreparation.PreparationReport?
     var protonationPH: Float = 7.4
     var isMinimizing: Bool = false
+    /// Tracks whether the user has actively run any preparation step (not just loaded a protein).
+    var proteinPrepared: Bool = false
 
     // Docking state
     var detectedPockets: [BindingPocket] = []
@@ -161,8 +163,145 @@ final class AppViewModel {
         renderer?.updateInteractionLines([])
         pushToRenderer()
         renderer?.fitToContent()
-        log.success("Set \(molecule.name) as active ligand (\(molecule.atomCount) atoms)", category: .molecule)
+        let heavyCount = molecule.atoms.filter { $0.element != .H }.count
+        log.success("Set \(molecule.name) as active ligand (\(molecule.atomCount) atoms, \(heavyCount) heavy, \(molecule.bondCount) bonds)", category: .molecule)
+        if let smiles = molecule.smiles, !smiles.isEmpty {
+            log.info("  SMILES: \(smiles.prefix(80))\(smiles.count > 80 ? "..." : "")", category: .molecule)
+        }
         statusMessage = "\(molecule.name) ready for docking"
+    }
+
+    /// Extract a chain from the protein, set it as the active ligand, and add
+    /// it to the ligand database. The chain is removed from the protein molecule.
+    /// Works for co-crystallized small-molecule ligands and peptide ligands.
+    func extractChainAsLigand(chainID: String) {
+        guard let prot = protein else { return }
+        guard let chain = prot.chains.first(where: { $0.id == chainID }) else {
+            log.warn("Chain \(chainID) not found", category: .molecule)
+            return
+        }
+
+        // Collect all atom indices belonging to this chain
+        let chainAtomIndices = Set(chain.residueIndices.flatMap { resIdx -> [Int] in
+            guard resIdx < prot.residues.count else { return [] }
+            return prot.residues[resIdx].atomIndices
+        })
+        guard !chainAtomIndices.isEmpty else {
+            log.warn("Chain \(chainID) has no atoms", category: .molecule)
+            return
+        }
+
+        // Build ligand name from first non-standard residue name, or chain ID
+        let firstRes = chain.residueIndices.first.flatMap { idx in
+            idx < prot.residues.count ? prot.residues[idx] : nil
+        }
+        let ligandName = firstRes?.name ?? "Chain_\(chainID)"
+
+        // Extract atoms and re-index
+        let (ligAtoms, ligBonds) = ProteinPreparation.remapSubstructure(
+            atoms: prot.atoms,
+            bonds: prot.bonds,
+            selectedIndices: Array(chainAtomIndices).sorted()
+        )
+
+        let ligMol = Molecule(name: ligandName, atoms: ligAtoms, bonds: ligBonds)
+        setLigandForDocking(ligMol)
+
+        // Try to generate SMILES from crystal coordinates (for conformer generation later)
+        // Done after setLigandForDocking so a failure here doesn't block ligand use
+        var smiles = ""
+        if !ligBonds.isEmpty {
+            smiles = RDKitBridge.atomsBondsToSMILES(atoms: ligAtoms, bonds: ligBonds) ?? ""
+        }
+        if !smiles.isEmpty {
+            ligMol.smiles = smiles
+            log.info("Generated SMILES for \(ligandName): \(smiles.prefix(60))...", category: .molecule)
+        }
+
+        // Add to ligand database (SMILES enables conformer generation if available)
+        let dbEntry = LigandEntry(
+            name: ligandName,
+            smiles: smiles,
+            atoms: ligAtoms,
+            bonds: ligBonds,
+            isPrepared: true,
+            conformerCount: 1
+        )
+        ligandDB.add(dbEntry)
+
+        // Remove chain atoms from protein
+        let keepIndices = prot.atoms.indices.filter { !chainAtomIndices.contains($0) }
+        let (newProtAtoms, newProtBonds) = ProteinPreparation.remapSubstructure(
+            atoms: prot.atoms,
+            bonds: prot.bonds,
+            selectedIndices: keepIndices
+        )
+        let newProt = Molecule(name: prot.name, atoms: newProtAtoms,
+                               bonds: newProtBonds, title: prot.title)
+        newProt.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        protein = newProt
+
+        pushToRenderer()
+        renderer?.fitToContent()
+        log.success("Extracted \(ligandName) (\(ligAtoms.count) atoms) from chain \(chainID) as ligand", category: .molecule)
+        statusMessage = "\(ligandName) extracted as ligand"
+    }
+
+    /// Define a docking pocket from the current active ligand's position.
+    func definePocketFromLigand() {
+        guard let prot = protein, let lig = ligand else { return }
+        if let pocket = BindingSiteDetector.ligandGuidedPocket(
+            protein: prot, ligand: lig, excludedChainIDs: hiddenChainIDs
+        ) {
+            detectedPockets = [pocket]
+            selectedPocket = pocket
+            log.success("Pocket from ligand: \(pocket.residueIndices.count) residues, \(Int(pocket.volume)) A\u{00B3}", category: .dock)
+        }
+    }
+
+    /// Remove a specific chain from the protein molecule.
+    func removeChain(chainID: String) {
+        guard let prot = protein else { return }
+        guard let chain = prot.chains.first(where: { $0.id == chainID }) else { return }
+
+        let chainAtomIndices = Set(chain.residueIndices.flatMap { resIdx -> [Int] in
+            guard resIdx < prot.residues.count else { return [] }
+            return prot.residues[resIdx].atomIndices
+        })
+        guard !chainAtomIndices.isEmpty else { return }
+
+        let keepIndices = prot.atoms.indices.filter { !chainAtomIndices.contains($0) }
+        if keepIndices.isEmpty {
+            // Removing last chain — clear protein entirely
+            clearProtein()
+            return
+        }
+
+        let (newAtoms, newBonds) = ProteinPreparation.remapSubstructure(
+            atoms: prot.atoms, bonds: prot.bonds, selectedIndices: keepIndices
+        )
+        let newProt = Molecule(name: prot.name, atoms: newAtoms,
+                               bonds: newBonds, title: prot.title)
+        newProt.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        protein = newProt
+        hiddenChainIDs.remove(chainID)
+        pushToRenderer()
+        log.info("Removed chain \(chainID) (\(chainAtomIndices.count) atoms)", category: .molecule)
+        statusMessage = "Chain \(chainID) removed"
+    }
+
+    /// Clear the entire protein.
+    func clearProtein() {
+        let name = protein?.name ?? "protein"
+        protein = nil
+        rawPDBContent = nil
+        preparationReport = nil
+        detectedPockets = []
+        selectedPocket = nil
+        hiddenChainIDs.removeAll()
+        pushToRenderer()
+        log.info("Cleared \(name)", category: .molecule)
+        statusMessage = "No protein loaded"
     }
 
     /// Clear the active ligand (removes co-crystallized or any loaded ligand).
@@ -516,6 +655,10 @@ final class AppViewModel {
         pushToRenderer()
     }
 
+    var proteinHasHydrogens: Bool {
+        protein?.atoms.contains { $0.element == .H } ?? false
+    }
+
     func toggleHydrogens() {
         showHydrogens.toggle()
         pushToRenderer()
@@ -579,8 +722,26 @@ final class AppViewModel {
                     protein = nil
                 }
 
-                ligand = result.ligands.first.map {
-                    Molecule(name: $0.name, atoms: $0.atoms, bonds: $0.bonds, title: $0.title)
+                if let firstLig = result.ligands.first {
+                    let ligMol = Molecule(name: firstLig.name, atoms: firstLig.atoms,
+                                          bonds: firstLig.bonds, title: firstLig.title)
+                    setLigandForDocking(ligMol)
+
+                    // Add all co-crystallized ligands to the database
+                    // SMILES generated on demand via extractChainAsLigand
+                    for ligData in result.ligands {
+                        let entry = LigandEntry(
+                            name: ligData.name,
+                            smiles: "",
+                            atoms: ligData.atoms,
+                            bonds: ligData.bonds,
+                            isPrepared: true,
+                            conformerCount: 1
+                        )
+                        ligandDB.add(entry)
+                    }
+                } else {
+                    ligand = nil
                 }
 
                 preparationReport = ProteinPreparation.analyze(
@@ -596,6 +757,13 @@ final class AppViewModel {
                 let atomCount = protein?.atomCount ?? 0
                 let ligCount = result.ligands.count
                 log.success("Loaded \(id.uppercased()): \(atomCount) protein atoms, \(ligCount) ligand(s), \(result.waterCount) waters removed", category: .pdb)
+
+                if let prot = protein {
+                    let chains = Set(prot.atoms.map(\.chainID)).sorted()
+                    let residueCount = prot.residues.filter(\.isStandard).count
+                    let hetCount = prot.atoms.filter(\.isHetAtom).count
+                    log.info("  Chains: \(chains.joined(separator: ", ")) — \(residueCount) residues, \(hetCount) het atoms", category: .pdb)
+                }
 
                 for w in result.warnings.prefix(5) {
                     log.warn(w, category: .pdb)
@@ -654,7 +822,12 @@ final class AppViewModel {
                         waterCount: result.waterCount
                     )
 
-                    log.success("Loaded PDB: \(protein?.atomCount ?? 0) atoms", category: .pdb)
+                    log.success("Loaded PDB: \(protein?.atomCount ?? 0) atoms, \(result.waterCount) waters removed", category: .pdb)
+                    if let prot = protein {
+                        let chains = Set(prot.atoms.map(\.chainID)).sorted()
+                        let residueCount = prot.residues.filter(\.isStandard).count
+                        log.info("  Chains: \(chains.joined(separator: ", ")) — \(residueCount) residues", category: .pdb)
+                    }
 
                 case .sdf, .mol:
                     let molecules = try await Task.detached { try SDFParser.parse(url: url) }.value
@@ -765,6 +938,7 @@ final class AppViewModel {
         protein = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
         pushToRenderer()
         renderer?.fitToContent()
+        proteinPrepared = true
         log.success("Removed \(result.removedCount) water molecules", category: .prep)
         statusMessage = "\(result.removedCount) waters removed"
 
@@ -791,6 +965,7 @@ final class AppViewModel {
         let updated = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
         updated.secondaryStructureAssignments = prot.secondaryStructureAssignments
         protein = updated
+        proteinPrepared = true
         pushToRenderer()
         renderer?.fitToContent()
         log.success(
@@ -812,6 +987,7 @@ final class AppViewModel {
         let updated = Molecule(name: prot.name, atoms: resolved.atoms, bonds: resolved.bonds, title: prot.title)
         updated.secondaryStructureAssignments = prot.secondaryStructureAssignments
         protein = updated
+        proteinPrepared = true
         pushToRenderer()
         log.success("Removed \(resolved.removedAtomCount) alternate conformation atoms", category: .prep)
         statusMessage = "\(resolved.removedAtomCount) alt confs removed"
@@ -822,13 +998,45 @@ final class AppViewModel {
     func assignProtonation() {
         guard let prot = protein else { return }
         let pH = protonationPH
-        let protonated = Protonation.applyProtonation(atoms: prot.atoms, pH: pH)
-        let chargedCount = zip(prot.atoms, protonated).filter { $0.formalCharge != $1.formalCharge }.count
-        protein = Molecule(name: prot.name, atoms: protonated, bonds: prot.bonds, title: prot.title)
-        protein?.secondaryStructureAssignments = prot.secondaryStructureAssignments
-        pushToRenderer()
-        log.success("Assigned protonation states at pH \(String(format: "%.1f", pH)) (\(chargedCount) residues charged)", category: .prep)
-        statusMessage = "Protonation at pH \(String(format: "%.1f", pH))"
+        isMinimizing = true
+        statusMessage = "Adding polar hydrogens..."
+        log.info("Adding polar hydrogens at pH \(String(format: "%.1f", pH))...", category: .prep)
+
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let name = prot.name
+        let title = prot.title
+        let secondaryStructure = prot.secondaryStructureAssignments
+
+        Task.detached(priority: .userInitiated) {
+            let completed = ProteinPreparation.completePhase23(
+                atoms: atoms, bonds: bonds, pH: pH, polarOnly: true
+            )
+            let protonatedResidues = completed.protonation.filter {
+                !$0.atomFormalCharges.isEmpty || !$0.protonatedAtoms.isEmpty
+            }.count
+
+            await MainActor.run {
+                let mol = Molecule(name: name, atoms: completed.atoms, bonds: completed.bonds, title: title)
+                mol.secondaryStructureAssignments = secondaryStructure
+                self.protein = mol
+                self.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
+                self.pushToRenderer()
+                let netSummary: String
+                if let nr = completed.report.networkReport, nr.moveableGroups > 0 {
+                    netSummary = ", \(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations optimized"
+                } else {
+                    netSummary = ""
+                }
+                self.log.success(
+                    "Added polar hydrogens at pH \(String(format: "%.1f", pH)) " +
+                    "(\(protonatedResidues) titratable, \(completed.report.hydrogensAdded) polar H\(netSummary))",
+                    category: .prep
+                )
+                self.statusMessage = "Polar H at pH \(String(format: "%.1f", pH))"
+                self.isMinimizing = false
+            }
+        }
     }
 
     // MARK: - Energy Minimization
@@ -845,53 +1053,36 @@ final class AppViewModel {
         statusMessage = "Protein cleanup..."
 
         Task {
-            let cleanup = ProteinPreparation.cleanupStructure(atoms: prot.atoms, bonds: prot.bonds)
-            let protonated = Protonation.applyProtonation(atoms: cleanup.atoms, pH: protonationPH)
-            var charged = protonated
-            let preparedBonds = cleanup.bonds
-            var rdkitMatchedAtoms = 0
+            let prepared = ProteinPreparation.prepareForDocking(
+                atoms: prot.atoms,
+                bonds: prot.bonds,
+                rawPDBContent: rawPDBContent,
+                pH: protonationPH
+            )
 
-            if let pdbContent = rawPDBContent,
-               let chargeData = await Task.detached(operation: {
-                   RDKitBridge.computeChargesPDB(pdbContent: pdbContent)
-               }).value {
-                let merged = mergeProteinAtoms(currentAtoms: protonated, sourceAtoms: chargeData.atoms) { current, source in
-                    current.charge = source.charge
-                }
-                charged = merged.atoms
-                rdkitMatchedAtoms = merged.matchedCount
-            }
-
-            charged = applyElectrostaticFallback(to: charged)
-
-            let mol = Molecule(name: prot.name, atoms: charged, bonds: preparedBonds, title: prot.title)
+            let mol = Molecule(name: prot.name, atoms: prepared.atoms, bonds: prepared.bonds, title: prot.title)
             mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
             protein = mol
             pushToRenderer()
             renderer?.fitToContent()
-            preparationReport = ProteinPreparation.analyze(atoms: charged, bonds: preparedBonds)
+            preparationReport = ProteinPreparation.analyze(atoms: prepared.atoms, bonds: prepared.bonds)
 
-            let chargedCount = zip(cleanup.atoms, charged).filter { $0.formalCharge != $1.formalCharge }.count
-            let cleanupSummary = [
-                cleanup.report.removedAltConformerAtoms > 0 ? "\(cleanup.report.removedAltConformerAtoms) altloc atoms removed" : nil,
-                cleanup.report.removedHeterogenResidues > 0 ? "\(cleanup.report.removedHeterogenResidues) non-standard residues removed" : nil,
-                cleanup.report.addedCappingResidues > 0 ? "\(cleanup.report.addedCappingResidues) cap residues added" : nil
+            let summary = [
+                prepared.report.altConformerAtomsRemoved > 0 ? "\(prepared.report.altConformerAtomsRemoved) altloc atoms removed" : nil,
+                prepared.report.heterogenResiduesRemoved > 0 ? "\(prepared.report.heterogenResiduesRemoved) non-standard residues removed" : nil,
+                prepared.report.cappingResiduesAdded > 0 ? "\(prepared.report.cappingResiduesAdded) cap residues added" : nil,
+                prepared.report.missingHeavyAtomsAdded > 0 ? "\(prepared.report.missingHeavyAtomsAdded) heavy atoms rebuilt" : nil,
+                prepared.report.hydrogensAdded > 0 ? "\(prepared.report.hydrogensAdded) hydrogens added" : nil,
+                prepared.report.protonationUpdates > 0 ? "\(prepared.report.protonationUpdates) ionization sites updated" : nil
             ].compactMap { $0 }.joined(separator: ", ")
-            if rdkitMatchedAtoms > 0 {
-                log.success(
-                    "Structure cleanup complete (\(cleanupSummary.isEmpty ? "no structural edits" : cleanupSummary), " +
-                    "pH \(String(format: "%.1f", protonationPH)), \(chargedCount) ionization updates, " +
-                    "RDKit charges merged onto \(rdkitMatchedAtoms) atoms)",
-                    category: .prep
-                )
-            } else {
-                log.success(
-                    "Structure cleanup complete (\(cleanupSummary.isEmpty ? "no structural edits" : cleanupSummary), " +
-                    "pH \(String(format: "%.1f", protonationPH)), \(chargedCount) ionization updates, formal-charge fallback applied)",
-                    category: .prep
-                )
-            }
+
+            log.success(
+                "Structure cleanup complete (\(summary.isEmpty ? "no structural edits" : summary), " +
+                "pH \(String(format: "%.1f", protonationPH)), charges on \(prepared.report.nonZeroChargeAtoms) atoms)",
+                category: .prep
+            )
             statusMessage = "Cleanup complete"
+            proteinPrepared = true
             isMinimizing = false
         }
     }
@@ -924,7 +1115,7 @@ final class AppViewModel {
     func analyzeMissingAtoms() {
         guard let prot = protein else { return }
 
-        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: prot.atoms)
+        let completeness = ProteinPreparation.analyzeResidueCompleteness(atoms: prot.atoms, bonds: prot.bonds)
         if preparationReport != nil {
             preparationReport?.residueCompleteness = completeness
         } else {
@@ -959,6 +1150,27 @@ final class AppViewModel {
         statusMessage = "\(completeness.count) residue issue(s)"
     }
 
+    func repairMissingAtoms() {
+        guard let prot = protein else { return }
+
+        let rebuilt = ProteinPreparation.reconstructMissingHeavyAtoms(atoms: prot.atoms, bonds: prot.bonds)
+        guard rebuilt.addedAtomCount > 0 else {
+            log.success("No missing heavy atoms required reconstruction", category: .prep)
+            statusMessage = "No heavy atoms rebuilt"
+            return
+        }
+
+        let mol = Molecule(name: prot.name, atoms: rebuilt.atoms, bonds: rebuilt.bonds, title: prot.title)
+        mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        protein = mol
+        preparationReport = ProteinPreparation.analyze(atoms: rebuilt.atoms, bonds: rebuilt.bonds)
+        pushToRenderer()
+        renderer?.fitToContent()
+
+        log.success("Rebuilt \(rebuilt.addedAtomCount) missing heavy atom(s) from residue templates", category: .prep)
+        statusMessage = "\(rebuilt.addedAtomCount) heavy atom(s) rebuilt"
+    }
+
     // MARK: - Solvation Shell
 
     func addSolvationShell() {
@@ -967,53 +1179,75 @@ final class AppViewModel {
         statusMessage = "Solvation: planned for future release"
     }
 
+    func removeHydrogens() {
+        guard let prot = protein else { return }
+        let kept = prot.atoms.indices.filter { prot.atoms[$0].element != .H }
+        let result = ProteinPreparation.remapSubstructure(
+            atoms: prot.atoms, bonds: prot.bonds, selectedIndices: kept
+        )
+        let mol = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
+        mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        protein = mol
+
+        // Also strip hydrogens from the active ligand if present
+        if let lig = ligand, lig.atoms.contains(where: { $0.element == .H }) {
+            let ligKept = lig.atoms.indices.filter { lig.atoms[$0].element != .H }
+            let ligResult = ProteinPreparation.remapSubstructure(
+                atoms: lig.atoms, bonds: lig.bonds, selectedIndices: ligKept
+            )
+            ligand = Molecule(name: lig.name, atoms: ligResult.atoms,
+                              bonds: ligResult.bonds, title: lig.title, smiles: lig.smiles)
+        }
+
+        pushToRenderer()
+        renderer?.fitToContent()
+        preparationReport = ProteinPreparation.analyze(atoms: result.atoms, bonds: result.bonds)
+        let removed = prot.atoms.count - result.atoms.count
+        log.success("Removed \(removed) hydrogen atoms", category: .prep)
+        statusMessage = "\(removed) H removed"
+    }
+
     // MARK: - C++ Protein Preparation
 
     func addHydrogens() {
         guard let prot = protein else { return }
 
-        log.info("Adding polar hydrogens...", category: .prep)
+        log.info("Adding template-driven hydrogens...", category: .prep)
         statusMessage = "Adding hydrogens..."
 
-        let existingHCount = prot.atoms.filter { $0.element == .H }.count
-        if existingHCount > 0 {
-            log.warn("Protein already has \(existingHCount) hydrogens — skipping", category: .prep)
-            statusMessage = "Hydrogens already present"
-            return
-        }
-
         Task {
-            let rdkitHydrogenated: MoleculeData? = if let pdbContent = rawPDBContent {
-                await Task.detached {
-                    RDKitBridge.addHydrogensToPDB(pdbContent: pdbContent)
-                }.value
-            } else {
-                nil
-            }
+            let completed = ProteinPreparation.completePhase23(
+                atoms: prot.atoms,
+                bonds: prot.bonds,
+                pH: protonationPH
+            )
 
-            let result: (atoms: [Atom], bonds: [Bond], method: String)
-            if let hydrogenated = rdkitHydrogenated,
-               canAdoptRDKitProteinGeometry(currentAtoms: prot.atoms, sourceAtoms: hydrogenated.atoms) {
-                result = (hydrogenated.atoms, hydrogenated.bonds, "RDKit")
-            } else {
-                let atoms = prot.atoms
-                let bonds = prot.bonds
-                let fallback = await Task.detached {
-                    ProteinPreparation.addPolarHydrogens(atoms: atoms, bonds: bonds)
-                }.value
-                result = (fallback.atoms, fallback.bonds, "geometry fallback")
-            }
-
-            let mol = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
+            let mol = Molecule(name: prot.name, atoms: completed.atoms, bonds: completed.bonds, title: prot.title)
             mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
             protein = mol
             pushToRenderer()
             renderer?.fitToContent()
 
-            let added = result.atoms.count - prot.atoms.count
-            log.success("Added \(added) hydrogens via \(result.method)", category: .prep)
-            statusMessage = "\(added) hydrogens added"
-            preparationReport = ProteinPreparation.analyze(atoms: result.atoms, bonds: result.bonds)
+            let added = completed.report.hydrogensAdded
+            let netSummary: String
+            if let nr = completed.report.networkReport, nr.moveableGroups > 0 {
+                netSummary = ", H-bond network: \(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations"
+            } else {
+                netSummary = ""
+            }
+            if added == 0 {
+                log.success("No additional hydrogens were required after template completion", category: .prep)
+                statusMessage = "No hydrogens added"
+            } else {
+                log.success(
+                    "Added \(added) hydrogens" +
+                    (completed.report.heavyAtomsAdded > 0 ? " (rebuilt \(completed.report.heavyAtomsAdded) heavy atoms)" : "") +
+                    netSummary,
+                    category: .prep
+                )
+                statusMessage = "\(added) H added"
+            }
+            preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
         }
     }
 
@@ -1063,6 +1297,7 @@ final class AppViewModel {
                 selectedPocket = best
                 showGridBoxForPocket(best)
                 log.success("Found \(pockets.count) pocket(s), best: \(String(format: "%.0f", best.volume)) ų, druggability: \(String(format: "%.1f", best.druggability))", category: .dock)
+                log.info("  Best pocket: \(best.residueIndices.count) residues, center=(\(String(format: "%.1f, %.1f, %.1f", best.center.x, best.center.y, best.center.z)))", category: .dock)
             } else {
                 renderer?.clearGridBox()
                 log.warn("No pockets detected", category: .dock)
@@ -1137,7 +1372,9 @@ final class AppViewModel {
         dockingStartTime = Date()
         dockingDuration = 0
         selectedPoseIndices = []
-        log.info("Starting docking: \(dockingConfig.populationSize) pop, \(dockingConfig.numGenerations) gen", category: .dock)
+        log.info("Starting docking: pop=\(dockingConfig.populationSize), gen=\(dockingConfig.numGenerations) (\(dockingConfig.numRuns)×\(dockingConfig.generationsPerRun)), grid=\(String(format: "%.3f", dockingConfig.gridSpacing)) Å", category: .dock)
+        log.info("  Ligand: \(lig.name) (\(lig.atoms.filter { $0.element != .H }.count) heavy atoms, \(lig.bondCount) bonds)", category: .dock)
+        log.info("  Pocket: center=(\(String(format: "%.1f, %.1f, %.1f", pocket.center.x, pocket.center.y, pocket.center.z))), size=\(String(format: "%.0f", pocket.volume)) ų", category: .dock)
 
         Task {
             if dockingEngine == nil, let device = renderer?.device {
@@ -1180,9 +1417,9 @@ final class AppViewModel {
             )
 
             // Compute grid maps
-            log.info("Computing grid maps...", category: .dock)
+            log.info("Computing grid maps (spacing=\(String(format: "%.2f", dockingConfig.gridSpacing)) Å)...", category: .dock)
             engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: dockingConfig.gridSpacing)
-            log.success("Grid maps computed", category: .dock)
+            log.success("Grid maps computed — \(scoringProtein.atoms.count) receptor atoms", category: .dock)
 
             // Capture the original ligand for all callbacks (not self.ligand which gets mutated)
             let origLig = self.originalDockingLigand ?? lig
@@ -1276,9 +1513,16 @@ final class AppViewModel {
             }
 
             let clusterCount = Set(results.map(\.clusterID)).count
+            let elapsed = Date().timeIntervalSince(dockingStartTime ?? Date())
             if let best = results.first {
-                log.success(String(format: "Docking complete: best %.1f kcal/mol, %d clusters",
-                                   best.energy, clusterCount), category: .dock)
+                log.success(String(format: "Docking complete: best %.1f kcal/mol, %d poses, %d clusters (%.1fs)",
+                                   best.energy, rankedResults.count, clusterCount, elapsed), category: .dock)
+                if currentInteractions.count > 0 {
+                    let hbonds = currentInteractions.filter { $0.type == .hbond }.count
+                    let hydro = currentInteractions.filter { $0.type == .hydrophobic }.count
+                    let pipi = currentInteractions.filter { $0.type == .piStack }.count
+                    log.info("  Best pose interactions: \(hbonds) H-bonds, \(hydro) hydrophobic, \(pipi) π-stacking", category: .dock)
+                }
                 statusMessage = String(format: "Best: %.1f kcal/mol", best.energy)
             }
         }

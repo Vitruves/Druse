@@ -311,12 +311,12 @@ struct PreDockSheet: View {
 
     @ViewBuilder
     private func infoChip(_ label: String, _ value: String) -> some View {
-        VStack(spacing: 1) {
+        VStack(spacing: 2) {
             Text(value)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
             Text(label)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 

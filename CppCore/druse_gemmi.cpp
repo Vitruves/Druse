@@ -211,6 +211,27 @@ DruseResidueTopologyResult* druse_parse_chemcomp_cif(const char* content) {
         result->success = true;
         copy_fixed(result->residueName, chemComp.name);
 
+        const gemmi::cif::Block& block = document.blocks.front();
+        std::unordered_map<std::string, gemmi::Position> atomPositions;
+        if (block.has_any_value("_chem_comp_atom.pdbx_model_Cartn_x_ideal") ||
+            block.has_any_value("_chem_comp_atom.model_Cartn_x") ||
+            block.has_any_value("_chem_comp_atom.x")) {
+            gemmi::ChemCompModel coordModel = gemmi::ChemCompModel::Xyz;
+            if (block.has_any_value("_chem_comp_atom.pdbx_model_Cartn_x_ideal")) {
+                coordModel = gemmi::ChemCompModel::Ideal;
+            } else if (block.has_any_value("_chem_comp_atom.model_Cartn_x")) {
+                coordModel = gemmi::ChemCompModel::Example;
+            } else {
+                coordModel = gemmi::ChemCompModel::Xyz;
+            }
+
+            gemmi::Residue coordResidue = gemmi::make_residue_from_chemcomp_block(block, coordModel);
+            atomPositions.reserve(coordResidue.atoms.size());
+            for (const gemmi::Atom& atom : coordResidue.atoms) {
+                atomPositions.emplace(atom.name, atom.pos);
+            }
+        }
+
         result->atomCount = static_cast<int32_t>(chemComp.atoms.size());
         if (result->atomCount > 0) {
             result->atoms = new DruseResidueTopologyAtom[result->atomCount];
@@ -243,15 +264,24 @@ DruseResidueTopologyResult* druse_parse_chemcomp_cif(const char* content) {
             copy_fixed(out.atom1, bond.id1.atom);
             copy_fixed(out.atom2, bond.id2.atom);
             out.order = bond_order_from_gemmi(bond.type);
+            if (std::isfinite(bond.value)) {
+                out.idealLength = static_cast<float>(bond.value);
+            } else if (std::isfinite(bond.value_nucleus)) {
+                out.idealLength = static_cast<float>(bond.value_nucleus);
+            }
 
             const auto atom1 = atomIndices.find(bond.id1.atom);
             const auto atom2 = atomIndices.find(bond.id2.atom);
             if (atom1 != atomIndices.end() && atom2 != atomIndices.end()) {
                 adjacency[atom1->second].push_back(atom2->second);
                 adjacency[atom2->second].push_back(atom1->second);
-
-                const gemmi::Position& pos1 = chemComp.atoms[atom1->second].xyz;
-                const gemmi::Position& pos2 = chemComp.atoms[atom2->second].xyz;
+            }
+            if (out.idealLength <= 0.0f &&
+                atom1 != atomIndices.end() && atom2 != atomIndices.end()) {
+                auto pos1It = atomPositions.find(bond.id1.atom);
+                auto pos2It = atomPositions.find(bond.id2.atom);
+                const gemmi::Position& pos1 = pos1It != atomPositions.end() ? pos1It->second : chemComp.atoms[atom1->second].xyz;
+                const gemmi::Position& pos2 = pos2It != atomPositions.end() ? pos2It->second : chemComp.atoms[atom2->second].xyz;
                 if (has_finite_position(pos1) && has_finite_position(pos2)) {
                     out.idealLength = distance_between(pos1, pos2);
                 }
@@ -259,31 +289,57 @@ DruseResidueTopologyResult* druse_parse_chemcomp_cif(const char* content) {
         }
 
         std::vector<DruseResidueTopologyAngle> angleBuffer;
-        for (size_t centerIndex = 0; centerIndex < adjacency.size(); ++centerIndex) {
-            const auto& neighbors = adjacency[centerIndex];
-            if (neighbors.size() < 2) {
-                continue;
+        angleBuffer.reserve(chemComp.rt.angles.size());
+        for (const gemmi::Restraints::Angle& restraint : chemComp.rt.angles) {
+            DruseResidueTopologyAngle angle{};
+            copy_fixed(angle.atom1, restraint.id1.atom);
+            copy_fixed(angle.atom2, restraint.id2.atom);
+            copy_fixed(angle.atom3, restraint.id3.atom);
+            if (std::isfinite(restraint.value)) {
+                angle.idealAngleDegrees = static_cast<float>(restraint.value);
             }
+            angleBuffer.push_back(angle);
+        }
 
-            const gemmi::Position& center = chemComp.atoms[centerIndex].xyz;
-            if (!has_finite_position(center)) {
-                continue;
-            }
+        if (angleBuffer.empty()) {
+            for (size_t centerIndex = 0; centerIndex < adjacency.size(); ++centerIndex) {
+                const auto& neighbors = adjacency[centerIndex];
+                if (neighbors.size() < 2) {
+                    continue;
+                }
 
-            for (size_t i = 0; i < neighbors.size(); ++i) {
-                for (size_t j = i + 1; j < neighbors.size(); ++j) {
-                    const gemmi::Position& pos1 = chemComp.atoms[neighbors[i]].xyz;
-                    const gemmi::Position& pos3 = chemComp.atoms[neighbors[j]].xyz;
-                    if (!has_finite_position(pos1) || !has_finite_position(pos3)) {
-                        continue;
+                const std::string& centerName = chemComp.atoms[centerIndex].id;
+                auto centerIt = atomPositions.find(centerName);
+                const gemmi::Position& center = centerIt != atomPositions.end()
+                    ? centerIt->second
+                    : chemComp.atoms[centerIndex].xyz;
+                if (!has_finite_position(center)) {
+                    continue;
+                }
+
+                for (size_t i = 0; i < neighbors.size(); ++i) {
+                    for (size_t j = i + 1; j < neighbors.size(); ++j) {
+                        const std::string& atom1Name = chemComp.atoms[neighbors[i]].id;
+                        const std::string& atom3Name = chemComp.atoms[neighbors[j]].id;
+                        auto pos1It = atomPositions.find(atom1Name);
+                        auto pos3It = atomPositions.find(atom3Name);
+                        const gemmi::Position& pos1 = pos1It != atomPositions.end()
+                            ? pos1It->second
+                            : chemComp.atoms[neighbors[i]].xyz;
+                        const gemmi::Position& pos3 = pos3It != atomPositions.end()
+                            ? pos3It->second
+                            : chemComp.atoms[neighbors[j]].xyz;
+                        if (!has_finite_position(pos1) || !has_finite_position(pos3)) {
+                            continue;
+                        }
+
+                        DruseResidueTopologyAngle angle{};
+                        copy_fixed(angle.atom1, atom1Name);
+                        copy_fixed(angle.atom2, centerName);
+                        copy_fixed(angle.atom3, atom3Name);
+                        angle.idealAngleDegrees = angle_degrees(pos1, center, pos3);
+                        angleBuffer.push_back(angle);
                     }
-
-                    DruseResidueTopologyAngle angle{};
-                    copy_fixed(angle.atom1, chemComp.atoms[neighbors[i]].id);
-                    copy_fixed(angle.atom2, chemComp.atoms[centerIndex].id);
-                    copy_fixed(angle.atom3, chemComp.atoms[neighbors[j]].id);
-                    angle.idealAngleDegrees = angle_degrees(pos1, center, pos3);
-                    angleBuffer.push_back(angle);
                 }
             }
         }

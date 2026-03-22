@@ -29,14 +29,15 @@ targets:
       - path: ML
       - path: Services
       - path: Utils
-    resources:
-      - path: Resources
+      - path: Resources/Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.druse.app
         PRODUCT_NAME: Druse
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.medical"
         INFOPLIST_KEY_CFBundleDisplayName: Druse
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_CFBundleIconName: AppIcon
         SWIFT_OBJC_BRIDGING_HEADER: Metal/Druse-Bridging-Header.h
         CODE_SIGN_ENTITLEMENTS: Druse.entitlements
         GENERATE_INFOPLIST_FILE: YES

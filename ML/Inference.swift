@@ -1,5 +1,6 @@
 import Foundation
 @preconcurrency import CoreML
+import Metal
 import simd
 
 // MARK: - Druse-Score Feature Extraction
@@ -24,8 +25,8 @@ struct DruseScoreFeatureExtractor {
         var proteinFeatures: [[Float]]         // per-atom feature vectors
         var ligandPositions: [SIMD3<Float>]
         var ligandFeatures: [[Float]]
-        var pairDistances: [[Float]]           // NxM distance matrix
-        var pairRBF: [[[Float]]]               // NxMx50 RBF-encoded distances
+        var pairDistances: [Float]             // flattened NxM distance matrix
+        var pairRBF: [Float]                   // flattened NxMx50 RBF-encoded distances
     }
 
     /// Extract features from a docked protein-ligand complex.
@@ -46,22 +47,38 @@ struct DruseScoreFeatureExtractor {
         let protFeats = pocketAtoms.map { atomFeatures($0, isProtein: true) }
         let ligFeats = ligandAtoms.map { atomFeatures($0, isProtein: false) }
 
-        // Compute pairwise distance matrix
+        // Compute pairwise distance matrix + RBF encoding
         let nProt = protPositions.count
         let nLig = ligPositions.count
+        let nPairs = nProt * nLig
 
-        var distances = [[Float]](repeating: [Float](repeating: 0, count: nLig), count: nProt)
-        var rbfEncoded = [[[Float]]](
-            repeating: [[Float]](repeating: [Float](repeating: 0, count: 50), count: nLig),
-            count: nProt
-        )
+        // Try GPU-accelerated RBF computation, fall back to CPU
+        let distances: [Float]
+        let rbfEncoded: [Float]
 
-        for i in 0..<nProt {
-            for j in 0..<nLig {
-                let d = simd_distance(protPositions[i], ligPositions[j])
-                distances[i][j] = d
-                rbfEncoded[i][j] = rbfEncode(d)
+        if let gpu = FeatureComputeAccelerator.shared,
+           let result = gpu.computeRBF(protPositions: protPositions, ligPositions: ligPositions) {
+            distances = result.distances
+            rbfEncoded = result.rbf
+        } else {
+            // CPU fallback with flat arrays
+            var cpuDist = [Float](repeating: 0, count: nPairs)
+            var cpuRBF = [Float](repeating: 0, count: nPairs * 50)
+            for i in 0..<nProt {
+                for j in 0..<nLig {
+                    let idx = i * nLig + j
+                    let d = simd_distance(protPositions[i], ligPositions[j])
+                    cpuDist[idx] = d
+                    let rbfBase = idx * 50
+                    for k in 0..<50 {
+                        let center = Float(k) * 0.2
+                        let diff = d - center
+                        cpuRBF[rbfBase + k] = exp(-rbfGamma * diff * diff)
+                    }
+                }
             }
+            distances = cpuDist
+            rbfEncoded = cpuRBF
         }
 
         return ComplexFeatures(
@@ -185,45 +202,71 @@ final class DruseScoreInference {
         guard nProt > 0 && nLig > 0 else { return nil }
 
         do {
-            // Protein features: [1, maxAtoms, featSize]
-            let protArray = try MLMultiArray(shape: [1, NSNumber(value: nProt), NSNumber(value: featSize)], dataType: .float32)
-            for i in 0..<nProt {
-                for j in 0..<featSize {
-                    protArray[[0, i, j] as [NSNumber]] = NSNumber(value: features.proteinFeatures[i][j])
+            // Zero-copy MLMultiArray: allocate contiguous Float buffer and wrap directly.
+            // Avoids per-element NSNumber boxing which dominates inference prep time.
+            func makeMLArray(shape: [Int], fill: (UnsafeMutablePointer<Float>) -> Void) throws -> MLMultiArray {
+                let totalCount = shape.reduce(1, *)
+                let byteCount = totalCount * MemoryLayout<Float>.stride
+                let raw = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: MemoryLayout<Float>.alignment)
+                let floatPtr = raw.bindMemory(to: Float.self, capacity: totalCount)
+                fill(floatPtr)
+                let strides = shape.indices.map { i in
+                    NSNumber(value: shape[(i+1)...].reduce(1, *))
                 }
+                return try MLMultiArray(
+                    dataPointer: raw,
+                    shape: shape.map { NSNumber(value: $0) },
+                    dataType: .float32,
+                    strides: strides,
+                    deallocator: { ptr in ptr.deallocate() }
+                )
             }
 
-            // Ligand features: [1, maxAtoms, featSize]
-            let ligArray = try MLMultiArray(shape: [1, NSNumber(value: nLig), NSNumber(value: featSize)], dataType: .float32)
-            for i in 0..<nLig {
-                for j in 0..<featSize {
-                    ligArray[[0, i, j] as [NSNumber]] = NSNumber(value: features.ligandFeatures[i][j])
-                }
-            }
-
-            // Protein positions: [1, maxAtoms, 3]
-            let protPos = try MLMultiArray(shape: [1, NSNumber(value: nProt), 3], dataType: .float32)
-            for i in 0..<nProt {
-                protPos[[0, i, 0] as [NSNumber]] = NSNumber(value: features.proteinPositions[i].x)
-                protPos[[0, i, 1] as [NSNumber]] = NSNumber(value: features.proteinPositions[i].y)
-                protPos[[0, i, 2] as [NSNumber]] = NSNumber(value: features.proteinPositions[i].z)
-            }
-
-            // Ligand positions: [1, maxAtoms, 3]
-            let ligPos = try MLMultiArray(shape: [1, NSNumber(value: nLig), 3], dataType: .float32)
-            for i in 0..<nLig {
-                ligPos[[0, i, 0] as [NSNumber]] = NSNumber(value: features.ligandPositions[i].x)
-                ligPos[[0, i, 1] as [NSNumber]] = NSNumber(value: features.ligandPositions[i].y)
-                ligPos[[0, i, 2] as [NSNumber]] = NSNumber(value: features.ligandPositions[i].z)
-            }
-
-            // RBF-encoded pairwise distances: [1, nProt, nLig, 50]
-            let rbfArray = try MLMultiArray(shape: [1, NSNumber(value: nProt), NSNumber(value: nLig), 50], dataType: .float32)
-            for i in 0..<nProt {
-                for j in 0..<nLig {
-                    for k in 0..<50 {
-                        rbfArray[[0, i, j, k] as [NSNumber]] = NSNumber(value: features.pairRBF[i][j][k])
+            // Protein features: [1, nProt, featSize]
+            let protArray = try makeMLArray(shape: [1, nProt, featSize]) { ptr in
+                for i in 0..<nProt {
+                    let base = i * featSize
+                    for j in 0..<featSize {
+                        ptr[base + j] = features.proteinFeatures[i][j]
                     }
+                }
+            }
+
+            // Ligand features: [1, nLig, featSize]
+            let ligArray = try makeMLArray(shape: [1, nLig, featSize]) { ptr in
+                for i in 0..<nLig {
+                    let base = i * featSize
+                    for j in 0..<featSize {
+                        ptr[base + j] = features.ligandFeatures[i][j]
+                    }
+                }
+            }
+
+            // Protein positions: [1, nProt, 3]
+            let protPos = try makeMLArray(shape: [1, nProt, 3]) { ptr in
+                for i in 0..<nProt {
+                    let base = i * 3
+                    ptr[base] = features.proteinPositions[i].x
+                    ptr[base + 1] = features.proteinPositions[i].y
+                    ptr[base + 2] = features.proteinPositions[i].z
+                }
+            }
+
+            // Ligand positions: [1, nLig, 3]
+            let ligPos = try makeMLArray(shape: [1, nLig, 3]) { ptr in
+                for i in 0..<nLig {
+                    let base = i * 3
+                    ptr[base] = features.ligandPositions[i].x
+                    ptr[base + 1] = features.ligandPositions[i].y
+                    ptr[base + 2] = features.ligandPositions[i].z
+                }
+            }
+
+            // RBF-encoded pairwise distances: [1, nProt, nLig, 50] — direct memcpy from flat buffer
+            let rbfArray = try makeMLArray(shape: [1, nProt, nLig, 50]) { ptr in
+                let count = min(features.pairRBF.count, nProt * nLig * 50)
+                features.pairRBF.withUnsafeBufferPointer { src in
+                    ptr.update(from: src.baseAddress!, count: count)
                 }
             }
 
@@ -470,23 +513,32 @@ final class ADMETPredictor {
 /// GNN-based binding site prediction using surface point features.
 /// Alternative to geometric alpha-sphere + DBSCAN detection.
 ///
-/// Model inputs:
-///   - surface_features: [1, maxPoints, featureSize] — per-point chemical features
-///   - knn_indices: [1, maxPoints, k] — k-nearest neighbor indices for graph convolution
-///   - point_mask: [1, maxPoints] — 1.0 for real points, 0.0 for padding
+/// Model inputs (matching train_pocket_detector.py features):
+///   - surface_features: [1, N, 11] — per-point: normal(3) + dist + hydrophobicity + charge +
+///                                     aromatic + donor + acceptor + buriedness + curvature
+///   - neighbor_features: [1, N, 11] — mean of k-nearest neighbor features (pre-aggregated GCN)
 ///
 /// Model outputs:
-///   - pocket_probability: [1, maxPoints] — per-point probability of being in a binding pocket
+///   - pocket_probability: [1, N, 1] — per-point probability of being in a binding pocket
 @MainActor
 final class PocketDetectorInference {
 
     private var model: MLModel?
     private var isLoaded = false
 
-    private let maxPoints = 2048
-    private let kNeighbors = 16
-    private let featureSize = 10  // element one-hot(6) + vdwRadius + charge + buriedness + is_surface
-    private let pocketThreshold: Float = 0.5
+    private nonisolated let maxPoints = 4096
+    private nonisolated let kNeighbors = 16
+    private nonisolated let featureSize = 11  // matches training SURFACE_FEAT_DIM
+    private nonisolated let pocketThreshold: Float = 0.49  // optimal threshold from training
+
+    // Kyte-Doolittle hydrophobicity scale (normalized by /4.5, matching training)
+    private nonisolated static let hydrophobicity: [String: Float] = [
+        "ALA":  1.8 / 4.5, "ARG": -4.5 / 4.5, "ASN": -3.5 / 4.5, "ASP": -3.5 / 4.5,
+        "CYS":  2.5 / 4.5, "GLU": -3.5 / 4.5, "GLN": -3.5 / 4.5, "GLY": -0.4 / 4.5,
+        "HIS": -3.2 / 4.5, "ILE":  4.5 / 4.5, "LEU":  3.8 / 4.5, "LYS": -3.9 / 4.5,
+        "MET":  1.9 / 4.5, "PHE":  2.8 / 4.5, "PRO": -1.6 / 4.5, "SER": -0.8 / 4.5,
+        "THR": -0.7 / 4.5, "TRP": -0.9 / 4.5, "TYR": -1.3 / 4.5, "VAL":  4.2 / 4.5,
+    ]
 
     /// Load the PocketDetector CoreML model from the app bundle.
     func loadModel() {
@@ -514,79 +566,84 @@ final class PocketDetectorInference {
     func detectPockets(protein: Molecule) async -> [BindingPocket] {
         guard let model else { return [] }
 
-        let heavyAtoms = protein.atoms.filter { $0.element != .H }
+        // Snapshot all data we need on MainActor before moving off-thread
+        let heavyAtoms = protein.atoms.filter { $0.element != .H && !$0.isHetAtom }
         guard heavyAtoms.count >= 10 else { return [] }
+        let residueSnapshot = protein.residues
+        let allAtoms = protein.atoms
 
-        // Sample surface-exposed atoms (up to maxPoints)
-        let surfaceAtoms = selectSurfacePoints(heavyAtoms)
-        let nPoints = min(surfaceAtoms.count, maxPoints)
-        guard nPoints > 0 else { return [] }
+        // Run heavy computation off the main actor
+        let (surfaceData, nPoints): ([SurfacePoint], Int) = await Task.detached(priority: .userInitiated) { [maxPoints, featureSize] in
+            let sd = Self.computeSurfaceFeatures(atoms: heavyAtoms, maxPoints: maxPoints, featureSize: featureSize)
+            return (sd, sd.count)
+        }.value
+
+        guard nPoints >= 10 else { return [] }
 
         do {
-            // Build surface features: [1, maxPoints, featureSize]
-            let features = try MLMultiArray(shape: [1, NSNumber(value: maxPoints), NSNumber(value: featureSize)], dataType: .float32)
-            for i in 0..<nPoints {
-                let atom = surfaceAtoms[i]
-                // Element one-hot (C, N, O, S, P, other)
-                let elemBin: Int
-                switch atom.element {
-                case .C:  elemBin = 0
-                case .N:  elemBin = 1
-                case .O:  elemBin = 2
-                case .S:  elemBin = 3
-                case .P:  elemBin = 4
-                default:  elemBin = 5
-                }
-                for j in 0..<6 {
-                    features[[0, i, j] as [NSNumber]] = NSNumber(value: j == elemBin ? 1.0 : 0.0)
-                }
-                features[[0, i, 6] as [NSNumber]] = NSNumber(value: atom.element.vdwRadius)
-                features[[0, i, 7] as [NSNumber]] = NSNumber(value: atom.charge)
-                features[[0, i, 8] as [NSNumber]] = NSNumber(value: Float(0.5))  // buriedness placeholder
-                features[[0, i, 9] as [NSNumber]] = NSNumber(value: Float(1.0))  // is_surface
-            }
+            // Build MLMultiArrays off the main actor
+            let (features, neighborFeatures) = try await Task.detached(priority: .userInitiated) { [featureSize, kNeighbors] in
+                let n = NSNumber(value: nPoints)
 
-            // Build KNN indices: [1, maxPoints, kNeighbors]
-            let knnIndices = try MLMultiArray(shape: [1, NSNumber(value: maxPoints), NSNumber(value: kNeighbors)], dataType: .int32)
-            let positions = surfaceAtoms.map(\.position)
-            for i in 0..<nPoints {
-                let neighbors = findKNN(positions: positions, queryIdx: i, k: kNeighbors, n: nPoints)
-                for j in 0..<kNeighbors {
-                    knnIndices[[0, i, j] as [NSNumber]] = NSNumber(value: neighbors[j])
+                let features = try MLMultiArray(
+                    shape: [1, n, NSNumber(value: featureSize)],
+                    dataType: .float32
+                )
+                for i in 0..<nPoints {
+                    let feat = surfaceData[i].features
+                    for j in 0..<featureSize {
+                        features[[0, i, j] as [NSNumber]] = NSNumber(value: feat[j])
+                    }
                 }
-            }
 
-            // Build point mask: [1, maxPoints]
-            let mask = try MLMultiArray(shape: [1, NSNumber(value: maxPoints)], dataType: .float32)
-            for i in 0..<maxPoints {
-                mask[[0, i] as [NSNumber]] = NSNumber(value: i < nPoints ? 1.0 : 0.0)
-            }
+                let neighborFeatures = try MLMultiArray(
+                    shape: [1, n, NSNumber(value: featureSize)],
+                    dataType: .float32
+                )
+                let positions = surfaceData.map(\.position)
+                for i in 0..<nPoints {
+                    let neighbors = Self.findKNN(positions: positions, queryIdx: i, k: kNeighbors, n: nPoints)
+                    var meanFeat = [Float](repeating: 0, count: featureSize)
+                    for ni in neighbors {
+                        let nFeat = surfaceData[Int(ni)].features
+                        for j in 0..<featureSize { meanFeat[j] += nFeat[j] }
+                    }
+                    let scale = 1.0 / Float(neighbors.count)
+                    for j in 0..<featureSize {
+                        neighborFeatures[[0, i, j] as [NSNumber]] = NSNumber(value: meanFeat[j] * scale)
+                    }
+                }
+
+                return (features, neighborFeatures)
+            }.value
 
             let provider = try MLDictionaryFeatureProvider(dictionary: [
                 "surface_features": features,
-                "knn_indices": knnIndices,
-                "point_mask": mask
+                "neighbor_features": neighborFeatures,
             ])
 
             let result = try await model.prediction(from: provider)
 
             guard let probArray = result.featureValue(for: "pocket_probability")?.multiArrayValue else {
+                print("[PocketDetector] Missing 'pocket_probability' in model output")
                 return []
             }
 
-            // Collect high-probability surface points
-            var pocketPoints: [(position: SIMD3<Float>, probability: Float)] = []
-            for i in 0..<nPoints {
-                let prob = probArray[[0, i] as [NSNumber]].floatValue
-                if prob >= pocketThreshold {
-                    pocketPoints.append((surfaceAtoms[i].position, prob))
+            // Collect high-probability surface points and cluster off main actor
+            let threshold = pocketThreshold
+            return await Task.detached(priority: .userInitiated) {
+                var pocketPoints: [(position: SIMD3<Float>, probability: Float)] = []
+                for i in 0..<nPoints {
+                    let prob = probArray[[0, i, 0] as [NSNumber]].floatValue
+                    if prob >= threshold {
+                        pocketPoints.append((surfaceData[i].position, prob))
+                    }
                 }
-            }
 
-            guard !pocketPoints.isEmpty else { return [] }
+                guard !pocketPoints.isEmpty else { return [] }
 
-            // Cluster high-probability points into separate pockets (simple distance-based)
-            return clusterIntoPockets(pocketPoints, protein: protein)
+                return Self.clusterIntoPockets(pocketPoints, residues: residueSnapshot, atoms: allAtoms)
+            }.value
 
         } catch {
             print("[PocketDetector] Inference failed: \(error)")
@@ -594,21 +651,137 @@ final class PocketDetectorInference {
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Surface Feature Computation (matches training pipeline)
 
-    /// Select surface-exposed atoms using a simple neighbor count heuristic.
-    /// Atoms with fewer nearby neighbors are more likely surface-exposed.
-    private func selectSurfacePoints(_ atoms: [Atom]) -> [Atom] {
-        guard atoms.count <= maxPoints else {
-            // Stride-sample to fit maxPoints
-            let stride = max(1, atoms.count / maxPoints)
-            return (0..<atoms.count).filter { $0 % stride == 0 }.prefix(maxPoints).map { atoms[$0] }
-        }
-        return atoms
+    private struct SurfacePoint: Sendable {
+        let position: SIMD3<Float>
+        let features: [Float]  // 11-dim matching SURFACE_FEAT_DIM
     }
 
-    /// Find k-nearest neighbors by brute force (small N, fast enough).
-    private func findKNN(positions: [SIMD3<Float>], queryIdx: Int, k: Int, n: Int) -> [Int32] {
+    /// Compute surface points and 11-dim features matching train_pocket_detector.py.
+    ///
+    /// Features: normal(3) + dist_to_atom + hydrophobicity + charge +
+    ///           aromatic_nearby + donor_nearby + acceptor_nearby + buriedness + curvature
+    private nonisolated static func computeSurfaceFeatures(atoms: [Atom], maxPoints: Int, featureSize: Int) -> [SurfacePoint] {
+        let atomPositions = atoms.map(\.position)
+
+        // Compute bounding box for grid generation
+        var bboxMin = SIMD3<Float>(repeating: .infinity)
+        var bboxMax = SIMD3<Float>(repeating: -.infinity)
+        for pos in atomPositions {
+            bboxMin = simd_min(bboxMin, pos)
+            bboxMax = simd_max(bboxMax, pos)
+        }
+        bboxMin -= SIMD3<Float>(repeating: 6.0)
+        bboxMax += SIMD3<Float>(repeating: 6.0)
+
+        // Generate grid points (spacing = 1.0 A, matching training)
+        let spacing: Float = 1.0
+        var gridPoints: [SIMD3<Float>] = []
+        var x = bboxMin.x
+        while x < bboxMax.x {
+            var y = bboxMin.y
+            while y < bboxMax.y {
+                var z = bboxMin.z
+                while z < bboxMax.z {
+                    gridPoints.append(SIMD3<Float>(x, y, z))
+                    z += spacing
+                }
+                y += spacing
+            }
+            x += spacing
+        }
+
+        // VdW radii matching training
+        func vdwRadius(for element: Element) -> Float {
+            switch element {
+            case .C: return 1.7
+            case .N: return 1.55
+            case .O: return 1.52
+            case .S: return 1.8
+            case .P: return 1.8
+            default: return 1.7
+            }
+        }
+
+        // Filter to surface region: distance to nearest atom surface ~ probe_radius
+        let probeRadius: Float = 1.4
+        var surfacePoints: [SurfacePoint] = []
+
+        for gridPt in gridPoints {
+            // Find nearest atom
+            var minDist: Float = .infinity
+            var nearestIdx = 0
+            for (ai, aPos) in atomPositions.enumerated() {
+                let d = simd_distance(gridPt, aPos)
+                if d < minDist {
+                    minDist = d
+                    nearestIdx = ai
+                }
+            }
+
+            let surfaceDist = minDist - vdwRadius(for: atoms[nearestIdx].element)
+            guard surfaceDist >= -0.5 && surfaceDist <= probeRadius + 0.5 else { continue }
+
+            let atom = atoms[nearestIdx]
+            let atomPos = atomPositions[nearestIdx]
+
+            // Feature [0-2]: surface normal (point - nearest atom, normalized)
+            var normal = gridPt - atomPos
+            let normLen = simd_length(normal)
+            if normLen > 0 { normal /= normLen }
+
+            // Feature [3]: distance to nearest atom
+            let distFeat = normLen
+
+            // Feature [4]: hydrophobicity of nearest residue (normalized)
+            let resName = atom.residueName
+            let hydro = Self.hydrophobicity[resName] ?? 0.0
+
+            // Feature [5]: charge
+            let charge = atom.charge
+
+            // Feature [6]: aromatic proxy (is carbon)
+            let aromatic: Float = atom.element == .C ? 1.0 : 0.0
+
+            // Feature [7]: H-bond donor nearby
+            let donor: Float = (atom.element == .N || atom.element == .O) ? 1.0 : 0.0
+
+            // Feature [8]: H-bond acceptor nearby
+            let acceptor: Float = (atom.element == .N || atom.element == .O || atom.element == .F) ? 1.0 : 0.0
+
+            // Feature [9]: buriedness (count atoms within 6A, normalized)
+            var nearbyCount = 0
+            for aPos in atomPositions {
+                if simd_distance(gridPt, aPos) <= 6.0 { nearbyCount += 1 }
+            }
+            let buriedness = min(Float(nearbyCount) / 20.0, 1.0)
+
+            // Feature [10]: curvature placeholder (matching training)
+            let curvature: Float = 0.5
+
+            surfacePoints.append(SurfacePoint(
+                position: gridPt,
+                features: [normal.x, normal.y, normal.z, distFeat, hydro, charge,
+                           aromatic, donor, acceptor, buriedness, curvature]
+            ))
+        }
+
+        // Subsample to maxPoints (matching training's 5000 cap, but we use maxPoints)
+        if surfacePoints.count > maxPoints {
+            // Stride-sample to fit
+            let stride = max(1, surfacePoints.count / maxPoints)
+            surfacePoints = (0..<surfacePoints.count)
+                .filter { $0 % stride == 0 }
+                .prefix(maxPoints)
+                .map { surfacePoints[$0] }
+        }
+
+        return surfacePoints
+    }
+
+    /// Find k-nearest neighbors by brute force.
+    private nonisolated static func findKNN(positions: [SIMD3<Float>], queryIdx: Int, k: Int, n: Int) -> [Int32] {
         let query = positions[queryIdx]
         var dists: [(Int, Float)] = []
         for i in 0..<n {
@@ -625,9 +798,10 @@ final class PocketDetectorInference {
     }
 
     /// Cluster pocket points into BindingPocket objects using simple single-linkage.
-    private func clusterIntoPockets(
+    private nonisolated static func clusterIntoPockets(
         _ points: [(position: SIMD3<Float>, probability: Float)],
-        protein: Molecule
+        residues: [Residue],
+        atoms: [Atom]
     ) -> [BindingPocket] {
         let eps: Float = 4.0
         let positions = points.map(\.position)
@@ -671,11 +845,11 @@ final class PocketDetectorInference {
 
             // Find nearby residues
             var residueSet = Set<Int>()
-            for (resIdx, residue) in protein.residues.enumerated() {
+            for (resIdx, residue) in residues.enumerated() {
                 guard residue.isStandard else { continue }
                 for atomIdx in residue.atomIndices {
-                    guard atomIdx < protein.atoms.count else { continue }
-                    if simd_distance(protein.atoms[atomIdx].position, center) < 8.0 {
+                    guard atomIdx < atoms.count else { continue }
+                    if simd_distance(atoms[atomIdx].position, center) < 8.0 {
                         residueSet.insert(resIdx)
                         break
                     }
@@ -697,5 +871,80 @@ final class PocketDetectorInference {
 
         pockets.sort { $0.druggability > $1.druggability }
         return pockets
+    }
+}
+
+// MARK: - Metal-Accelerated Feature Compute
+
+/// Singleton Metal accelerator for RBF distance encoding.
+/// Falls back gracefully to CPU if Metal is unavailable.
+private final class FeatureComputeAccelerator {
+    nonisolated(unsafe) static let shared: FeatureComputeAccelerator? = {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue(),
+              let library = device.makeDefaultLibrary(),
+              let rbfFunction = library.makeFunction(name: "computeRBFDistances")
+        else { return nil }
+
+        do {
+            let pipeline = try device.makeComputePipelineState(function: rbfFunction)
+            return FeatureComputeAccelerator(device: device, commandQueue: commandQueue, rbfPipeline: pipeline)
+        } catch {
+            return nil
+        }
+    }()
+
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let rbfPipeline: MTLComputePipelineState
+
+    private init(device: MTLDevice, commandQueue: MTLCommandQueue, rbfPipeline: MTLComputePipelineState) {
+        self.device = device
+        self.commandQueue = commandQueue
+        self.rbfPipeline = rbfPipeline
+    }
+
+    /// Compute pairwise distances and RBF-encoded features on GPU.
+    /// Returns flat arrays: distances[nProt * nLig], rbf[nProt * nLig * 50].
+    func computeRBF(protPositions: [SIMD3<Float>], ligPositions: [SIMD3<Float>]) -> (distances: [Float], rbf: [Float])? {
+        let nProt = protPositions.count
+        let nLig = ligPositions.count
+        guard nProt > 0, nLig > 0 else { return nil }
+
+        let nPairs = nProt * nLig
+        var protPos = protPositions
+        var ligPos = ligPositions
+        var params = RBFParams(nProt: UInt32(nProt), nLig: UInt32(nLig), numBins: 50, gamma: 10.0, binSpacing: 0.2, _pad0: 0)
+
+        guard let protBuffer = device.makeBuffer(bytes: &protPos, length: nProt * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared),
+              let ligBuffer = device.makeBuffer(bytes: &ligPos, length: nLig * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared),
+              let rbfBuffer = device.makeBuffer(length: nPairs * 50 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let distBuffer = device.makeBuffer(length: nPairs * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let paramsBuffer = device.makeBuffer(bytes: &params, length: MemoryLayout<RBFParams>.stride, options: .storageModeShared),
+              let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder()
+        else { return nil }
+
+        enc.setComputePipelineState(rbfPipeline)
+        enc.setBuffer(protBuffer, offset: 0, index: 0)
+        enc.setBuffer(ligBuffer, offset: 0, index: 1)
+        enc.setBuffer(rbfBuffer, offset: 0, index: 2)
+        enc.setBuffer(distBuffer, offset: 0, index: 3)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 4)
+
+        let tgSize = MTLSize(width: min(nPairs, 256), height: 1, depth: 1)
+        let tgCount = MTLSize(width: (nPairs + 255) / 256, height: 1, depth: 1)
+        enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        let distPtr = distBuffer.contents().bindMemory(to: Float.self, capacity: nPairs)
+        let rbfPtr = rbfBuffer.contents().bindMemory(to: Float.self, capacity: nPairs * 50)
+
+        return (
+            distances: Array(UnsafeBufferPointer(start: distPtr, count: nPairs)),
+            rbf: Array(UnsafeBufferPointer(start: rbfPtr, count: nPairs * 50))
+        )
     }
 }
