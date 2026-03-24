@@ -19,12 +19,17 @@ final class Renderer: NSObject {
     private var depthStateDisabled: MTLDepthStencilState!
     private var depthStateReadWrite: MTLDepthStencilState!
 
-    // Buffers
-    private var uniformBuffer: MTLBuffer!
+    // Triple-buffered uniforms to avoid CPU-GPU race on shared memory
+    private static let maxFramesInFlight = 3
+    private var uniformBuffers: [MTLBuffer] = []
+    private var currentUniformBufferIndex = 0
+    private let frameSemaphore = DispatchSemaphore(value: maxFramesInFlight)
     private var atomInstanceBuffer: MTLBuffer?
     private var bondInstanceBuffer: MTLBuffer?
     private var atomInstanceCount: Int = 0
     private var bondInstanceCount: Int = 0
+    private var atomInstanceCapacity: Int = 0   // pooled capacity (in instance count)
+    private var bondInstanceCapacity: Int = 0
 
     // Ribbon buffers
     private var ribbonVertexBuffer: MTLBuffer?
@@ -38,6 +43,8 @@ final class Renderer: NSObject {
     // Interaction line buffers
     private var interactionLineBuffer: MTLBuffer?
     private var interactionLineCount: Int = 0
+    private var constraintIndicatorBuffer: MTLBuffer?
+    private var constraintIndicatorCount: Int = 0
 
     // Grid box wireframe
     private var gridBoxPipeline: MTLRenderPipelineState!
@@ -72,6 +79,10 @@ final class Renderer: NSObject {
     var selectedResidueAtomIndices: Set<Int> = []
     var renderMode: RenderMode = .ballAndStick
     var lightingMode: Int32 = 0 // 0 = uniform, 1 = directional
+    var themeMode: Int32 = 0    // 0 = dark, 1 = light
+    var backgroundOpacity: Float = 1.0
+    var surfaceOpacity: Float = 0.85
+    var gridLineWidth: Float = 2.5
 
     // Z-slab clipping
     var enableClipping: Bool = false
@@ -293,8 +304,11 @@ final class Renderer: NSObject {
     }
 
     private func buildBuffers() {
-        uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared)
-        uniformBuffer?.label = "Uniforms"
+        uniformBuffers = (0..<Self.maxFramesInFlight).map { i in
+            let buf = device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared)!
+            buf.label = "Uniforms[\(i)]"
+            return buf
+        }
     }
 
     // MARK: - Update Molecule Data
@@ -336,10 +350,18 @@ final class Renderer: NSObject {
         atomInstanceCount = atomInstances.count
         if atomInstanceCount > 0 {
             let size = atomInstanceCount * MemoryLayout<AtomInstance>.stride
-            atomInstanceBuffer = device.makeBuffer(bytes: atomInstances, length: size, options: .storageModeShared)
-            atomInstanceBuffer?.label = "AtomInstances"
+            if atomInstanceCount > atomInstanceCapacity {
+                // Grow with 50% headroom to reduce future reallocations
+                let allocCount = max(atomInstanceCount, atomInstanceCapacity * 3 / 2)
+                let allocSize = allocCount * MemoryLayout<AtomInstance>.stride
+                atomInstanceBuffer = device.makeBuffer(length: allocSize, options: .storageModeShared)
+                atomInstanceBuffer?.label = "AtomInstances"
+                atomInstanceCapacity = allocCount
+            }
+            atomInstanceBuffer?.contents().copyMemory(from: atomInstances, byteCount: size)
         } else {
             atomInstanceBuffer = nil
+            atomInstanceCapacity = 0
         }
 
         // Bond instances
@@ -374,10 +396,17 @@ final class Renderer: NSObject {
         bondInstanceCount = bondInstances.count
         if bondInstanceCount > 0 {
             let size = bondInstanceCount * MemoryLayout<BondInstance>.stride
-            bondInstanceBuffer = device.makeBuffer(bytes: bondInstances, length: size, options: .storageModeShared)
-            bondInstanceBuffer?.label = "BondInstances"
+            if bondInstanceCount > bondInstanceCapacity {
+                let allocCount = max(bondInstanceCount, bondInstanceCapacity * 3 / 2)
+                let allocSize = allocCount * MemoryLayout<BondInstance>.stride
+                bondInstanceBuffer = device.makeBuffer(length: allocSize, options: .storageModeShared)
+                bondInstanceBuffer?.label = "BondInstances"
+                bondInstanceCapacity = allocCount
+            }
+            bondInstanceBuffer?.contents().copyMemory(from: bondInstances, byteCount: size)
         } else {
             bondInstanceBuffer = nil
+            bondInstanceCapacity = 0
         }
     }
 
@@ -446,6 +475,62 @@ final class Renderer: NSObject {
         interactionLineCount = 0
     }
 
+    // MARK: - Constraint Indicators
+
+    /// Render pharmacophore constraints as colored lines from source atom to target position.
+    /// Uses the same InteractionLineVertex pipeline but with solid lines (dashLength = 0).
+    func updateConstraintIndicators(_ constraints: [PharmacophoreConstraintDef], atoms: [Atom]) {
+        guard !constraints.isEmpty else {
+            constraintIndicatorBuffer = nil
+            constraintIndicatorCount = 0
+            return
+        }
+
+        var lines: [InteractionLineVertex] = []
+        for constraint in constraints where constraint.isEnabled {
+            let color = constraint.interactionType.color
+            // Draw a line from the source atom to each target position
+            let sourcePos: SIMD3<Float>
+            if let atomIdx = constraint.proteinAtomIndex ?? constraint.ligandAtomIndex,
+               atomIdx >= 0, atomIdx < atoms.count {
+                sourcePos = atoms[atomIdx].position
+            } else if constraint.residueIndex != nil,
+                      let positions = constraint.targetPositions.first {
+                // Use first target position as source for residue-level constraints
+                sourcePos = positions
+            } else {
+                continue
+            }
+
+            for targetPos in constraint.targetPositions {
+                lines.append(InteractionLineVertex(
+                    positionA: sourcePos,
+                    positionB: targetPos,
+                    color: color,
+                    dashLength: constraint.strength.isHard ? 0.0 : 0.1,  // solid for hard, dashed for soft
+                    interactionType: Int32(constraint.interactionType.gpuType),
+                    _pad0: 0, _pad1: 0
+                ))
+            }
+        }
+
+        constraintIndicatorCount = lines.count
+        if lines.isEmpty {
+            constraintIndicatorBuffer = nil
+        } else {
+            constraintIndicatorBuffer = device.makeBuffer(
+                bytes: &lines, length: lines.count * MemoryLayout<InteractionLineVertex>.stride,
+                options: .storageModeShared
+            )
+            constraintIndicatorBuffer?.label = "ConstraintIndicators"
+        }
+    }
+
+    func clearConstraintIndicators() {
+        constraintIndicatorBuffer = nil
+        constraintIndicatorCount = 0
+    }
+
     // MARK: - Ghost Ligand Pose (translucent docking preview)
 
     /// Update the ghost ligand overlay with a docked pose.
@@ -453,7 +538,7 @@ final class Renderer: NSObject {
     func updateGhostPose(atoms: [Atom], bonds: [Bond]) {
         guard !atoms.isEmpty else { clearGhostPose(); return }
 
-        let ghostAlpha: Float = 0.9
+        let ghostAlpha: Float = 1.0
         let atomScale: Float = RenderMode.ballAndStick.atomRadiusScale
 
         var atomInstances: [AtomInstance] = atoms.map { atom in
@@ -562,25 +647,51 @@ final class Renderer: NSObject {
     // MARK: - Draw
 
     func draw(in view: MTKView) {
+        // Wait for a frame slot (triple-buffered)
+        frameSemaphore.wait()
+
         camera.update()
 
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let descriptor = view.currentRenderPassDescriptor
-        else { return }
+        else {
+            frameSemaphore.signal()
+            return
+        }
+
+        // Signal semaphore when GPU finishes this frame
+        commandBuffer.addCompletedHandler { [semaphore = frameSemaphore] _ in
+            semaphore.signal()
+        }
+
+        // Rotate uniform buffer index
+        currentUniformBufferIndex = (currentUniformBufferIndex + 1) % Self.maxFramesInFlight
+        let uniformBuffer = uniformBuffers[currentUniformBufferIndex]
 
         // MSAA: storeAndMultisampleResolve
         descriptor.colorAttachments[0].storeAction = view.sampleCount > 1 ? .storeAndMultisampleResolve : .store
         descriptor.colorAttachments[0].loadAction = .clear
-        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
+        let clearColor: MTLClearColor
+        if backgroundOpacity <= 0.01 {
+            clearColor = themeMode == 1
+                ? MTLClearColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+                : MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
+        } else {
+            clearColor = themeMode == 1
+                ? MTLClearColor(red: 0.96, green: 0.96, blue: 0.98, alpha: 1.0)
+                : MTLClearColor(red: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
+        }
+        descriptor.colorAttachments[0].clearColor = clearColor
 
-        // Update uniforms
-        updateUniforms(viewportSize: SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height)))
+        // Update uniforms into the current ring buffer slot
+        updateUniforms(into: uniformBuffer, viewportSize: SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height)))
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
 
         // 1. Background gradient
         encoder.setRenderPipelineState(backgroundPipeline)
         encoder.setDepthStencilState(depthStateDisabled)
+        encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
 
         // 2. Atoms (impostor spheres)
@@ -631,13 +742,25 @@ final class Renderer: NSObject {
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: interactionLineCount)
         }
 
-        // 6. Grid box wireframe (docking pocket visualization)
+        // 5b. Constraint indicators (same pipeline as interaction lines)
+        if constraintIndicatorCount > 0, let cstBuf = constraintIndicatorBuffer {
+            encoder.setRenderPipelineState(interactionLinePipeline)
+            encoder.setDepthStencilState(depthStateReadWrite)
+            encoder.setVertexBuffer(cstBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
+            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+            encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: constraintIndicatorCount)
+        }
+
+        // 6. Grid box wireframe (docking pocket visualization — thick quads)
         if gridBoxVertexCount > 0, let boxBuf = gridBoxVertexBuffer {
             encoder.setRenderPipelineState(gridBoxPipeline)
             encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(boxBuf, offset: 0, index: Int(BufferIndexVertices.rawValue))
             encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-            encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: gridBoxVertexCount)
+            // 6 vertices per edge (2 triangles), gridBoxVertexCount/2 edges
+            let edgeCount = gridBoxVertexCount / 2
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: edgeCount * 6)
         }
 
         // 7. Molecular surface (triangle mesh from marching cubes)
@@ -658,9 +781,9 @@ final class Renderer: NSObject {
             encoder.setCullMode(.back) // Restore
         }
 
-        // 8. Ghost ligand (docking preview — depth read+write so it properly occludes)
+        // 8. Live docking ligand (opaque ball-and-stick, same pipeline as main atoms/bonds)
         if ghostAtomCount > 0, let ghostAtomBuf = ghostAtomBuffer {
-            encoder.setRenderPipelineState(ghostAtomPipeline)
+            encoder.setRenderPipelineState(atomPipeline)
             encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(ghostAtomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
             encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
@@ -668,7 +791,7 @@ final class Renderer: NSObject {
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: ghostAtomCount)
         }
         if ghostBondCount > 0, let ghostBondBuf = ghostBondBuffer {
-            encoder.setRenderPipelineState(ghostBondPipeline)
+            encoder.setRenderPipelineState(bondPipeline)
             encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(ghostBondBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
             encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
@@ -684,7 +807,7 @@ final class Renderer: NSObject {
         commandBuffer.commit()
     }
 
-    private func updateUniforms(viewportSize: SIMD2<Float>) {
+    private func updateUniforms(into buffer: MTLBuffer, viewportSize: SIMD2<Float>) {
         camera.aspectRatio = viewportSize.x / viewportSize.y
 
         var uniforms = Uniforms()
@@ -704,8 +827,12 @@ final class Renderer: NSObject {
         uniforms.enableClipping = enableClipping ? 1 : 0
         uniforms.clipNearZ = clipNearZ
         uniforms.clipFarZ = clipFarZ
+        uniforms.themeMode = themeMode
+        uniforms.backgroundOpacity = backgroundOpacity
+        uniforms.surfaceOpacity = surfaceOpacity
+        uniforms.gridLineWidth = gridLineWidth
 
-        uniformBuffer?.contents().copyMemory(from: &uniforms, byteCount: MemoryLayout<Uniforms>.stride)
+        buffer.contents().copyMemory(from: &uniforms, byteCount: MemoryLayout<Uniforms>.stride)
     }
 
     // MARK: - Atom Picking (GPU object-ID buffer)
@@ -742,9 +869,10 @@ final class Renderer: NSObject {
 
         encoder.setRenderPipelineState(pickPipeline)
         encoder.setDepthStencilState(depthStateReadWrite)
+        let pickUniformBuffer = uniformBuffers[currentUniformBufferIndex]
         encoder.setVertexBuffer(atomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
-        encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-        encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+        encoder.setVertexBuffer(pickUniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+        encoder.setFragmentBuffer(pickUniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: atomInstanceCount)
         encoder.endEncoding()
 
@@ -867,5 +995,18 @@ final class Renderer: NSObject {
         let c = centroid(positions)
         let r = boundingRadius(positions: positions, center: c)
         camera.fitToSphere(center: c, radius: max(r, 2.0))
+    }
+
+    /// Focus camera on a pocket and set Z-clipping slab to frame it.
+    func focusOnPocket(center: SIMD3<Float>, halfExtent: SIMD3<Float>) {
+        let pocketRadius = max(halfExtent.x, max(halfExtent.y, halfExtent.z))
+        camera.fitToSphere(center: center, radius: max(pocketRadius + 4.0, 6.0))
+
+        // Set Z-slab around the pocket depth
+        let slabHalf = pocketRadius + 6.0
+        let camDist = camera.distance
+        enableClipping = true
+        clipNearZ = max(camDist - slabHalf, 0.5)
+        clipFarZ = camDist + slabHalf
     }
 }

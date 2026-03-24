@@ -36,6 +36,11 @@ struct Uniforms {
     float         clipNearZ;        // view-space Z clip near (0 = disabled)
     float         clipFarZ;         // view-space Z clip far (0 = disabled)
     int32_t       enableClipping;   // 1 = slab clipping enabled
+    int32_t       themeMode;        // 0 = dark, 1 = light
+    float         backgroundOpacity; // 0 = plain white/black, 1 = full gradient
+    float         surfaceOpacity;    // 0.1–1.0 for molecular surface alpha
+    float         gridLineWidth;     // screen-space pixels for grid box lines
+    float         _pad2;
 };
 
 // Per-atom instance data for impostor sphere rendering
@@ -144,7 +149,7 @@ struct DockLigandAtom {
     float       vdwRadius;
     float       charge;
     int32_t     vinaType;     // VinaAtomType enum
-    int32_t     _pad0;
+    int32_t     formalCharge;  // formal charge (for π-cation / salt bridge detection)
     float       _pad1;
     float       _pad2;
 };
@@ -162,6 +167,42 @@ struct DockPose {
     float       hbondEnergy;
     float       torsionPenalty;  // N_rot entropy term
     float       clashPenalty;    // out-of-grid + intramolecular correction term
+    float       drusinaCorrection; // Drusina extended scoring correction (π-π, π-cation, halogen, metal)
+    float       constraintPenalty; // pharmacophore constraint penalty (0 if all satisfied)
+
+    // Receptor flexibility: sidechain chi angles for 1-6 flexible residues
+    float       chiAngles[24]; // up to 6 residues × 4 chi angles each (radians)
+    int32_t     numChiAngles;  // total chi angles across all flexible residues (0 = rigid receptor)
+    int32_t     _flexPad;
+};
+
+// Flexible sidechain atom (excluded from grid, scored explicitly)
+struct FlexSidechainAtom {
+    simd_float3 referencePosition; // position in the original (rigid) conformation
+    float       charge;
+    int32_t     vinaType;          // VinaAtomType enum
+    int32_t     residueIndex;      // which flexible residue (0-5)
+    float       _pad0;
+    float       _pad1;
+};
+
+// Flexible sidechain torsion (chi angle definition)
+struct FlexTorsionEdge {
+    int32_t     pivotAtom;    // local index in flex atom buffer: rotation pivot
+    int32_t     axisAtom;     // local index in flex atom buffer: defines axis with pivotAtom
+    int32_t     movingStart;  // first index in flex moving-indices array
+    int32_t     movingCount;  // count of atoms that rotate with this chi angle
+    int32_t     chiSlot;      // index into DockPose.chiAngles[] for this torsion
+    int32_t     _pad;
+};
+
+// Parameters for flexible residue docking
+struct FlexParams {
+    uint32_t    numFlexAtoms;      // total sidechain atoms across all flexible residues
+    uint32_t    numFlexTorsions;   // total chi angle torsions
+    uint32_t    numFlexResidues;   // 0 = rigid receptor (skip all flex scoring)
+    float       flexWeight;        // weight for flex-ligand pairwise scoring (default 1.0)
+    float       chiStep;           // chi angle mutation step in radians (full=0.6, soft=0.25)
     float       _pad0;
 };
 
@@ -216,6 +257,82 @@ struct BatchScreenParams {
     uint32_t    posesPerLigand;
     uint32_t    numLigands;
     uint32_t    seed;
+};
+
+// ============================================================================
+// Drusina extended scoring types
+// ============================================================================
+
+// Pre-computed protein aromatic ring descriptor (fixed during docking)
+struct ProteinRingGPU {
+    simd_float3 centroid;
+    float       _pad0;
+    simd_float3 normal;
+    float       _pad1;
+};
+
+// Ligand aromatic ring (atom indices for dynamic centroid/normal from transformed positions)
+struct LigandRingGPU {
+    int32_t     atomIndices[6];  // indices into DockLigandAtom array
+    int32_t     numAtoms;        // 5 or 6
+    int32_t     _pad;
+};
+
+// Halogen bond info (maps ligand halogen to its bonded carbon for σ-hole angle check)
+struct HalogenBondInfo {
+    int32_t     halogenAtomIndex;
+    int32_t     carbonAtomIndex;
+};
+
+// Drusina scoring parameters
+struct DrusinaParams {
+    uint32_t    numProteinRings;
+    uint32_t    numLigandRings;
+    uint32_t    numProteinCations;
+    uint32_t    numHalogens;
+    float       wPiPi;           // π-π stacking weight (default: -0.40)
+    float       wPiCation;       // π-cation weight (default: -0.80)
+    float       wHalogenBond;    // halogen bond weight (default: -0.50)
+    float       wMetalCoord;     // metal coordination weight (default: -1.00)
+};
+
+// ============================================================================
+// Pharmacophore constraint types
+// ============================================================================
+
+#define MAX_PHARMACOPHORE_CONSTRAINTS 16u
+
+// Constraint interaction category (determines compatible ligand atom matching)
+enum PharmacophoreInteractionType {
+    PHARMA_HBOND_DONOR    = 0,   // receptor wants a donor ligand atom nearby
+    PHARMA_HBOND_ACCEPTOR = 1,   // receptor wants an acceptor ligand atom nearby
+    PHARMA_SALT_BRIDGE    = 2,   // charged interaction required
+    PHARMA_PI_STACK       = 3,   // aromatic ring required
+    PHARMA_HALOGEN        = 4,   // halogen bond required
+    PHARMA_METAL_COORD    = 5,   // metal coordination (ligand O/N/S near metal)
+    PHARMA_HYDROPHOBIC    = 6,   // hydrophobic contact required
+};
+
+// A single pharmacophore constraint point.
+// If multiple atoms share a groupID, the constraint is satisfied if ANY
+// atom in the group has a compatible ligand atom within threshold.
+struct PharmacophoreConstraint {
+    simd_float3 position;           // 3D target position (protein atom coords)
+    float       distanceThreshold;  // satisfaction cutoff (default 3.5 Å)
+    uint32_t    compatibleVinaTypes; // bitmask: bit N set if VinaAtomType(N) is compatible
+    float       strength;           // penalty scale (kcal/mol/Å²). soft=5.0, hard=1000.0
+    uint16_t    groupID;            // constraints sharing groupID form OR-group
+    uint16_t    constraintType;     // PharmacophoreInteractionType enum value
+    int32_t     ligandAtomIndex;    // ≥0: ligand-side (only this atom checked), -1: any compatible
+    float       _pad0;              // pad to 48 bytes (16-byte aligned)
+};
+
+// Global pharmacophore parameters
+struct PharmacophoreParams {
+    uint32_t    numConstraints;     // number of active PharmacophoreConstraint entries
+    uint32_t    numGroups;          // number of distinct groupIDs
+    float       globalScale;        // overall multiplier (1.0 default, 0 to disable)
+    uint32_t    _pad0;
 };
 
 // ============================================================================
@@ -310,6 +427,60 @@ struct RMSDParams {
     uint32_t numAtoms;
     uint32_t _pad0;
     uint32_t _pad1;
+};
+
+// ============================================================================
+// ML Pocket Detection GPU types
+// ============================================================================
+
+struct PocketMLAtom {
+    simd_float3 position;
+    float       vdwRadius;
+    float       charge;
+    float       hydrophobicity;  // normalized Kyte-Doolittle
+    uint32_t    flags;           // bit 0: is_N/O (donor/acceptor), bit 1: is_C (aromatic proxy)
+    uint32_t    _pad0;
+};
+
+struct PocketSurfacePoint {
+    simd_float3 position;
+    float       nearestDist;      // distance to nearest atom
+    simd_float3 normal;           // direction to nearest atom (normalized)
+    float       hydrophobicity;
+    float       charge;
+    float       aromatic;
+    float       donor;
+    float       acceptor;
+    float       buriedness;
+    float       curvature;
+    uint32_t    nearestAtomIdx;
+    uint32_t    _pad0;
+};
+
+struct PocketDetectParams {
+    uint32_t numGridPoints;
+    uint32_t numAtoms;
+    float    probeRadius;
+    float    buriednessCutoff;    // 6.0 A
+};
+
+struct PocketKNNParams {
+    uint32_t numPoints;
+    uint32_t k;
+    uint32_t featureSize;        // 11
+    uint32_t useSpatialHash;     // 1 = spatial hash available, 0 = brute-force fallback
+};
+
+// Spatial hash grid parameters for accelerated KNN in pocket detection
+struct SpatialHashParams {
+    simd_float3 gridOrigin;      // bounding box min corner
+    float       cellSize;        // cell edge length (e.g., 4.0 Angstroms)
+    simd_uint3  gridDims;        // number of cells in each dimension
+    uint32_t    numPoints;       // total number of surface points
+    uint32_t    totalCells;      // gridDims.x * gridDims.y * gridDims.z
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+    uint32_t    _pad2;
 };
 
 // ============================================================================

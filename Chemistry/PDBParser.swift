@@ -34,6 +34,10 @@ struct MoleculeData: Sendable {
     let atoms: [Atom]
     let bonds: [Bond]
     var ssRanges: [SecondaryStructureRange] = []
+    /// SDF data block properties (e.g. Ki, pKi, IC50)
+    var properties: [String: String] = [:]
+    /// Raw MDL mol block text (preserved for SDF molecules so RDKit can parse directly)
+    var molBlock: String?
 }
 
 // MARK: - PDB Parser
@@ -43,8 +47,13 @@ enum PDBParser {
     static func parse(_ content: String) -> PDBParseResult {
         let metadata = parseHeaderMetadata(from: content)
         do {
-            return try parseWithGemmi(content, header: metadata.header, ssRanges: metadata.ssRanges)
+            let result = try parseWithGemmi(content, header: metadata.header, ssRanges: metadata.ssRanges)
+            let atomCount = result.protein?.atoms.count ?? 0
+            let chainCount = Set(result.protein?.atoms.map(\.chainID) ?? []).count
+            Task { @MainActor in ActivityLog.shared.info("[Parser] PDB parsed via Gemmi: \(atomCount) atoms, \(chainCount) chains, \(result.ligands.count) ligands", category: .pdb) }
+            return result
         } catch {
+            Task { @MainActor in ActivityLog.shared.warn("[Parser] Gemmi parse failed (\(error.localizedDescription)), falling back to legacy parser", category: .pdb) }
             return parseLegacy(content)
         }
     }
@@ -158,22 +167,27 @@ enum PDBParser {
         // Group het atoms into separate ligands by (chainID, residueName, residueSeq)
         let ligandGroups = groupLigands(hetAtoms: hetAtoms, hetBonds: hetBonds)
 
+        // Validate HELIX/SHEET ranges against actual residues
+        let validatedSSRanges = validateSSRanges(ssRanges, atoms: proteinAtoms, warnings: &warnings)
+
         // Build results
         let proteinData: MoleculeData? = proteinAtoms.isEmpty ? nil : MoleculeData(
             name: header.pdbID.isEmpty ? "Protein" : header.pdbID,
             title: header.title,
             atoms: proteinAtoms,
             bonds: proteinBonds,
-            ssRanges: ssRanges
+            ssRanges: validatedSSRanges
         )
 
-        return PDBParseResult(
+        let result = PDBParseResult(
             protein: proteinData,
             ligands: ligandGroups,
             waterCount: waterCount,
             header: header,
             warnings: warnings
         )
+        Task { @MainActor in ActivityLog.shared.info("[Parser] Legacy PDB parse: \(proteinAtoms.count) atoms, \(ligandGroups.count) ligands, \(waterCount) waters", category: .pdb) }
+        return result
     }
 
     static func parse(url: URL) throws -> PDBParseResult {
@@ -310,22 +324,35 @@ enum PDBParser {
     // MARK: - ATOM/HETATM Line Parsing
 
     private static func parseAtomLine(_ line: String, warnings: inout [String]) -> (Atom, Int)? {
+        // Minimum valid ATOM/HETATM line needs 54 chars (through z coordinate)
+        guard line.count >= 54 else {
+            warnings.append("Truncated ATOM/HETATM record (\(line.count) chars)")
+            Task { @MainActor in ActivityLog.shared.debug("[Parser] Skipped truncated ATOM/HETATM record (\(line.count) chars)", category: .pdb) }
+            return nil
+        }
+
         let record = substr(line, 0, 6).trimmingCharacters(in: .whitespaces)
         let isHet = record == "HETATM"
 
-        guard let serial = Int(substr(line, 6, 5).trimmingCharacters(in: .whitespaces)) else { return nil }
+        guard let serial = Int(substr(line, 6, 5).trimmingCharacters(in: .whitespaces)) else {
+            warnings.append("Non-numeric serial in ATOM record")
+            Task { @MainActor in ActivityLog.shared.warn("[Parser] Non-numeric serial in ATOM record, line skipped", category: .pdb) }
+            return nil
+        }
 
         let atomName = substr(line, 12, 4).trimmingCharacters(in: .whitespaces)
         let altLoc = substr(line, 16, 1).trimmingCharacters(in: .whitespaces)
         let resName = substr(line, 17, 3).trimmingCharacters(in: .whitespaces)
         let chainID = substr(line, 21, 1)
         let resSeqStr = substr(line, 22, 4).trimmingCharacters(in: .whitespaces)
+        let insertionCode = substr(line, 26, 1).trimmingCharacters(in: .whitespaces)
 
         guard let x = Float(substr(line, 30, 8).trimmingCharacters(in: .whitespaces)),
               let y = Float(substr(line, 38, 8).trimmingCharacters(in: .whitespaces)),
               let z = Float(substr(line, 46, 8).trimmingCharacters(in: .whitespaces))
         else {
             warnings.append("Bad coordinates at serial \(serial)")
+            Task { @MainActor in ActivityLog.shared.warn("[Parser] Bad coordinates at serial \(serial), atom skipped", category: .pdb) }
             return nil
         }
 
@@ -351,7 +378,8 @@ enum PDBParser {
             isHetAtom: isHet,
             occupancy: occupancy,
             tempFactor: tempFactor,
-            altLoc: altLoc
+            altLoc: altLoc,
+            insertionCode: insertionCode
         )
 
         return (atom, serial)
@@ -667,6 +695,46 @@ enum PDBParser {
         }
 
         return (repairedAtoms, repairedBonds)
+    }
+
+    // MARK: - SS Range Validation
+
+    /// Validate HELIX/SHEET ranges against actual residues, clamping or removing invalid ranges.
+    private static func validateSSRanges(
+        _ ranges: [SecondaryStructureRange],
+        atoms: [Atom],
+        warnings: inout [String]
+    ) -> [SecondaryStructureRange] {
+        guard !ranges.isEmpty else { return [] }
+
+        // Build set of (chain, resSeq) present in the structure
+        var residuesByChain: [String: Set<Int>] = [:]
+        for atom in atoms {
+            residuesByChain[atom.chainID, default: []].insert(atom.residueSeq)
+        }
+
+        return ranges.compactMap { range in
+            guard let chainResidues = residuesByChain[range.chain], !chainResidues.isEmpty else {
+                warnings.append("SS range references unknown chain '\(range.chain)'")
+                return nil
+            }
+            let hasStart = chainResidues.contains(range.start)
+            let hasEnd = chainResidues.contains(range.end)
+            if !hasStart || !hasEnd {
+                // Clamp to actual residue range
+                let sorted = chainResidues.sorted()
+                let clampedStart = sorted.first(where: { $0 >= range.start }) ?? range.start
+                let clampedEnd = sorted.last(where: { $0 <= range.end }) ?? range.end
+                if clampedStart <= clampedEnd {
+                    return SecondaryStructureRange(
+                        start: clampedStart, end: clampedEnd,
+                        type: range.type, chain: range.chain
+                    )
+                }
+                return nil
+            }
+            return range
+        }
     }
 
     /// Safe substring extraction by character offset and length.

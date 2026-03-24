@@ -75,7 +75,9 @@ final class SurfaceGenerator {
     // Compute pipeline states
     private let distanceFieldPipeline: MTLComputePipelineState
     private let gaussianFieldPipeline: MTLComputePipelineState
-    private let marchingCubesPipeline: MTLComputePipelineState
+    private let marchingCubesSinglePassPipeline: MTLComputePipelineState
+    private let marchingCubesCountPipeline: MTLComputePipelineState
+    private let marchingCubesEmitPipeline: MTLComputePipelineState
     private let espColoringPipeline: MTLComputePipelineState
     private let hydrophobicityPipeline: MTLComputePipelineState
     private let pharmacophorePipeline: MTLComputePipelineState
@@ -112,10 +114,20 @@ final class SurfaceGenerator {
         }
         self.gaussianFieldPipeline = try device.makeComputePipelineState(function: gaussFn)
 
-        guard let mcFn = lib.makeFunction(name: "marchingCubes") else {
-            throw SurfaceGeneratorError.kernelNotFound("marchingCubes")
+        guard let mcSinglePassFn = lib.makeFunction(name: "marchingCubesSinglePass") else {
+            throw SurfaceGeneratorError.kernelNotFound("marchingCubesSinglePass")
         }
-        self.marchingCubesPipeline = try device.makeComputePipelineState(function: mcFn)
+        self.marchingCubesSinglePassPipeline = try device.makeComputePipelineState(function: mcSinglePassFn)
+
+        guard let mcCountFn = lib.makeFunction(name: "marchingCubesCount") else {
+            throw SurfaceGeneratorError.kernelNotFound("marchingCubesCount")
+        }
+        self.marchingCubesCountPipeline = try device.makeComputePipelineState(function: mcCountFn)
+
+        guard let mcEmitFn = lib.makeFunction(name: "marchingCubesEmit") else {
+            throw SurfaceGeneratorError.kernelNotFound("marchingCubesEmit")
+        }
+        self.marchingCubesEmitPipeline = try device.makeComputePipelineState(function: mcEmitFn)
 
         guard let espFn = lib.makeFunction(name: "computeSurfaceESP") else {
             throw SurfaceGeneratorError.kernelNotFound("computeSurfaceESP")
@@ -140,7 +152,11 @@ final class SurfaceGenerator {
     ///   - atoms: Array of atoms with positions and element types
     ///   - Returns: SurfaceResult with vertex and index buffers ready for rendering
     func generateSurface(atoms: [Atom]) -> SurfaceResult? {
-        guard !atoms.isEmpty else { return nil }
+        guard !atoms.isEmpty else {
+            ActivityLog.shared.debug("[Surface] generateSurface skipped: empty atom array", category: .render)
+            return nil
+        }
+        ActivityLog.shared.info("[Surface] Generating \(fieldType == .connolly ? "Connolly" : "Gaussian") surface: \(atoms.count) atoms, spacing=\(gridSpacing), probe=\(probeRadius), color=\(colorMode.rawValue)", category: .render)
 
         // Prepare GPU atom data
         let gpuAtoms = atoms.map { atom -> GPUSurfaceAtom in
@@ -173,7 +189,10 @@ final class SurfaceGenerator {
     ) -> SurfaceResult? {
         guard positions.count == radii.count,
               positions.count == charges.count,
-              !positions.isEmpty else { return nil }
+              !positions.isEmpty else {
+            ActivityLog.shared.debug("[Surface] generateSurface(raw) skipped: mismatched or empty arrays (pos=\(positions.count), radii=\(radii.count), charges=\(charges.count))", category: .render)
+            return nil
+        }
 
         let gpuAtoms = (0..<positions.count).map { i -> GPUSurfaceAtom in
             GPUSurfaceAtom(
@@ -207,7 +226,16 @@ final class SurfaceGenerator {
         let totalPoints = nx * ny * nz
 
         // Safety check: grid must be reasonable
-        guard totalPoints > 0, totalPoints < 256_000_000 else { return nil }
+        guard totalPoints > 0, totalPoints < 256_000_000 else {
+            ActivityLog.shared.warn("[Surface] Grid too large: \(nx)x\(ny)x\(nz) = \(totalPoints) points (max 256M)", category: .render)
+            return nil
+        }
+
+        let totalVoxels = Int((nx - 1) * (ny - 1) * (nz - 1))
+        guard totalVoxels > 0 else {
+            ActivityLog.shared.warn("[Surface] Zero voxels after grid setup", category: .render)
+            return nil
+        }
 
         // Build grid params
         let effectiveIso: Float = (fieldType == .connolly) ? 0.0 : isovalue
@@ -229,7 +257,10 @@ final class SurfaceGenerator {
             bytes: gpuAtoms,
             length: gpuAtoms.count * MemoryLayout<GPUSurfaceAtom>.stride,
             options: .storageModeShared
-        ) else { return nil }
+        ) else {
+            ActivityLog.shared.error("[Surface] Failed to create atom buffer (\(gpuAtoms.count) atoms)", category: .render)
+            return nil
+        }
         atomBuffer.label = "SurfaceAtoms"
 
         guard let scalarFieldBuffer = device.makeBuffer(
@@ -245,41 +276,29 @@ final class SurfaceGenerator {
         ) else { return nil }
         paramsBuffer.label = "SurfaceGridParams"
 
-        let vertexBufferSize = Int(maxVertices) * MemoryLayout<GPUSurfaceVertex>.stride
-        guard let vertexBuffer = device.makeBuffer(
-            length: vertexBufferSize,
+        // Per-voxel triangle count buffer (Pass 1 output)
+        guard let triCountBuffer = device.makeBuffer(
+            length: totalVoxels * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         ) else { return nil }
-        vertexBuffer.label = "SurfaceVertices"
+        triCountBuffer.label = "TriCountPerVoxel"
 
-        let indexBufferSize = Int(maxIndices) * MemoryLayout<UInt32>.stride
-        guard let indexBuffer = device.makeBuffer(
-            length: indexBufferSize,
-            options: .storageModeShared
-        ) else { return nil }
-        indexBuffer.label = "SurfaceIndices"
-
-        // Atomic counters for vertex and index counts
-        guard let vertexCounterBuffer = device.makeBuffer(
+        // Global triangle count (single atomic uint, Pass 1 output)
+        guard let globalTriCountBuffer = device.makeBuffer(
             length: MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         ) else { return nil }
-        vertexCounterBuffer.label = "VertexCounter"
-        memset(vertexCounterBuffer.contents(), 0, MemoryLayout<UInt32>.stride)
+        globalTriCountBuffer.label = "GlobalTriCount"
+        memset(globalTriCountBuffer.contents(), 0, MemoryLayout<UInt32>.stride)
 
-        guard let indexCounterBuffer = device.makeBuffer(
-            length: MemoryLayout<UInt32>.stride,
-            options: .storageModeShared
-        ) else { return nil }
-        indexCounterBuffer.label = "IndexCounter"
-        memset(indexCounterBuffer.contents(), 0, MemoryLayout<UInt32>.stride)
+        // ====================================================================
+        // Command Buffer 1: Scalar field + Marching cubes count pass
+        // ====================================================================
+        guard let cmdBuf1 = commandQueue.makeCommandBuffer() else { return nil }
+        cmdBuf1.label = "SurfaceGeneration_ScalarField+Count"
 
-        // Execute on GPU
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return nil }
-        commandBuffer.label = "SurfaceGeneration"
-
-        // Pass 1: Compute scalar field (distance field or Gaussian)
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+        // Compute scalar field (distance field or Gaussian)
+        if let encoder = cmdBuf1.makeComputeCommandEncoder() {
             encoder.label = "ScalarField"
 
             let pipeline = (fieldType == .connolly)
@@ -305,20 +324,17 @@ final class SurfaceGenerator {
             encoder.endEncoding()
         }
 
-        // Pass 2: Marching cubes
-        let totalVoxels = Int((nx - 1) * (ny - 1) * (nz - 1))
-        if totalVoxels > 0, let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "MarchingCubes"
-            encoder.setComputePipelineState(marchingCubesPipeline)
+        // Marching cubes Pass 1: count triangles per voxel
+        if let encoder = cmdBuf1.makeComputeCommandEncoder() {
+            encoder.label = "MarchingCubesCount"
+            encoder.setComputePipelineState(marchingCubesCountPipeline)
             encoder.setBuffer(scalarFieldBuffer, offset: 0, index: 0)
-            encoder.setBuffer(vertexBuffer, offset: 0, index: 1)
-            encoder.setBuffer(indexBuffer, offset: 0, index: 2)
-            encoder.setBuffer(vertexCounterBuffer, offset: 0, index: 3)
-            encoder.setBuffer(indexCounterBuffer, offset: 0, index: 4)
-            encoder.setBuffer(paramsBuffer, offset: 0, index: 5)
+            encoder.setBuffer(triCountBuffer, offset: 0, index: 1)
+            encoder.setBuffer(globalTriCountBuffer, offset: 0, index: 2)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 3)
 
             let threadGroupSize = min(
-                marchingCubesPipeline.maxTotalThreadsPerThreadgroup,
+                marchingCubesCountPipeline.maxTotalThreadsPerThreadgroup,
                 totalVoxels
             )
             let threadGroups = MTLSize(
@@ -331,7 +347,100 @@ final class SurfaceGenerator {
             encoder.endEncoding()
         }
 
-        // Pass 3: Surface coloring (optional, based on colorMode)
+        cmdBuf1.commit()
+        cmdBuf1.waitUntilCompleted()
+
+        // ====================================================================
+        // CPU: Read back total triangle count, compute exclusive prefix sum
+        // ====================================================================
+        let totalTriangles = Int(globalTriCountBuffer.contents()
+            .bindMemory(to: UInt32.self, capacity: 1).pointee)
+
+        guard totalTriangles > 0 else {
+            ActivityLog.shared.info("[Surface] Marching cubes produced 0 triangles", category: .render)
+            return nil
+        }
+
+        let totalVertices = totalTriangles * 3
+        let totalIndices = totalTriangles * 3
+
+        // Clamp to buffer limits
+        guard totalVertices <= Int(maxVertices), totalIndices <= Int(maxIndices) else {
+            // Surface too large for allocated buffers
+            ActivityLog.shared.warn("[Surface] Surface too large: \(totalVertices) vertices (max \(maxVertices)), \(totalIndices) indices (max \(maxIndices))", category: .render)
+            return nil
+        }
+
+        // Compute exclusive prefix sum of per-voxel triangle counts on CPU
+        let triCountPtr = triCountBuffer.contents().bindMemory(to: UInt32.self, capacity: totalVoxels)
+
+        guard let offsetBuffer = device.makeBuffer(
+            length: totalVoxels * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+        offsetBuffer.label = "TriOffsets"
+        let offsetPtr = offsetBuffer.contents().bindMemory(to: UInt32.self, capacity: totalVoxels)
+
+        var runningSum: UInt32 = 0
+        for i in 0..<totalVoxels {
+            offsetPtr[i] = runningSum
+            runningSum += triCountPtr[i]
+        }
+
+        // ====================================================================
+        // Command Buffer 2: Marching cubes emit pass + surface coloring
+        // ====================================================================
+
+        // Allocate vertex/index buffers to exact size
+        let vertexBufferSize = totalVertices * MemoryLayout<GPUSurfaceVertex>.stride
+        guard let vertexBuffer = device.makeBuffer(
+            length: vertexBufferSize,
+            options: .storageModeShared
+        ) else {
+            ActivityLog.shared.error("[Surface] Failed to create vertex buffer (\(vertexBufferSize / 1024) KB)", category: .render)
+            return nil
+        }
+        vertexBuffer.label = "SurfaceVertices"
+
+        let indexBufferSize = totalIndices * MemoryLayout<UInt32>.stride
+        guard let indexBuffer = device.makeBuffer(
+            length: indexBufferSize,
+            options: .storageModeShared
+        ) else {
+            ActivityLog.shared.error("[Surface] Failed to create index buffer (\(indexBufferSize / 1024) KB)", category: .render)
+            return nil
+        }
+        indexBuffer.label = "SurfaceIndices"
+
+        guard let cmdBuf2 = commandQueue.makeCommandBuffer() else { return nil }
+        cmdBuf2.label = "SurfaceGeneration_Emit+Color"
+
+        // Marching cubes Pass 2: emit triangles at prefix-sum offsets (no atomics)
+        if let encoder = cmdBuf2.makeComputeCommandEncoder() {
+            encoder.label = "MarchingCubesEmit"
+            encoder.setComputePipelineState(marchingCubesEmitPipeline)
+            encoder.setBuffer(scalarFieldBuffer, offset: 0, index: 0)
+            encoder.setBuffer(vertexBuffer, offset: 0, index: 1)
+            encoder.setBuffer(indexBuffer, offset: 0, index: 2)
+            encoder.setBuffer(offsetBuffer, offset: 0, index: 3)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 4)
+
+            let threadGroupSize = min(
+                marchingCubesEmitPipeline.maxTotalThreadsPerThreadgroup,
+                totalVoxels
+            )
+            let threadGroups = MTLSize(
+                width: (totalVoxels + threadGroupSize - 1) / threadGroupSize,
+                height: 1,
+                depth: 1
+            )
+            let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
+            encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadsPerGroup)
+            encoder.endEncoding()
+        }
+
+        // Surface coloring (optional, based on colorMode)
+        // For coloring kernels, we store the vertex count in a small buffer
         if colorMode != .uniform {
             let colorPipeline: MTLComputePipelineState
             let label: String
@@ -349,7 +458,16 @@ final class SurfaceGenerator {
                 fatalError("unreachable")
             }
 
-            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            // The coloring kernels read vertexCount[0] to know how many vertices to process
+            guard let vertexCounterBuffer = device.makeBuffer(
+                length: MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            ) else { return nil }
+            vertexCounterBuffer.label = "VertexCounter"
+            vertexCounterBuffer.contents()
+                .bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(totalVertices)
+
+            if let encoder = cmdBuf2.makeComputeCommandEncoder() {
                 encoder.label = label
                 encoder.setComputePipelineState(colorPipeline)
                 encoder.setBuffer(vertexBuffer, offset: 0, index: 0)
@@ -357,7 +475,7 @@ final class SurfaceGenerator {
                 encoder.setBuffer(paramsBuffer, offset: 0, index: 2)
                 encoder.setBuffer(vertexCounterBuffer, offset: 0, index: 3)
 
-                let dispatchCount = Int(maxVertices)
+                let dispatchCount = totalVertices
                 let threadGroupSize = min(
                     colorPipeline.maxTotalThreadsPerThreadgroup,
                     dispatchCount
@@ -373,23 +491,15 @@ final class SurfaceGenerator {
             }
         }
 
-        // Commit and wait
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+        cmdBuf2.commit()
+        cmdBuf2.waitUntilCompleted()
 
-        // Read back vertex and index counts
-        let vertexCount = Int(vertexCounterBuffer.contents()
-            .bindMemory(to: UInt32.self, capacity: 1).pointee)
-        let indexCount = Int(indexCounterBuffer.contents()
-            .bindMemory(to: UInt32.self, capacity: 1).pointee)
-
-        guard vertexCount > 0, indexCount > 0 else { return nil }
-
+        ActivityLog.shared.debug("[Surface] Complete: \(totalVertices) vertices, \(totalTriangles) triangles, grid \(nx)x\(ny)x\(nz)", category: .render)
         return SurfaceResult(
             vertexBuffer: vertexBuffer,
             indexBuffer: indexBuffer,
-            vertexCount: vertexCount,
-            indexCount: indexCount
+            vertexCount: totalVertices,
+            indexCount: totalIndices
         )
     }
 }

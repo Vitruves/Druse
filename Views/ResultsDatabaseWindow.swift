@@ -29,10 +29,10 @@ struct ResultsDatabaseWindow: View {
     // Current results to display (either single docking or selected batch ligand)
     private var displayedResults: [DockingResult] {
         if let batchLigand = selectedBatchLigand,
-           let entry = viewModel.batchResults.first(where: { $0.ligandName == batchLigand }) {
+           let entry = viewModel.docking.batchResults.first(where: { $0.ligandName == batchLigand }) {
             return entry.results
         }
-        return viewModel.dockingResults
+        return viewModel.docking.dockingResults
     }
 
     private var sortedResults: [DockingResult] {
@@ -55,12 +55,12 @@ struct ResultsDatabaseWindow: View {
             toolbar
             Divider()
 
-            if viewModel.dockingResults.isEmpty && viewModel.batchResults.isEmpty {
+            if viewModel.docking.dockingResults.isEmpty && viewModel.docking.batchResults.isEmpty {
                 emptyState
             } else {
                 HSplitView {
                     // Left: batch ligand list (if batch results)
-                    if !viewModel.batchResults.isEmpty {
+                    if !viewModel.docking.batchResults.isEmpty {
                         batchLigandList
                             .frame(minWidth: 180, idealWidth: 220, maxWidth: 260)
                     }
@@ -83,10 +83,10 @@ struct ResultsDatabaseWindow: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(isPresented: $showInteractionDiagram) {
             if let idx = selectedPoseIndex, idx < displayedResults.count,
-               let ligand = viewModel.ligand, let protein = viewModel.protein {
+               let ligand = viewModel.molecules.ligand, let protein = viewModel.molecules.protein {
                 let result = displayedResults[idx]
                 InteractionDiagramView(
-                    interactions: viewModel.currentInteractions,
+                    interactions: viewModel.docking.currentInteractions,
                     ligandAtoms: ligand.atoms.filter { $0.element != .H },
                     ligandBonds: ligand.bonds,
                     proteinAtoms: protein.atoms.filter { $0.element != .H },
@@ -114,7 +114,7 @@ struct ResultsDatabaseWindow: View {
             Text("Results Database")
                 .font(.system(size: 13, weight: .semibold))
 
-            if let ligandName = viewModel.ligand?.name, !ligandName.isEmpty {
+            if let ligandName = viewModel.molecules.ligand?.name, !ligandName.isEmpty {
                 Text(ligandName)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
@@ -149,7 +149,7 @@ struct ResultsDatabaseWindow: View {
             Divider().frame(height: 18)
 
             // Correlation analysis button (when batch results with affinity data exist)
-            if !viewModel.batchResults.isEmpty {
+            if !viewModel.docking.batchResults.isEmpty {
                 Button(action: { showCorrelation = true }) {
                     Label("Correlation", systemImage: "chart.line.uptrend.xyaxis")
                         .font(.system(size: 10))
@@ -188,7 +188,7 @@ struct ResultsDatabaseWindow: View {
                 Label("Ligands", systemImage: "tray.full")
                     .font(.system(size: 11, weight: .semibold))
                 Spacer()
-                Text("\(viewModel.batchResults.count)")
+                Text("\(viewModel.docking.batchResults.count)")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
@@ -198,7 +198,7 @@ struct ResultsDatabaseWindow: View {
 
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(viewModel.batchResults.enumerated()), id: \.offset) { rank, entry in
+                    ForEach(Array(viewModel.docking.batchResults.enumerated()), id: \.offset) { rank, entry in
                         let isSelected = selectedBatchLigand == entry.ligandName
                         let bestEnergy = entry.results.first?.energy ?? .infinity
                         let affinityData = ligandAffinityData(for: entry.ligandName)
@@ -237,12 +237,12 @@ struct ResultsDatabaseWindow: View {
                             selectedBatchLigand = entry.ligandName
                             selectedPoseIndex = nil
                             // Load this ligand's results into the main view model
-                            viewModel.dockingResults = entry.results
+                            viewModel.docking.dockingResults = entry.results
                             if let dbEntry = viewModel.ligandDB.entries.first(where: { $0.name == entry.ligandName }) {
                                 let mol = Molecule(name: dbEntry.name, atoms: dbEntry.atoms,
                                                    bonds: dbEntry.bonds, title: dbEntry.smiles, smiles: dbEntry.smiles)
                                 viewModel.setLigandForDocking(mol)
-                                viewModel.dockingResults = entry.results
+                                viewModel.docking.dockingResults = entry.results
                             }
                         }
                     }
@@ -257,9 +257,9 @@ struct ResultsDatabaseWindow: View {
     private var poseTableView: some View {
         VStack(spacing: 0) {
             // Multi-pose action bar
-            if viewModel.selectedPoseIndices.count > 1 {
+            if viewModel.docking.selectedPoseIndices.count > 1 {
                 HStack {
-                    Text("\(viewModel.selectedPoseIndices.count) poses selected")
+                    Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -269,7 +269,7 @@ struct ResultsDatabaseWindow: View {
                     .controlSize(.small)
                     .buttonStyle(.borderedProminent)
                     Button("Clear Selection") {
-                        viewModel.selectedPoseIndices.removeAll()
+                        viewModel.docking.selectedPoseIndices.removeAll()
                     }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
@@ -325,10 +325,10 @@ struct ResultsDatabaseWindow: View {
         HStack(spacing: 0) {
             // Multi-pose selection checkbox
             Button(action: { viewModel.togglePoseSelection(at: index) }) {
-                Image(systemName: viewModel.selectedPoseIndices.contains(index)
+                Image(systemName: viewModel.docking.selectedPoseIndices.contains(index)
                       ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 10))
-                    .foregroundStyle(viewModel.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.3))
+                    .foregroundStyle(viewModel.docking.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.3))
             }
             .buttonStyle(.plain)
             .frame(width: 24)
@@ -338,10 +338,17 @@ struct ResultsDatabaseWindow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 40, alignment: .leading)
 
-            Text(String(format: "%.2f", result.energy))
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(energyColor(result.energy))
-                .frame(width: 80, alignment: .leading)
+            if viewModel.docking.scoringMethod == .druseAffinity, let pKd = result.mlPKd {
+                Text(viewModel.docking.affinityDisplayUnit.format(pKd))
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
+                    .frame(width: 80, alignment: .leading)
+            } else {
+                Text(String(format: "%.2f", result.energy))
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(energyColor(result.energy))
+                    .frame(width: 80, alignment: .leading)
+            }
 
             Text(String(format: "%.1f", result.vdwEnergy))
                 .font(.system(size: 10, design: .monospaced))
@@ -394,7 +401,7 @@ struct ResultsDatabaseWindow: View {
                 Button {
                     selectedPoseIndex = index
                     viewModel.showDockingPose(at: index)
-                    viewModel.interactionDiagramPoseIndex = index
+                    viewModel.docking.interactionDiagramPoseIndex = index
                     showInteractionDiagram = true
                 } label: {
                     Image(systemName: "circle.hexagongrid")
@@ -426,9 +433,15 @@ struct ResultsDatabaseWindow: View {
                 Label("Pose #\(index + 1)", systemImage: "cube")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text(String(format: "%.2f kcal/mol", result.energy))
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(energyColor(result.energy))
+                if viewModel.docking.scoringMethod == .druseAffinity, let pKd = result.mlPKd {
+                    Text("\(viewModel.docking.affinityDisplayUnit.format(pKd)) \(viewModel.docking.affinityDisplayUnit.unitLabel)")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
+                } else {
+                    Text(String(format: "%.2f kcal/mol", result.energy))
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(energyColor(result.energy))
+                }
             }
             .padding(10)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
@@ -451,7 +464,7 @@ struct ResultsDatabaseWindow: View {
                     VStack(spacing: 6) {
                         Button(action: {
                             viewModel.showDockingPose(at: index)
-                            viewModel.interactionDiagramPoseIndex = index
+                            viewModel.docking.interactionDiagramPoseIndex = index
                             showInteractionDiagram = true
                         }) {
                             Label("2D Interaction Diagram", systemImage: "circle.hexagongrid")
@@ -540,7 +553,7 @@ struct ResultsDatabaseWindow: View {
 
     @ViewBuilder
     private var interactionsSummary: some View {
-        let interactions = viewModel.currentInteractions
+        let interactions = viewModel.docking.currentInteractions
         VStack(alignment: .leading, spacing: 6) {
             Text("Interactions")
                 .font(.system(size: 11, weight: .semibold))
@@ -806,10 +819,10 @@ struct ResultsDatabaseWindow: View {
                     .foregroundStyle(.secondary)
             }
 
-            if !viewModel.batchResults.isEmpty {
+            if !viewModel.docking.batchResults.isEmpty {
                 Text("•")
                     .foregroundStyle(.tertiary)
-                Text("\(viewModel.batchResults.count) ligands in batch")
+                Text("\(viewModel.docking.batchResults.count) ligands in batch")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -845,7 +858,7 @@ struct ResultsDatabaseWindow: View {
     private func affinityDockingPairs() -> [(ligand: String, dockingEnergy: Float, pKi: Float)] {
         var pairs: [(ligand: String, dockingEnergy: Float, pKi: Float)] = []
 
-        for batch in viewModel.batchResults {
+        for batch in viewModel.docking.batchResults {
             guard let bestEnergy = batch.results.first?.energy else { continue }
             if let entry = viewModel.ligandDB.entries.first(where: { $0.name == batch.ligandName }) {
                 let pKi: Float?
@@ -870,7 +883,7 @@ struct ResultsDatabaseWindow: View {
 
     private func computeClusterConsensus() -> [(cluster: Int, count: Int)] {
         var counts: [Int: Int] = [:]
-        for batch in viewModel.batchResults {
+        for batch in viewModel.docking.batchResults {
             if let best = batch.results.first, best.clusterID >= 0 {
                 counts[best.clusterID, default: 0] += 1
             }

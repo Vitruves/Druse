@@ -34,15 +34,27 @@ vertex BackgroundVertexOut backgroundVertex(uint vertexID [[vertex_id]]) {
     return out;
 }
 
-fragment float4 backgroundFragment(BackgroundVertexOut in [[stage_in]]) {
-    // Dark gradient: bottom dark → top slightly lighter
-    float3 bottomColor = float3(0.06, 0.07, 0.10);
-    float3 topColor    = float3(0.14, 0.16, 0.22);
+fragment float4 backgroundFragment(BackgroundVertexOut in [[stage_in]],
+                                   constant Uniforms &uniforms [[buffer(BufferIndexUniforms)]]) {
+    float3 bottomColor, topColor, plainColor;
+    if (uniforms.themeMode == 1) {
+        // Light theme
+        bottomColor = float3(0.94, 0.94, 0.96);
+        topColor    = float3(0.99, 0.99, 1.00);
+        plainColor  = float3(1.0, 1.0, 1.0);
+    } else {
+        // Dark theme
+        bottomColor = float3(0.06, 0.07, 0.10);
+        topColor    = float3(0.14, 0.16, 0.22);
+        plainColor  = float3(0.0, 0.0, 0.0);
+    }
     float t = in.texCoord.y;
-    // Slight radial vignette
     float2 center = in.texCoord - float2(0.5);
-    float vignette = 1.0 - 0.3 * dot(center, center);
-    float3 color = mix(bottomColor, topColor, t) * vignette;
+    float vignetteStrength = uniforms.themeMode == 1 ? 0.08 : 0.3;
+    float vignette = 1.0 - vignetteStrength * dot(center, center);
+    float3 gradient = mix(bottomColor, topColor, t) * vignette;
+    // Blend between plain color and gradient based on backgroundOpacity
+    float3 color = mix(plainColor, gradient, uniforms.backgroundOpacity);
     return float4(color, 1.0);
 }
 
@@ -569,15 +581,43 @@ struct GridBoxVertexOut {
     float4 color;
 };
 
+// Renders each line segment as a screen-space quad (2 triangles, 6 vertices per edge).
+// Input: pairs of GridBoxVertex (A, B) per edge. vertex_id encodes which quad corner.
 vertex GridBoxVertexOut gridBoxVertex(
     uint vertexID [[vertex_id]],
     constant GridBoxVertex *vertices [[buffer(BufferIndexVertices)]],
     constant Uniforms &uniforms [[buffer(BufferIndexUniforms)]]
 ) {
-    GridBoxVertexOut out;
+    // 6 vertices per edge (2 triangles): indices 0-5 map to quad corners
+    uint edgeIndex = vertexID / 6;
+    uint cornerID  = vertexID % 6;
+    // Quad corners: 0=A-, 1=A+, 2=B+, 3=A-, 4=B+, 5=B-
+    const uint quadMap[6] = {0, 1, 2, 0, 2, 3};
+    uint quad = quadMap[cornerID];
+    bool isB   = (quad >= 2);          // endpoint B vs A
+    float side = (quad == 1 || quad == 2) ? 1.0 : -1.0;  // +/- offset
+
+    uint vtxA = edgeIndex * 2;
+    uint vtxB = edgeIndex * 2 + 1;
+
     float4x4 mvp = uniforms.projectionMatrix * uniforms.viewMatrix * uniforms.modelMatrix;
-    out.position = mvp * float4(vertices[vertexID].position, 1.0);
-    out.color = vertices[vertexID].color;
+    float4 clipA = mvp * float4(vertices[vtxA].position, 1.0);
+    float4 clipB = mvp * float4(vertices[vtxB].position, 1.0);
+
+    // Screen-space direction
+    float2 ndcA = clipA.xy / clipA.w;
+    float2 ndcB = clipB.xy / clipB.w;
+    float2 dir = normalize(ndcB - ndcA);
+    float2 perp = float2(-dir.y, dir.x);
+
+    float halfWidth = uniforms.gridLineWidth * 0.001;  // NDC units (~pixels / 1000)
+
+    float4 clip = isB ? clipB : clipA;
+    clip.xy += perp * side * halfWidth * clip.w;
+
+    GridBoxVertexOut out;
+    out.position = clip;
+    out.color = vertices[vtxA].color;
     return out;
 }
 
@@ -660,5 +700,6 @@ fragment float4 surfaceFragment(
               + specular * uniforms.lightColor;
     }
 
-    return float4(color, in.color.a);
+    float alpha = uniforms.surfaceOpacity > 0.0 ? uniforms.surfaceOpacity : in.color.a;
+    return float4(color, alpha);
 }

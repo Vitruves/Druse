@@ -9,7 +9,10 @@ enum BondPerception {
         tolerance: Float = 1.3,
         minDistance: Float = 0.4
     ) -> [Bond] {
-        guard atoms.count > 1 else { return [] }
+        guard atoms.count > 1 else {
+            Task { @MainActor in ActivityLog.shared.debug("[Prep] Bond perception skipped: \(atoms.count) atom(s)", category: .prep) }
+            return []
+        }
 
         let cellSize: Float = 5.0 // covers max bonded distance
         var grid: [SIMD3<Int32>: [Int]] = [:]
@@ -54,6 +57,7 @@ enum BondPerception {
             }
         }
 
+        Task { @MainActor in ActivityLog.shared.debug("[Prep] Bond perception: \(bonds.count) bonds from \(atoms.count) atoms", category: .prep) }
         return bonds
     }
 

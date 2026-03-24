@@ -55,6 +55,20 @@ HYDROPHOBICITY = {
 }
 
 
+def _farthest_point_sample(points: np.ndarray, n_samples: int) -> np.ndarray:
+    """Farthest Point Sampling for uniform spatial coverage.
+    Returns indices of n_samples points from the input array."""
+    n = len(points)
+    selected = np.zeros(n_samples, dtype=np.int64)
+    selected[0] = np.random.randint(n)
+    min_dists = np.full(n, np.inf, dtype=np.float64)
+    for i in range(1, n_samples):
+        dists = np.sum((points - points[selected[i - 1]]) ** 2, axis=1)
+        np.minimum(min_dists, dists, out=min_dists)
+        selected[i] = np.argmax(min_dists)
+    return selected
+
+
 def compute_surface_features(pdb_path: Path, probe_radius: float = 1.4,
                               grid_spacing: float = 1.0) -> tuple:
     """Compute surface points and features from a PDB file.
@@ -123,9 +137,10 @@ def compute_surface_features(pdb_path: Path, probe_radius: float = 1.4,
     if len(surface_points) < 10:
         return None, None, None
 
-    # Subsample to max 5000 points
+    # Subsample to max 5000 points using farthest point sampling (FPS)
+    # for uniform spatial coverage — random choice can delete pocket regions
     if len(surface_points) > 5000:
-        choice = np.random.choice(len(surface_points), 5000, replace=False)
+        choice = _farthest_point_sample(surface_points, 5000)
         surface_points = surface_points[choice]
         nearest_idx = nearest_idx[choice]
 

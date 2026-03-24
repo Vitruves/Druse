@@ -168,6 +168,7 @@ struct Atom: Identifiable, Sendable {
     var occupancy: Float
     var tempFactor: Float
     var altLoc: String
+    var insertionCode: String
 
     init(
         id: Int,
@@ -182,7 +183,8 @@ struct Atom: Identifiable, Sendable {
         isHetAtom: Bool = false,
         occupancy: Float = 1.0,
         tempFactor: Float = 0.0,
-        altLoc: String = ""
+        altLoc: String = "",
+        insertionCode: String = ""
     ) {
         self.id = id
         self.element = element
@@ -197,6 +199,7 @@ struct Atom: Identifiable, Sendable {
         self.occupancy = occupancy
         self.tempFactor = tempFactor
         self.altLoc = altLoc
+        self.insertionCode = insertionCode
     }
 }
 
@@ -292,6 +295,113 @@ struct ResidueSubset: Identifiable, Sendable {
     }
 }
 
+// MARK: - Scoring Method
+
+/// Which scoring function to use for ranking docked poses.
+enum ScoringMethod: String, CaseIterable, Sendable {
+    case vina = "Vina"
+    case drusina = "Drusina"
+    case druseAffinity = "Druse Affinity"
+
+    /// Short label for compact UI (picker buttons).
+    var shortLabel: String {
+        switch self {
+        case .vina:          "Vina"
+        case .drusina:       "Drusina"
+        case .druseAffinity: "Druse AF"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .vina:          "function"
+        case .drusina:       "sparkles"
+        case .druseAffinity: "brain"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .vina:          "Empirical energy scoring (kcal/mol)"
+        case .drusina:       "Extended Vina + π-π, π-cation, halogen bond, metal coord (kcal/mol)"
+        case .druseAffinity: "Neural network affinity prediction (pKi)"
+        }
+    }
+}
+
+// MARK: - Affinity Display Unit
+
+/// How to display binding affinity from the Druse ML scorer.
+enum AffinityDisplayUnit: String, CaseIterable, Sendable {
+    case pKi = "pKi"
+    case ki  = "Ki"
+
+    /// Format a pKd value for display in the selected unit.
+    func format(_ pKd: Float) -> String {
+        switch self {
+        case .pKi:
+            return String(format: "%.2f", pKd)
+        case .ki:
+            return Self.formatKi(pKd: pKd)
+        }
+    }
+
+    /// Unit label for display.
+    var unitLabel: String {
+        switch self {
+        case .pKi: "pKi"
+        case .ki:  "nM"
+        }
+    }
+
+    /// Convert pKd to Ki in nanomolar and format with appropriate unit prefix.
+    static func formatKi(pKd: Float) -> String {
+        let ki_M = pow(10, -Double(pKd))  // Ki in molar
+        let ki_nM = ki_M * 1e9
+        if ki_nM >= 1_000_000 {
+            return String(format: "%.1f mM", ki_nM / 1_000_000)
+        } else if ki_nM >= 1_000 {
+            return String(format: "%.1f \u{00B5}M", ki_nM / 1_000)
+        } else if ki_nM >= 1 {
+            return String(format: "%.1f nM", ki_nM)
+        } else {
+            return String(format: "%.2f pM", ki_nM * 1_000)
+        }
+    }
+
+    /// Convert pKd to Ki in molar.
+    static func pKdToKi(pKd: Float) -> Double {
+        pow(10, -Double(pKd))
+    }
+}
+
+// MARK: - Charge Method
+
+enum ChargeMethod: String, CaseIterable, Sendable {
+    case gasteiger = "Gasteiger"
+    case eem = "EEM"
+    case qeq = "QEq"
+    case xtb = "GFN2-xTB"
+
+    var icon: String {
+        switch self {
+        case .gasteiger: "bolt"
+        case .eem:       "equal.circle"
+        case .qeq:       "waveform"
+        case .xtb:       "atom"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .gasteiger: "Gasteiger-Marsili empirical (fast, lowest accuracy)"
+        case .eem:       "Electronegativity Equalization Method (fast, good accuracy)"
+        case .qeq:       "Charge Equilibration - Rapp\u{00E9} & Goddard (fast, good accuracy)"
+        case .xtb:       "GFN2-xTB semi-empirical quantum (slow, highest accuracy)"
+        }
+    }
+}
+
 // MARK: - Side Chain Display (ribbon mode)
 
 /// Controls which residue side chains are shown as ball-and-stick in ribbon mode.
@@ -312,6 +422,27 @@ enum SideChainDisplay: String, CaseIterable, Sendable {
 
     /// Backbone atom names to EXCLUDE when showing side chains.
     static let backboneAtomNames: Set<String> = ["N", "CA", "C", "O", "OXT", "H", "HA"]
+}
+
+// MARK: - Variant Kind (Tautomer / Protomer)
+
+enum VariantKind: Int, Sendable, Codable {
+    case tautomer = 0
+    case protomer = 1
+
+    var label: String {
+        switch self {
+        case .tautomer: "Tautomer"
+        case .protomer: "Protomer"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .tautomer: "T"
+        case .protomer: "P"
+        }
+    }
 }
 
 // MARK: - Render Mode

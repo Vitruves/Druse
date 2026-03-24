@@ -3,6 +3,33 @@ import AppKit
 import UniformTypeIdentifiers
 import simd
 
+/// A tautomer or protomer variant of a ligand.
+struct MolecularVariant: Identifiable, Sendable {
+    let id: UUID
+    var smiles: String
+    var atoms: [Atom]
+    var bonds: [Bond]
+    var relativeEnergy: Double     // kcal/mol (MMFF energy)
+    var kind: VariantKind          // .tautomer or .protomer
+    var label: String              // human-readable description
+    var isPrepared: Bool
+    var conformerCount: Int
+
+    init(smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
+         relativeEnergy: Double = 0, kind: VariantKind, label: String,
+         isPrepared: Bool = false, conformerCount: Int = 0) {
+        self.id = UUID()
+        self.smiles = smiles
+        self.atoms = atoms
+        self.bonds = bonds
+        self.relativeEnergy = relativeEnergy
+        self.kind = kind
+        self.label = label
+        self.isPrepared = isPrepared
+        self.conformerCount = conformerCount
+    }
+}
+
 /// An entry in the ligand database.
 struct LigandEntry: Identifiable, Sendable {
     let id: UUID
@@ -20,6 +47,9 @@ struct LigandEntry: Identifiable, Sendable {
     var pKi: Float?      // -log10(Ki in M)
     var ic50: Float?     // IC50 in nM
 
+    // Tautomer and protomer variants
+    var variants: [MolecularVariant] = []
+
     /// Computed pKi from whatever affinity data is available (pKi > Ki > IC50).
     var effectivePKi: Float? {
         if let pk = pKi { return pk }
@@ -30,7 +60,8 @@ struct LigandEntry: Identifiable, Sendable {
 
     init(name: String, smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
          descriptors: LigandDescriptors? = nil, isPrepared: Bool = false,
-         conformerCount: Int = 0, ki: Float? = nil, pKi: Float? = nil, ic50: Float? = nil) {
+         conformerCount: Int = 0, ki: Float? = nil, pKi: Float? = nil, ic50: Float? = nil,
+         variants: [MolecularVariant] = []) {
         self.id = UUID()
         self.name = name
         self.smiles = smiles
@@ -43,6 +74,7 @@ struct LigandEntry: Identifiable, Sendable {
         self.ki = ki
         self.pKi = pKi
         self.ic50 = ic50
+        self.variants = variants
     }
 }
 
@@ -86,6 +118,10 @@ final class LigandDatabase {
 
     func remove(id: UUID) {
         entries.removeAll { $0.id == id }
+    }
+
+    func remove(ids: Set<UUID>) {
+        entries.removeAll { ids.contains($0.id) }
     }
 
     func removeAll() {
@@ -303,7 +339,7 @@ final class LigandDatabase {
     }
 
     /// Heuristic: does this string look like a SMILES notation?
-    private static func looksLikeSMILES(_ s: String) -> Bool {
+    static func looksLikeSMILES(_ s: String) -> Bool {
         guard s.count >= 2 else { return false }
         // SMILES have organic atoms and structural chars; scores/names don't
         let smilesChars = CharacterSet(charactersIn: "CNOSPFIBrcnospfi[]()=#@+-/\\%0123456789")
@@ -373,6 +409,16 @@ final class LigandDatabase {
     func saveToDefault() { save() }
     func loadFromDefault() { load() }
 
+    /// Encode the entire database to Data (for project save).
+    func encodeToData() -> Data {
+        (try? encodeToDisk()) ?? Data()
+    }
+
+    /// Decode database from Data (for project load). Replaces current entries.
+    func decodeFromData(_ data: Data) {
+        try? decodeFromDisk(data)
+    }
+
     /// Export as SDF to a user-selected file.
     func exportSDF() {
         let panel = NSSavePanel()
@@ -390,6 +436,19 @@ final class LigandDatabase {
     }
 
     // MARK: - Codable Helpers
+
+    private struct SerializableVariant: Codable {
+        let smiles: String
+        let relativeEnergy: Double
+        let kind: Int           // 0=tautomer, 1=protomer
+        let label: String
+        let isPrepared: Bool
+        let conformerCount: Int
+        let atomData: [Float]?
+        let atomElements: [Int]?
+        let atomNames: [String]?
+        let bondData: [Int]?
+    }
 
     private struct SerializableEntry: Codable {
         let name: String
@@ -417,14 +476,65 @@ final class LigandDatabase {
         let atomElements: [Int]?
         let atomNames: [String]?
         let bondData: [Int]?  // [a1,a2,order, a1,a2,order, ...]
+        // Tautomer/protomer variants
+        let variants: [SerializableVariant]?
+    }
+
+    private static func encodeAtoms(_ atoms: [Atom]) -> (data: [Float]?, elements: [Int]?, names: [String]?) {
+        guard !atoms.isEmpty else { return (nil, nil, nil) }
+        return (
+            atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] },
+            atoms.map { $0.element.rawValue },
+            atoms.map(\.name)
+        )
+    }
+
+    private static func encodeBonds(_ bonds: [Bond]) -> [Int]? {
+        guard !bonds.isEmpty else { return nil }
+        return bonds.flatMap { [$0.atomIndex1, $0.atomIndex2, $0.order == .single ? 1 : $0.order == .double ? 2 : $0.order == .triple ? 3 : 4] }
+    }
+
+    private static func decodeAtoms(data: [Float]?, elements: [Int]?, names: [String]?) -> [Atom] {
+        guard let ad = data, let ae = elements, let an = names else { return [] }
+        var atoms: [Atom] = []
+        for i in stride(from: 0, to: ad.count - 2, by: 3) {
+            let idx = i / 3
+            guard idx < ae.count, idx < an.count else { break }
+            atoms.append(Atom(
+                id: idx, element: Element(rawValue: ae[idx]) ?? .C,
+                position: SIMD3(ad[i], ad[i+1], ad[i+2]),
+                name: an[idx], residueName: "LIG", residueSeq: 1, chainID: "L",
+                charge: 0, formalCharge: 0, isHetAtom: true
+            ))
+        }
+        return atoms
+    }
+
+    private static func decodeBonds(data: [Int]?) -> [Bond] {
+        guard let bd = data else { return [] }
+        var bonds: [Bond] = []
+        for i in stride(from: 0, to: bd.count - 2, by: 3) {
+            let order: BondOrder = switch bd[i+2] { case 2: .double; case 3: .triple; case 4: .aromatic; default: .single }
+            bonds.append(Bond(id: bonds.count, atomIndex1: bd[i], atomIndex2: bd[i+1], order: order))
+        }
+        return bonds
     }
 
     private func encodeToDisk() throws -> Data {
         let serializable = entries.map { entry -> SerializableEntry in
-            let atomData: [Float]? = entry.atoms.isEmpty ? nil : entry.atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] }
-            let atomElements: [Int]? = entry.atoms.isEmpty ? nil : entry.atoms.map { $0.element.rawValue }
-            let atomNames: [String]? = entry.atoms.isEmpty ? nil : entry.atoms.map(\.name)
-            let bondData: [Int]? = entry.bonds.isEmpty ? nil : entry.bonds.flatMap { [$0.atomIndex1, $0.atomIndex2, $0.order == .single ? 1 : $0.order == .double ? 2 : $0.order == .triple ? 3 : 4] }
+            let (atomData, atomElements, atomNames) = Self.encodeAtoms(entry.atoms)
+            let bondData = Self.encodeBonds(entry.bonds)
+
+            let serializedVariants: [SerializableVariant]? = entry.variants.isEmpty ? nil : entry.variants.map { v in
+                let (vad, vae, van) = Self.encodeAtoms(v.atoms)
+                return SerializableVariant(
+                    smiles: v.smiles, relativeEnergy: v.relativeEnergy,
+                    kind: v.kind.rawValue, label: v.label,
+                    isPrepared: v.isPrepared, conformerCount: v.conformerCount,
+                    atomData: vad, atomElements: vae, atomNames: van,
+                    bondData: Self.encodeBonds(v.bonds)
+                )
+            }
 
             return SerializableEntry(
                 name: entry.name, smiles: entry.smiles, isPrepared: entry.isPrepared,
@@ -436,7 +546,8 @@ final class LigandDatabase {
                 fractionCSP3: entry.descriptors?.fractionCSP3, lipinski: entry.descriptors?.lipinski,
                 veber: entry.descriptors?.veber,
                 ki: entry.ki, pKi: entry.pKi, ic50: entry.ic50,
-                atomData: atomData, atomElements: atomElements, atomNames: atomNames, bondData: bondData
+                atomData: atomData, atomElements: atomElements, atomNames: atomNames, bondData: bondData,
+                variants: serializedVariants
             )
         }
         return try JSONEncoder().encode(serializable)
@@ -444,28 +555,9 @@ final class LigandDatabase {
 
     private func decodeFromDisk(_ data: Data) throws {
         let decoded = try JSONDecoder().decode([SerializableEntry].self, from: data)
-        // Temporarily suppress auto-save while bulk-loading
         let loaded: [LigandEntry] = decoded.map { s in
-            var atoms: [Atom] = []
-            if let ad = s.atomData, let ae = s.atomElements, let an = s.atomNames {
-                for i in stride(from: 0, to: ad.count - 2, by: 3) {
-                    let idx = i / 3
-                    guard idx < ae.count, idx < an.count else { break }
-                    atoms.append(Atom(
-                        id: idx, element: Element(rawValue: ae[idx]) ?? .C,
-                        position: SIMD3(ad[i], ad[i+1], ad[i+2]),
-                        name: an[idx], residueName: "LIG", residueSeq: 1, chainID: "L",
-                        charge: 0, formalCharge: 0, isHetAtom: true
-                    ))
-                }
-            }
-            var bonds: [Bond] = []
-            if let bd = s.bondData {
-                for i in stride(from: 0, to: bd.count - 2, by: 3) {
-                    let order: BondOrder = switch bd[i+2] { case 2: .double; case 3: .triple; case 4: .aromatic; default: .single }
-                    bonds.append(Bond(id: bonds.count, atomIndex1: bd[i], atomIndex2: bd[i+1], order: order))
-                }
-            }
+            let atoms = Self.decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames)
+            let bonds = Self.decodeBonds(data: s.bondData)
             let desc: LigandDescriptors? = s.mw != nil ? LigandDescriptors(
                 molecularWeight: s.mw!, exactMW: s.mw!, logP: s.logP ?? 0, tpsa: s.tpsa ?? 0,
                 hbd: s.hbd ?? 0, hba: s.hba ?? 0, rotatableBonds: s.rotBonds ?? 0,
@@ -473,10 +565,23 @@ final class LigandDatabase {
                 heavyAtomCount: s.heavyAtomCount ?? 0, fractionCSP3: s.fractionCSP3 ?? 0,
                 lipinski: s.lipinski ?? false, veber: s.veber ?? false
             ) : nil
+            let variants: [MolecularVariant] = (s.variants ?? []).map { sv in
+                MolecularVariant(
+                    smiles: sv.smiles,
+                    atoms: Self.decodeAtoms(data: sv.atomData, elements: sv.atomElements, names: sv.atomNames),
+                    bonds: Self.decodeBonds(data: sv.bondData),
+                    relativeEnergy: sv.relativeEnergy,
+                    kind: VariantKind(rawValue: sv.kind) ?? .tautomer,
+                    label: sv.label,
+                    isPrepared: sv.isPrepared,
+                    conformerCount: sv.conformerCount
+                )
+            }
             return LigandEntry(name: s.name, smiles: s.smiles, atoms: atoms, bonds: bonds,
                               descriptors: desc, isPrepared: s.isPrepared,
                               conformerCount: s.conformerCount ?? 0,
-                              ki: s.ki, pKi: s.pKi, ic50: s.ic50)
+                              ki: s.ki, pKi: s.pKi, ic50: s.ic50,
+                              variants: variants)
         }
         entries = loaded
     }

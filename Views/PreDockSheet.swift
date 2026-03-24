@@ -18,6 +18,10 @@ struct PreDockSheet: View {
                     ligandInfoSection
                     Divider()
                     pocketInfoSection
+                    if !viewModel.docking.pharmacophoreConstraints.isEmpty {
+                        Divider()
+                        constraintInfoSection
+                    }
                     Divider()
                     configSummarySection
                     Divider()
@@ -59,7 +63,7 @@ struct PreDockSheet: View {
         VStack(alignment: .leading, spacing: 6) {
             sectionLabel("Protein", icon: "building.columns")
 
-            if let prot = viewModel.protein {
+            if let prot = viewModel.molecules.protein {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(prot.name)
@@ -108,7 +112,7 @@ struct PreDockSheet: View {
         VStack(alignment: .leading, spacing: 6) {
             sectionLabel("Ligand", icon: "hexagon")
 
-            if let lig = viewModel.ligand {
+            if let lig = viewModel.molecules.ligand {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Circle().fill(.green).frame(width: 6, height: 6)
@@ -152,7 +156,7 @@ struct PreDockSheet: View {
         VStack(alignment: .leading, spacing: 6) {
             sectionLabel("Binding Pocket", icon: "scope")
 
-            if let pocket = viewModel.selectedPocket {
+            if let pocket = viewModel.docking.selectedPocket {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 16) {
                         infoChip("Volume", String(format: "%.0f A\u{00B3}", pocket.volume))
@@ -201,7 +205,7 @@ struct PreDockSheet: View {
         VStack(alignment: .leading, spacing: 6) {
             sectionLabel("GA Configuration", icon: "gearshape")
 
-            let config = viewModel.dockingConfig
+            let config = viewModel.docking.dockingConfig
             VStack(spacing: 4) {
                 configLine("Population size", "\(config.populationSize)")
                 configLine("Generations", "\(config.numGenerations)")
@@ -219,24 +223,88 @@ struct PreDockSheet: View {
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
-            // ML re-ranking option
-            if viewModel.druseScore.isAvailable {
-                @Bindable var vm = viewModel
-                Toggle(isOn: $vm.useDruseScoreReranking) {
+            // Scoring method picker
+            @Bindable var vm = viewModel
+            if viewModel.druseMLScoring.isAvailable {
+                HStack(spacing: 6) {
+                    Image(systemName: "function")
+                        .font(.system(size: 10))
+                    Text("Scoring")
+                        .font(.system(size: 11))
+                    Spacer()
+                    Picker("", selection: $vm.docking.scoringMethod) {
+                        ForEach(ScoringMethod.allCases, id: \.self) { method in
+                            Label(method.rawValue, systemImage: method.icon).tag(method)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 220)
+                }
+                if viewModel.docking.scoringMethod == .druseAffinity {
+                    HStack(spacing: 6) {
+                        Image(systemName: "textformat.123")
+                            .font(.system(size: 10))
+                        Text("Display")
+                            .font(.system(size: 11))
+                        Spacer()
+                        Picker("", selection: $vm.docking.affinityDisplayUnit) {
+                            ForEach(AffinityDisplayUnit.allCases, id: \.self) { unit in
+                                Text(unit.rawValue).tag(unit)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 100)
+                    }
+                    .help("pKi: -log10(Ki). Ki: dissociation constant in nM/\u{00B5}M")
+                }
+            }
+
+            // Post-docking ML refinement (secondary model, for Vina/Drusina modes)
+            if viewModel.druseRescoring.isAvailable &&
+               (viewModel.docking.scoringMethod == .vina || viewModel.docking.scoringMethod == .drusina) {
+                Toggle(isOn: $vm.docking.usePostDockingRefinement) {
                     HStack(spacing: 4) {
                         Image(systemName: "brain")
                             .font(.system(size: 10))
-                        Text("Re-rank with DruseScore ML")
+                        Text("Post-docking ML refinement")
                             .font(.system(size: 11))
                     }
                 }
                 .toggleStyle(.checkbox)
-                .help("After docking, re-rank poses using the DruseScore neural network (70% ML + 30% physics)")
+                .help("After Vina scoring, refine pose ranking with a secondary neural network (blends ML + Vina energies in kcal/mol)")
             }
         }
     }
 
     // MARK: - GPU Info
+
+    @ViewBuilder
+    private var constraintInfoSection: some View {
+        let constraints = viewModel.docking.pharmacophoreConstraints.filter(\.isEnabled)
+        let hardCount = constraints.filter { $0.strength.isHard }.count
+        VStack(alignment: .leading, spacing: 6) {
+            sectionLabel("Pharmacophore Constraints", icon: "scope")
+            HStack(spacing: 16) {
+                infoChip("Active", "\(constraints.count)")
+                if hardCount > 0 {
+                    infoChip("Hard", "\(hardCount)")
+                }
+            }
+            ForEach(constraints) { c in
+                HStack(spacing: 4) {
+                    Image(systemName: c.interactionType.icon)
+                        .font(.system(size: 9))
+                    Text("\(c.interactionType.rawValue) \u{2192} \(c.targetLabel)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(c.strength.label)
+                        .font(.system(size: 9))
+                        .foregroundStyle(c.strength.isHard ? .orange : .secondary)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
     private var gpuInfoSection: some View {
@@ -273,9 +341,9 @@ struct PreDockSheet: View {
 
             Spacer()
 
-            let canStart = viewModel.selectedPocket != nil
-                && viewModel.ligand != nil
-                && viewModel.protein != nil
+            let canStart = viewModel.docking.selectedPocket != nil
+                && viewModel.molecules.ligand != nil
+                && viewModel.molecules.protein != nil
 
             Button(action: { launchDocking() }) {
                 Label("Start Docking", systemImage: "play.fill")

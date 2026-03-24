@@ -41,27 +41,35 @@ actor PDBService {
     func fetchPDBFile(id: String) async throws -> String {
         let cleanID = id.trimmingCharacters(in: .whitespaces).uppercased()
         guard cleanID.count == 4, cleanID.allSatisfy({ $0.isLetter || $0.isNumber }) else {
+            await MainActor.run { ActivityLog.shared.error("[PDB] Invalid PDB ID: '\(id)'", category: .network) }
             throw PDBServiceError.invalidPDBID(id)
         }
 
         let url = URL(string: "https://files.rcsb.org/download/\(cleanID).pdb")!
+        await MainActor.run { ActivityLog.shared.debug("[PDB] Fetching \(cleanID) from \(url.absoluteString)", category: .network) }
         let (data, response) = try await session.data(from: url)
 
         guard let http = response as? HTTPURLResponse else {
+            await MainActor.run { ActivityLog.shared.error("[PDB] Non-HTTP response for \(cleanID)", category: .network) }
             throw PDBServiceError.networkError(URLError(.badServerResponse))
         }
 
         if http.statusCode == 404 {
+            await MainActor.run { ActivityLog.shared.warn("[PDB] Entry \(cleanID) not found (404)", category: .network) }
             throw PDBServiceError.notFound(cleanID)
         }
 
         guard (200..<300).contains(http.statusCode) else {
+            await MainActor.run { ActivityLog.shared.error("[PDB] HTTP \(http.statusCode) for \(cleanID)", category: .network) }
             throw PDBServiceError.httpError(http.statusCode)
         }
 
         guard let content = String(data: data, encoding: .utf8), !content.isEmpty else {
+            await MainActor.run { ActivityLog.shared.error("[PDB] Empty response body for \(cleanID)", category: .network) }
             throw PDBServiceError.parseError("Empty response for \(cleanID)")
         }
+
+        await MainActor.run { ActivityLog.shared.debug("[PDB] Fetched \(cleanID): \(data.count / 1024) KB", category: .network) }
 
         // Prefetch CCD templates for any non-water HET groups so downstream parsing
         // can restore chemically correct bond orders and formal charges.
@@ -73,6 +81,7 @@ actor PDBService {
     // MARK: - Text Search
 
     func search(query: String, maxResults: Int = 20) async throws -> [PDBSearchResult] {
+        await MainActor.run { ActivityLog.shared.debug("[PDB] Search: query='\(query)', maxResults=\(maxResults)", category: .network) }
         let url = URL(string: "https://search.rcsb.org/rcsbsearch/v2/query")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -98,17 +107,21 @@ actor PDBService {
 
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
-            throw PDBServiceError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            await MainActor.run { ActivityLog.shared.error("[PDB] Search HTTP error \(code) for '\(query)'", category: .network) }
+            throw PDBServiceError.httpError(code)
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let resultSet = json["result_set"] as? [[String: Any]]
         else {
+            await MainActor.run { ActivityLog.shared.info("[PDB] Search returned no result_set for '\(query)'", category: .network) }
             return []
         }
 
         // Extract PDB IDs from results
         let pdbIDs = resultSet.compactMap { $0["identifier"] as? String }
+        await MainActor.run { ActivityLog.shared.debug("[PDB] Search matched \(pdbIDs.count) IDs for '\(query)'", category: .network) }
 
         // Fetch metadata for each result
         return await withTaskGroup(of: PDBSearchResult?.self, returning: [PDBSearchResult].self) { group in
@@ -137,10 +150,12 @@ actor PDBService {
 
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
+            await MainActor.run { ActivityLog.shared.debug("[PDB] Metadata fetch failed for \(id), using default title", category: .network) }
             return PDBSearchResult(id: id, title: id)
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            await MainActor.run { ActivityLog.shared.debug("[PDB] Metadata JSON parse failed for \(id), using default title", category: .network) }
             return PDBSearchResult(id: id, title: id)
         }
 

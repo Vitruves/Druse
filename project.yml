@@ -11,6 +11,7 @@ settings:
     SWIFT_VERSION: "5.9"
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     DEVELOPMENT_TEAM: ""
+    GCC_PREPROCESSOR_DEFINITIONS: "ACCELERATE_NEW_LAPACK=1"
 
 targets:
   Druse:
@@ -19,6 +20,8 @@ targets:
     sources:
       - path: App
       - path: Models
+        excludes:
+          - "new-models-2/**"
       - path: Renderer
       - path: Metal
         buildPhase: sources
@@ -49,6 +52,7 @@ targets:
           - "$(SRCROOT)/CppCore"
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/CppCore/build"
+          - "$(SRCROOT)/CppCore/build/_deps/openmm-install/lib"
           - "/opt/homebrew/lib"
         OTHER_LDFLAGS:
           - "-ldruse_core"
@@ -83,10 +87,14 @@ targets:
           - "-lRDKitSubgraphs"
           - "-lRDKitMMPA"
           - "-lRDKitMolChemicalFeatures"
+          - "-lRDKitMolStandardize"
           - "-ltbb"
+          - "-lOpenMM"
           - "-lc++"
           - "-rpath"
           - "/opt/homebrew/lib"
+          - "-rpath"
+          - "$(SRCROOT)/CppCore/build/_deps/openmm-install/lib"
       configs:
         Debug:
           SWIFT_OPTIMIZATION_LEVEL: -Onone
@@ -101,6 +109,14 @@ targets:
     platform: macOS
     sources:
       - path: Tests
+      - path: Benchmark
+        excludes:
+          - "*.py"
+          - "*.txt"
+          - "data/**"
+          - "manifests/**"
+          - "results/**"
+          - "reports/**"
     dependencies:
       - target: Druse
     settings:

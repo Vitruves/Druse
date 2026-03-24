@@ -25,15 +25,23 @@ struct DockingConfig: Sendable {
     // Local search (Vina-like basin hopping: refine every MC step by default)
     var localSearchFrequency: Int = 1   // every N generations
     var localSearchSteps: Int = 30      // gradient descent steps per refinement
-    var liveUpdateFrequency: Int = 3    // visual update every N generations (lower = smoother animation)
+    var liveUpdateFrequency: Int = 10   // visual update every N generations (higher = fewer GPU syncs = faster)
 
     // Flexibility
     var enableFlexibility: Bool = true  // torsion flexibility during docking
     var flexRefinementSteps: Int = 50   // extra torsion refinement steps after GA
 
+    // Gradient method
+    var useAnalyticalGradients: Bool = true  // analytical (~28x fewer evals) vs numerical finite differences
+
     // Clash handling
     var maxClashOverlap: Float = 0.4    // Angstroms of VdW overlap allowed
     var clashPenaltyScale: Float = 5.0  // kcal/mol per Angstrom of excess overlap
+
+    // Ligand strain penalty: MMFF94-based post-docking filter
+    var strainPenaltyEnabled: Bool = true
+    var strainPenaltyThreshold: Float = 6.0  // kcal/mol above free energy before penalizing
+    var strainPenaltyWeight: Float = 0.5     // score += weight * max(0, strain - threshold)
 
     // Exploration: broader initial search with higher translation/rotation steps
     // before switching to fine-grained local refinement
@@ -42,8 +50,82 @@ struct DockingConfig: Sendable {
     var explorationRotationStep: Float = 0.6     // wider initial rotation (vs 0.3)
     var explorationMutationRate: Float = 0.15    // higher mutation during exploration
 
+    // Auto mode: adapt parameters to protein/ligand/pocket complexity
+    var autoMode: Bool = false
+
     // Legacy flat-generation count (for backward compatibility)
     var numGenerations: Int { numRuns * generationsPerRun }
+
+    /// Compute adaptive docking parameters based on system complexity.
+    /// Called once per protein (for pocket/protein features) and can be refined per ligand.
+    static func autoTune(
+        proteinAtomCount: Int,
+        pocketVolume: Float,
+        pocketBuriedness: Float,
+        ligandHeavyAtoms: Int,
+        ligandRotatableBonds: Int
+    ) -> DockingConfig {
+        var config = DockingConfig()
+        config.autoMode = true
+
+        // --- Population scales with ligand flexibility ---
+        // More torsions = larger conformational space = need more population diversity
+        let torsionFactor = max(1.0, Float(ligandRotatableBonds) / 5.0) // 1.0 for ≤5 torsions, up to ~6 for 30
+        let basePop = 150
+        config.populationSize = min(500, max(100, Int(Float(basePop) * sqrt(torsionFactor))))
+
+        // --- Generations scale with pocket size and buriedness ---
+        // Large/shallow pockets need more exploration; buried pockets converge faster
+        let buriednessFactor = max(0.6, 1.5 - pocketBuriedness) // 0.6 for fully buried, 1.5 for exposed
+        let volumeFactor = max(0.8, min(2.0, pocketVolume / 800.0)) // normalize around 800 A³
+        let baseGen = 150
+        config.generationsPerRun = min(400, max(80, Int(Float(baseGen) * buriednessFactor * volumeFactor)))
+
+        // --- Runs scale with overall difficulty ---
+        // Large proteins + flexible ligands benefit from independent restarts
+        let proteinSizeFactor: Float = proteinAtomCount > 5000 ? 1.5 : (proteinAtomCount > 3000 ? 1.2 : 1.0)
+        let difficultyScore = torsionFactor * buriednessFactor * proteinSizeFactor
+        config.numRuns = min(8, max(1, Int(difficultyScore)))
+
+        // --- Grid spacing: coarsen for very large proteins to stay in memory ---
+        if proteinAtomCount > 10000 {
+            config.gridSpacing = 0.5
+        } else {
+            config.gridSpacing = 0.375
+        }
+
+        // --- Exploration phase: extend for flexible ligands ---
+        if ligandRotatableBonds > 10 {
+            config.explorationPhaseRatio = 0.5 // more exploration for floppy molecules
+            config.explorationTranslationStep = 5.0
+            config.explorationMutationRate = 0.18
+        }
+
+        // --- Local search frequency: increase for rigid ligands (cheap, high payoff) ---
+        if ligandRotatableBonds <= 3 {
+            config.localSearchFrequency = 1 // every generation
+            config.localSearchSteps = 40
+        } else if ligandRotatableBonds > 15 {
+            config.localSearchFrequency = 3 // less frequent for expensive LS
+            config.localSearchSteps = 20
+        }
+
+        return config
+    }
+}
+
+// MARK: - VRAM Estimation
+
+struct VRAMEstimate: Sendable {
+    let gridBytes: Int
+    let populationBytes: Int
+    let ligandBytes: Int
+    let proteinAtomBytes: Int
+    let miscBytes: Int
+    var totalBytes: Int { gridBytes + populationBytes + ligandBytes + proteinAtomBytes + miscBytes }
+    var totalMB: Float { Float(totalBytes) / (1024 * 1024) }
+    let deviceBudgetMB: Float
+    var usageRatio: Float { deviceBudgetMB > 0 ? totalMB / deviceBudgetMB : 0 }
 }
 
 // MARK: - Docking Result
@@ -62,6 +144,29 @@ struct DockingResult: Identifiable, Sendable {
     var transformedAtomPositions: [SIMD3<Float>] = []
     var refinementEnergy: Float? = nil
 
+    // Druse ML scoring outputs (populated when scoring method is .druseAffinity)
+    var mlDockingScore: Float? = nil    // pKd * confidence (primary ranking value)
+    var mlPKd: Float? = nil             // predicted -log10(Kd)
+    var mlPoseConfidence: Float? = nil  // 0-1, how native-like the pose is
+
+    // Drusina extended scoring correction (populated when scoring method is .drusina)
+    var drusinaCorrection: Float = 0
+
+    // Pharmacophore constraint penalty (0 = all constraints satisfied)
+    var constraintPenalty: Float = 0
+
+    // MMFF94 ligand strain energy (docked − free, kcal/mol; nil if not computed)
+    var strainEnergy: Float? = nil
+
+    /// The display score depending on the active scoring method.
+    func displayScore(method: ScoringMethod) -> Float {
+        switch method {
+        case .vina:          return energy
+        case .drusina:       return energy  // energy already includes Drusina corrections
+        case .druseAffinity: return mlDockingScore ?? energy
+        }
+    }
+
     // Backward-compatible aliases
     var vdwEnergy: Float { stericEnergy }
     var elecEnergy: Float { hydrophobicEnergy }
@@ -72,6 +177,7 @@ struct DockPoseSwift: Sendable {
     var translation: SIMD3<Float>
     var rotation: simd_quatf
     var torsions: [Float]
+    var chiAngles: [Float] = []
 }
 
 struct PreparedDockingLigand {
@@ -142,8 +248,8 @@ struct MolecularInteraction: Identifiable, Sendable {
 
 @MainActor
 final class DockingEngine {
-    private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
+    let device: MTLDevice
+    private(set) var commandQueue: MTLCommandQueue
 
     private var stericGridPipeline: MTLComputePipelineState!
     private var hydrophobicGridPipeline: MTLComputePipelineState!
@@ -156,15 +262,23 @@ final class DockingEngine {
     private var mcPerturbPipeline: MTLComputePipelineState!
     private var metropolisAcceptPipeline: MTLComputePipelineState!
     private var explicitScorePipeline: MTLComputePipelineState!
+    private var localSearchAnalyticalPipeline: MTLComputePipelineState!
+    private var drusinaScorePipeline: MTLComputePipelineState?
+    private var drusinaCorrectionPipeline: MTLComputePipelineState?
 
-    private var stericGridBuffer: MTLBuffer?
+    /// Active local search pipeline based on config.useAnalyticalGradients.
+    private var activeLocalSearchPipeline: MTLComputePipelineState {
+        config.useAnalyticalGradients ? localSearchAnalyticalPipeline : localSearchPipeline
+    }
+
+    private(set) var stericGridBuffer: MTLBuffer?
     private var hydrophobicGridBuffer: MTLBuffer?
     private var hbondGridBuffer: MTLBuffer?
-    private var vinaAffinityGridBuffer: MTLBuffer?
+    private(set) var vinaAffinityGridBuffer: MTLBuffer?
     private var vinaTypeIndexBuffer: MTLBuffer?
     private var vinaAffinityTypeBuffer: MTLBuffer?
     private var proteinAtomBuffer: MTLBuffer?
-    private var gridParamsBuffer: MTLBuffer?
+    private(set) var gridParamsBuffer: MTLBuffer?
     private var populationBuffer: MTLBuffer?
     private var offspringBuffer: MTLBuffer?
     private var bestPopulationBuffer: MTLBuffer?
@@ -176,13 +290,38 @@ final class DockingEngine {
     private var movingIndicesBuffer: MTLBuffer?
     private var exclusionMaskBuffer: MTLBuffer?
 
+    // Drusina extended scoring buffers
+    private var proteinRingBuffer: MTLBuffer?
+    private var ligandRingBuffer: MTLBuffer?
+    private var proteinCationBuffer: MTLBuffer?
+    private var drusinaParamsBuffer: MTLBuffer?
+    private var halogenInfoBuffer: MTLBuffer?
+
+    // Pharmacophore constraint buffers
+    private var pharmaConstraintBuffer: MTLBuffer?
+    private var pharmaParamsBuffer: MTLBuffer?
+
     private(set) var isRunning = false
     private(set) var currentGeneration = 0
     private(set) var bestEnergy: Float = .infinity
+
+    /// Grid dimensions from last computeGridMaps call (for flex grid proxy)
+    private(set) var lastGridTotalPoints: Int = 0
+    private(set) var lastGridNumAffinityTypes: Int = 0
+
+    /// Optional flex docking engine for receptor flexibility (induced fit).
+    /// When set, flex scoring/evolution/local-search kernels are dispatched
+    /// alongside the standard docking loop.
+    var flexEngine: FlexDockingEngine?
     private var gridParams = GridParams()
     private var config = DockingConfig()
     /// Tracks the last allocated population buffer capacity to avoid redundant reallocation.
     private var lastPopulationBufferCapacity: Int = 0
+    /// Tracks last allocated ligand buffer capacities (in bytes) to avoid churn during batch docking.
+    private var lastLigandAtomBufferCapacity: Int = 0
+    private var lastTorsionEdgeBufferCapacity: Int = 0
+    private var lastMovingIndicesBufferCapacity: Int = 0
+    private var lastExclusionMaskBufferCapacity: Int = 0
 
     /// Diagnostics from the last completed docking run.
     private(set) var lastDiagnostics: DockingDiagnostics?
@@ -211,9 +350,16 @@ final class DockingEngine {
             initPopPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "initializePopulation")!)
             evolvePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "gaEvolve")!)
             localSearchPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearch")!)
+            localSearchAnalyticalPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearchAnalytical")!)
             mcPerturbPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "mcPerturb")!)
             metropolisAcceptPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "metropolisAccept")!)
             explicitScorePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "scorePosesExplicit")!)
+            if let drusinaFunc = library.makeFunction(name: "scorePosesDrusina") {
+                drusinaScorePipeline = try device.makeComputePipelineState(function: drusinaFunc)
+            }
+            if let drusinaCorrFunc = library.makeFunction(name: "applyDrusinaCorrection") {
+                drusinaCorrectionPipeline = try device.makeComputePipelineState(function: drusinaCorrFunc)
+            }
             if let rmsdFunction = library.makeFunction(name: "computePairwiseRMSD") {
                 pairwiseRMSDPipeline = try device.makeComputePipelineState(function: rmsdFunction)
             }
@@ -249,7 +395,12 @@ final class DockingEngine {
     /// Approximate protein XS typing in the same space Vina uses upstream.
     /// Donor/acceptor assignment leans on residue chemistry while carbon polarity
     /// uses the actual bond graph when available.
-    private func vinaProteinAtomType(for atomIndex: Int, in molecule: Molecule) -> Int32 {
+    /// Compute Vina XS types for all atoms in a protein molecule.
+    func vinaTypesForProtein(_ molecule: Molecule) -> [Int32] {
+        molecule.atoms.indices.map { vinaProteinAtomType(for: $0, in: molecule) }
+    }
+
+    func vinaProteinAtomType(for atomIndex: Int, in molecule: Molecule) -> Int32 {
         let atom = molecule.atoms[atomIndex]
         let name = atom.name.trimmingCharacters(in: .whitespaces)
         let res = atom.residueName
@@ -479,6 +630,16 @@ final class DockingEngine {
         }
     }
 
+    private func chiAngles(from pose: DockPose) -> [Float] {
+        let count = max(0, min(Int(pose.numChiAngles), 24))
+        guard count > 0 else { return [] }
+        return withUnsafePointer(to: pose.chiAngles) {
+            $0.withMemoryRebound(to: Float.self, capacity: 24) { buffer in
+                Array(UnsafeBufferPointer(start: buffer, count: count))
+            }
+        }
+    }
+
     private func makeDockPose(from result: DockingResult) -> DockPose {
         var pose = DockPose()
         pose.translation = result.pose.translation
@@ -504,7 +665,8 @@ final class DockingEngine {
         pose.hbondEnergy = result.hbondEnergy
         pose.torsionPenalty = result.torsionPenalty
         pose.clashPenalty = 0
-        pose._pad0 = 0
+        pose.drusinaCorrection = 0
+        pose.constraintPenalty = 0
         return pose
     }
 
@@ -548,14 +710,23 @@ final class DockingEngine {
         gaParamsBuffer: MTLBuffer,
         populationSize: Int
     ) {
-        let tgSize = MTLSize(width: min(max(populationSize, 1), 64), height: 1, depth: 1)
-        let tgCount = MTLSize(width: (max(populationSize, 1) + tgSize.width - 1) / tgSize.width, height: 1, depth: 1)
-        dispatchCompute(pipeline: explicitScorePipeline, buffers: [
+        // SIMD-cooperative: each SIMD group (32 threads) handles one pose, so dispatch
+        // populationSize * simdWidth total threads. Threadgroup size = 32 (one SIMD group).
+        let simdWidth = explicitScorePipeline.threadExecutionWidth
+        let totalThreads = max(populationSize, 1) * simdWidth
+        let tgSize = MTLSize(width: simdWidth, height: 1, depth: 1)
+        let tgCount = MTLSize(width: (totalThreads + tgSize.width - 1) / tgSize.width, height: 1, depth: 1)
+        var buffers: [(MTLBuffer, Int)] = [
             (buffer, 0), (ligandAtomBuffer!, 1), (proteinAtomBuffer!, 2),
             (gridParamsBuffer, 3), (gaParamsBuffer, 4),
             (torsionEdgeBuffer!, 5), (movingIndicesBuffer!, 6),
             (exclusionMaskBuffer!, 7)
-        ], threadGroups: tgCount, threadGroupSize: tgSize)
+        ]
+        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
+            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
+        }
+        dispatchCompute(pipeline: explicitScorePipeline, buffers: buffers,
+                        threadGroups: tgCount, threadGroupSize: tgSize)
     }
 
     private func localOptimizeGrid(
@@ -566,13 +737,18 @@ final class DockingEngine {
     ) {
         let tgSize = MTLSize(width: min(max(populationSize, 1), 64), height: 1, depth: 1)
         let tgCount = MTLSize(width: (max(populationSize, 1) + tgSize.width - 1) / tgSize.width, height: 1, depth: 1)
-        dispatchCompute(pipeline: localSearchPipeline, buffers: [
+        var buffers: [(MTLBuffer, Int)] = [
             (buffer, 0), (ligandAtomBuffer!, 1),
             (vinaAffinityGridBuffer!, 2), (vinaTypeIndexBuffer!, 3),
             (gridParamsBuffer, 4), (gaParamsBuffer, 5),
             (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
             (exclusionMaskBuffer!, 8)
-        ], threadGroups: tgCount, threadGroupSize: tgSize)
+        ]
+        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
+            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
+        }
+        dispatchCompute(pipeline: activeLocalSearchPipeline, buffers: buffers,
+                        threadGroups: tgCount, threadGroupSize: tgSize)
     }
 
     private func rerankClusterRepresentativesExplicit(
@@ -735,7 +911,9 @@ final class DockingEngine {
 
         // Memory guard: if the typed maps would exceed the GPU budget, coarsen spacing.
         var effectiveSpacing = spacing
-        let maxGridFloatValues: UInt64 = 24_000_000
+        // Half-precision grids use 2 bytes per value instead of 4, so we can
+        // accommodate 2x the grid points for the same memory budget (~91.5 MB → ~91.5 MB)
+        let maxGridFloatValues: UInt64 = 48_000_000
 
         // Safely compute grid dimensions — clamp to avoid overflow from inf/NaN
         func gridDim(_ length: Float, _ sp: Float) -> UInt64 {
@@ -773,24 +951,58 @@ final class DockingEngine {
             searchHalfExtent: searchHalfExtent, _pad4: 0
         )
 
+        ActivityLog.shared.info(
+            "[Engine] Grid: dims=\(nx)×\(ny)×\(nz) (\(totalPoints) points), spacing=\(String(format: "%.3f", effectiveSpacing)) Å, " +
+            "\(activeVinaTypes.count) affinity types, \(gpuAtoms.count) protein atoms, " +
+            "box=(\(String(format: "%.1f,%.1f,%.1f", boxMin.x, boxMin.y, boxMin.z)))→(\(String(format: "%.1f,%.1f,%.1f", boxMax.x, boxMax.y, boxMax.z)))",
+            category: .dock
+        )
+
+        // Pre-flight VRAM check
+        lastGridTotalPoints = Int(totalPoints)
+        lastGridNumAffinityTypes = activeVinaTypes.count
+
+        let vramEstimate = estimateVRAMUsage(
+            gridDims: SIMD3(nx, ny, nz),
+            numAffinityTypes: activeVinaTypes.count,
+            populationSize: 300, // default; actual popSize set later in runDocking
+            numLigandAtoms: 50,  // reasonable upper bound for estimation
+            numTorsions: 10,
+            numProteinAtoms: gpuAtoms.count
+        )
+        if vramEstimate.usageRatio > 0.85 {
+            print("[DockingEngine] WARNING: Estimated VRAM usage \(String(format: "%.0f", vramEstimate.totalMB))MB / \(String(format: "%.0f", vramEstimate.deviceBudgetMB))MB (\(String(format: "%.0f%%", vramEstimate.usageRatio * 100))) — coarsening grid spacing")
+            // Already handled by adaptive spacing above, but log the warning
+        }
+
         var proteinGPUAtoms = gpuAtoms
         proteinAtomBuffer = device.makeBuffer(bytes: &proteinGPUAtoms, length: proteinGPUAtoms.count * MemoryLayout<GridProteinAtom>.stride, options: .storageModeShared)
         gridParamsBuffer = device.makeBuffer(bytes: &gridParams, length: MemoryLayout<GridParams>.stride, options: .storageModeShared)
 
-        let gridByteSize = Int(totalPoints) * MemoryLayout<Float>.stride
+        // Grid maps use half-precision (Float16) on GPU for 2x bandwidth
+        let gridByteSize = Int(totalPoints) * MemoryLayout<UInt16>.stride   // half = 2 bytes
         stericGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
         hydrophobicGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
         hbondGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
+
+        if stericGridBuffer == nil || hydrophobicGridBuffer == nil || hbondGridBuffer == nil {
+            ActivityLog.shared.error("[Engine] Grid buffer allocation failed: \(gridByteSize) bytes per map (\(totalPoints) points)", category: .dock)
+            return
+        }
 
         if activeVinaTypes.isEmpty {
             vinaAffinityGridBuffer = nil
             vinaTypeIndexBuffer = nil
             vinaAffinityTypeBuffer = nil
         } else {
+            let affinityGridSize = gridByteSize * activeVinaTypes.count
             vinaAffinityGridBuffer = device.makeBuffer(
-                length: gridByteSize * activeVinaTypes.count,
+                length: affinityGridSize,
                 options: .storageModeShared
             )
+            if vinaAffinityGridBuffer == nil {
+                ActivityLog.shared.error("[Engine] Affinity grid allocation failed: \(affinityGridSize) bytes (\(activeVinaTypes.count) types × \(totalPoints) points)", category: .dock)
+            }
 
             var typeLookup = [Int32](repeating: -1, count: 32)
             for (slot, type) in activeVinaTypes.enumerated() where Int(type) < typeLookup.count {
@@ -813,45 +1025,61 @@ final class DockingEngine {
         let tgSize = MTLSize(width: gridThreads, height: 1, depth: 1)
         let tgCount = MTLSize(width: (Int(totalPoints) + gridThreads - 1) / gridThreads, height: 1, depth: 1)
 
-        guard let cmdBuf = commandQueue.makeCommandBuffer(),
-              let enc = cmdBuf.makeComputeCommandEncoder() else { return }
-
         guard let stericBuf = stericGridBuffer,
               let hydroBuf = hydrophobicGridBuffer,
               let hbondBuf = hbondGridBuffer,
               let stericPipe = stericGridPipeline,
               let hydroPipe = hydrophobicGridPipeline,
-              let hbondPipe = hbondGridPipeline else { return }
+              let hbondPipe = hbondGridPipeline,
+              let protAtomBuf = proteinAtomBuffer,
+              let gParamsBuf = gridParamsBuffer else { return }
 
-        for (pipeline, gridBuf) in [(stericPipe, stericBuf),
-                                     (hydroPipe, hydroBuf),
-                                     (hbondPipe, hbondBuf)] {
+        // Dispatch each grid kernel in its own command buffer to avoid GPU timeouts
+        // on large proteins (>3000 atoms × >1M grid points can exceed Metal's ~5s limit)
+        func dispatchGridKernel(_ pipeline: MTLComputePipelineState, _ gridBuf: MTLBuffer,
+                                threadGroups tg: MTLSize, label: String) {
+            guard let cb = commandQueue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
             enc.setComputePipelineState(pipeline)
             enc.setBuffer(gridBuf, offset: 0, index: 0)
-            enc.setBuffer(proteinAtomBuffer, offset: 0, index: 1)
-            enc.setBuffer(gridParamsBuffer, offset: 0, index: 2)
-            enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+            enc.setBuffer(protAtomBuf, offset: 0, index: 1)
+            enc.setBuffer(gParamsBuf, offset: 0, index: 2)
+            enc.dispatchThreadgroups(tg, threadsPerThreadgroup: tgSize)
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            if cb.status == .error {
+                ActivityLog.shared.error("[Engine] Grid \(label) GPU error: \(cb.error?.localizedDescription ?? "unknown")", category: .dock)
+            }
         }
 
+        dispatchGridKernel(stericPipe, stericBuf, threadGroups: tgCount, label: "steric")
+        dispatchGridKernel(hydroPipe, hydroBuf, threadGroups: tgCount, label: "hydrophobic")
+        dispatchGridKernel(hbondPipe, hbondBuf, threadGroups: tgCount, label: "hbond")
+
+        // Affinity maps: one command buffer per dispatch (separate from basic grids)
         if let affinityBuf = vinaAffinityGridBuffer,
            let affinityTypes = vinaAffinityTypeBuffer {
             let affinityEntryCount = Int(totalPoints) * activeVinaTypes.count
             let affinityTGCount = MTLSize(
                 width: (affinityEntryCount + gridThreads - 1) / gridThreads,
-                height: 1,
-                depth: 1
+                height: 1, depth: 1
             )
+            guard let cb = commandQueue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
             enc.setComputePipelineState(vinaAffinityGridPipeline)
             enc.setBuffer(affinityBuf, offset: 0, index: 0)
-            enc.setBuffer(proteinAtomBuffer, offset: 0, index: 1)
-            enc.setBuffer(gridParamsBuffer, offset: 0, index: 2)
+            enc.setBuffer(protAtomBuf, offset: 0, index: 1)
+            enc.setBuffer(gParamsBuf, offset: 0, index: 2)
             enc.setBuffer(affinityTypes, offset: 0, index: 3)
             enc.dispatchThreadgroups(affinityTGCount, threadsPerThreadgroup: tgSize)
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            if cb.status == .error {
+                ActivityLog.shared.error("[Engine] Affinity grid GPU error: \(cb.error?.localizedDescription ?? "unknown")", category: .dock)
+            }
         }
-
-        enc.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
     }
 
     func gridSnapshot() -> DockingGridSnapshot? {
@@ -896,7 +1124,8 @@ final class DockingEngine {
                 vinaType: allVinaTypes.indices.contains(entry.offset)
                     ? allVinaTypes[entry.offset]
                     : fallbackLigandVinaAtomType(for: entry.offset, in: chargedLigand),
-                _pad0: 0, _pad1: 0, _pad2: 0
+                formalCharge: Int32(atom.formalCharge),
+                _pad1: 0, _pad2: 0
             )
         }
 
@@ -908,18 +1137,206 @@ final class DockingEngine {
         )
     }
 
-    /// Debug: read back grid map statistics
+    // MARK: - Drusina Buffer Preparation
+
+    /// Prepare GPU buffers for Drusina extended scoring (protein rings, cations, ligand rings, halogens).
+    private func prepareDrusinaBuffers(
+        ligandAtoms: [Atom],
+        ligandBonds: [Bond],
+        gpuLigAtoms: [DockLigandAtom],
+        centroid: SIMD3<Float>
+    ) {
+        // --- Protein aromatic rings ---
+        let protRings = InteractionDetector.detectAromaticRings(atoms: proteinAtoms)
+        var protRingGPU: [ProteinRingGPU] = protRings.map { ring in
+            ProteinRingGPU(centroid: ring.centroid, _pad0: 0, normal: ring.normal, _pad1: 0)
+        }
+        if protRingGPU.isEmpty {
+            protRingGPU.append(ProteinRingGPU(centroid: .zero, _pad0: 0, normal: .init(0,1,0), _pad1: 0))
+        }
+        proteinRingBuffer = device.makeBuffer(
+            bytes: &protRingGPU,
+            length: protRingGPU.count * MemoryLayout<ProteinRingGPU>.stride,
+            options: .storageModeShared)
+
+        // --- Ligand aromatic rings (atom indices, centroid/normal computed on GPU from transformed positions) ---
+        let ligRings = InteractionDetector.detectAromaticRings(
+            atoms: ligandAtoms, bonds: ligandBonds)
+        var ligRingGPU: [LigandRingGPU] = ligRings.map { ring in
+            var indices: (Int32, Int32, Int32, Int32, Int32, Int32) = (-1, -1, -1, -1, -1, -1)
+            let idxArray = ring.atomIndices.prefix(6).map { Int32($0) }
+            if idxArray.count > 0 { indices.0 = idxArray[0] }
+            if idxArray.count > 1 { indices.1 = idxArray[1] }
+            if idxArray.count > 2 { indices.2 = idxArray[2] }
+            if idxArray.count > 3 { indices.3 = idxArray[3] }
+            if idxArray.count > 4 { indices.4 = idxArray[4] }
+            if idxArray.count > 5 { indices.5 = idxArray[5] }
+            return LigandRingGPU(
+                atomIndices: indices,
+                numAtoms: Int32(min(ring.atomIndices.count, 6)),
+                _pad: 0)
+        }
+        if ligRingGPU.isEmpty {
+            ligRingGPU.append(LigandRingGPU(atomIndices: (-1,-1,-1,-1,-1,-1), numAtoms: 0, _pad: 0))
+        }
+        ligandRingBuffer = device.makeBuffer(
+            bytes: &ligRingGPU,
+            length: ligRingGPU.count * MemoryLayout<LigandRingGPU>.stride,
+            options: .storageModeShared)
+
+        // --- Protein cations (LYS NZ, ARG NH1/NH2/CZ, metals, any +charge) ---
+        let cationNames: Set<String> = ["NZ", "NH1", "NH2"]
+        var cations: [SIMD4<Float>] = []
+        for atom in proteinAtoms {
+            let name = atom.name.trimmingCharacters(in: .whitespaces)
+            let isCation = cationNames.contains(name) || atom.formalCharge > 0 ||
+                [Element.Zn, .Fe, .Mg, .Ca, .Mn, .Cu, .Co, .Ni].contains(atom.element)
+            if isCation {
+                cations.append(SIMD4(atom.position, Float(atom.formalCharge)))
+            }
+        }
+        if cations.isEmpty {
+            cations.append(.zero)
+        }
+        proteinCationBuffer = device.makeBuffer(
+            bytes: &cations,
+            length: cations.count * MemoryLayout<SIMD4<Float>>.stride,
+            options: .storageModeShared)
+
+        // --- Halogen bond info (ligand halogen → bonded carbon mapping) ---
+        var halogens: [HalogenBondInfo] = []
+        for (i, gpuAtom) in gpuLigAtoms.enumerated() {
+            let vt = gpuAtom.vinaType
+            let isHalogen = (vt == Int32(VINA_F_H.rawValue) || vt == Int32(VINA_Cl_H.rawValue) ||
+                             vt == Int32(VINA_Br_H.rawValue) || vt == Int32(VINA_I_H.rawValue))
+            guard isHalogen else { continue }
+            // Find bonded carbon
+            for bond in ligandBonds {
+                let partner: Int?
+                if bond.atomIndex1 == i { partner = bond.atomIndex2 }
+                else if bond.atomIndex2 == i { partner = bond.atomIndex1 }
+                else { partner = nil }
+                if let p = partner, p < ligandAtoms.count, ligandAtoms[p].element == .C {
+                    halogens.append(HalogenBondInfo(halogenAtomIndex: Int32(i), carbonAtomIndex: Int32(p)))
+                    break
+                }
+            }
+        }
+        if halogens.isEmpty {
+            halogens.append(HalogenBondInfo(halogenAtomIndex: -1, carbonAtomIndex: -1))
+        }
+        halogenInfoBuffer = device.makeBuffer(
+            bytes: &halogens,
+            length: halogens.count * MemoryLayout<HalogenBondInfo>.stride,
+            options: .storageModeShared)
+
+        // --- Drusina parameters ---
+        var params = DrusinaParams(
+            numProteinRings: UInt32(protRings.count),
+            numLigandRings: UInt32(ligRings.count),
+            numProteinCations: UInt32(max(cations.count - (cations.first == .zero ? 1 : 0), 0)),
+            numHalogens: UInt32(halogens.first?.halogenAtomIndex == -1 ? 0 : halogens.count),
+            wPiPi: -0.40,
+            wPiCation: -0.80,
+            wHalogenBond: -0.50,
+            wMetalCoord: -1.00)
+        drusinaParamsBuffer = device.makeBuffer(
+            bytes: &params,
+            length: MemoryLayout<DrusinaParams>.stride,
+            options: .storageModeShared)
+    }
+
+    // MARK: - Pharmacophore Constraint Buffers
+
+    /// Prepare GPU buffers for pharmacophore constraints.
+    /// Always creates buffers (zero-constraint PharmacophoreParams causes early return on GPU).
+    func prepareConstraintBuffers(_ constraints: [PharmacophoreConstraintDef],
+                                   atoms: [Atom], residues: [Residue]) {
+        let (gpuConstraints, params) = PharmacophoreConstraintDef.toGPUBuffers(
+            constraints: constraints, atoms: atoms, residues: residues
+        )
+
+        if gpuConstraints.isEmpty {
+            // Zero-constraint case: still need valid buffers for Metal
+            var emptyConstraint = PharmacophoreConstraint()
+            pharmaConstraintBuffer = device.makeBuffer(
+                bytes: &emptyConstraint,
+                length: MemoryLayout<PharmacophoreConstraint>.stride,
+                options: .storageModeShared)
+        } else {
+            var mutableConstraints = gpuConstraints
+            pharmaConstraintBuffer = device.makeBuffer(
+                bytes: &mutableConstraints,
+                length: MemoryLayout<PharmacophoreConstraint>.stride * gpuConstraints.count,
+                options: .storageModeShared)
+        }
+
+        var mutableParams = params
+        pharmaParamsBuffer = device.makeBuffer(
+            bytes: &mutableParams,
+            length: MemoryLayout<PharmacophoreParams>.stride,
+            options: .storageModeShared)
+    }
+
+    /// Device VRAM budget in MB (recommended max working set).
+    var deviceVRAMBudgetMB: Float {
+        Float(device.recommendedMaxWorkingSetSize) / (1024 * 1024)
+    }
+
+    /// Estimate total VRAM usage for a docking run with the given parameters.
+    func estimateVRAMUsage(
+        gridDims: SIMD3<UInt32>,
+        numAffinityTypes: Int,
+        populationSize: Int,
+        numLigandAtoms: Int,
+        numTorsions: Int,
+        numProteinAtoms: Int
+    ) -> VRAMEstimate {
+        let totalPoints = Int(UInt64(gridDims.x) * UInt64(gridDims.y) * UInt64(gridDims.z))
+        let gridMapCount = 3 + numAffinityTypes
+        let gridBytes = totalPoints * MemoryLayout<UInt16>.stride * gridMapCount  // half-precision grids
+
+        // 3 population buffers (current, offspring, best) + 3 ring buffers for GAParams
+        let poseStride = 304 // DockPose stride (from ShaderTypes.h)
+        let gaParamsStride = 192
+        let populationBytes = 3 * populationSize * poseStride + 3 * gaParamsStride
+
+        // Ligand: atoms + torsion edges + moving indices + exclusion mask
+        let ligandAtomStride = 32 // DockLigandAtom stride
+        let torsionEdgeStride = 16
+        let ligandBytes = numLigandAtoms * ligandAtomStride
+            + numTorsions * torsionEdgeStride
+            + numLigandAtoms * MemoryLayout<UInt32>.stride // moving indices (upper bound)
+            + (numLigandAtoms * numLigandAtoms + 31) / 32 * MemoryLayout<UInt32>.stride // exclusion mask bits
+
+        let proteinAtomBytes = numProteinAtoms * 32 // GridProteinAtom stride
+
+        // Type lookup + affinity type array + grid params
+        let miscBytes = 32 * MemoryLayout<Int32>.stride + numAffinityTypes * MemoryLayout<Int32>.stride
+            + MemoryLayout<GridParams>.stride
+
+        return VRAMEstimate(
+            gridBytes: gridBytes,
+            populationBytes: populationBytes,
+            ligandBytes: ligandBytes,
+            proteinAtomBytes: proteinAtomBytes,
+            miscBytes: miscBytes,
+            deviceBudgetMB: deviceVRAMBudgetMB
+        )
+    }
+
+    /// Debug: read back grid map statistics (grid maps are stored in half precision)
     func gridDiagnostics() -> String {
         var lines: [String] = []
         for (name, buf) in [("Steric", stericGridBuffer), ("Hydrophobic", hydrophobicGridBuffer),
                              ("HBond", hbondGridBuffer)] {
             guard let buf else { lines.append("  \(name): nil"); continue }
-            let count = buf.length / MemoryLayout<Float>.stride
-            let ptr = buf.contents().bindMemory(to: Float.self, capacity: count)
+            let count = buf.length / MemoryLayout<Float16>.stride
+            let ptr = buf.contents().bindMemory(to: Float16.self, capacity: count)
             var minV: Float = .infinity, maxV: Float = -.infinity, nonZero = 0
             var sum: Float = 0
             for i in 0..<count {
-                let v = ptr[i]
+                let v = Float(ptr[i])
                 if v < minV { minV = v }
                 if v > maxV { maxV = v }
                 if abs(v) > 1e-6 { nonZero += 1 }
@@ -933,8 +1350,10 @@ final class DockingEngine {
     // MARK: - Run Docking
 
     func runDocking(
-        ligand: Molecule, pocket: BindingPocket, config: DockingConfig = DockingConfig()
+        ligand: Molecule, pocket: BindingPocket, config: DockingConfig = DockingConfig(),
+        scoringMethod: ScoringMethod = .vina
     ) async -> [DockingResult] {
+        guard !isRunning else { return [] }
         self.config = config
         isRunning = true
         currentGeneration = 0
@@ -946,10 +1365,16 @@ final class DockingEngine {
         let centroid = preparedLigand.centroid
         var gpuLigAtoms = preparedLigand.gpuAtoms
 
+        ActivityLog.shared.info(
+            "[Engine] Ligand geometry: \(heavyAtoms.count) heavy atoms, \(heavyBonds.count) heavy bonds, " +
+            "\(gpuLigAtoms.count) GPU atoms, centroid=(\(String(format: "%.2f, %.2f, %.2f", centroid.x, centroid.y, centroid.z)))",
+            category: .dock
+        )
+
         // Metal shaders use fixed-size stack arrays of 128 atoms; reject oversized ligands
         // to prevent silent truncation and exclusion mask index out-of-bounds
         guard gpuLigAtoms.count <= 128 else {
-            print("⚠️ Ligand has \(gpuLigAtoms.count) heavy atoms, exceeding the 128-atom GPU limit")
+            ActivityLog.shared.error("[Engine] Ligand has \(gpuLigAtoms.count) heavy atoms, exceeding the 128-atom GPU limit", category: .dock)
             isRunning = false
             return []
         }
@@ -977,7 +1402,14 @@ final class DockingEngine {
             )
         }
 
-        ligandAtomBuffer = device.makeBuffer(bytes: &gpuLigAtoms, length: gpuLigAtoms.count * MemoryLayout<DockLigandAtom>.stride, options: .storageModeShared)
+        // Reuse ligand atom buffer if large enough, otherwise reallocate
+        let ligAtomSize = gpuLigAtoms.count * MemoryLayout<DockLigandAtom>.stride
+        if ligAtomSize > lastLigandAtomBufferCapacity {
+            ligandAtomBuffer = device.makeBuffer(bytes: &gpuLigAtoms, length: ligAtomSize, options: .storageModeShared)
+            lastLigandAtomBufferCapacity = ligAtomSize
+        } else {
+            ligandAtomBuffer?.contents().copyMemory(from: &gpuLigAtoms, byteCount: ligAtomSize)
+        }
 
         var torsionEdges: [TorsionEdge] = []
         var movingIndices: [Int32] = []
@@ -999,8 +1431,20 @@ final class DockingEngine {
         if movingIndices.isEmpty {
             movingIndices.append(0)
         }
-        torsionEdgeBuffer = device.makeBuffer(bytes: &torsionEdges, length: torsionEdges.count * MemoryLayout<TorsionEdge>.stride, options: .storageModeShared)
-        movingIndicesBuffer = device.makeBuffer(bytes: &movingIndices, length: movingIndices.count * MemoryLayout<Int32>.stride, options: .storageModeShared)
+        let torsionSize = torsionEdges.count * MemoryLayout<TorsionEdge>.stride
+        if torsionSize > lastTorsionEdgeBufferCapacity {
+            torsionEdgeBuffer = device.makeBuffer(bytes: &torsionEdges, length: torsionSize, options: .storageModeShared)
+            lastTorsionEdgeBufferCapacity = torsionSize
+        } else {
+            torsionEdgeBuffer?.contents().copyMemory(from: &torsionEdges, byteCount: torsionSize)
+        }
+        let movingSize = movingIndices.count * MemoryLayout<Int32>.stride
+        if movingSize > lastMovingIndicesBufferCapacity {
+            movingIndicesBuffer = device.makeBuffer(bytes: &movingIndices, length: movingSize, options: .storageModeShared)
+            lastMovingIndicesBufferCapacity = movingSize
+        } else {
+            movingIndicesBuffer?.contents().copyMemory(from: &movingIndices, byteCount: movingSize)
+        }
 
         // Build exclusion mask for intramolecular clash detection.
         // Marks 1-2 (bonded) and 1-3 (angle) pairs to skip during clash evaluation.
@@ -1031,16 +1475,35 @@ final class DockingEngine {
             }
         }
 
-        exclusionMaskBuffer = device.makeBuffer(
-            bytes: &mask,
-            length: mask.count * MemoryLayout<UInt32>.stride,
-            options: .storageModeShared
-        )
+        let maskSize = mask.count * MemoryLayout<UInt32>.stride
+        if maskSize > lastExclusionMaskBufferCapacity {
+            exclusionMaskBuffer = device.makeBuffer(bytes: &mask, length: maskSize, options: .storageModeShared)
+            lastExclusionMaskBufferCapacity = maskSize
+        } else {
+            // Mask is fixed-size (128x128 bitmask) but contents differ per ligand — must overwrite
+            exclusionMaskBuffer?.contents().copyMemory(from: &mask, byteCount: maskSize)
+        }
         let referenceIntraEnergy = intramolecularReferenceEnergy(
             ligandAtoms: gpuLigAtoms,
             exclusionMask: mask,
             maxAtoms: maxAtoms
         )
+
+        ActivityLog.shared.info(
+            "[Engine] Torsion tree: \(numTorsions) rotatable bonds, \(movingIndices.count) moving atom indices, refIntraE=\(String(format: "%.3f", referenceIntraEnergy))",
+            category: .dock
+        )
+
+        // Prepare Drusina buffers if using extended scoring
+        let useDrusina = scoringMethod == .drusina && drusinaScorePipeline != nil
+        if useDrusina {
+            prepareDrusinaBuffers(
+                ligandAtoms: heavyAtoms,
+                ligandBonds: heavyBonds,
+                gpuLigAtoms: gpuLigAtoms,
+                centroid: centroid)
+        }
+        ActivityLog.shared.info("[Engine] Scoring method: \(scoringMethod.rawValue), Drusina: \(useDrusina)", category: .dock)
 
         let popSize = config.populationSize
         let poseSize = popSize * MemoryLayout<DockPose>.stride
@@ -1083,6 +1546,35 @@ final class DockingEngine {
             gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
         }
 
+        // Buffer validation logging
+        ActivityLog.shared.info(
+            "[Engine] GA: pop=\(popSize), torsions=\(gaParams.numTorsions), " +
+            "ligAtoms=\(gaParams.numLigandAtoms), lsSteps=\(gaParams.localSearchSteps), " +
+            "T=\(String(format: "%.3f", gaParams.mcTemperature)), flex=\(config.enableFlexibility)",
+            category: .dock
+        )
+        ActivityLog.shared.info(
+            "[Engine] GPU dispatch: tgSize=\(tgSize.width), tgCount=\(tgCount.width), poseStride=\(MemoryLayout<DockPose>.stride) bytes",
+            category: .dock
+        )
+        ActivityLog.shared.info(
+            "[Engine] Buffers: pop=\(populationBuffer != nil), offspring=\(offspringBuffer != nil), " +
+            "best=\(bestPopulationBuffer != nil), ligAtom=\(ligandAtomBuffer != nil), " +
+            "grid=\(vinaAffinityGridBuffer != nil), gridParams=\(gridParamsBuffer != nil), " +
+            "torsion=\(torsionEdgeBuffer != nil), moving=\(movingIndicesBuffer != nil), " +
+            "exclusion=\(exclusionMaskBuffer != nil), gaParams=\(gaParamsBuffer != nil)",
+            category: .dock
+        )
+        if let flexEng = flexEngine, flexEng.isEnabled {
+            ActivityLog.shared.info(
+                "[Engine] Flex: atoms=\(flexEng.numFlexAtoms), torsions=\(flexEng.numFlexTorsions), " +
+                "chiSlots=\(flexEng.numChiSlots), buffers=(atom=\(flexEng.flexAtomBuffer != nil), " +
+                "edge=\(flexEng.flexTorsionEdgeBuffer != nil), moving=\(flexEng.flexMovingIndicesBuffer != nil), " +
+                "params=\(flexEng.flexParamsBuffer != nil))",
+                category: .dock
+            )
+        }
+
         let totalRuns = max(config.numRuns, 1)
         var aggregatedResults: [DockingResult] = []
         let localSearchFrequency = max(config.localSearchFrequency, 1)
@@ -1102,15 +1594,39 @@ final class DockingEngine {
             onGenerationComplete?(generation, bestEnergy)
         }
 
+        // Validate all critical buffers before entering the GA loop
+        guard let popBuf = populationBuffer,
+              let offBuf = offspringBuffer,
+              let bestBuf = bestPopulationBuffer,
+              let ligBuf = ligandAtomBuffer,
+              let affinityBuf = vinaAffinityGridBuffer,
+              let typeIdxBuf = vinaTypeIndexBuffer,
+              let gpBuf = gridParamsBuffer,
+              let teBuf = torsionEdgeBuffer,
+              let miBuf = movingIndicesBuffer,
+              let emBuf = exclusionMaskBuffer,
+              let gaBuf = gaParamsBuffer
+        else {
+            ActivityLog.shared.error("[Engine] Critical buffer nil — cannot start GA. pop=\(populationBuffer != nil) grid=\(gridParamsBuffer != nil) affinity=\(vinaAffinityGridBuffer != nil) typeIdx=\(vinaTypeIndexBuffer != nil) ligand=\(ligandAtomBuffer != nil) torsion=\(torsionEdgeBuffer != nil) moving=\(movingIndicesBuffer != nil) exclusion=\(exclusionMaskBuffer != nil) ga=\(gaParamsBuffer != nil)", category: .dock)
+            isRunning = false
+            return []
+        }
+
         runLoop: for runIndex in 0..<totalRuns {
             guard isRunning else { break }
 
+            // Pipeline init → local search → score into a single async sequence,
+            // syncing only once before the main generation loop starts.
             dispatchCompute(pipeline: initPopPipeline, buffers: [
-                (populationBuffer!, 0), (gridParamsBuffer!, 1), (gaParamsBuffer!, 2)
+                (popBuf, 0), (gpBuf, 1), (gaBuf, 2)
             ], threadGroups: tgCount, threadGroupSize: tgSize)
-            localOptimize(buffer: populationBuffer!, tg: tgCount, tgs: tgSize)
-            scorePopulation(buffer: populationBuffer!, tg: tgCount, tgs: tgSize)
-            copyPoseBuffer(from: populationBuffer!, to: bestPopulationBuffer!, poseCount: popSize)
+            localOptimize(buffer: popBuf, tg: tgCount, tgs: tgSize)
+            if useDrusina {
+                scoreDrusina(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
+            } else {
+                scorePopulation(buffer: popBuf, tg: tgCount, tgs: tgSize)
+            }
+            copyPoseBuffer(from: popBuf, to: bestBuf, poseCount: popSize)
 
             let generationBase = runIndex * config.generationsPerRun
 
@@ -1120,9 +1636,12 @@ final class DockingEngine {
 
             for step in 0..<config.generationsPerRun {
                 guard isRunning else {
-                    if let buf = lastCmdBuf { await buf.completed() }
+                    if let buf = lastCmdBuf {
+                        await buf.completed()
+                        lastCmdBuf = nil
+                    }
                     aggregatedResults.append(contentsOf: extractAllResults(
-                        from: bestPopulationBuffer,
+                        from: bestBuf,
                         ligandAtoms: heavyAtoms,
                         centroid: centroid,
                         idOffset: aggregatedResults.count
@@ -1154,37 +1673,89 @@ final class DockingEngine {
                 ringBuf.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
 
                 let perturbBuffers: [(MTLBuffer, Int)] = [
-                    (offspringBuffer!, 0), (populationBuffer!, 1),
-                    (ringBuf, 2), (gridParamsBuffer!, 3)
+                    (offBuf, 0), (popBuf, 1),
+                    (ringBuf, 2), (gpBuf, 3)
                 ]
-                let scoreBuffers: [(MTLBuffer, Int)] = [
-                    (offspringBuffer!, 0), (ligandAtomBuffer!, 1),
-                    (vinaAffinityGridBuffer!, 2), (vinaTypeIndexBuffer!, 3),
-                    (gridParamsBuffer!, 4), (ringBuf, 5),
-                    (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
-                    (exclusionMaskBuffer!, 8)
+                var vinaScoreBuffers: [(MTLBuffer, Int)] = [
+                    (offBuf, 0), (ligBuf, 1),
+                    (affinityBuf, 2), (typeIdxBuf, 3),
+                    (gpBuf, 4), (ringBuf, 5),
+                    (teBuf, 6), (miBuf, 7),
+                    (emBuf, 8)
                 ]
+                // Append pharmacophore constraint buffers at indices 15-16
+                if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
+                    vinaScoreBuffers.append(contentsOf: [
+                        (pcBuf, 15), (ppBuf, 16)
+                    ])
+                }
                 let acceptBuffers: [(MTLBuffer, Int)] = [
-                    (populationBuffer!, 0), (offspringBuffer!, 1),
-                    (bestPopulationBuffer!, 2), (ringBuf, 3)
+                    (popBuf, 0), (offBuf, 1),
+                    (bestBuf, 2), (ringBuf, 3)
                 ]
+                // Build dispatch sequence: perturb → [chi evolve] → local search → score → [flex score] → [flex LS] → accept
+                // Flex dispatches must happen BEFORE metropolisAccept so the GA sees the full energy.
                 var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
                     (pipeline: mcPerturbPipeline, buffers: perturbBuffers)
                 ]
                 if step % localSearchFrequency == 0 {
-                    dispatches.append((pipeline: localSearchPipeline, buffers: scoreBuffers))
+                    dispatches.append((pipeline: activeLocalSearchPipeline, buffers: vinaScoreBuffers))
                 }
-                dispatches.append((pipeline: scorePipeline, buffers: scoreBuffers))
-                dispatches.append((pipeline: metropolisAcceptPipeline, buffers: acceptBuffers))
-                lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
+                if useDrusina, let drusinaPipe = drusinaScorePipeline {
+                    // Drusina: grid Vina + π-π, π-cation, halogen, metal corrections
+                    var drusinaBuffers = vinaScoreBuffers
+                    drusinaBuffers.append(contentsOf: [
+                        (proteinRingBuffer!, 9), (ligandRingBuffer!, 10),
+                        (proteinCationBuffer!, 11), (drusinaParamsBuffer!, 12),
+                        (proteinAtomBuffer!, 13), (halogenInfoBuffer!, 14)
+                    ])
+                    dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
+                } else {
+                    dispatches.append((pipeline: scorePipeline, buffers: vinaScoreBuffers))
+                }
+                // Flex scoring BEFORE accept so GA sees the complete energy landscape.
+                // Include metropolis accept in the same batch to avoid a GPU sync per generation.
+                if let fe = flexEngine, fe.isEnabled {
+                    // Flex dispatches need their own command buffers (different pipeline/buffer sets).
+                    // Batch the main dispatches first, then flex, then accept — all async.
+                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
+                    fe.dispatchChiEvolution(
+                        offspringBuffer: offBuf, populationBuffer: popBuf,
+                        gaParamsBuffer: ringBuf, populationSize: popSize
+                    )
+                    fe.dispatchFlexScoring(
+                        populationBuffer: offBuf, ligandAtomBuffer: ligBuf,
+                        gaParamsBuffer: ringBuf, torsionEdgeBuffer: teBuf,
+                        movingIndicesBuffer: miBuf, populationSize: popSize
+                    )
+                    if step % localSearchFrequency == 0 {
+                        fe.dispatchFlexLocalSearch(
+                            populationBuffer: offBuf, ligandAtomBuffer: ligBuf,
+                            gaParamsBuffer: ringBuf, torsionEdgeBuffer: teBuf,
+                            movingIndicesBuffer: miBuf, affinityGridBuffer: affinityBuf,
+                            typeIndexBuffer: typeIdxBuf, gridParamsBuffer: gpBuf,
+                            exclusionMaskBuffer: emBuf, populationSize: popSize
+                        )
+                    }
+                    // Accept after flex scoring — still needs its own sync since flex used separate CBs
+                    lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
+                                                       threadGroups: tgCount, threadGroupSize: tgSize)
+                } else {
+                    // No flex: append accept to the same batch as perturb+score → single command buffer
+                    dispatches.append((pipeline: metropolisAcceptPipeline, buffers: acceptBuffers))
+                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
+                }
 
-                // Update more frequently during exploration phase for smoother visualization
-                // of ligand moving through the binding site, less during refinement
+                // Sync with GPU only at live update boundaries — not every generation.
+                // This lets the GPU pipeline multiple generations without CPU round-trips.
                 let updateFreq = step < explorationCutoff
-                    ? max(liveUpdateFrequency / 2, 1)  // 2x more frequent during exploration
+                    ? max(liveUpdateFrequency * 2 / 3, 1)
                     : liveUpdateFrequency
                 if step % updateFreq == 0 || step == config.generationsPerRun - 1 {
-                    if let buf = lastCmdBuf { await buf.completed() }
+                    if let buf = lastCmdBuf {
+                        await buf.completed()
+                        lastCmdBuf = nil
+                    }
                     emitLiveUpdate(generation: globalGeneration)
                 }
 
@@ -1192,7 +1763,10 @@ final class DockingEngine {
             }
 
             // Ensure all GPU work completes before reading results
-            if let buf = lastCmdBuf { await buf.completed() }
+            if let buf = lastCmdBuf {
+                await buf.completed()
+                lastCmdBuf = nil
+            }
 
             aggregatedResults.append(contentsOf: extractAllResults(
                 from: bestPopulationBuffer,
@@ -1202,7 +1776,7 @@ final class DockingEngine {
             ))
         }
 
-        let clustered = clusterPoses(aggregatedResults)
+        let clustered = await clusterPoses(aggregatedResults)
         let reranked = rerankClusterRepresentativesExplicit(
             clustered,
             ligandAtoms: heavyAtoms,
@@ -1330,7 +1904,8 @@ final class DockingEngine {
         pose.hbondEnergy = 0
         pose.torsionPenalty = 0
         pose.clashPenalty = 0
-        pose._pad0 = 0
+        pose.drusinaCorrection = 0
+        pose.constraintPenalty = 0
 
         populationBuffer = device.makeBuffer(
             bytes: &pose,
@@ -1377,22 +1952,50 @@ final class DockingEngine {
     // MARK: - GPU Helpers
 
     private func localOptimize(buffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
-        dispatchCompute(pipeline: localSearchPipeline, buffers: [
+        var buffers: [(MTLBuffer, Int)] = [
             (buffer, 0), (ligandAtomBuffer!, 1),
             (vinaAffinityGridBuffer!, 2), (vinaTypeIndexBuffer!, 3),
             (gridParamsBuffer!, 4), (gaParamsBuffer!, 5),
             (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
             (exclusionMaskBuffer!, 8)
-        ], threadGroups: tg, threadGroupSize: tgs)
+        ]
+        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
+            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
+        }
+        dispatchCompute(pipeline: activeLocalSearchPipeline, buffers: buffers,
+                        threadGroups: tg, threadGroupSize: tgs)
     }
 
     private func scorePopulation(buffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
-        dispatchCompute(pipeline: scorePipeline, buffers: [
+        var buffers: [(MTLBuffer, Int)] = [
             (buffer, 0), (ligandAtomBuffer!, 1),
             (vinaAffinityGridBuffer!, 2), (vinaTypeIndexBuffer!, 3),
             (gridParamsBuffer!, 4), (gaParamsBuffer!, 5),
             (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
             (exclusionMaskBuffer!, 8)
+        ]
+        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
+            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
+        }
+        dispatchCompute(pipeline: scorePipeline, buffers: buffers,
+                        threadGroups: tg, threadGroupSize: tgs)
+    }
+
+    private func scoreDrusina(buffer: MTLBuffer, gaParamsBuffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
+        guard let pipe = drusinaScorePipeline,
+              let prBuf = proteinRingBuffer, let lrBuf = ligandRingBuffer,
+              let pcBuf = proteinCationBuffer, let dpBuf = drusinaParamsBuffer,
+              let paBuf = proteinAtomBuffer, let hiBuf = halogenInfoBuffer else {
+            scorePopulation(buffer: buffer, tg: tg, tgs: tgs)
+            return
+        }
+        dispatchCompute(pipeline: pipe, buffers: [
+            (buffer, 0), (ligandAtomBuffer!, 1),
+            (vinaAffinityGridBuffer!, 2), (vinaTypeIndexBuffer!, 3),
+            (gridParamsBuffer!, 4), (gaParamsBuffer, 5),
+            (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
+            (exclusionMaskBuffer!, 8),
+            (prBuf, 9), (lrBuf, 10), (pcBuf, 11), (dpBuf, 12), (paBuf, 13), (hiBuf, 14)
         ], threadGroups: tg, threadGroupSize: tgs)
     }
 
@@ -1401,7 +2004,13 @@ final class DockingEngine {
         buffers: [(MTLBuffer, Int)],
         threadGroups: MTLSize, threadGroupSize: MTLSize
     ) {
-        guard isRunning else { return }  // Don't dispatch if stopped
+        guard isRunning else { return }
+        guard threadGroups.width > 0, threadGroups.height > 0, threadGroups.depth > 0,
+              threadGroupSize.width > 0, threadGroupSize.height > 0, threadGroupSize.depth > 0
+        else {
+            ActivityLog.shared.warn("[Engine] Skipped dispatch: zero threadGroups=\(threadGroups.width)×\(threadGroups.height)×\(threadGroups.depth) or threadGroupSize=\(threadGroupSize.width)×\(threadGroupSize.height)×\(threadGroupSize.depth)", category: .dock)
+            return
+        }
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pipeline)
@@ -1410,12 +2019,40 @@ final class DockingEngine {
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        if cmdBuf.status == .error {
+            let err = cmdBuf.error?.localizedDescription ?? "unknown"
+            ActivityLog.shared.error("[Engine] GPU command buffer error: \(err)", category: .dock)
+            isRunning = false
+        }
+    }
+
+    /// Async single-dispatch — commits work without blocking CPU.
+    /// Returns the command buffer so callers can await completion only when needed.
+    @discardableResult
+    private func dispatchComputeAsync(
+        pipeline: MTLComputePipelineState,
+        buffers: [(MTLBuffer, Int)],
+        threadGroups: MTLSize, threadGroupSize: MTLSize
+    ) -> MTLCommandBuffer? {
+        guard isRunning else { return nil }
+        guard threadGroups.width > 0, threadGroups.height > 0, threadGroups.depth > 0,
+              threadGroupSize.width > 0, threadGroupSize.height > 0, threadGroupSize.depth > 0
+        else { return nil }
+        guard let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder() else { return nil }
+        enc.setComputePipelineState(pipeline)
+        for (buf, idx) in buffers { enc.setBuffer(buf, offset: 0, index: idx) }
+        enc.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        enc.endEncoding()
+        cmdBuf.commit()
+        return cmdBuf
     }
 
     /// Batch multiple GPU dispatches into a single command buffer (synchronous).
     private func dispatchBatch(_ dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])],
                                 threadGroups: MTLSize, threadGroupSize: MTLSize) {
         guard isRunning else { return }
+        guard threadGroups.width > 0, threadGroupSize.width > 0 else { return }
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
         for d in dispatches {
@@ -1426,6 +2063,11 @@ final class DockingEngine {
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        if cmdBuf.status == .error {
+            let err = cmdBuf.error?.localizedDescription ?? "unknown"
+            ActivityLog.shared.error("[Engine] GPU batch error: \(err)", category: .dock)
+            isRunning = false
+        }
     }
 
     /// Async batch dispatch — commits work to GPU without blocking CPU.
@@ -1434,6 +2076,7 @@ final class DockingEngine {
     private func dispatchBatchAsync(_ dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])],
                                      threadGroups: MTLSize, threadGroupSize: MTLSize) -> MTLCommandBuffer? {
         guard isRunning else { return nil }
+        guard threadGroups.width > 0, threadGroupSize.width > 0 else { return nil }
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return nil }
         for d in dispatches {
@@ -1532,9 +2175,9 @@ final class DockingEngine {
         let transformed = applyPoseTransform(p, ligandAtoms: ligandAtoms, centroid: centroid)
 
         // Vina scores are already in kcal/mol — no kCalScale division needed
-        return DockingResult(
+        var result = DockingResult(
             id: bestIdx,
-            pose: DockPoseSwift(translation: trans, rotation: quat, torsions: torsions(from: p)),
+            pose: DockPoseSwift(translation: trans, rotation: quat, torsions: torsions(from: p), chiAngles: chiAngles(from: p)),
             energy: p.energy,
             stericEnergy: p.stericEnergy,
             hydrophobicEnergy: p.hydrophobicEnergy,
@@ -1543,6 +2186,9 @@ final class DockingEngine {
             generation: Int(p.generation),
             transformedAtomPositions: transformed
         )
+        result.drusinaCorrection = p.drusinaCorrection
+        result.constraintPenalty = p.constraintPenalty
+        return result
     }
 
     private func extractAllResults(
@@ -1572,9 +2218,9 @@ final class DockingEngine {
             // Skip poses with NaN positions (degenerate quaternion/torsion)
             guard transformed.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { continue }
 
-            results.append(DockingResult(
+            var r = DockingResult(
                 id: results.count + idOffset,
-                pose: DockPoseSwift(translation: trans, rotation: quat, torsions: torsions(from: p)),
+                pose: DockPoseSwift(translation: trans, rotation: quat, torsions: torsions(from: p), chiAngles: chiAngles(from: p)),
                 energy: p.energy,
                 stericEnergy: p.stericEnergy,
                 hydrophobicEnergy: p.hydrophobicEnergy,
@@ -1582,21 +2228,24 @@ final class DockingEngine {
                 torsionPenalty: p.torsionPenalty,
                 generation: Int(p.generation),
                 transformedAtomPositions: transformed
-            ))
+            )
+            r.drusinaCorrection = p.drusinaCorrection
+            r.constraintPenalty = p.constraintPenalty
+            results.append(r)
         }
         return sortByEnergy ? results.sorted { $0.energy < $1.energy } : results
     }
 
     // MARK: - RMSD Clustering
 
-    private func clusterPoses(_ results: [DockingResult]) -> [DockingResult] {
+    private func clusterPoses(_ results: [DockingResult]) async -> [DockingResult] {
         guard !results.isEmpty else { return [] }
         let threshold: Float = 2.0
         var out = results
         let n = out.count
 
         // Precompute full pairwise RMSD matrix (GPU if available, CPU fallback)
-        let rmsdMatrix = computeRMSDMatrixGPU(out) ?? computeRMSDMatrixCPU(out)
+        let rmsdMatrix = await computeRMSDMatrixGPU(out) ?? computeRMSDMatrixCPU(out)
 
         // Greedy leader-based clustering using precomputed matrix
         var clusterID = 0
@@ -1626,7 +2275,7 @@ final class DockingEngine {
     }
 
     /// Compute pairwise RMSD matrix on GPU using Metal compute.
-    private func computeRMSDMatrixGPU(_ results: [DockingResult]) -> [Float]? {
+    private func computeRMSDMatrixGPU(_ results: [DockingResult]) async -> [Float]? {
         guard let pipeline = pairwiseRMSDPipeline,
               let first = results.first,
               !first.transformedAtomPositions.isEmpty else { return nil }
@@ -1666,13 +2315,19 @@ final class DockingEngine {
         enc.setBuffer(matrixBuffer, offset: 0, index: 1)
         enc.setBuffer(paramsBuffer, offset: 0, index: 2)
 
-        // 2D dispatch: each thread handles one (i, j) pair
-        let tgSize = MTLSize(width: 16, height: 16, depth: 1)
-        let tgCount = MTLSize(width: (n + 15) / 16, height: (n + 15) / 16, depth: 1)
+        // 1D dispatch over upper-triangular pairs only (no wasted threads)
+        let totalPairs = n * (n - 1) / 2
+        let threadWidth = 256
+        let tgSize = MTLSize(width: threadWidth, height: 1, depth: 1)
+        let tgCount = MTLSize(width: (totalPairs + threadWidth - 1) / threadWidth, height: 1, depth: 1)
         enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
         enc.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
+        await withCheckedContinuation { continuation in
+            cmdBuf.addCompletedHandler { _ in
+                continuation.resume()
+            }
+            cmdBuf.commit()
+        }
 
         let ptr = matrixBuffer.contents().bindMemory(to: Float.self, capacity: matrixSize)
         return Array(UnsafeBufferPointer(start: ptr, count: matrixSize))
@@ -1754,10 +2409,10 @@ final class DockingEngine {
            let tree = RDKitBridge.buildTorsionTree(smiles: smi), !tree.isEmpty {
             return tree
         }
-        return buildGraphTorsionTree(atomCount: ligand.heavyAtomCount, bonds: heavyBonds)
+        return buildGraphTorsionTree(atomCount: ligand.heavyAtomCount, bonds: heavyBonds, atoms: ligand.atoms.filter { $0.element != .H })
     }
 
-    private func buildGraphTorsionTree(atomCount: Int, bonds: [Bond]) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])] {
+    private func buildGraphTorsionTree(atomCount: Int, bonds: [Bond], atoms: [Atom]) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])] {
         guard atomCount > 1 else { return [] }
 
         var adjacency = Array(repeating: [Int](), count: atomCount)
@@ -1815,12 +2470,48 @@ final class DockingEngine {
             }
         }
 
+        // Build bond-order lookup for amide detection
+        var bondOrderMap: [Int: [Int: BondOrder]] = [:]
+        for bond in bonds {
+            bondOrderMap[bond.atomIndex1, default: [:]][bond.atomIndex2] = bond.order
+            bondOrderMap[bond.atomIndex2, default: [:]][bond.atomIndex1] = bond.order
+        }
+
+        // Check if a single bond A-B is an amide bond (C-N where C=O or C=S)
+        func isAmideBond(_ a: Int, _ b: Int) -> Bool {
+            guard a < atoms.count, b < atoms.count else { return false }
+            let elemA = atoms[a].element
+            let elemB = atoms[b].element
+            // Determine which is C and which is N
+            let carbonIdx: Int
+            if elemA == .C && elemB == .N {
+                carbonIdx = a
+            } else if elemA == .N && elemB == .C {
+                carbonIdx = b
+            } else {
+                return false
+            }
+            // Check if the carbon has a double bond to O or S
+            guard let neighbors = bondOrderMap[carbonIdx] else { return false }
+            for (neighborIdx, order) in neighbors {
+                guard order == .double, neighborIdx < atoms.count else { continue }
+                let neighborElem = atoms[neighborIdx].element
+                if neighborElem == .O || neighborElem == .S {
+                    return true
+                }
+            }
+            return false
+        }
+
         var torsions: [(atom1: Int, atom2: Int, movingAtoms: [Int])] = []
         for bond in bonds where bond.order == .single {
             let a = bond.atomIndex1
             let b = bond.atomIndex2
             guard adjacency[a].count > 1, adjacency[b].count > 1 else { continue }
             guard !hasAlternatePath(from: a, to: b, excluding: (a, b)) else { continue }
+
+            // Skip amide bonds (C-N where C=O/S) — partial double-bond character
+            if isAmideBond(a, b) { continue }
 
             let forward = bfsSide(start: b, excluding: a)
             let backward = bfsSide(start: a, excluding: b)

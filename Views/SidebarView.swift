@@ -1,34 +1,37 @@
 import SwiftUI
 
 /// Sidebar tabs ordered by pipeline processing flow:
-/// Search → Prepare → Sequence → Ligands → Docking → Results
+/// Search → Prepare → Sequence → Ligands → Docking → Results → Lead Opt
 enum SidebarTab: String, CaseIterable {
-    case search       = "Search"
-    case preparation  = "Preparation"
-    case sequence     = "Sequence"
-    case ligands      = "Ligands"
-    case dock         = "Docking"
-    case results      = "Results"
+    case search           = "Search"
+    case preparation      = "Preparation"
+    case sequence         = "Sequence"
+    case ligands          = "Ligands"
+    case dock             = "Docking"
+    case results          = "Results"
+    case leadOptimization = "Lead Opt"
 
     var icon: String {
         switch self {
-        case .search:      "magnifyingglass"
-        case .preparation: "wand.and.stars"
-        case .sequence:    "textformat.abc"
-        case .ligands:     "tray.full"
-        case .dock:        "arrow.triangle.merge"
-        case .results:     "chart.bar.xaxis"
+        case .search:           "magnifyingglass"
+        case .preparation:      "wand.and.stars"
+        case .sequence:         "textformat.abc"
+        case .ligands:          "tray.full"
+        case .dock:             "arrow.triangle.merge"
+        case .results:          "chart.bar.xaxis"
+        case .leadOptimization: "arrow.triangle.branch"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .search:      "Load structure"
-        case .preparation: "Clean & protonate"
-        case .sequence:    "Inspect chains"
-        case .ligands:     "Add compounds"
-        case .dock:        "Run docking"
-        case .results:     "Analyze poses"
+        case .search:           "Load structure"
+        case .preparation:      "Clean & protonate"
+        case .sequence:         "Inspect chains"
+        case .ligands:          "Add compounds"
+        case .dock:             "Run docking"
+        case .results:          "Analyze poses"
+        case .leadOptimization: "Optimize leads"
         }
     }
 }
@@ -104,7 +107,8 @@ struct SidebarView: View {
                         case .sequence:    SequenceView()
                         case .ligands:     LigandDatabaseView()
                         case .dock:        DockingTabView()
-                        case .results:     ResultsTabView()
+                        case .results:          ResultsTabView()
+                        case .leadOptimization: LeadOptimizationTabView()
                         }
                     }
                 }
@@ -202,19 +206,22 @@ struct SidebarView: View {
     private func stepStatus(_ tab: SidebarTab) -> StepStatus {
         switch tab {
         case .search:
-            return viewModel.protein != nil ? .completed : .upcoming
+            return viewModel.molecules.protein != nil ? .completed : .upcoming
         case .preparation:
-            if viewModel.proteinPrepared { return .completed }
-            return viewModel.protein != nil ? .available : .upcoming
+            if viewModel.molecules.proteinPrepared { return .completed }
+            return viewModel.molecules.protein != nil ? .available : .upcoming
         case .sequence:
-            return viewModel.protein != nil ? .completed : .upcoming
+            return viewModel.molecules.protein != nil ? .completed : .upcoming
         case .ligands:
-            return viewModel.ligand != nil ? .completed : .upcoming
+            return viewModel.molecules.ligand != nil ? .completed : .upcoming
         case .dock:
-            if !viewModel.dockingResults.isEmpty { return .completed }
-            return (viewModel.ligand != nil && viewModel.protein != nil) ? .available : .upcoming
+            if !viewModel.docking.dockingResults.isEmpty { return .completed }
+            return (viewModel.molecules.ligand != nil && viewModel.molecules.protein != nil) ? .available : .upcoming
         case .results:
-            return !viewModel.dockingResults.isEmpty ? .completed : .upcoming
+            return !viewModel.docking.dockingResults.isEmpty ? .completed : .upcoming
+        case .leadOptimization:
+            if !viewModel.leadOpt.analogs.isEmpty { return .completed }
+            return !viewModel.docking.dockingResults.isEmpty || !viewModel.docking.screeningHits.isEmpty ? .available : .upcoming
         }
     }
 

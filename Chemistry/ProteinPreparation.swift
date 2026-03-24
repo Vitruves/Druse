@@ -294,6 +294,9 @@ enum ProteinPreparation {
         var workingAtoms = altConformerSelection.atoms
         var workingBonds = altConformerSelection.bonds
         report.removedAltConformerAtoms = altConformerSelection.removedAtomCount
+        if altConformerSelection.removedAtomCount > 0 {
+            Task { @MainActor in ActivityLog.shared.info("[Prep] Alt-conf selection: kept \(altConformerSelection.atoms.count) atoms, removed \(altConformerSelection.removedAtomCount)", category: .prep) }
+        }
 
         if options.removeNonStandardResidues {
             let filtered = removeNonStandardResidues(
@@ -306,6 +309,9 @@ enum ProteinPreparation {
             workingBonds = filtered.bonds
             report.removedHeterogenResidues = filtered.removedResidueCount
             report.removedHeterogenAtoms = filtered.removedAtomCount
+            if filtered.removedResidueCount > 0 {
+                Task { @MainActor in ActivityLog.shared.info("[Prep] Removed \(filtered.removedResidueCount) non-standard residues (\(filtered.removedAtomCount) atoms)", category: .prep) }
+            }
         }
 
         switch options.waterPolicy {
@@ -328,6 +334,10 @@ enum ProteinPreparation {
             report.removedWaterResidues = stripped.removedCount
         }
 
+        if report.removedWaterResidues > 0 {
+            Task { @MainActor in ActivityLog.shared.info("[Prep] Removed \(report.removedWaterResidues) water residues", category: .prep) }
+        }
+
         report.chainBreaks = detectChainBreaks(in: workingAtoms, bonds: workingBonds)
 
         if options.capChainBreaks {
@@ -338,9 +348,11 @@ enum ProteinPreparation {
                 workingBonds = capped.bonds
                 report.addedCappingResidues = capped.addedResidueCount
                 report.chainBreaks = detectChainBreaks(in: workingAtoms, bonds: workingBonds)
+                Task { @MainActor in ActivityLog.shared.info("[Prep] Capped \(capped.addedResidueCount) chain break termini", category: .prep) }
             }
         }
 
+        Task { @MainActor in ActivityLog.shared.info("[Prep] Cleanup complete: \(workingAtoms.count) atoms, \(report.chainBreaks.count) chain breaks", category: .prep) }
         return (workingAtoms, workingBonds, report)
     }
 
@@ -408,6 +420,75 @@ enum ProteinPreparation {
         report.residueCompleteness = analyzeResidueCompleteness(atoms: atoms, bonds: bonds)
 
         return report
+    }
+
+    // MARK: - Disulfide Bond Detection
+
+    struct DisulfideBond: Sendable {
+        let cys1ChainID: String
+        let cys1ResSeq: Int
+        let cys2ChainID: String
+        let cys2ResSeq: Int
+        let sgDistance: Float
+    }
+
+    /// Detect disulfide bonds between CYS residues (SG-SG distance < 2.5 Å).
+    /// Returns detected bonds and adds them to the molecule's bond array.
+    static func detectDisulfideBonds(atoms: [Atom]) -> [DisulfideBond] {
+        let sgAtoms = atoms.enumerated().filter { _, atom in
+            atom.residueName == "CYS"
+                && atom.name.trimmingCharacters(in: .whitespaces) == "SG"
+                && !atom.isHetAtom
+        }
+        var bonds: [DisulfideBond] = []
+        for i in 0..<sgAtoms.count {
+            for j in (i + 1)..<sgAtoms.count {
+                let (_, a1) = sgAtoms[i]
+                let (_, a2) = sgAtoms[j]
+                let dist = simd_distance(a1.position, a2.position)
+                if dist < 2.5 {
+                    bonds.append(DisulfideBond(
+                        cys1ChainID: a1.chainID, cys1ResSeq: a1.residueSeq,
+                        cys2ChainID: a2.chainID, cys2ResSeq: a2.residueSeq,
+                        sgDistance: dist
+                    ))
+                }
+            }
+        }
+        return bonds
+    }
+
+    /// Add disulfide bonds to the bond array and return indices of bonded SG atoms
+    /// (so protonation can skip adding HG to these cysteines).
+    static func applyDisulfideBonds(
+        atoms: [Atom],
+        bonds: inout [Bond],
+        disulfides: [DisulfideBond]
+    ) -> Set<Int> {
+        var bondedSGIndices = Set<Int>()
+        for ss in disulfides {
+            let sg1 = atoms.firstIndex(where: {
+                $0.chainID == ss.cys1ChainID && $0.residueSeq == ss.cys1ResSeq
+                    && $0.name.trimmingCharacters(in: .whitespaces) == "SG"
+            })
+            let sg2 = atoms.firstIndex(where: {
+                $0.chainID == ss.cys2ChainID && $0.residueSeq == ss.cys2ResSeq
+                    && $0.name.trimmingCharacters(in: .whitespaces) == "SG"
+            })
+            if let i1 = sg1, let i2 = sg2 {
+                // Check if bond already exists
+                let exists = bonds.contains {
+                    ($0.atomIndex1 == i1 && $0.atomIndex2 == i2)
+                        || ($0.atomIndex1 == i2 && $0.atomIndex2 == i1)
+                }
+                if !exists {
+                    bonds.append(Bond(id: bonds.count, atomIndex1: i1, atomIndex2: i2, order: .single))
+                }
+                bondedSGIndices.insert(i1)
+                bondedSGIndices.insert(i2)
+            }
+        }
+        return bondedSGIndices
     }
 
     // MARK: - Detect Chain Breaks
@@ -493,7 +574,8 @@ enum ProteinPreparation {
         atoms: [Atom],
         bonds: [Bond],
         rawPDBContent: String? = nil,
-        pH: Float = 7.4
+        pH: Float = 7.4,
+        chargeMethod: ChargeMethod = .gasteiger
     ) -> (atoms: [Atom], bonds: [Bond], report: DockingPreparationReport) {
         var report = DockingPreparationReport()
 
@@ -529,13 +611,56 @@ enum ProteinPreparation {
         workingBonds = network.bonds
         report.hbondNetworkReport = network.report
 
-        if let pdbContent = rawPDBContent,
-           let chargeData = RDKitBridge.computeChargesPDB(pdbContent: pdbContent) {
-            let merged = mergeProteinAtoms(currentAtoms: workingAtoms, sourceAtoms: chargeData.atoms) { current, source in
-                current.charge = source.charge
+        // Phase 5: Charge assignment — dispatch based on selected method
+        switch chargeMethod {
+        case .gasteiger:
+            // RDKit's PDB parser can crash on very large proteins (>8000 atoms).
+            // For large structures, skip RDKit Gasteiger and rely on the
+            // electrostatic fallback table (residue-based partial charges).
+            // RDKit's PDB-based Gasteiger charges can crash on large structures.
+            // The fragment-based approach in RDKit parses each residue independently
+            // which is O(n_residues) but the internal graph operations are expensive
+            // for large molecules. Above this threshold, we use the residue-based
+            // fallback charge table instead (accurate for standard amino acids).
+            let maxAtomsForRDKitCharges = 6000
+            if let pdbContent = rawPDBContent, workingAtoms.count <= maxAtomsForRDKitCharges,
+               let chargeData = RDKitBridge.computeChargesPDB(pdbContent: pdbContent) {
+                let merged = mergeProteinAtoms(currentAtoms: workingAtoms, sourceAtoms: chargeData.atoms) { current, source in
+                    current.charge = source.charge
+                }
+                workingAtoms = merged.atoms
+                report.rdkitChargeMatches = merged.matchedCount
+            } else if workingAtoms.count > maxAtomsForRDKitCharges {
+                report.hydrogenMethod = (report.hydrogenMethod ?? "") + " (charges: fallback, too large for RDKit)"
             }
-            workingAtoms = merged.atoms
-            report.rdkitChargeMatches = merged.matchedCount
+
+        case .eem, .qeq, .xtb:
+            // Use the new charge calculators (EEM/QEq run on GPU, xTB on CPU)
+            let calculator: ChargeCalculator
+            switch chargeMethod {
+            case .eem: calculator = EEMChargeCalculator(device: nil)
+            case .qeq: calculator = QEqChargeCalculator(device: nil)
+            case .xtb: calculator = XTBChargeCalculator()
+            default:   calculator = GasteigerChargeCalculator()
+            }
+            // Synchronous wrapper — prepareForDocking is called from a Task context
+            let semaphore = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var computedCharges: [Float]?
+            let calcAtoms = workingAtoms
+            let calcBonds = workingBonds
+            let calc = calculator
+            Task.detached { @Sendable in
+                computedCharges = try? await calc.computeCharges(
+                    atoms: calcAtoms, bonds: calcBonds, totalCharge: 0
+                )
+                semaphore.signal()
+            }
+            semaphore.wait()
+            if let charges = computedCharges {
+                for i in 0..<min(charges.count, workingAtoms.count) {
+                    workingAtoms[i].charge = charges[i]
+                }
+            }
         }
 
         let beforeFallback = workingAtoms
@@ -545,6 +670,7 @@ enum ProteinPreparation {
         }.count
         report.nonZeroChargeAtoms = workingAtoms.filter { abs($0.charge) > 0.001 }.count
 
+        Task { @MainActor in ActivityLog.shared.info("[Prep] Docking prep done: \(workingAtoms.count) atoms, \(report.hydrogensAdded) H added, \(report.nonZeroChargeAtoms) charged atoms (\(chargeMethod))", category: .prep) }
         return (workingAtoms, workingBonds, report)
     }
 
@@ -607,11 +733,17 @@ enum ProteinPreparation {
             }
 
             // Hydroxyl O-H: OG (Ser), OG1 (Thr), OH (Tyr)
+            // These are sp3 oxygens — H should be placed at ~109.5° from the C-O bond,
+            // not 180° opposite (which would be linear / sp geometry).
             if atom.element == .O {
                 let hydroxyls: Set<String> = ["OG", "OG1", "OH"]
                 if hydroxyls.contains(trimmedName) {
                     let oNeighbors = (neighbors[idx] ?? []).filter { atoms[$0].element != .H }
-                    let hPos = placeHydrogen(on: atom.position, awayFrom: oNeighbors.map { atoms[$0].position }, distance: ohDist)
+                    let hPos = placeTetrahedralHydrogen(
+                        on: atom.position,
+                        neighbors: oNeighbors.map { atoms[$0].position },
+                        distance: ohDist
+                    )
                     let hAtom = Atom(
                         id: newAtoms.count, element: .H, position: hPos,
                         name: "HO", residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -645,6 +777,74 @@ enum ProteinPreparation {
         // Place H opposite to average neighbor direction
         let dir = -simd_normalize(avg)
         return center + dir * distance
+    }
+
+    /// Place a hydrogen at tetrahedral (sp3) geometry from `center`.
+    ///
+    /// - 1 neighbor: place H at 109.5° from the neighbor-center bond, with an arbitrary
+    ///   dihedral rotation. The exact dihedral will be refined later by H-bond network
+    ///   optimization, so any consistent choice is fine.
+    /// - 2 neighbors: place H in the direction that makes ~109.5° with both existing bonds
+    ///   (i.e. between the two lone-pair positions of a tetrahedral center).
+    /// - 0 or 3+ neighbors: falls back to the linear (opposite) placement.
+    private static func placeTetrahedralHydrogen(
+        on center: SIMD3<Float>,
+        neighbors: [SIMD3<Float>],
+        distance: Float
+    ) -> SIMD3<Float> {
+        let tetrahedralAngle: Float = 109.5 * .pi / 180.0  // radians
+
+        if neighbors.count == 1 {
+            // Single neighbor (e.g. C-O-H): place H at 109.5° from the C-O bond direction
+            let bondDir = simd_normalize(center - neighbors[0])  // O←C direction, i.e. away from C
+
+            // Find a vector perpendicular to bondDir
+            let candidate: SIMD3<Float> = abs(bondDir.x) < 0.9
+                ? SIMD3<Float>(1, 0, 0)
+                : SIMD3<Float>(0, 1, 0)
+            let perp = simd_normalize(simd_cross(bondDir, candidate))
+
+            // Rotate bondDir by (180° - 109.5°) = 70.5° around the perpendicular axis
+            // This gives the H direction at 109.5° from the neighbor bond (measuring C-O-H angle)
+            let rotAngle = Float.pi - tetrahedralAngle  // 70.5°
+            let hDir = rotateVector(bondDir, around: perp, by: rotAngle)
+
+            return center + hDir * distance
+
+        } else if neighbors.count == 2 {
+            // Two neighbors: place H so it makes ~109.5° with both existing bonds.
+            // The H goes roughly opposite to the average neighbor direction, but tilted
+            // to maintain tetrahedral angles.
+            let dir1 = simd_normalize(neighbors[0] - center)
+            let dir2 = simd_normalize(neighbors[1] - center)
+            let avgNeighborDir = simd_normalize(dir1 + dir2)
+
+            // The H direction is opposite to the average, which for ideal tetrahedral
+            // geometry already gives the correct angle. For two neighbors in a tetrahedron,
+            // the third position is in the plane defined by the two bonds, pointing away.
+            let hDir = -avgNeighborDir
+
+            // Verify: for a perfect tetrahedral with 2 neighbors, placing opposite to
+            // their average naturally yields ~109.5° angles when the neighbor-center-neighbor
+            // angle is also ~109.5°. This is the standard approach.
+            return center + hDir * distance
+
+        } else {
+            // Fallback to linear placement for 0 or 3+ neighbors
+            return placeHydrogen(on: center, awayFrom: neighbors, distance: distance)
+        }
+    }
+
+    /// Rotate a vector around an axis by a given angle (Rodrigues' rotation formula).
+    private static func rotateVector(
+        _ v: SIMD3<Float>,
+        around axis: SIMD3<Float>,
+        by angle: Float
+    ) -> SIMD3<Float> {
+        let k = simd_normalize(axis)
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+        return v * cosA + simd_cross(k, v) * sinA + k * simd_dot(k, v) * (1 - cosA)
     }
 
     private struct ProteinAtomIdentity: Hashable {
@@ -810,7 +1010,10 @@ enum ProteinPreparation {
                 isHetAtom: false
             )]
 
-            guard let previousResidue, let nextResidue else { continue }
+            guard let previousResidue, let nextResidue else {
+                Task { @MainActor in ActivityLog.shared.debug("[Prep] Skipped capping chain break at \(chainBreak.chainID):\(chainBreak.previousResidueSeq)-\(chainBreak.nextResidueSeq) — residue not found", category: .prep) }
+                continue
+            }
 
             if appendNMECap(
                 to: &workingAtoms,
@@ -854,6 +1057,7 @@ enum ProteinPreparation {
         toward nextResidue: ResidueRecord
     ) -> Bool {
         guard let carbonIndex = atomIndex(named: "C", element: .C, in: residue, atoms: atoms) else {
+            Task { @MainActor in ActivityLog.shared.debug("[Prep] NME cap skipped: no backbone C in residue \(residue.chainID):\(residue.residueSeq)", category: .prep) }
             return false
         }
         if hasCapBond(anchorAtomIndex: carbonIndex, capResidueName: "NME", capAtomName: "N", atoms: atoms, bonds: bonds) {
@@ -910,6 +1114,7 @@ enum ProteinPreparation {
         toward previousResidue: ResidueRecord
     ) -> Bool {
         guard let nitrogenIndex = atomIndex(named: "N", element: .N, in: residue, atoms: atoms) else {
+            Task { @MainActor in ActivityLog.shared.debug("[Prep] ACE cap skipped: no backbone N in residue \(residue.chainID):\(residue.residueSeq)", category: .prep) }
             return false
         }
         if hasCapBond(anchorAtomIndex: nitrogenIndex, capResidueName: "ACE", capAtomName: "C", atoms: atoms, bonds: bonds) {

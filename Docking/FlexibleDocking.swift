@@ -12,6 +12,57 @@ struct FlexibleResidueConfig: Sendable {
     static let maxFlexibleResidues = 6
     /// Rotamer library resolution (degrees)
     var rotamerResolution: Float = 10.0
+
+    /// When true, pocket-lining residues are automatically selected with soft parameters.
+    /// This enables gentle sidechain adjustments without requiring manual residue selection.
+    var autoFlex: Bool = false
+
+    /// Soft-flex parameters (used when autoFlex is true)
+    static let softFlexWeight: Float = 0.5    // gentler weight on flex-ligand pairwise scoring
+    static let softChiStep: Float = 0.25      // ~14° — small rotamer perturbations
+    static let fullChiStep: Float = 0.6       // ~34° — standard induced-fit step
+
+    /// Auto-select pocket-lining residues with rotatable sidechains.
+    /// Picks up to `maxFlexibleResidues` closest to pocket center, excluding
+    /// ALA/GLY/PRO (no rotatable sidechains).
+    static func autoSelectResidues(
+        protein: [Atom],
+        pocket: (center: SIMD3<Float>, residueIndices: [Int])
+    ) -> [Int] {
+        let pocketResidueSet = Set(pocket.residueIndices)
+
+        // Group protein atoms by residue sequence number
+        var residueNames: [Int: String] = [:]
+        var residueCBPositions: [Int: SIMD3<Float>] = [:]
+        for atom in protein {
+            let seq = atom.residueSeq
+            if residueNames[seq] == nil {
+                residueNames[seq] = atom.residueName
+            }
+            // Use CB (sidechain root) as reference; fall back to CA
+            if atom.name == "CB" {
+                residueCBPositions[seq] = atom.position
+            } else if atom.name == "CA" && residueCBPositions[seq] == nil {
+                residueCBPositions[seq] = atom.position
+            }
+        }
+
+        // Filter to pocket-lining residues that have rotamers
+        var candidates: [(seq: Int, distance: Float)] = []
+        for seq in pocketResidueSet {
+            guard let name = residueNames[seq],
+                  RotamerLibrary.rotamers(for: name) != nil,
+                  let pos = residueCBPositions[seq] else { continue }
+            let dist = simd_distance(pos, pocket.center)
+            candidates.append((seq, dist))
+        }
+
+        // Sort by distance to pocket center, take closest up to limit
+        candidates.sort { $0.distance < $1.distance }
+        let selected = Array(candidates.prefix(maxFlexibleResidues).map(\.seq))
+        Task { @MainActor in ActivityLog.shared.info("autoSelectResidues: \(pocketResidueSet.count) pocket residues → \(candidates.count) rotamer candidates → \(selected.count) selected", category: .dock) }
+        return selected
+    }
 }
 
 /// Standard amino acid rotamer definitions.

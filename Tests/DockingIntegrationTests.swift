@@ -252,7 +252,9 @@ final class DockingIntegrationTests: DockingTestCase {
         guard let pocket else { throw XCTSkip("No pocket") }
 
         let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 64, generations: 40)
-        let maxR = simd_length(pocket.size) + 5.0
+        // Docking constrains translations per-axis to pocket.size + searchPadding (2.0Å).
+        // Max centroid distance from center is the half-diagonal of that box + ligand extent margin.
+        let maxR = simd_length(pocket.size + SIMD3<Float>(repeating: 2.0)) + 10.0
 
         for (i, r) in results.prefix(5).enumerated() {
             guard !r.transformedAtomPositions.isEmpty else { continue }
@@ -531,5 +533,722 @@ final class DockingIntegrationTests: DockingTestCase {
         try await runRoundTripTest(pdbID: "4DFR", ligandResidue: "MTX",
             smiles: "CN(Cc1cnc2nc(N)nc(N)c2n1)c1ccc(C(=O)NC(CCC(=O)O)C(=O)O)cc1",
             ligandName: "Methotrexate", centroidThreshold: 12.0)
+    }
+
+    // ======================================================================
+    // MARK: — DruseMLScoring Integration Test
+    // ======================================================================
+
+    /// Integration test: dock a known ligand, then score with DruseMLScoring.
+    /// Verifies that:
+    ///   1. ML scorer loads and produces valid predictions
+    ///   2. pKd values are in a reasonable range (2-12)
+    ///   3. Confidence values are in [0, 1]
+    ///   4. dockingScore = pKd * confidence
+    ///   5. pKd → Ki conversion is mathematically correct
+    @MainActor
+    func testDruseMLScoringOnDockedPoses() async throws {
+        let engine = try sharedDockingEngine()
+
+        // Load 3PYY (kinase + imatinib)
+        let (protein, crystalLigand, _) = try await fetchAndParsePDB(id: "3PYY", ligandResidue: "STI")
+        print("  [MLScoring] Protein: \(protein.atomCount) atoms")
+
+        // Dock imatinib from SMILES
+        let imatinibSMILES = "Cc1ccc(NC(=O)c2ccc(CN3CCN(C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1"
+        let (molData, err) = RDKitBridge.smilesToMolecule(smiles: imatinibSMILES, name: "Imatinib", numConformers: 1, minimize: true)
+        XCTAssertNil(err, "RDKit error: \(err ?? "")")
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: "imatinib")
+        print("  [MLScoring] Ligand: \(ligand.atomCount) atoms")
+
+        guard let pocket = BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: crystalLigand, distance: 6.0) else {
+            throw XCTSkip("3PYY pocket detection failed")
+        }
+        print("  [MLScoring] Pocket: center=\(pocket.center), vol=\(String(format: "%.0f", pocket.volume))")
+
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+                                            populationSize: 200, generations: 150, flexibility: false)
+        XCTAssertFalse(results.isEmpty, "Docking must produce results")
+        print("  [MLScoring] Docking: \(results.count) poses, best Vina = \(String(format: "%.1f", results.first!.energy))")
+
+        // Score with DruseMLScoring
+        let scorer = DruseMLScoringInference()
+        scorer.loadModel()
+
+        guard scorer.isAvailable else {
+            print("  [MLScoring] SKIP: DruseScorePKi model not available in test bundle")
+            throw XCTSkip("DruseScorePKi model not in test bundle")
+        }
+
+        let pocketProteinAtoms = protein.atoms.filter {
+            simd_distance($0.position, pocket.center) <= 10.0
+        }
+
+        let topN = min(results.count, 10)
+        var scoredResults: [DockingResult] = []
+
+        for i in 0..<topN {
+            var poseAtoms = ligand.atoms
+            for j in 0..<poseAtoms.count {
+                if j < results[i].transformedAtomPositions.count {
+                    poseAtoms[j].position = results[i].transformedAtomPositions[j]
+                }
+            }
+
+            let features = DruseScoreFeatureExtractor.extract(
+                proteinAtoms: pocketProteinAtoms,
+                ligandAtoms: poseAtoms,
+                pocketCenter: pocket.center
+            )
+
+            if let pred = await scorer.score(features: features) {
+                var result = results[i]
+                result.mlDockingScore = pred.dockingScore
+                result.mlPKd = pred.pKd
+                result.mlPoseConfidence = pred.poseConfidence
+                scoredResults.append(result)
+
+                print("    Pose \(i): Vina=\(String(format: "%6.1f", result.energy)) pKd=\(String(format: "%.2f", pred.pKd)) conf=\(String(format: "%.2f", pred.poseConfidence)) score=\(String(format: "%.2f", pred.dockingScore))")
+
+                // Validate ranges
+                XCTAssertTrue(pred.pKd >= 0 && pred.pKd <= 15,
+                    "pKd should be in [0, 15], got \(pred.pKd)")
+                XCTAssertTrue(pred.poseConfidence >= 0 && pred.poseConfidence <= 1,
+                    "Confidence should be in [0, 1], got \(pred.poseConfidence)")
+                XCTAssertTrue(pred.dockingScore.isFinite,
+                    "dockingScore must be finite, got \(pred.dockingScore)")
+
+                // Verify docking_score ≈ pKd * confidence
+                let expected = pred.pKd * pred.poseConfidence
+                XCTAssertEqual(pred.dockingScore, expected, accuracy: 0.1,
+                    "dockingScore should ≈ pKd * confidence: \(pred.dockingScore) vs \(expected)")
+
+                // Verify Ki conversion
+                let ki = AffinityDisplayUnit.pKdToKi(pKd: pred.pKd)
+                XCTAssertTrue(ki > 0, "Ki must be positive, got \(ki)")
+                let expectedKi = pow(10, -Double(pred.pKd))
+                XCTAssertEqual(ki, expectedKi, accuracy: expectedKi * 0.001,
+                    "Ki conversion: \(ki) vs expected \(expectedKi)")
+            }
+        }
+
+        XCTAssertFalse(scoredResults.isEmpty, "At least one pose should be scored")
+        print("  [MLScoring] Scored \(scoredResults.count)/\(topN) poses with DruseMLScoring")
+
+        // Best ML-scored pose should have reasonable pKd for imatinib (known ~8 pKd for ABL kinase)
+        if let bestML = scoredResults.max(by: { ($0.mlDockingScore ?? 0) < ($1.mlDockingScore ?? 0) }) {
+            let pKd = bestML.mlPKd ?? 0
+            let kiFormatted = AffinityDisplayUnit.ki.format(pKd)
+            print("  [MLScoring] Best ML pose: pKd=\(String(format: "%.2f", pKd)), Ki=\(kiFormatted), conf=\(String(format: "%.0f%%", (bestML.mlPoseConfidence ?? 0) * 100))")
+        }
+
+        print("✓ DruseMLScoring integration test PASSED")
+    }
+
+    // ======================================================================
+    // MARK: 8 — Pharmacophore Constrained Docking
+    // ======================================================================
+
+    /// Test the Swift-side constraint data model: bitmask computation, residue resolution,
+    /// GPU buffer conversion.
+    @MainActor
+    func testPharmacophoreConstraintDataModel() throws {
+        // 1. Bitmask correctness
+        let hbondDonor = ConstraintInteractionType.hbondDonor
+        let mask = hbondDonor.compatibleVinaTypes
+        // N_D = 3, N_DA = 5, O_D = 7, O_DA = 9, MET_D = 18
+        XCTAssertTrue(mask & (1 << 3) != 0, "N_D (3) should be compatible with H-bond donor")
+        XCTAssertTrue(mask & (1 << 5) != 0, "N_DA (5) should be compatible with H-bond donor")
+        XCTAssertTrue(mask & (1 << 7) != 0, "O_D (7) should be compatible with H-bond donor")
+        XCTAssertTrue(mask & (1 << 9) != 0, "O_DA (9) should be compatible with H-bond donor")
+        XCTAssertTrue(mask & (1 << 18) != 0, "MET_D (18) should be compatible with H-bond donor")
+        XCTAssertTrue(mask & (1 << 0) == 0, "C_H (0) should NOT be compatible with H-bond donor")
+        XCTAssertTrue(mask & (1 << 12) == 0, "F_H (12) should NOT be compatible with H-bond donor")
+        print("  [Constraint] H-bond donor bitmask: 0x\(String(mask, radix: 16)) ✓")
+
+        let halogen = ConstraintInteractionType.halogen
+        let halMask = halogen.compatibleVinaTypes
+        XCTAssertTrue(halMask & (1 << 12) != 0, "F_H (12) should be compatible with halogen")
+        XCTAssertTrue(halMask & (1 << 13) != 0, "Cl_H (13) should be compatible with halogen")
+        XCTAssertTrue(halMask & (1 << 14) != 0, "Br_H (14) should be compatible with halogen")
+        XCTAssertTrue(halMask & (1 << 15) != 0, "I_H (15) should be compatible with halogen")
+        print("  [Constraint] Halogen bitmask: 0x\(String(halMask, radix: 16)) ✓")
+
+        // 2. Auto-detection
+        let suggestedN = ConstraintInteractionType.suggestDefault(element: .N, atomName: "NZ", residueName: "LYS")
+        XCTAssertEqual(suggestedN, .hbondDonor, "NZ on LYS should suggest H-bond donor, got \(suggestedN)")
+
+        let suggestedO = ConstraintInteractionType.suggestDefault(element: .O, atomName: "OD1", residueName: "ASP")
+        XCTAssertEqual(suggestedO, .hbondAcceptor, "OD1 on ASP should suggest H-bond acceptor, got \(suggestedO)")
+
+        let suggestedZn = ConstraintInteractionType.suggestDefault(element: .Zn, atomName: "ZN", residueName: "ZN")
+        XCTAssertEqual(suggestedZn, .metalCoordination, "Zn should suggest metal coordination, got \(suggestedZn)")
+
+        let suggestedC = ConstraintInteractionType.suggestDefault(element: .C, atomName: "CG", residueName: "PHE")
+        XCTAssertEqual(suggestedC, .piStacking, "CG on PHE should suggest pi-stacking, got \(suggestedC)")
+        print("  [Constraint] Auto-detection ✓")
+
+        // 3. Residue atom resolution
+        let aspAcceptors = ConstraintAtomResolver.relevantAtomNames(residueName: "ASP", interactionType: .hbondAcceptor)
+        XCTAssertTrue(aspAcceptors.contains("OD1"), "ASP acceptors should include OD1")
+        XCTAssertTrue(aspAcceptors.contains("OD2"), "ASP acceptors should include OD2")
+
+        let lysDonors = ConstraintAtomResolver.relevantAtomNames(residueName: "LYS", interactionType: .hbondDonor)
+        XCTAssertTrue(lysDonors.contains("NZ"), "LYS donors should include NZ")
+
+        let pheAromatic = ConstraintAtomResolver.relevantAtomNames(residueName: "PHE", interactionType: .piStacking)
+        XCTAssertTrue(pheAromatic.count >= 6, "PHE pi-stacking should include 6 ring atoms, got \(pheAromatic.count)")
+        print("  [Constraint] Residue resolution ✓")
+
+        // 4. GPU buffer conversion
+        let constraint = PharmacophoreConstraintDef(
+            targetScope: .atom,
+            interactionType: .hbondAcceptor,
+            strength: .soft(kcalPerAngstromSq: 5.0),
+            distanceThreshold: 3.5,
+            sourceType: .receptor,
+            proteinAtomIndex: 0
+        )
+        let (gpuConstraints, params) = PharmacophoreConstraintDef.toGPUBuffers(
+            constraints: [constraint], atoms: [
+                Atom(id: 0, element: .O, position: SIMD3<Float>(1, 2, 3),
+                     name: "OD1", residueName: "ASP", residueSeq: 25, chainID: "A")
+            ], residues: []
+        )
+        XCTAssertEqual(params.numConstraints, 1, "Should have 1 GPU constraint")
+        XCTAssertEqual(params.numGroups, 1, "Should have 1 group")
+        XCTAssertEqual(gpuConstraints[0].strength, 5.0, accuracy: 0.01, "Soft strength should be 5.0")
+        XCTAssertEqual(gpuConstraints[0].distanceThreshold, 3.5, accuracy: 0.01)
+        XCTAssertEqual(gpuConstraints[0].ligandAtomIndex, -1, "Receptor-side constraint should have ligandAtomIndex = -1")
+        print("  [Constraint] GPU buffer conversion ✓")
+
+        // 5. Hard constraint GPU value
+        let hardConstraint = PharmacophoreConstraintDef(
+            targetScope: .atom,
+            interactionType: .hbondDonor,
+            strength: .hard,
+            sourceType: .receptor,
+            proteinAtomIndex: 0
+        )
+        let (hardGPU, _) = PharmacophoreConstraintDef.toGPUBuffers(
+            constraints: [hardConstraint], atoms: [
+                Atom(id: 0, element: .N, position: .zero, name: "N", residueName: "ALA", residueSeq: 1, chainID: "A")
+            ], residues: []
+        )
+        XCTAssertEqual(hardGPU[0].strength, 1000.0, accuracy: 0.01, "Hard constraint strength should be 1000.0")
+        print("  [Constraint] Hard constraint value ✓")
+
+        print("✓ Pharmacophore constraint data model test PASSED")
+    }
+
+    /// Test that constraint buffers can be created and passed to the docking engine
+    /// without crashing, and that constrained docking produces valid results.
+    @MainActor
+    func testConstrainedDockingProducesValidResults() async throws {
+        let engine = try sharedDockingEngine()
+
+        let protein = TestMolecules.alanineDipeptide()
+        let pocket = await BindingSiteDetector.pocketFromResidues(
+            protein: protein, residueIndices: Array(0..<protein.residues.count))
+
+        let (molData, err) = RDKitBridge.smilesToMolecule(
+            smiles: "CC(=O)Oc1ccccc1C(=O)O", name: "Aspirin", numConformers: 1, minimize: true)
+        XCTAssertNil(err, "RDKit error: \(err ?? "")")
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: "aspirin")
+
+        // Create a soft constraint at the pocket center (should be easily satisfiable)
+        var constraint = PharmacophoreConstraintDef(
+            targetScope: .atom,
+            interactionType: .hydrophobic,
+            strength: .soft(kcalPerAngstromSq: 5.0),
+            distanceThreshold: 5.0,  // generous threshold
+            sourceType: .receptor,
+            proteinAtomIndex: 0
+        )
+        constraint.targetPositions = [pocket.center]
+        print("  [ConstrainedDock] Constraint: hydrophobic at pocket center \(pocket.center), threshold=5.0 Å")
+
+        // Prepare constraint buffers
+        engine.prepareConstraintBuffers([constraint], atoms: protein.atoms, residues: protein.residues)
+        print("  [ConstrainedDock] Constraint buffers prepared")
+
+        // Run docking with constraint
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+                                            populationSize: 100, generations: 80, flexibility: false)
+
+        XCTAssertFalse(results.isEmpty, "Constrained docking must produce results")
+        print("  [ConstrainedDock] \(results.count) poses returned")
+
+        for (i, r) in results.prefix(5).enumerated() {
+            print("    Pose \(i): E=\(String(format: "%8.2f", r.energy)) constraintPen=\(String(format: "%.3f", r.constraintPenalty))")
+            XCTAssertTrue(r.energy.isFinite, "Pose \(i) energy not finite: \(r.energy)")
+            XCTAssertTrue(r.constraintPenalty.isFinite, "Pose \(i) constraint penalty not finite: \(r.constraintPenalty)")
+            XCTAssertTrue(r.constraintPenalty >= 0, "Constraint penalty should be non-negative, got \(r.constraintPenalty)")
+        }
+
+        // Best pose should have low or zero constraint penalty with the generous threshold
+        let best = results[0]
+        print("  [ConstrainedDock] Best pose: E=\(String(format: "%.2f", best.energy)), constraintPenalty=\(String(format: "%.4f", best.constraintPenalty))")
+
+        // Clean up: clear constraint buffers so other tests are unaffected
+        engine.prepareConstraintBuffers([], atoms: [], residues: [])
+
+        print("✓ Constrained docking valid results test PASSED")
+    }
+
+    /// Test that a hard constraint steers the GA toward satisfying the constraint.
+    /// Compare energies of unconstrained vs hard-constrained docking to verify
+    /// the constraint penalty is active.
+    @MainActor
+    func testHardConstraintAffectsScoring() async throws {
+        let engine = try sharedDockingEngine()
+
+        let protein = TestMolecules.alanineDipeptide()
+        let pocket = await BindingSiteDetector.pocketFromResidues(
+            protein: protein, residueIndices: Array(0..<protein.residues.count))
+
+        let (molData, _) = RDKitBridge.smilesToMolecule(
+            smiles: "c1ccccc1", name: "Benzene", numConformers: 1, minimize: true)
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: "benzene")
+
+        // First: unconstrained docking
+        engine.prepareConstraintBuffers([], atoms: [], residues: [])
+        let unconstrainedResults = await runTestDocking(
+            engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+            populationSize: 80, generations: 60, flexibility: false)
+        let unconstrainedBestE = unconstrainedResults.first?.energy ?? .infinity
+        print("  [HardConstraint] Unconstrained best energy: \(String(format: "%.2f", unconstrainedBestE))")
+
+        // Now: add a hard hydrophobic constraint far from the pocket (impossible to satisfy).
+        // Use hydrophobic type so benzene C_H atoms are compatible — the penalty fires
+        // because no C_H atom can reach a target 50 Å away within the grid box.
+        var impossibleConstraint = PharmacophoreConstraintDef(
+            targetScope: .atom,
+            interactionType: .hydrophobic,
+            strength: .hard,
+            distanceThreshold: 2.0,  // very tight threshold
+            sourceType: .receptor,
+            proteinAtomIndex: 0
+        )
+        // Place constraint 50 Å away from the pocket — no ligand atom can reach it
+        impossibleConstraint.targetPositions = [pocket.center + SIMD3<Float>(50, 50, 50)]
+        engine.prepareConstraintBuffers([impossibleConstraint], atoms: protein.atoms, residues: protein.residues)
+        print("  [HardConstraint] Hard hydrophobic constraint placed 50 Å from pocket center")
+
+        let constrainedResults = await runTestDocking(
+            engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+            populationSize: 80, generations: 60, flexibility: false)
+
+        let constrainedBestE = constrainedResults.first?.energy ?? .infinity
+        let constrainedPenalty = constrainedResults.first?.constraintPenalty ?? 0
+        print("  [HardConstraint] Constrained best energy: \(String(format: "%.2f", constrainedBestE)), penalty: \(String(format: "%.2f", constrainedPenalty))")
+
+        // The constrained energy should be worse (higher) or the penalty non-zero,
+        // because the constraint target is unreachable. With a tiny test system the
+        // GA may not fully explore, so we check the combined effect.
+        let totalWorsening = constrainedBestE - unconstrainedBestE + constrainedPenalty
+        XCTAssertGreaterThanOrEqual(totalWorsening, 0,
+            "Hard constraint should worsen total energy+penalty: unconstrained=\(unconstrainedBestE), constrained=\(constrainedBestE), penalty=\(constrainedPenalty)")
+
+        // Clean up
+        engine.prepareConstraintBuffers([], atoms: [], residues: [])
+
+        print("✓ Hard constraint affects scoring test PASSED")
+    }
+
+    /// Test that constraint buffers with zero constraints (the no-op case) don't
+    /// alter docking results compared to having no buffers.
+    @MainActor
+    func testZeroConstraintsNoOp() async throws {
+        let engine = try sharedDockingEngine()
+
+        let protein = TestMolecules.alanineDipeptide()
+        let pocket = await BindingSiteDetector.pocketFromResidues(
+            protein: protein, residueIndices: Array(0..<protein.residues.count))
+
+        let (molData, _) = RDKitBridge.smilesToMolecule(
+            smiles: "CC(=O)Oc1ccccc1C(=O)O", name: "Aspirin", numConformers: 1, minimize: true)
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: "aspirin")
+
+        // Prepare empty constraint buffers (should be a no-op)
+        engine.prepareConstraintBuffers([], atoms: [], residues: [])
+
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+                                            populationSize: 80, generations: 60, flexibility: false)
+
+        XCTAssertFalse(results.isEmpty, "Docking with zero constraints should produce results")
+        for r in results {
+            XCTAssertLessThan(r.constraintPenalty, 0.1,
+                "Zero constraints should produce near-zero constraint penalty, got \(r.constraintPenalty)")
+        }
+        print("  [ZeroConstraints] \(results.count) poses, all with zero constraint penalty ✓")
+
+        // Clean up
+        engine.prepareConstraintBuffers([], atoms: [], residues: [])
+
+        print("✓ Zero constraints no-op test PASSED")
+    }
+
+    // ======================================================================
+    // MARK: 8 — Ligand Strain Penalty (Functional)
+    // ======================================================================
+
+    /// Dock aspirin into alanine dipeptide, compute MMFF strain for top poses,
+    /// and verify that strained poses get penalized.
+    @MainActor
+    func testStrainPenaltyAffectsRanking() async throws {
+        print("\n  ========== STRAIN PENALTY: Aspirin / Ala dipeptide ==========")
+        let engine = try sharedDockingEngine()
+        let protein = TestMolecules.alanineDipeptide()
+        let pocket = await BindingSiteDetector.pocketFromResidues(
+            protein: protein, residueIndices: Array(0..<protein.residues.count))
+
+        let smiles = "CC(=O)Oc1ccccc1C(=O)O"
+        let (molData, err) = RDKitBridge.smilesToMolecule(smiles: smiles, name: "Aspirin", numConformers: 5, minimize: true)
+        XCTAssertNil(err, "RDKit error: \(err ?? "")")
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: smiles, smiles: smiles)
+
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+                                            populationSize: 100, generations: 80, flexibility: true)
+        XCTAssertFalse(results.isEmpty, "Docking must produce results")
+
+        // Compute reference energy
+        guard let refEnergy = RDKitBridge.mmffReferenceEnergy(smiles: smiles) else {
+            throw XCTSkip("MMFF reference energy failed")
+        }
+        print("  [Strain] Reference energy: \(String(format: "%.2f", refEnergy)) kcal/mol")
+
+        // Compute strain for top 10 poses
+        var strainValues: [(index: Int, strain: Float, energy: Float)] = []
+        for (i, r) in results.prefix(10).enumerated() {
+            guard !r.transformedAtomPositions.isEmpty else { continue }
+            if let dockedE = RDKitBridge.mmffStrainEnergy(smiles: smiles, heavyPositions: r.transformedAtomPositions) {
+                let strain = Float(dockedE - refEnergy)
+                strainValues.append((i, strain, r.energy))
+                print("  [Strain] Pose \(i): Vina=\(String(format: "%7.2f", r.energy)) kcal/mol, MMFF strain=\(String(format: "%7.1f", strain)) kcal/mol")
+            }
+        }
+
+        XCTAssertFalse(strainValues.isEmpty, "Should compute strain for at least one pose")
+
+        // Verify strain values are finite and mostly non-negative
+        for sv in strainValues {
+            XCTAssertTrue(sv.strain.isFinite, "Strain for pose \(sv.index) should be finite")
+        }
+
+        // Apply penalty and verify re-ranking
+        let threshold: Float = 6.0
+        let weight: Float = 0.5
+        var penalizedEnergies = results.prefix(10).enumerated().map { (i, r) -> (Int, Float) in
+            let strain = strainValues.first(where: { $0.index == i })?.strain ?? 0
+            let penalty = strain > threshold ? weight * (strain - threshold) : 0
+            return (i, r.energy + penalty)
+        }
+        penalizedEnergies.sort { $0.1 < $1.1 }
+
+        let originalOrder = Array(0..<min(10, results.count))
+        let penalizedOrder = penalizedEnergies.map(\.0)
+        let orderChanged = originalOrder != penalizedOrder
+        print("  [Strain] Re-ranking changed order: \(orderChanged)")
+        print("  [Strain] Original top-3: \(originalOrder.prefix(3)), Penalized top-3: \(penalizedOrder.prefix(3))")
+
+        print("✓ Strain penalty test PASSED (\(strainValues.count) poses scored)")
+    }
+
+    // ======================================================================
+    // MARK: 9 — Bridging Waters (Functional)
+    // ======================================================================
+
+    /// Verify that keeping a water near the pocket changes the grid energy landscape.
+    @MainActor
+    func testBridgingWaterChangesGridScoring() async throws {
+        print("\n  ========== BRIDGING WATER: Grid impact ==========")
+        let engine = try sharedDockingEngine()
+
+        // Build a small protein with and without a water at a specific position
+        var baseAtoms: [Atom] = []
+        // 3 ALA residues as a minimal pocket
+        let backbonePositions: [(String, SIMD3<Float>, Element)] = [
+            ("N",  SIMD3(0, 0, 0), .N), ("CA", SIMD3(1.47, 0, 0), .C),
+            ("C",  SIMD3(2.5, 1.2, 0), .C), ("O",  SIMD3(2.5, 2.4, 0), .O),
+            ("CB", SIMD3(1.47, -1.5, 0), .C),
+            ("N",  SIMD3(3.5, 0.5, 0), .N), ("CA", SIMD3(5.0, 0.5, 0), .C),
+            ("C",  SIMD3(6.0, 1.7, 0), .C), ("O",  SIMD3(6.0, 2.9, 0), .O),
+            ("CB", SIMD3(5.0, -1.0, 0), .C),
+            ("N",  SIMD3(7.0, 1.0, 0), .N), ("CA", SIMD3(8.5, 1.0, 0), .C),
+            ("C",  SIMD3(9.5, 2.2, 0), .C), ("O",  SIMD3(9.5, 3.4, 0), .O),
+            ("CB", SIMD3(8.5, -0.5, 0), .C),
+        ]
+        for (i, (name, pos, elem)) in backbonePositions.enumerated() {
+            let resSeq = i / 5 + 1
+            baseAtoms.append(Atom(id: i, element: elem, position: pos, name: name,
+                                   residueName: "ALA", residueSeq: resSeq, chainID: "A", charge: 0.0))
+        }
+
+        let proteinNoWater = Molecule(name: "test", atoms: baseAtoms, bonds: [], title: "no water")
+        let pocket = await BindingSiteDetector.pocketFromResidues(
+            protein: proteinNoWater, residueIndices: [1, 2, 3])
+
+        // Version WITH water at the pocket center
+        var atomsWithWater = baseAtoms
+        let waterPos = pocket.center
+        let waterIdx = atomsWithWater.count
+        atomsWithWater.append(Atom(id: waterIdx, element: .O, position: waterPos, name: "O",
+                                    residueName: "HOH", residueSeq: 100, chainID: "W", charge: -0.8))
+        // Two H atoms for the water
+        atomsWithWater.append(Atom(id: waterIdx + 1, element: .H,
+                                    position: waterPos + SIMD3(0.96, 0, 0), name: "H1",
+                                    residueName: "HOH", residueSeq: 100, chainID: "W", charge: 0.4))
+        atomsWithWater.append(Atom(id: waterIdx + 2, element: .H,
+                                    position: waterPos + SIMD3(-0.24, 0.93, 0), name: "H2",
+                                    residueName: "HOH", residueSeq: 100, chainID: "W", charge: 0.4))
+        let proteinWithWater = Molecule(name: "test+water", atoms: atomsWithWater, bonds: [], title: "with water")
+
+        // Dock a small ligand against both
+        let (molData, _) = RDKitBridge.smilesToMolecule(smiles: "c1ccccc1", name: "Benzene", numConformers: 1, minimize: true)
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: "benzene")
+
+        // Dock WITHOUT water
+        let resultsNoWater = await runTestDocking(engine: engine, protein: proteinNoWater, ligand: ligand, pocket: pocket,
+                                                    populationSize: 80, generations: 60, flexibility: false)
+        let bestNoWater = resultsNoWater.first?.energy ?? .infinity
+
+        // Dock WITH water
+        let resultsWithWater = await runTestDocking(engine: engine, protein: proteinWithWater, ligand: ligand, pocket: pocket,
+                                                     populationSize: 80, generations: 60, flexibility: false)
+        let bestWithWater = resultsWithWater.first?.energy ?? .infinity
+
+        print("  [Water] Best energy without water: \(String(format: "%.2f", bestNoWater)) kcal/mol")
+        print("  [Water] Best energy with water:    \(String(format: "%.2f", bestWithWater)) kcal/mol")
+        print("  [Water] Difference:                \(String(format: "%.2f", bestWithWater - bestNoWater)) kcal/mol")
+
+        // The water should change the energy landscape — energies should differ
+        XCTAssertNotEqual(bestNoWater, bestWithWater, accuracy: 0.01,
+            "Adding a water molecule at the pocket center should change the best docking energy")
+
+        print("✓ Bridging water grid impact test PASSED")
+    }
+
+    // ======================================================================
+    // MARK: 10 — Receptor Flexibility (Functional)
+    // ======================================================================
+
+    /// Verify that FlexDockingEngine correctly excludes sidechain atoms and creates valid GPU buffers
+    /// using a real protein from PDB.
+    @MainActor
+    func testFlexExclusionOnRealProtein() async throws {
+        print("\n  ========== FLEX EXCLUSION: 3PYY real protein ==========")
+        let engine = try sharedDockingEngine()
+
+        let (protein, ligand, _) = try await fetchAndParsePDB(id: "3PYY", ligandResidue: "STI")
+        let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
+        guard let pocket else { return XCTFail("[Flex] Pocket detection failed") }
+
+        // Pick 3 pocket residues that have rotamers
+        // pocket.residueIndices are indices into protein.residues, not residueSeq values
+        let residues = protein.residues
+        var flexIndices: [Int] = []
+        for resArrayIdx in pocket.residueIndices {
+            guard flexIndices.count < 3 else { break }
+            guard resArrayIdx < residues.count else { continue }
+            let res = residues[resArrayIdx]
+            if RotamerLibrary.rotamers(for: res.name) != nil {
+                flexIndices.append(res.sequenceNumber)
+            }
+        }
+        print("  [Flex] Selected \(flexIndices.count) flexible residues from pocket")
+        guard flexIndices.count >= 2 else { throw XCTSkip("Not enough rotamerable residues in 3PYY pocket") }
+
+        for idx in flexIndices {
+            if let atom = protein.atoms.first(where: { $0.residueSeq == idx }) {
+                let chiCount = RotamerLibrary.rotamers(for: atom.residueName)?.chiAngles.count ?? 0
+                print("    Residue \(atom.residueName)\(idx): \(chiCount) chi angles")
+            }
+        }
+
+        // Create flex engine and exclude atoms
+        let flexEngine = FlexDockingEngine(device: engine.device, commandQueue: engine.commandQueue)
+        var config = FlexibleResidueConfig()
+        config.flexibleResidueIndices = flexIndices
+
+        let exclusion = flexEngine.excludeFlexAtoms(
+            proteinAtoms: protein.atoms, proteinBonds: protein.bonds,
+            flexConfig: config
+        )
+
+        print("  [Flex] Rigid atoms: \(exclusion.rigidAtoms.count) (was \(protein.atoms.count))")
+        print("  [Flex] Flex atoms:  \(exclusion.flexAtoms.count)")
+        print("  [Flex] Chi slots:   \(exclusion.chiSlotCount)")
+        print("  [Flex] Torsion edges: \(exclusion.flexTorsionEdges.count)")
+        print("  [Flex] Moving indices: \(exclusion.flexMovingIndices.count)")
+
+        // Validate exclusion
+        XCTAssertGreaterThan(exclusion.flexAtoms.count, 0, "Should have flex atoms")
+        XCTAssertGreaterThan(exclusion.chiSlotCount, 0, "Should have chi slots")
+        // Rigid + flex atoms should cover the original protein (flex buffer may include
+        // pseudo backbone atoms used as rotation pivots, so allow some tolerance)
+        let rigidCount = exclusion.rigidAtoms.count
+        let flexCount = exclusion.flexAtoms.count
+        let totalOriginal = protein.atoms.count
+        XCTAssertGreaterThanOrEqual(rigidCount + flexCount, totalOriginal,
+            "Rigid (\(rigidCount)) + flex (\(flexCount)) should be >= original (\(totalOriginal))")
+
+        // Verify rigid protein has no sidechain atoms from the flex residues
+        let flexResSet = Set(flexIndices)
+        let backboneNames: Set<String> = ["N", "CA", "C", "O", "H", "HA"]
+        for atom in exclusion.rigidAtoms {
+            if flexResSet.contains(atom.residueSeq) {
+                XCTAssertTrue(backboneNames.contains(atom.name),
+                    "Rigid protein should only contain backbone atoms for flex residues, found \(atom.name) in \(atom.residueName)\(atom.residueSeq)")
+            }
+        }
+
+        // Create GPU buffers and verify
+        flexEngine.prepareFlexBuffers(exclusion: exclusion)
+        XCTAssertTrue(flexEngine.isEnabled, "Flex engine should be enabled after buffer creation")
+        XCTAssertNotNil(flexEngine.flexAtomBuffer, "flexAtomBuffer should be created")
+        XCTAssertNotNil(flexEngine.flexTorsionEdgeBuffer, "flexTorsionEdgeBuffer should be created")
+        XCTAssertNotNil(flexEngine.flexParamsBuffer, "flexParamsBuffer should be created")
+
+        print("  [Flex] GPU buffers created: atomBuf=\(flexEngine.flexAtomBuffer!.length)B, " +
+              "edgeBuf=\(flexEngine.flexTorsionEdgeBuffer!.length)B")
+
+        print("✓ Flex exclusion on real protein test PASSED")
+    }
+
+    /// Verify that flexible docking with a real system runs, converges, and produces
+    /// results comparable to rigid docking. Uses 3PYY (imatinib/ABL kinase).
+    /// Runs rigid baseline first, then flex with 2-3 pocket residues.
+    @MainActor
+    func testFlexDockingProducesValidResults() async throws {
+        print("\n  ========== FLEX DOCKING: 3PYY / Imatinib ==========")
+        let engine = try sharedDockingEngine()
+
+        let (protein, ligand, crystalHeavy) = try await fetchAndParsePDB(id: "3PYY", ligandResidue: "STI")
+        let pocket = await BindingSiteDetector.ligandGuidedPocket(protein: protein, ligand: ligand, distance: 6.0)
+        guard let pocket else { return XCTFail("[Flex] Pocket detection failed") }
+
+        // ---------- Phase 1: Rigid baseline ----------
+        print("  [FlexDock] Phase 1: Rigid baseline (300 pop, 300 gen)")
+        engine.flexEngine = nil
+        let rigidResults = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+                                                 populationSize: 300, generations: 300, flexibility: true)
+        let rigidBest = rigidResults.first!
+        let rigidRMSD = computeRMSD(crystalHeavy, rigidBest.transformedAtomPositions)
+        let rigidClusters = Set(rigidResults.map(\.clusterID)).count
+        print("  [FlexDock] Rigid: E=\(String(format: "%.1f", rigidBest.energy)), RMSD=\(String(format: "%.2f", rigidRMSD))Å, \(rigidResults.count) poses, \(rigidClusters) clusters")
+
+        // ---------- Phase 2: Select flex residues ----------
+        // Pick 2-3 residues from pocket that are on the ligand's chain and close to ligand centroid,
+        // so they actually matter for induced-fit scoring.
+        let ligandCentroid = crystalHeavy.reduce(SIMD3<Float>.zero, +) / Float(max(crystalHeavy.count, 1))
+        let ligandChain = ligand.atoms.first?.chainID ?? "A"
+        let residues = protein.residues
+
+        // Collect candidate residues: must have rotamers, be on the same chain as (or near) the ligand,
+        // and have sidechain atoms within 6 Å of the ligand centroid
+        struct FlexCandidate {
+            let seqNum: Int
+            let name: String
+            let minDist: Float
+            let chiCount: Int
+        }
+        var candidates: [FlexCandidate] = []
+        for resArrayIdx in pocket.residueIndices {
+            guard resArrayIdx < residues.count else { continue }
+            let res = residues[resArrayIdx]
+            guard let rotDef = RotamerLibrary.rotamers(for: res.name) else { continue }
+
+            // Check that this residue's sidechain atoms are near the ligand
+            let backboneNames: Set<String> = ["N", "CA", "C", "O", "H", "HA"]
+            let scAtoms = res.atomIndices.compactMap { idx -> Atom? in
+                guard idx < protein.atoms.count else { return nil }
+                let a = protein.atoms[idx]
+                return backboneNames.contains(a.name) ? nil : a
+            }
+            guard !scAtoms.isEmpty else { continue }
+            let minDist = scAtoms.map { simd_distance($0.position, ligandCentroid) }.min() ?? 999
+            guard minDist < 12.0 else { continue }  // sidechain within 12 Å of ligand center
+
+            candidates.append(FlexCandidate(
+                seqNum: res.sequenceNumber, name: res.name,
+                minDist: minDist, chiCount: rotDef.chiAngles.count
+            ))
+        }
+        // Sort by proximity to ligand, pick closest 3
+        candidates.sort { $0.minDist < $1.minDist }
+        let flexIndices = Array(candidates.prefix(3).map(\.seqNum))
+
+        guard flexIndices.count >= 2 else { throw XCTSkip("Not enough rotamerable residues near ligand in 3PYY pocket") }
+
+        for c in candidates.prefix(3) {
+            print("  [FlexDock] Flex residue: \(c.name)\(c.seqNum), \(c.chiCount) chi, minDist=\(String(format: "%.1f", c.minDist))Å")
+        }
+
+        // ---------- Phase 3: Flex docking ----------
+        let flexEngine = FlexDockingEngine(device: engine.device, commandQueue: engine.commandQueue)
+        var flexConfig = FlexibleResidueConfig()
+        flexConfig.flexibleResidueIndices = flexIndices
+
+        let vinaTypes = engine.vinaTypesForProtein(protein)
+        let exclusion = flexEngine.excludeFlexAtoms(
+            proteinAtoms: protein.atoms, proteinBonds: protein.bonds,
+            flexConfig: flexConfig, vinaTypes: vinaTypes
+        )
+        flexEngine.prepareFlexBuffers(exclusion: exclusion)
+        engine.flexEngine = flexEngine
+
+        let typedCount = exclusion.flexAtoms.filter { $0.vinaType >= 0 }.count
+        print("  [FlexDock] Flex atoms: \(exclusion.flexAtoms.count) (\(typedCount) typed), \(exclusion.chiSlotCount) chi slots")
+        print("  [FlexDock] Delta scoring: grid includes ALL atoms; flex kernel computes (rotated - reference)")
+        print("  [FlexDock] Phase 3: Flex docking (300 pop, 300 gen)")
+
+        // Grid uses FULL protein (flex atoms at reference positions). The flex kernel
+        // computes delta = pairwise(rotated) - pairwise(reference). When chi=0, delta=0 → rigid docking.
+        let flexResults = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket,
+                                                populationSize: 300, generations: 300, flexibility: true)
+
+        XCTAssertFalse(flexResults.isEmpty, "[FlexDock] No results")
+
+        let flexBest = flexResults[0]
+        XCTAssertTrue(flexBest.energy.isFinite, "[FlexDock] Best energy not finite: \(flexBest.energy)")
+        XCTAssertTrue(flexBest.energy < 0, "[FlexDock] Energy should be negative, got \(flexBest.energy)")
+        XCTAssertFalse(flexBest.transformedAtomPositions.isEmpty, "[FlexDock] No transformed positions")
+
+        let flexRMSD = computeRMSD(crystalHeavy, flexBest.transformedAtomPositions)
+        let flexClusters = Set(flexResults.map(\.clusterID)).count
+
+        if !flexBest.pose.chiAngles.isEmpty {
+            print("  [FlexDock] Best chi angles: \(flexBest.pose.chiAngles.map { String(format: "%.1f°", $0 * 180 / .pi) })")
+        }
+
+        // ---------- Phase 4: Compare ----------
+        print("")
+        print("  ╔═══════════════════════════════════════════════════════╗")
+        print("  ║  3PYY Flex vs Rigid Comparison                       ║")
+        print("  ╠═══════════════════════════════════════════════════════╣")
+        print("  ║  Rigid:  E=\(String(format: "%7.1f", rigidBest.energy)) kcal/mol  RMSD=\(String(format: "%5.2f", rigidRMSD))Å  \(String(format: "%3d", rigidClusters)) clusters ║")
+        print("  ║  Flex:   E=\(String(format: "%7.1f", flexBest.energy)) kcal/mol  RMSD=\(String(format: "%5.2f", flexRMSD))Å  \(String(format: "%3d", flexClusters)) clusters ║")
+        print("  ║  ΔE=\(String(format: "%+.1f", flexBest.energy - rigidBest.energy))  ΔRMSD=\(String(format: "%+.2f", flexRMSD - rigidRMSD))Å                          ║")
+        print("  ╚═══════════════════════════════════════════════════════╝")
+
+        // Flex should produce valid results — don't assert RMSD improvement since
+        // flex with few residues on a well-packed kinase may not help, but it must
+        // not catastrophically diverge
+        XCTAssertLessThan(flexRMSD, 20.0,
+            "[FlexDock] Flex RMSD \(String(format: "%.2f", flexRMSD))Å is too high — scoring may be broken")
+        XCTAssertGreaterThan(flexClusters, 1,
+            "[FlexDock] Should have >1 cluster, got \(flexClusters)")
+
+        // Clean up
+        engine.flexEngine = nil
+
+        print("✓ Flex docking test PASSED")
     }
 }

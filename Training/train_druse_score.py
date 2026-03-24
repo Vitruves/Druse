@@ -36,7 +36,7 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.nn import radius_graph
 from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
 # ============================================================================
@@ -893,8 +893,15 @@ def train(args):
         print("ERROR: No data found. Run: python download_data.py --all")
         return
 
-    # 5-fold cross-validation
-    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+    # Protein-cluster-based cross-validation to prevent target leakage.
+    # PDBbind contains many structures of the same protein target (e.g., multiple
+    # kinase inhibitors co-crystallized with the same kinase). Random KFold would
+    # leak target information across folds, inflating validation metrics. We group
+    # complexes by the first 4 characters of the PDB ID, which corresponds to the
+    # PDB entry and serves as a rough proxy for protein identity. This ensures all
+    # complexes of the same protein end up in the same fold.
+    groups = [entry["pdb_id"][:4].upper() for entry in dataset.entries]
+    gkf = GroupKFold(n_splits=3)
     all_indices = list(range(len(dataset)))
 
     best_overall_r = -1
@@ -908,10 +915,12 @@ def train(args):
     with open(log_path, "w") as f:
         f.write("fold,epoch,train_loss,val_rmse,val_mae,val_r,lr,max_grad,nan_count,skip_count,time_sec\n")
 
-    print(f"\nTraining log: {log_path}")
+    n_unique_groups = len(set(groups))
+    print(f"\nProtein-cluster GroupKFold: {n_unique_groups} unique protein groups")
+    print(f"Training log: {log_path}")
     print(f"Monitor with: tail -f {log_path}\n")
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices)):
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(all_indices, groups=groups)):
         print(f"\n{'='*60}")
         print(f"Fold {fold + 1}/3 ({len(train_idx)} train, {len(val_idx)} val)")
         print(f"{'='*60}")

@@ -7,18 +7,10 @@ struct ResultsTabView: View {
 
     // Screening hit filters (stored in viewModel to persist across tab switches)
 
-    // Analog generation
-    @State private var analogRefSmiles: String = ""
-    @State private var analogRefName: String = ""
-    @State private var analogCount: Double = 50
-    @State private var analogSimilarity: Double = 0.7
-    @State private var analogKeepScaffold: Bool = true
-    @State private var showAnalogSection: Bool = false
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Results Database button always on top when results exist
-            if !viewModel.dockingResults.isEmpty || !viewModel.batchResults.isEmpty {
+            if !viewModel.docking.dockingResults.isEmpty || !viewModel.docking.batchResults.isEmpty {
                 Button(action: { openWindow(id: "results-database") }) {
                     Label("Open Results Database", systemImage: "tablecells")
                         .frame(maxWidth: .infinity)
@@ -29,25 +21,25 @@ struct ResultsTabView: View {
             }
 
             // Batch docking progress
-            if viewModel.isBatchDocking {
+            if viewModel.docking.isBatchDocking {
                 batchProgressSection
             }
 
             // Batch docking results (ranked across all ligands)
-            if !viewModel.batchResults.isEmpty && !viewModel.isBatchDocking {
+            if !viewModel.docking.batchResults.isEmpty && !viewModel.docking.isBatchDocking {
                 batchResultsSection
                 Divider()
             }
 
-            if !viewModel.dockingResults.isEmpty && !viewModel.isDocking && viewModel.batchResults.isEmpty {
+            if !viewModel.docking.dockingResults.isEmpty && !viewModel.docking.isDocking && viewModel.docking.batchResults.isEmpty {
                 dockingResultsSection
                 Divider()
                 dockingExportSection
             }
 
             // Show screening results section when available
-            if !viewModel.screeningHits.isEmpty {
-                if !viewModel.dockingResults.isEmpty { Divider() }
+            if !viewModel.docking.screeningHits.isEmpty {
+                if !viewModel.docking.dockingResults.isEmpty { Divider() }
                 screeningResultsSection
                 Divider()
                 screeningFilterSection
@@ -55,34 +47,28 @@ struct ResultsTabView: View {
                 screeningExportSection
             }
 
-            // Analog generation section
-            if showAnalogSection || !viewModel.dockingResults.isEmpty || !viewModel.screeningHits.isEmpty {
-                Divider()
-                analogGenerationSection
-            }
-
             // Empty state
-            if viewModel.dockingResults.isEmpty && viewModel.screeningHits.isEmpty && !viewModel.isDocking {
+            if viewModel.docking.dockingResults.isEmpty && viewModel.docking.screeningHits.isEmpty && !viewModel.docking.isDocking {
                 emptyState
             }
 
             Spacer(minLength: 0)
         }
         .padding(12)
-        .onChange(of: viewModel.screeningHits.count) { _, _ in
+        .onChange(of: viewModel.docking.screeningHits.count) { _, _ in
             initializeCutoffsIfNeeded()
         }
         .sheet(isPresented: Binding(
-            get: { viewModel.showInteractionDiagram },
-            set: { viewModel.showInteractionDiagram = $0 }
+            get: { viewModel.docking.showInteractionDiagram },
+            set: { viewModel.docking.showInteractionDiagram = $0 }
         )) {
-            if let ligand = viewModel.ligand,
-               let protein = viewModel.protein,
-               viewModel.interactionDiagramPoseIndex < viewModel.dockingResults.count {
-                let idx = viewModel.interactionDiagramPoseIndex
-                let result = viewModel.dockingResults[idx]
+            if let ligand = viewModel.molecules.ligand,
+               let protein = viewModel.molecules.protein,
+               viewModel.docking.interactionDiagramPoseIndex < viewModel.docking.dockingResults.count {
+                let idx = viewModel.docking.interactionDiagramPoseIndex
+                let result = viewModel.docking.dockingResults[idx]
                 InteractionDiagramView(
-                    interactions: viewModel.currentInteractions,
+                    interactions: viewModel.docking.currentInteractions,
                     ligandAtoms: ligand.atoms.filter { $0.element != .H },
                     ligandBonds: ligand.bonds,
                     proteinAtoms: protein.atoms.filter { $0.element != .H },
@@ -103,7 +89,7 @@ struct ResultsTabView: View {
             HStack {
                 Label("Docking Results", systemImage: "chart.bar.xaxis")
                     .font(.system(size: 12, weight: .semibold))
-                if let ligandName = viewModel.ligand?.name, !ligandName.isEmpty {
+                if let ligandName = viewModel.molecules.ligand?.name, !ligandName.isEmpty {
                     Text(ligandName)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
@@ -114,23 +100,33 @@ struct ResultsTabView: View {
             }
 
             // Summary card
-            if let best = viewModel.dockingResults.first {
+            if let best = viewModel.docking.dockingResults.first {
+                let isML = viewModel.docking.scoringMethod == .druseAffinity
+                let bestValue = isML ? (best.mlPKd ?? best.energy) : best.energy
+                let unit = isML ? viewModel.docking.affinityDisplayUnit.unitLabel : "kcal/mol"
+                let display = isML ? viewModel.docking.affinityDisplayUnit.format(best.mlPKd ?? 0) : String(format: "%.1f", best.energy)
+                let color: Color = isML
+                    ? ((best.mlPKd ?? 0) > 8 ? .green : (best.mlPKd ?? 0) > 5 ? .yellow : .red)
+                    : (bestValue < -6 ? .green : bestValue < 0 ? .yellow : .red)
                 summaryCard(
-                    bestEnergy: best.energy,
-                    poseCount: viewModel.dockingResults.count,
-                    clusterCount: Set(viewModel.dockingResults.map(\.clusterID)).count
+                    bestDisplay: display,
+                    bestUnit: unit,
+                    bestColor: color,
+                    poseCount: viewModel.docking.dockingResults.count,
+                    clusterCount: Set(viewModel.docking.dockingResults.map(\.clusterID)).count,
+                    confidence: isML ? best.mlPoseConfidence : nil
                 )
             }
 
             // Energy landscape bar chart
-            if viewModel.dockingResults.count > 1 {
+            if viewModel.docking.dockingResults.count > 1 {
                 energyLandscapeChart
             }
 
             // Multi-pose action bar
-            if viewModel.selectedPoseIndices.count > 1 {
+            if viewModel.docking.selectedPoseIndices.count > 1 {
                 HStack {
-                    Text("\(viewModel.selectedPoseIndices.count) poses selected")
+                    Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -140,7 +136,7 @@ struct ResultsTabView: View {
                     .controlSize(.small)
                     .buttonStyle(.borderedProminent)
                     Button("Clear") {
-                        viewModel.selectedPoseIndices.removeAll()
+                        viewModel.docking.selectedPoseIndices.removeAll()
                     }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
@@ -149,12 +145,12 @@ struct ResultsTabView: View {
             }
 
             // Scrollable pose list (up to 50)
-            ForEach(Array(viewModel.dockingResults.prefix(50).enumerated()), id: \.offset) { idx, result in
+            ForEach(Array(viewModel.docking.dockingResults.prefix(50).enumerated()), id: \.offset) { idx, result in
                 dockingPoseRow(index: idx, result: result)
             }
 
-            if viewModel.dockingResults.count > 50 {
-                Text("+ \(viewModel.dockingResults.count - 50) more poses")
+            if viewModel.docking.dockingResults.count > 50 {
+                Text("+ \(viewModel.docking.dockingResults.count - 50) more poses")
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -163,12 +159,14 @@ struct ResultsTabView: View {
     }
 
     @ViewBuilder
-    private func summaryCard(bestEnergy: Float, poseCount: Int, clusterCount: Int) -> some View {
+    private func summaryCard(bestDisplay: String, bestUnit: String, bestColor: Color, poseCount: Int, clusterCount: Int, confidence: Float? = nil) -> some View {
         HStack(spacing: 12) {
-            statBadge("Best", String(format: "%.1f", bestEnergy), unit: "kcal/mol",
-                       color: bestEnergy < -6 ? .green : bestEnergy < 0 ? .yellow : .red)
+            statBadge("Best", bestDisplay, unit: bestUnit, color: bestColor)
             statBadge("Poses", "\(poseCount)")
             statBadge("Clusters", "\(clusterCount)")
+            if let conf = confidence {
+                statBadge("Conf", String(format: "%.0f%%", conf * 100), color: conf > 0.7 ? .green : conf > 0.4 ? .yellow : .red)
+            }
         }
         .padding(8)
         .frame(maxWidth: .infinity)
@@ -186,28 +184,31 @@ struct ResultsTabView: View {
 
     @ViewBuilder
     private var energyLandscapeChart: some View {
-        let results = viewModel.dockingResults
-        let energies = results.map(\.energy)
-        let minE = energies.min() ?? 0
-        let maxE = energies.max() ?? 0
+        let results = viewModel.docking.dockingResults
+        let isML = viewModel.docking.scoringMethod == .druseAffinity
+        let scores: [Float] = isML ? results.map { $0.mlDockingScore ?? $0.energy } : results.map(\.energy)
+        let minE = scores.min() ?? 0
+        let maxE = scores.max() ?? 0
         let range = max(abs(maxE - minE), 0.1)
-        let selectedIdx = viewModel.selectedPoseIndices.count == 1 ? viewModel.selectedPoseIndices.first : nil
+        let selectedIdx = viewModel.docking.selectedPoseIndices.count == 1 ? viewModel.docking.selectedPoseIndices.first : nil
+        let chartTitle = isML ? "Scoring Landscape" : "Energy Landscape"
+        let unitLabel = isML ? viewModel.docking.affinityDisplayUnit.unitLabel : "kcal/mol"
 
         VStack(alignment: .leading, spacing: 4) {
-            // Axis labels
             HStack {
-                Text("Energy Landscape")
+                Text(chartTitle)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let sel = selectedIdx, sel < results.count {
-                    Text(String(format: "Pose %d: %.2f kcal/mol", sel + 1, results[sel].energy))
+                    let val = scores[sel]
+                    let display = isML ? viewModel.docking.affinityDisplayUnit.format(results[sel].mlPKd ?? val) : String(format: "%.2f", val)
+                    Text("Pose \(sel + 1): \(display) \(unitLabel)")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(.primary)
                 }
             }
 
-            // Bar chart
             GeometryReader { geo in
                 let barCount = min(results.count, 50)
                 let spacing: CGFloat = 1
@@ -217,13 +218,15 @@ struct ResultsTabView: View {
 
                 HStack(alignment: .bottom, spacing: spacing) {
                     ForEach(0..<barCount, id: \.self) { idx in
-                        let energy = results[idx].energy
-                        let normalized = CGFloat((energy - minE) / range)
-                        let barHeight = max(3, (1.0 - normalized) * (chartHeight - 4) + 4)
+                        let score = scores[idx]
+                        let normalized: CGFloat = isML
+                            ? CGFloat((score - minE) / range)  // ML: higher = better, tall bars on left
+                            : CGFloat((score - minE) / range)
+                        let barHeight = max(3, (isML ? normalized : (1.0 - normalized)) * (chartHeight - 4) + 4)
                         let isSelected = selectedIdx == idx
 
                         Rectangle()
-                            .fill(barColor(energy: energy, isSelected: isSelected))
+                            .fill(barColor(energy: isML ? -score : score, isSelected: isSelected))
                             .frame(width: barWidth, height: barHeight)
                             .clipShape(RoundedRectangle(cornerRadius: 1.5))
                             .overlay(
@@ -240,19 +243,18 @@ struct ResultsTabView: View {
             }
             .frame(height: 60)
 
-            // Scale
             HStack {
-                Text(String(format: "%.1f", minE))
+                Text(String(format: "%.1f", isML ? maxE : minE))
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.green)
                 Spacer()
-                Text("kcal/mol")
+                Text(unitLabel)
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                 Spacer()
-                Text(String(format: "%.1f", maxE))
+                Text(String(format: "%.1f", isML ? minE : maxE))
                     .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(maxE > 0 ? .red : .yellow)
+                    .foregroundStyle(isML ? .red : (maxE > 0 ? .red : .yellow))
             }
         }
         .padding(10)
@@ -280,10 +282,10 @@ struct ResultsTabView: View {
         HStack(spacing: 6) {
             // Multi-pose selection toggle
             Button(action: { viewModel.togglePoseSelection(at: index) }) {
-                Image(systemName: viewModel.selectedPoseIndices.contains(index)
+                Image(systemName: viewModel.docking.selectedPoseIndices.contains(index)
                       ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 13))
-                    .foregroundStyle(viewModel.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.4))
+                    .foregroundStyle(viewModel.docking.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.4))
             }
             .buttonStyle(.plain)
             .help("Select for multi-pose overlay")
@@ -295,12 +297,26 @@ struct ResultsTabView: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
-                    Text(String(format: "%.2f", result.energy))
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(energyColor(result.energy))
-                    Text("kcal/mol")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                    if viewModel.docking.scoringMethod == .druseAffinity, let pKd = result.mlPKd {
+                        Text(viewModel.docking.affinityDisplayUnit.format(pKd))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
+                        Text(viewModel.docking.affinityDisplayUnit.unitLabel)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                        if let conf = result.mlPoseConfidence {
+                            Text(String(format: "%.0f%%", conf * 100))
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .foregroundStyle(conf > 0.7 ? Color.green.opacity(0.8) : .secondary)
+                        }
+                    } else {
+                        Text(String(format: "%.2f", result.energy))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(energyColor(result.energy))
+                        Text("kcal/mol")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
 
                 HStack(spacing: 6) {
@@ -313,6 +329,17 @@ struct ResultsTabView: View {
                     Text(String(format: "hb:%.1f", result.hbondEnergy))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.secondary)
+                    if let strain = result.strainEnergy, strain > 4.0 {
+                        Text(String(format: "str:%.0f", strain))
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(strain > 10.0 ? .red : .orange)
+                            .help("MMFF94 strain energy: \(String(format: "%.1f", strain)) kcal/mol")
+                    }
+                    if result.constraintPenalty > 0.01 {
+                        Text(String(format: "cst:%.1f", result.constraintPenalty))
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
                     if result.clusterID >= 0 {
                         Text("C\(result.clusterID)")
                             .font(.system(size: 9, weight: .medium, design: .monospaced))
@@ -328,8 +355,8 @@ struct ResultsTabView: View {
 
             Button {
                 viewModel.showDockingPose(at: index)
-                viewModel.interactionDiagramPoseIndex = index
-                viewModel.showInteractionDiagram = true
+                viewModel.docking.interactionDiagramPoseIndex = index
+                viewModel.docking.showInteractionDiagram = true
             } label: {
                 Image(systemName: "circle.hexagongrid")
                     .font(.system(size: 11))
@@ -343,6 +370,18 @@ struct ResultsTabView: View {
             }
             .controlSize(.small)
             .buttonStyle(.bordered)
+
+            if let lig = viewModel.docking.originalDockingLigand ?? viewModel.molecules.ligand {
+                Button {
+                    viewModel.selectReferenceForOptimization(result: result, ligand: lig)
+                } label: {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 11))
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+                .help("Optimize — use as reference for lead optimization")
+            }
         }
         .padding(.vertical, 2)
     }
@@ -469,16 +508,14 @@ struct ResultsTabView: View {
                 .padding(.leading, 30)
             }
 
-            // "Use as reference" button for analog generation
             HStack {
                 Spacer()
-                Button("Analogs") {
-                    analogRefSmiles = hit.smiles
-                    analogRefName = hit.name
-                    showAnalogSection = true
+                Button("Optimize") {
+                    viewModel.selectReferenceFromHit(hit)
                 }
                 .controlSize(.mini)
                 .buttonStyle(.bordered)
+                .help("Use as reference for lead optimization")
             }
         }
         .padding(.vertical, 2)
@@ -493,7 +530,7 @@ struct ResultsTabView: View {
             Label("Filters", systemImage: "line.3.horizontal.decrease")
                 .font(.system(size: 12, weight: .semibold))
 
-            Toggle("Lipinski compliant only", isOn: $vm.resultsLipinskiFilter)
+            Toggle("Lipinski compliant only", isOn: $vm.docking.resultsLipinskiFilter)
                 .font(.system(size: 11))
 
             VStack(alignment: .leading, spacing: 2) {
@@ -501,11 +538,11 @@ struct ResultsTabView: View {
                     Text("Energy cutoff")
                         .font(.system(size: 11))
                     Spacer()
-                    Text(String(format: "%.1f kcal/mol", vm.resultsEnergyCutoff))
+                    Text(String(format: "%.1f kcal/mol", vm.docking.resultsEnergyCutoff))
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
-                Slider(value: $vm.resultsEnergyCutoff, in: -20...5, step: 0.5)
+                Slider(value: $vm.docking.resultsEnergyCutoff, in: -20...5, step: 0.5)
                     .controlSize(.small)
             }
 
@@ -514,15 +551,15 @@ struct ResultsTabView: View {
                     Text("ML score cutoff")
                         .font(.system(size: 11))
                     Spacer()
-                    Text(String(format: "%.1f", vm.resultsMLScoreCutoff))
+                    Text(String(format: "%.1f", vm.docking.resultsMLScoreCutoff))
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
-                Slider(value: $vm.resultsMLScoreCutoff, in: 0...15, step: 0.5)
+                Slider(value: $vm.docking.resultsMLScoreCutoff, in: 0...15, step: 0.5)
                     .controlSize(.small)
             }
 
-            Text("\(filteredScreeningHits.count) / \(viewModel.screeningHits.count) hits pass filters")
+            Text("\(filteredScreeningHits.count) / \(viewModel.docking.screeningHits.count) hits pass filters")
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
         }
@@ -539,117 +576,11 @@ struct ResultsTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(viewModel.screeningHits.isEmpty)
+            .disabled(viewModel.docking.screeningHits.isEmpty)
         }
     }
 
     // MARK: - Analog Generation
-
-    @ViewBuilder
-    private var analogGenerationSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Generate Analogs", systemImage: "arrow.triangle.branch")
-                .font(.system(size: 12, weight: .semibold))
-
-            // Reference SMILES input
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Reference SMILES")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-
-                TextField("SMILES...", text: $analogRefSmiles)
-                    .font(.system(size: 10, design: .monospaced))
-                    .textFieldStyle(.roundedBorder)
-                    .controlSize(.small)
-
-                if !analogRefName.isEmpty {
-                    Text("Ref: \(analogRefName)")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                }
-
-                // Quick-fill from docking result
-                if !viewModel.dockingResults.isEmpty, let lig = viewModel.ligand {
-                    Button("Use best docking pose") {
-                        analogRefSmiles = lig.title  // title typically stores SMILES
-                        analogRefName = lig.name
-                    }
-                    .controlSize(.mini)
-                    .buttonStyle(.bordered)
-                    .disabled(lig.title.isEmpty)
-                }
-            }
-
-            // Options
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Options")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-
-                configRow("Analogs to generate") {
-                    Picker("", selection: $analogCount) {
-                        Text("10").tag(Double(10))
-                        Text("25").tag(Double(25))
-                        Text("50").tag(Double(50))
-                        Text("100").tag(Double(100))
-                        Text("500").tag(Double(500))
-                        Text("1000").tag(Double(1000))
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .frame(width: 70)
-                }
-
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("Similarity threshold")
-                            .font(.system(size: 11))
-                        Spacer()
-                        Text(String(format: "%.2f", analogSimilarity))
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $analogSimilarity, in: 0.5...0.9, step: 0.05)
-                        .controlSize(.small)
-                }
-
-                Toggle("Keep scaffold (modify R-groups)", isOn: $analogKeepScaffold)
-                    .font(.system(size: 11))
-            }
-
-            // Generate button
-            Button(action: {
-                viewModel.generateAnalogs(
-                    referenceSmiles: analogRefSmiles,
-                    referenceName: analogRefName.isEmpty ? "ref" : analogRefName,
-                    count: Int(analogCount),
-                    similarityThreshold: Float(analogSimilarity),
-                    keepScaffold: analogKeepScaffold
-                )
-            }) {
-                Label("Generate", systemImage: "sparkles")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .disabled(analogRefSmiles.isEmpty || viewModel.isGeneratingAnalogs)
-
-            // Progress
-            if viewModel.isGeneratingAnalogs {
-                ProgressView(value: Double(viewModel.analogGenerationProgress))
-                    .progressViewStyle(.linear)
-                HStack {
-                    Text("Generating...")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(String(format: "%.0f%%", viewModel.analogGenerationProgress * 100))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
 
     // MARK: - Batch Docking Results
 
@@ -659,16 +590,16 @@ struct ResultsTabView: View {
             Label("Batch Docking", systemImage: "arrow.triangle.merge")
                 .font(.system(size: 12, weight: .semibold))
 
-            let (current, total) = viewModel.batchProgress
+            let (current, total) = viewModel.docking.batchProgress
             ProgressView(value: total > 0 ? Double(current) / Double(total) : 0) {
-                Text("\(viewModel.statusMessage)")
+                Text("\(viewModel.workspace.statusMessage)")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
             .controlSize(.small)
 
-            if !viewModel.batchResults.isEmpty {
-                Text("\(viewModel.batchResults.count) ligands docked so far")
+            if !viewModel.docking.batchResults.isEmpty {
+                Text("\(viewModel.docking.batchResults.count) ligands docked so far")
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
             }
@@ -689,18 +620,18 @@ struct ResultsTabView: View {
                 Label("Batch Results", systemImage: "chart.bar.xaxis")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text("\(viewModel.batchResults.count) ligands")
+                Text("\(viewModel.docking.batchResults.count) ligands")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
 
             // Summary: best ligand
-            if let best = viewModel.batchResults.first, let bestPose = best.results.first {
+            if let best = viewModel.docking.batchResults.first, let bestPose = best.results.first {
                 HStack(spacing: 12) {
                     statBadge("Best", best.ligandName, color: .green)
                     statBadge("Energy", String(format: "%.1f", bestPose.energy), unit: "kcal/mol",
                                color: bestPose.energy < -6 ? .green : bestPose.energy < 0 ? .yellow : .red)
-                    statBadge("Ligands", "\(viewModel.batchResults.count)")
+                    statBadge("Ligands", "\(viewModel.docking.batchResults.count)")
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity)
@@ -709,12 +640,12 @@ struct ResultsTabView: View {
             }
 
             // Ranked ligand list (top 10)
-            ForEach(Array(viewModel.batchResults.prefix(10).enumerated()), id: \.offset) { rank, entry in
+            ForEach(Array(viewModel.docking.batchResults.prefix(10).enumerated()), id: \.offset) { rank, entry in
                 batchResultRow(rank: rank, ligandName: entry.ligandName, results: entry.results)
             }
 
-            if viewModel.batchResults.count > 10 {
-                Text("+ \(viewModel.batchResults.count - 10) more ligands")
+            if viewModel.docking.batchResults.count > 10 {
+                Text("+ \(viewModel.docking.batchResults.count - 10) more ligands")
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -737,12 +668,12 @@ struct ResultsTabView: View {
 
         Button(action: {
             // Load this ligand's results into the main docking results view
-            viewModel.dockingResults = results
+            viewModel.docking.dockingResults = results
             if let bestEntry = viewModel.ligandDB.entries.first(where: { $0.name == ligandName }),
                results.first != nil {
                 let mol = Molecule(name: bestEntry.name, atoms: bestEntry.atoms, bonds: bestEntry.bonds, title: bestEntry.smiles, smiles: bestEntry.smiles)
                 viewModel.setLigandForDocking(mol)
-                viewModel.dockingResults = results
+                viewModel.docking.dockingResults = results
                 viewModel.showDockingPose(at: 0)
             }
         }) {
@@ -833,16 +764,16 @@ struct ResultsTabView: View {
     }
 
     private var filteredScreeningHits: [VirtualScreeningPipeline.ScreeningHit] {
-        viewModel.screeningHits.filter { hit in
-            if viewModel.resultsLipinskiFilter {
+        viewModel.docking.screeningHits.filter { hit in
+            if viewModel.docking.resultsLipinskiFilter {
                 guard hit.descriptors?.lipinski == true else { return false }
             }
-            if viewModel.resultsEnergyCutoff < 0 {
-                guard hit.compositeScore <= viewModel.resultsEnergyCutoff else { return false }
+            if viewModel.docking.resultsEnergyCutoff < 0 {
+                guard hit.compositeScore <= viewModel.docking.resultsEnergyCutoff else { return false }
             }
-            if viewModel.resultsMLScoreCutoff > 0 {
+            if viewModel.docking.resultsMLScoreCutoff > 0 {
                 if let ml = hit.mlScore {
-                    guard ml >= viewModel.resultsMLScoreCutoff else { return false }
+                    guard ml >= viewModel.docking.resultsMLScoreCutoff else { return false }
                 }
             }
             return true
@@ -850,19 +781,19 @@ struct ResultsTabView: View {
     }
 
     private var totalScreened: Int {
-        if case .complete(_, let total) = viewModel.screeningState {
+        if case .complete(_, let total) = viewModel.docking.screeningState {
             return total
         }
-        return viewModel.screeningHits.count
+        return viewModel.docking.screeningHits.count
     }
 
     private func initializeCutoffsIfNeeded() {
-        guard !viewModel.resultsHasInitializedCutoffs, !viewModel.screeningHits.isEmpty else { return }
-        viewModel.resultsHasInitializedCutoffs = true
+        guard !viewModel.docking.resultsHasInitializedCutoffs, !viewModel.docking.screeningHits.isEmpty else { return }
+        viewModel.docking.resultsHasInitializedCutoffs = true
         // Set energy cutoff to median hit energy
-        let energies = viewModel.screeningHits.map(\.compositeScore).sorted()
+        let energies = viewModel.docking.screeningHits.map(\.compositeScore).sorted()
         if let median = energies[safe: energies.count / 2] {
-            viewModel.resultsEnergyCutoff = median
+            viewModel.docking.resultsEnergyCutoff = median
         }
     }
 }

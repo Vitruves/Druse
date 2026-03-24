@@ -5,12 +5,17 @@ import MetalKit
 struct DruseApp: App {
     @State private var viewModel = AppViewModel()
     @Environment(\.openWindow) private var openWindow
+    @AppStorage("appTheme") private var appTheme: String = AppTheme.dark.rawValue
+
+    private var selectedColorScheme: ColorScheme? {
+        (AppTheme(rawValue: appTheme) ?? .dark).colorScheme
+    }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(viewModel)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(selectedColorScheme)
                 .onAppear {
                     initializeRenderer()
                 }
@@ -24,6 +29,11 @@ struct DruseApp: App {
             CommandGroup(after: .newItem) {
                 Button("Open...") { viewModel.importFile() }
                     .keyboardShortcut("o", modifiers: .command)
+                Divider()
+                Button("Save Project...") { saveProject() }
+                    .keyboardShortcut("s", modifiers: .command)
+                Button("Open Project...") { openProject() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
                 Divider()
                 Button("Load Ligand Database") {
                     viewModel.ligandDB.load()
@@ -70,11 +80,17 @@ struct DruseApp: App {
             }
         }
 
-        // Ligand Database window — shares the same viewModel (and thus LigandDatabase) as the main window
+        Settings {
+            SettingsView()
+                .environment(viewModel)
+                .preferredColorScheme(selectedColorScheme)
+        }
+
+        // Ligand Database window
         Window("Ligand Database", id: "ligand-database") {
             LigandDatabaseWindow()
                 .environment(viewModel)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(selectedColorScheme)
         }
         .defaultSize(width: 1200, height: 700)
         .windowStyle(.titleBar)
@@ -84,12 +100,57 @@ struct DruseApp: App {
         Window("Results Database", id: "results-database") {
             ResultsDatabaseWindow()
                 .environment(viewModel)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(selectedColorScheme)
         }
         .defaultSize(width: 1300, height: 800)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
 
+    }
+
+    private func saveProject() {
+        let panel = NSSavePanel()
+        panel.title = "Save Druse Project"
+        panel.allowedContentTypes = [.folder]
+        panel.nameFieldStringValue = "\(viewModel.molecules.protein?.name ?? "Untitled").druse"
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                do {
+                    try DruseProjectIO.save(to: url, viewModel: viewModel)
+                } catch {
+                    viewModel.log.error("Save failed: \(error.localizedDescription)", category: .system)
+                }
+            }
+        }
+    }
+
+    private func openProject() {
+        let panel = NSOpenPanel()
+        panel.title = "Open Druse Project"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowedContentTypes = [.folder]
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                do {
+                    try await DruseProjectIO.load(from: url, into: viewModel)
+                } catch {
+                    viewModel.log.error("Load failed: \(error.localizedDescription)", category: .system)
+                }
+            }
+        }
+    }
+
+    private let terminationObserver = NotificationCenter.default.addObserver(
+        forName: NSApplication.willTerminateNotification,
+        object: nil, queue: .main
+    ) { _ in
+        MainActor.assumeIsolated {
+            ActivityLog.shared.shutdown()
+        }
     }
 
     private func initializeRenderer() {
@@ -113,6 +174,9 @@ struct DruseApp: App {
         viewModel.renderer = renderer
         viewModel.log.success("Metal renderer initialized (\(device.name))", category: .render)
         viewModel.log.info("GPU: \(device.name), Unified Memory: \(device.hasUnifiedMemory)", category: .system)
+        if let logURL = ActivityLog.shared.currentLogFileURL {
+            viewModel.log.info("Log file: \(logURL.path)", category: .system)
+        }
 
         // Load ML models in the background (non-blocking)
         viewModel.loadMLModels()

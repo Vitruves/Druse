@@ -23,91 +23,97 @@ kernel void detectInteractions(
     device GPUInteraction *output              [[buffer(3)]],
     device atomic_uint *counter                [[buffer(4)]],
     constant InteractionDetectParams &params   [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]
+    uint tid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]]
 ) {
-    if (tid >= params.numLigandAtoms) return;
+    // Maximum interactions a single ligand atom can produce.
+    // 6 strong (metal/salt/hbond/halogen) + 3 hydrophobic = 9 typical max,
+    // but protein atoms can have multiple contacts; 24 is a safe upper bound.
+    const uint MAX_LOCAL = 24;
+    GPUInteraction localInteractions[MAX_LOCAL];
+    uint myCount = 0;
 
-    InteractionAtomGPU ligAtom = ligAtoms[tid];
-    float3 lp = ligPositions[tid];
-    uint ligFlags = ligAtom.flags;
-    int ligCharge = ligAtom.formalCharge;
+    if (tid < params.numLigandAtoms) {
+        InteractionAtomGPU ligAtom = ligAtoms[tid];
+        float3 lp = ligPositions[tid];
+        uint ligFlags = ligAtom.flags;
+        int ligCharge = ligAtom.formalCharge;
 
-    // Track whether this ligand atom found a strong (non-hydrophobic) interaction
-    bool hasStrongInteraction = false;
-    uint hydroCount = 0;
-    const uint maxHydroPerAtom = 3;
+        // Track whether this ligand atom found a strong (non-hydrophobic) interaction
+        bool hasStrongInteraction = false;
+        uint hydroCount = 0;
+        const uint maxHydroPerAtom = 3;
 
-    for (uint pi = 0; pi < params.numProteinAtoms; pi++) {
-        InteractionAtomGPU protAtom = protAtoms[pi];
-        float d = distance(lp, protAtom.position);
-        if (d >= 6.0f) continue;
+        for (uint pi = 0; pi < params.numProteinAtoms; pi++) {
+            InteractionAtomGPU protAtom = protAtoms[pi];
+            float d = distance(lp, protAtom.position);
+            if (d >= 6.0f) continue;
 
-        uint protFlags = protAtom.flags;
-        uint type = 0xFFFFFFFF; // sentinel: no interaction
+            uint protFlags = protAtom.flags;
+            uint type = 0xFFFFFFFF; // sentinel: no interaction
 
-        // ---- Metal coordination: < 2.8 Å, metal ↔ N/O/S ----
-        if (d < 2.8f) {
-            bool ligCoord  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O | IDET_FLAG_S)) != 0;
-            bool protMetal = (protFlags & IDET_FLAG_METAL) != 0;
-            bool ligMetal  = (ligFlags  & IDET_FLAG_METAL) != 0;
-            bool protCoord = (protFlags & (IDET_FLAG_N | IDET_FLAG_O | IDET_FLAG_S)) != 0;
+            // ---- Metal coordination: < 2.8 Angstrom, metal <-> N/O/S ----
+            if (d < 2.8f) {
+                bool ligCoord  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O | IDET_FLAG_S)) != 0;
+                bool protMetal = (protFlags & IDET_FLAG_METAL) != 0;
+                bool ligMetal  = (ligFlags  & IDET_FLAG_METAL) != 0;
+                bool protCoord = (protFlags & (IDET_FLAG_N | IDET_FLAG_O | IDET_FLAG_S)) != 0;
 
-            if ((protMetal && ligCoord) || (ligMetal && protCoord)) {
-                type = 6; // metalCoord
+                if ((protMetal && ligCoord) || (ligMetal && protCoord)) {
+                    type = 6; // metalCoord
+                }
             }
-        }
 
-        // ---- Salt bridge: < 4.0 Å, charged group ↔ charged group ----
-        if (type == 0xFFFFFFFF && d < 4.0f) {
-            bool protPositive = (protFlags & IDET_FLAG_POS_RES) != 0;
-            bool protNegative = (protFlags & IDET_FLAG_NEG_RES) != 0;
-            bool ligPositive  = ligCharge > 0;
-            bool ligNegative  = ligCharge < 0;
+            // ---- Salt bridge: < 4.0 Angstrom, charged group <-> charged group ----
+            if (type == 0xFFFFFFFF && d < 4.0f) {
+                bool protPositive = (protFlags & IDET_FLAG_POS_RES) != 0;
+                bool protNegative = (protFlags & IDET_FLAG_NEG_RES) != 0;
+                bool ligPositive  = ligCharge > 0;
+                bool ligNegative  = ligCharge < 0;
 
-            if ((protPositive && ligNegative) || (protNegative && ligPositive)) {
-                type = 2; // saltBridge
+                if ((protPositive && ligNegative) || (protNegative && ligPositive)) {
+                    type = 2; // saltBridge
+                }
             }
-        }
 
-        // ---- H-bond: 2.2-3.5 Å between donor/acceptor (N/O) ----
-        if (type == 0xFFFFFFFF && d >= 2.2f && d <= 3.5f) {
-            bool ligDA  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
-            bool protDA = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
-            if (ligDA && protDA) {
-                type = 0; // hbond
+            // ---- H-bond: 2.2-3.5 Angstrom between donor/acceptor (N/O) ----
+            if (type == 0xFFFFFFFF && d >= 2.2f && d <= 3.5f) {
+                bool ligDA  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
+                bool protDA = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
+                if (ligDA && protDA) {
+                    type = 0; // hbond
+                }
             }
-        }
 
-        // ---- Halogen bond: 2.5-3.5 Å, halogen ↔ N/O ----
-        if (type == 0xFFFFFFFF && d >= 2.5f && d <= 3.5f) {
-            bool halogen  = (ligFlags  & IDET_FLAG_HALOGEN) != 0;
-            bool acceptor = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
-            if (halogen && acceptor) {
-                type = 5; // halogen
+            // ---- Halogen bond: 2.5-3.5 Angstrom, halogen <-> N/O ----
+            if (type == 0xFFFFFFFF && d >= 2.5f && d <= 3.5f) {
+                bool halogen  = (ligFlags  & IDET_FLAG_HALOGEN) != 0;
+                bool acceptor = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
+                if (halogen && acceptor) {
+                    type = 5; // halogen
+                }
             }
-        }
 
-        // Mark strong interactions (anything except hydrophobic)
-        if (type != 0xFFFFFFFF) {
-            hasStrongInteraction = true;
-        }
-
-        // ---- Hydrophobic: 3.3-4.5 Å, C/S ↔ C/S ----
-        // Only if no strong interaction found for this ligand atom, max 3 per atom
-        if (type == 0xFFFFFFFF && !hasStrongInteraction &&
-            d >= 3.3f && d <= 4.5f && hydroCount < maxHydroPerAtom) {
-            bool ligHydro  = (ligFlags  & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
-            bool protHydro = (protFlags & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
-            if (ligHydro && protHydro) {
-                type = 1; // hydrophobic
-                hydroCount++;
+            // Mark strong interactions (anything except hydrophobic)
+            if (type != 0xFFFFFFFF) {
+                hasStrongInteraction = true;
             }
-        }
 
-        // Atomically append to output buffer
-        if (type != 0xFFFFFFFF) {
-            uint idx = atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
-            if (idx < params.maxInteractions) {
+            // ---- Hydrophobic: 3.3-4.5 Angstrom, C/S <-> C/S ----
+            // Allow hydrophobic contacts even if this atom has a strong interaction elsewhere, max 3 per atom
+            if (type == 0xFFFFFFFF &&
+                d >= 3.3f && d <= 4.5f && hydroCount < maxHydroPerAtom) {
+                bool ligHydro  = (ligFlags  & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
+                bool protHydro = (protFlags & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
+                if (ligHydro && protHydro) {
+                    type = 1; // hydrophobic
+                    hydroCount++;
+                }
+            }
+
+            // Store to thread-local buffer instead of global atomic append
+            if (type != 0xFFFFFFFF && myCount < MAX_LOCAL) {
                 GPUInteraction inter;
                 inter.ligandAtomIndex = tid;
                 inter.proteinAtomIndex = pi;
@@ -115,8 +121,47 @@ kernel void detectInteractions(
                 inter.distance = d;
                 inter.ligandPosition = lp;
                 inter.proteinPosition = protAtom.position;
-                output[idx] = inter;
+                localInteractions[myCount] = inter;
+                myCount++;
             }
+        }
+    }
+
+    // ---- Phase 2: Per-threadgroup reduction + single global atomic ----
+
+    // Each thread stores its count into threadgroup memory
+    threadgroup uint localCounts[256];
+    localCounts[lid] = myCount;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 computes total for the group and allocates a contiguous block
+    // groupOffset is written by thread 0; threadgroup_barrier ensures visibility to all threads.
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wsometimes-uninitialized"
+    threadgroup uint groupOffset;
+    threadgroup uint prefixSums[256];
+    if (lid == 0) {
+        uint running = 0;
+        for (uint i = 0; i < tgSize; i++) {
+            prefixSums[i] = running;
+            running += localCounts[i];
+        }
+        // Single atomic allocation for the entire threadgroup
+        if (running > 0) {
+            groupOffset = atomic_fetch_add_explicit(counter, running, memory_order_relaxed);
+        } else {
+            groupOffset = 0;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Phase 3: Write interactions at the computed offset (no atomics) ----
+    uint myOffset = groupOffset + prefixSums[lid];
+    #pragma clang diagnostic pop
+    for (uint i = 0; i < myCount; i++) {
+        uint writeIdx = myOffset + i;
+        if (writeIdx < params.maxInteractions) {
+            output[writeIdx] = localInteractions[i];
         }
     }
 }

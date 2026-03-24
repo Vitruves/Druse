@@ -42,7 +42,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from torch_geometric.data import Data
 from torch_geometric.nn import radius_graph
 from scipy.spatial.distance import cdist
@@ -853,10 +853,16 @@ def train_epoch(model, loader, optimizer, device, epoch_num=0):
 
         # === Multi-task loss (all batched) ===
 
-        # 1. Affinity loss weighted by pose confidence
-        confidence_weight = batch['pose_confidence'].clamp(min=0.1)  # [B]
+        # 1. Affinity loss — only on poses with meaningful confidence.
+        # Decoy poses (confidence ~0, i.e. RMSD >> 2.5 A) should NOT contribute
+        # to the affinity loss: penalizing the model for failing to predict pKd
+        # on geometrically nonsensical poses adds noise and hurts convergence.
+        # Threshold 0.2 corresponds to ~RMSD < 2.5 A given sigma=2.0 Gaussian decay.
+        confidence_mask = (batch['pose_confidence'] > 0.2).float()  # [B]
+        confidence_weight = batch['pose_confidence'] * confidence_mask  # [B]
         loss_affinity = (confidence_weight * F.huber_loss(
-            output["pKd"], batch['y'], reduction="none", delta=2.0)).mean()
+            output["pKd"], batch['y'], reduction="none", delta=2.0))
+        loss_affinity = loss_affinity.sum() / confidence_weight.sum().clamp(min=1.0)
 
         # 2. Pose confidence loss
         loss_confidence = F.mse_loss(output["pose_confidence"], batch['pose_confidence'])
@@ -1029,14 +1035,33 @@ def train(args):
         print("ERROR: No data found. Run: python download_data.py --all")
         return
 
-    # 80/20 split (no k-fold for faster iteration)
-    n_train = int(0.8 * len(dataset))
-    n_val = len(dataset) - n_train
-    train_set, val_set = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42))
+    # Protein-grouped split to prevent target leakage.
+    # All perturbations of the same PDB complex (and complexes from the same
+    # protein target, approximated by 4-char PDB ID) stay in the same fold.
+    from sklearn.model_selection import GroupShuffleSplit
 
-    print(f"\nTrain: {n_train}, Val: {n_val}")
+    # Extract protein group for each sample
+    pdb_ids = []
+    for i in range(len(dataset)):
+        if isinstance(dataset, CachedPKiDataset):
+            pdb_ids.append(dataset.samples[i].pdb_id)
+        else:  # OnTheFlyPKiDataset
+            pdb_ids.append(dataset.entries[i][0])
+    # Group by first 4 chars (PDB entry) so same protein stays together
+    groups = [pid[:4].upper() for pid in pdb_ids]
+    n_groups = len(set(groups))
+    print(f"\nProtein-grouped split: {len(dataset)} samples, {n_groups} unique protein groups")
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, val_idx = next(gss.split(range(len(dataset)), groups=groups))
+    train_set = Subset(dataset, train_idx)
+    val_set = Subset(dataset, val_idx)
+
+    # Verify no group leakage
+    train_groups = set(groups[i] for i in train_idx)
+    val_groups = set(groups[i] for i in val_idx)
+    assert train_groups.isdisjoint(val_groups), "Target leakage detected!"
+    print(f"Train: {len(train_set)} ({len(train_groups)} proteins), Val: {len(val_set)} ({len(val_groups)} proteins)")
     print(f"Batch size: {TRAIN_BATCH_SIZE} (×{GRAD_ACCUM_STEPS} accum = {TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS} effective)")
 
     train_loader = DataLoader(train_set, batch_size=TRAIN_BATCH_SIZE, shuffle=True,

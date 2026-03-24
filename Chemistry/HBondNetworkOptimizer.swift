@@ -1813,6 +1813,7 @@ enum HBondNetworkOptimizer {
         report: inout NetworkReport
     ) -> (atoms: [Atom], bonds: [Bond]) {
         var workingAtoms = atoms
+        var indicesToRemove: Set<Int> = []
 
         for (groupIdx, group) in graph.groups.enumerated() {
             let stateIdx = optimalStates[groupIdx]
@@ -1864,26 +1865,44 @@ enum HBondNetworkOptimizer {
                 }
             }
 
-            // For His flips with tautomer changes, handle proton presence
+            // For His flips with tautomer changes, mark unwanted protons for removal
             if group.kind == .flipHis {
                 let hasHD1 = state.atomPositions["HD1"] != nil
                 let hasHE2 = state.atomPositions["HE2"] != nil
 
-                // Remove or add protons based on tautomer state
-                // HD1 present = δ-tautomer or doubly protonated
-                // HE2 present = ε-tautomer or doubly protonated
                 for atomIdx in group.moveableAtomIndices {
                     let name = workingAtoms[atomIdx].name.trimmingCharacters(in: .whitespaces).uppercased()
                     if name == "HD1" && !hasHD1 {
-                        // Move proton far away (effectively remove — actual removal
-                        // would require array surgery that breaks indices)
-                        workingAtoms[atomIdx].position = SIMD3<Float>(9999, 9999, 9999)
+                        indicesToRemove.insert(atomIdx)
                     }
                     if name == "HE2" && !hasHE2 {
-                        workingAtoms[atomIdx].position = SIMD3<Float>(9999, 9999, 9999)
+                        indicesToRemove.insert(atomIdx)
                     }
                 }
             }
+        }
+
+        // Actually remove marked atoms and remap bond indices
+        if !indicesToRemove.isEmpty {
+            var newAtoms: [Atom] = []
+            var oldToNew: [Int: Int] = [:]
+            for (oldIdx, atom) in workingAtoms.enumerated() {
+                if indicesToRemove.contains(oldIdx) { continue }
+                oldToNew[oldIdx] = newAtoms.count
+                newAtoms.append(Atom(
+                    id: newAtoms.count, element: atom.element, position: atom.position,
+                    name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                    chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                    isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
+                ))
+            }
+            var newBonds: [Bond] = []
+            for bond in bonds {
+                if let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] {
+                    newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+                }
+            }
+            return (newAtoms, newBonds)
         }
 
         return (workingAtoms, bonds)

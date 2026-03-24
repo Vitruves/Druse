@@ -29,7 +29,7 @@ struct SearchTabView: View {
                 }
 
                 // Loaded molecules
-                if let prot = viewModel.protein {
+                if let prot = viewModel.molecules.protein {
                     HStack(spacing: 6) {
                         Circle().fill(.cyan).frame(width: 8, height: 8)
                         Text(prot.name)
@@ -38,7 +38,7 @@ struct SearchTabView: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Button(action: { viewModel.protein = nil; viewModel.pushToRenderer() }) {
+                        Button(action: { viewModel.molecules.protein = nil; viewModel.pushToRenderer() }) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 14))
                                 .foregroundStyle(.secondary)
@@ -50,7 +50,7 @@ struct SearchTabView: View {
                     .background(Color.cyan.opacity(0.06))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                if let lig = viewModel.ligand {
+                if let lig = viewModel.molecules.ligand {
                     HStack(spacing: 6) {
                         Circle().fill(.green).frame(width: 8, height: 8)
                         Text(lig.name)
@@ -88,7 +88,7 @@ struct SearchTabView: View {
 
                     Button("Fetch") { fetchPDB() }
                         .controlSize(.small)
-                        .disabled(pdbID.trimmingCharacters(in: .whitespaces).count < 4 || viewModel.isLoading)
+                        .disabled(pdbID.trimmingCharacters(in: .whitespaces).count < 4 || viewModel.workspace.isLoading)
                 }
             }
 
@@ -107,21 +107,21 @@ struct SearchTabView: View {
 
                     Button("Search") { viewModel.searchPDB(query: searchQuery) }
                         .controlSize(.small)
-                        .disabled(searchQuery.isEmpty || viewModel.isSearching)
+                        .disabled(searchQuery.isEmpty || viewModel.workspace.isSearching)
                 }
             }
 
             // Loading indicators
-            if viewModel.isLoading {
+            if viewModel.workspace.isLoading {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text(viewModel.loadingMessage)
+                    Text(viewModel.workspace.loadingMessage)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
             }
 
-            if viewModel.isSearching {
+            if viewModel.workspace.isSearching {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
                     Text("Searching...")
@@ -131,14 +131,14 @@ struct SearchTabView: View {
             }
 
             // Search results as cards
-            if !viewModel.searchResults.isEmpty {
+            if !viewModel.workspace.searchResults.isEmpty {
                 Divider()
 
-                Text("\(viewModel.searchResults.count) results")
+                Text("\(viewModel.workspace.searchResults.count) results")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.tertiary)
 
-                ForEach(viewModel.searchResults) { result in
+                ForEach(viewModel.workspace.searchResults) { result in
                     resultCard(result)
                 }
             }
@@ -206,7 +206,7 @@ struct SearchTabView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-            .disabled(viewModel.isLoading)
+            .disabled(viewModel.workspace.isLoading)
         }
         .padding(10)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))

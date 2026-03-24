@@ -5,7 +5,7 @@ struct PreparationTabView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let prot = viewModel.protein {
+            if let prot = viewModel.molecules.protein {
                 proteinInfo(prot)
             } else {
                 ContentUnavailableView {
@@ -25,7 +25,7 @@ struct PreparationTabView: View {
             .font(.system(size: 12, weight: .semibold))
 
         // Chain summary
-        if let report = viewModel.preparationReport {
+        if let report = viewModel.molecules.preparationReport {
             VStack(alignment: .leading, spacing: 4) {
                 Label("Structure", systemImage: "link")
                     .font(.system(size: 11, weight: .medium))
@@ -133,13 +133,28 @@ struct PreparationTabView: View {
             Label("Preparation", systemImage: "wand.and.stars")
                 .font(.system(size: 12, weight: .semibold))
 
-            // Remove waters
-            Button(action: { viewModel.removeWaters() }) {
-                Label("Remove Waters", systemImage: "drop.triangle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            // Water management
+            HStack(spacing: 4) {
+                Button(action: { viewModel.removeWaters() }) {
+                    Label("Remove All Waters", systemImage: "drop.triangle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button(action: { viewModel.keepPocketWaters() }) {
+                    Label("Keep Pocket Waters", systemImage: "drop.circle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(viewModel.docking.selectedPocket == nil)
+                .help("Remove bulk waters but keep those within \(String(format: "%.0f", viewModel.molecules.pocketWaterRadius)) Å of the pocket center as bridging waters for docking.")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+
+            if !viewModel.molecules.keptWaterKeys.isEmpty {
+                bridgingWaterInfo
+            }
 
             Button(action: { viewModel.removeNonStandardResidues() }) {
                 Label("Remove Non-standard Residues", systemImage: "trash.slash")
@@ -169,7 +184,7 @@ struct PreparationTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(viewModel.protein == nil)
+            .disabled(viewModel.molecules.protein == nil)
             .help("Add all hydrogens (polar + nonpolar) from residue templates.")
 
             // Polar hydrogens at pH with slider
@@ -191,20 +206,14 @@ struct PreparationTabView: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            Button(action: { viewModel.assignGasteigerCharges() }) {
-                Label("Assign Gasteiger Charges", systemImage: "bolt.circle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(viewModel.rawPDBContent == nil)
+            chargeMethodSection
 
             // Structure Cleanup (protonation + charge assignment)
             Button(action: { viewModel.runEnergyMinimization() }) {
                 HStack {
                     Label("Structure Cleanup", systemImage: "waveform.path.ecg")
                     Spacer()
-                    if viewModel.isMinimizing {
+                    if viewModel.molecules.isMinimizing {
                         ProgressView()
                             .controlSize(.mini)
                     }
@@ -213,7 +222,7 @@ struct PreparationTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(viewModel.protein == nil || viewModel.isMinimizing)
+            .disabled(viewModel.molecules.protein == nil || viewModel.molecules.isMinimizing)
             .help("Apply protonation at current pH and assign charges. Protein structure is preserved.")
 
             // Fix Missing Residues (detection)
@@ -241,25 +250,15 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .help("Rebuild missing standard-residue heavy atoms from bundled geometry templates.")
 
-            // Solvation Shell
-            Button(action: { viewModel.addSolvationShell() }) {
-                HStack {
-                    Label("Solvation Shell", systemImage: "drop.circle")
-                    Spacer()
-                    Text("Beta")
-                        .font(.system(size: 9, weight: .medium))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Color.blue.opacity(0.2))
-                        .foregroundStyle(.blue)
-                        .clipShape(Capsule())
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // Bridging Waters (was Solvation Shell)
+            Button(action: { viewModel.keepPocketWaters() }) {
+                Label("Retain Bridging Waters", systemImage: "drop.circle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(true)
-            .help("Solvation shell generation — coming in a future release.")
+            .disabled(viewModel.docking.selectedPocket == nil)
+            .help("Keep water molecules near the pocket as part of the rigid receptor for docking. Select a pocket first.")
         }
 
         Divider()
@@ -279,6 +278,36 @@ struct PreparationTabView: View {
         }
     }
 
+    // MARK: - Bridging Water Info
+
+    @ViewBuilder
+    private var bridgingWaterInfo: some View {
+        @Bindable var vm = viewModel
+
+        HStack(spacing: 4) {
+            Image(systemName: "drop.fill")
+                .foregroundStyle(.blue)
+                .font(.system(size: 9))
+            Text("\(viewModel.molecules.keptWaterKeys.count) bridging water(s) retained")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.leading, 4)
+
+        HStack {
+            Text("Radius")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Slider(value: $vm.molecules.pocketWaterRadius, in: 2.0...10.0, step: 0.5)
+                .controlSize(.mini)
+            Text("\(String(format: "%.1f", viewModel.molecules.pocketWaterRadius)) Å")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .trailing)
+        }
+        .padding(.leading, 4)
+    }
+
     // MARK: - Protonation Section with pH Slider
 
     @ViewBuilder
@@ -290,7 +319,7 @@ struct PreparationTabView: View {
                 HStack {
                     Label("Add Polar Hydrogens", systemImage: "flask")
                     Spacer()
-                    Text("pH \(String(format: "%.1f", viewModel.protonationPH))")
+                    Text("pH \(String(format: "%.1f", viewModel.molecules.protonationPH))")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
@@ -298,7 +327,7 @@ struct PreparationTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(viewModel.protein == nil)
+            .disabled(viewModel.molecules.protein == nil)
             .help("Add polar hydrogens (N-H, O-H, S-H) with pH-dependent protonation states.")
 
             HStack(spacing: 6) {
@@ -307,10 +336,10 @@ struct PreparationTabView: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 18, alignment: .trailing)
 
-                Slider(value: $vm.protonationPH, in: 1.0...14.0, step: 0.1)
+                Slider(value: $vm.molecules.protonationPH, in: 1.0...14.0, step: 0.1)
                     .controlSize(.mini)
 
-                Text(String(format: "%.1f", viewModel.protonationPH))
+                Text(String(format: "%.1f", viewModel.molecules.protonationPH))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .frame(width: 28, alignment: .trailing)
@@ -332,8 +361,42 @@ struct PreparationTabView: View {
         }
     }
 
+    // MARK: - Charge Method Section
+
+    @ViewBuilder
+    private var chargeMethodSection: some View {
+        @Bindable var vm = viewModel
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Picker("Charges", selection: $vm.docking.chargeMethod) {
+                    ForEach(ChargeMethod.allCases, id: \.self) { method in
+                        Text(method.rawValue).tag(method)
+                    }
+                }
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .frame(maxWidth: .infinity)
+            }
+
+            Button(action: { viewModel.assignCharges() }) {
+                Label("Assign \(viewModel.docking.chargeMethod.rawValue) Charges",
+                      systemImage: viewModel.docking.chargeMethod.icon)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled({
+                if viewModel.docking.chargeMethod == .gasteiger {
+                    return viewModel.molecules.rawPDBContent == nil
+                }
+                return viewModel.molecules.protein == nil
+            }())
+        }
+    }
+
     private func pkaRow(_ residue: String, _ pKa: Float) -> some View {
-        let pH = viewModel.protonationPH
+        let pH = viewModel.molecules.protonationPH
         let isAcidic = ["ASP", "GLU", "CYS", "TYR"].contains(residue)
         let protonated = pH < pKa
         let chargeState: String

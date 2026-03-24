@@ -38,7 +38,10 @@ enum PocketDetection {
         params: DetectionParams = DetectionParams()
     ) -> [Pocket] {
         let proteinAtoms = molecule.atoms.filter { !$0.isHetAtom }
-        guard proteinAtoms.count >= 10 else { return [] }
+        guard proteinAtoms.count >= 10 else {
+            ActivityLog.shared.warn("[Pocket] Too few protein atoms (\(proteinAtoms.count)) for pocket detection, need >= 10", category: .dock)
+            return []
+        }
 
         let positions = proteinAtoms.map(\.position)
 
@@ -85,7 +88,10 @@ enum PocketDetection {
             x += params.gridSpacing
         }
 
-        guard !probes.isEmpty else { return [] }
+        guard !probes.isEmpty else {
+            ActivityLog.shared.warn("[Pocket] Alpha-sphere probing produced no valid probes", category: .dock)
+            return []
+        }
 
         // Step 4: Compute buriedness for each probe (26-direction ray casting)
         var buriedness: [Float] = []
@@ -105,7 +111,10 @@ enum PocketDetection {
             }
         }
 
-        guard !filteredProbes.isEmpty else { return [] }
+        guard !filteredProbes.isEmpty else {
+            ActivityLog.shared.warn("[Pocket] No probes passed buriedness threshold (\(params.buriednessThreshold)), clustering skipped", category: .dock)
+            return []
+        }
 
         // Step 6: DBSCAN clustering
         let clusters = dbscan(points: filteredProbes, eps: params.clusterEps, minPts: params.clusterMinPts)
@@ -145,6 +154,9 @@ enum PocketDetection {
 
         // Sort by druggability
         pockets.sort { $0.druggability > $1.druggability }
+
+        let bestScore = pockets.first?.druggability ?? 0
+        ActivityLog.shared.info("[Pocket] Detected \(pockets.count) pockets from \(filteredProbes.count) probes, best druggability: \(String(format: "%.2f", bestScore))", category: .dock)
 
         return pockets
     }

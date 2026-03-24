@@ -32,13 +32,25 @@ extension ProteinPreparation {
         pH: Float = 7.4,
         polarOnly: Bool = false
     ) -> (atoms: [Atom], bonds: [Bond], report: ReconstructionReport, protonation: [Protonation.ResiduePrediction]) {
+        let logSync = { (msg: String) in
+            _ = Task { @MainActor in ActivityLog.shared.debug(msg, category: .prep) }
+        }
+
+        logSync("[Phase2] Reconstructing heavy atoms (\(atoms.count) input)...")
         let reconstructed = reconstructMissingHeavyAtoms(atoms: atoms, bonds: bonds)
+        logSync("[Phase2] Reconstruction done: \(reconstructed.atoms.count) atoms (+\(reconstructed.addedAtomCount) added)")
+
+        logSync("[Phase2] Predicting protonation states at pH \(pH)...")
         let protonation = Protonation.predictResidueStates(
             atoms: reconstructed.atoms,
             bonds: reconstructed.bonds,
             pH: pH
         )
+        logSync("[Phase2] Protonation: \(protonation.count) predictions")
+
         let chargedAtoms = Protonation.applyProtonation(atoms: reconstructed.atoms, predictions: protonation)
+
+        logSync("[Phase3] Adding template hydrogens (\(chargedAtoms.count) atoms, polarOnly=\(polarOnly))...")
         let hydrogenated = addTemplateHydrogens(
             atoms: chargedAtoms,
             bonds: reconstructed.bonds,
@@ -46,13 +58,16 @@ extension ProteinPreparation {
             predictions: protonation,
             polarOnly: polarOnly
         )
+        logSync("[Phase3] Hydrogens added: \(hydrogenated.atoms.count) atoms (+\(hydrogenated.addedAtomCount) H)")
 
         // Phase 4: H-bond network optimization (rotamer search, flips, scoring)
+        logSync("[Phase4] H-bond network optimization (\(hydrogenated.atoms.count) atoms)...")
         let network = HBondNetworkOptimizer.optimizeNetwork(
             atoms: hydrogenated.atoms,
             bonds: hydrogenated.bonds,
             predictions: protonation
         )
+        logSync("[Phase4] Network done: \(network.report.moveableGroups) groups, \(network.report.cliques) cliques")
 
         var report = ReconstructionReport(
             heavyAtomsAdded: reconstructed.addedAtomCount,

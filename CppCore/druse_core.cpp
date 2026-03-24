@@ -639,6 +639,259 @@ void druse_free_conformer_set(DruseConformerSet *set) {
 }
 
 // ============================================================================
+// Tautomer & Protomer Enumeration
+// ============================================================================
+
+#include <GraphMol/MolStandardize/Tautomer.h>
+#include <GraphMol/Substruct/SubstructMatch.h>
+
+/// Helper: generate 3D for a molecule and return MMFF energy, or NaN on failure.
+static double embed_and_minimize(RWMol &mol) {
+    MolOps::addHs(mol, false, true);
+    int cid = embed_molecule(mol);
+    if (cid < 0) return NAN;
+    std::vector<std::pair<int, double>> results;
+    MMFF::MMFFOptimizeMoleculeConfs(mol, results);
+    if (!results.empty() && results[0].first >= 0)
+        return results[0].second;
+    return NAN;
+}
+
+DruseVariantSet* druse_enumerate_tautomers(
+    const char *smiles, const char *name,
+    int32_t maxTautomers, double energyCutoff
+) {
+    auto *set = new DruseVariantSet();
+    memset(set, 0, sizeof(DruseVariantSet));
+
+    if (!smiles || !smiles[0]) return set;
+
+    try {
+        std::unique_ptr<ROMol> mol(SmilesToMol(smiles));
+        if (!mol) return set;
+
+        // Enumerate tautomers
+        MolStandardize::TautomerEnumerator enumerator;
+        enumerator.setMaxTautomers(std::max(maxTautomers, (int32_t)2));
+        enumerator.setMaxTransforms(1000);
+        auto result = enumerator.enumerate(*mol);
+
+        // Collect unique tautomers by canonical SMILES
+        struct TautEntry {
+            std::string smi;
+            std::unique_ptr<RWMol> rwmol;
+            double energy;
+            int score;
+        };
+        std::vector<TautEntry> entries;
+        std::set<std::string> seen;
+
+        for (const auto &taut : result) {
+            std::string tautSmi = MolToSmiles(*taut);
+            if (seen.count(tautSmi)) continue;
+            seen.insert(tautSmi);
+
+            auto rw = std::make_unique<RWMol>(*taut);
+            int score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw);
+            double energy = embed_and_minimize(*rw);
+
+            entries.push_back({tautSmi, std::move(rw), energy, score});
+            if ((int)entries.size() >= maxTautomers) break;
+        }
+
+        // Sort by energy (lowest first); NaN goes to end
+        std::sort(entries.begin(), entries.end(), [](const TautEntry &a, const TautEntry &b) {
+            if (std::isnan(a.energy)) return false;
+            if (std::isnan(b.energy)) return true;
+            return a.energy < b.energy;
+        });
+
+        // Apply energy cutoff
+        double bestE = entries.empty() || std::isnan(entries[0].energy) ? 0 : entries[0].energy;
+        if (energyCutoff > 0) {
+            entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const TautEntry &e) {
+                return !std::isnan(e.energy) && e.energy > bestE + energyCutoff;
+            }), entries.end());
+        }
+
+        int count = (int)entries.size();
+        if (count == 0) return set;
+
+        set->count = count;
+        set->variants = new DruseMoleculeResult*[count];
+        set->scores = new double[count];
+        set->infos = new DruseVariantInfo[count];
+
+        for (int i = 0; i < count; i++) {
+            set->variants[i] = mol_to_result(*entries[i].rwmol, name);
+            set->scores[i] = entries[i].energy;
+            set->infos[i].kind = 0; // tautomer
+            snprintf(set->infos[i].label, sizeof(set->infos[i].label),
+                     "Tautomer %d (score %d)", i + 1, entries[i].score);
+        }
+    } catch (...) {}
+
+    return set;
+}
+
+DruseVariantSet* druse_enumerate_protomers(
+    const char *smiles, const char *name,
+    int32_t maxProtomers, double pH, double pkaThreshold
+) {
+    auto *set = new DruseVariantSet();
+    memset(set, 0, sizeof(DruseVariantSet));
+
+    if (!smiles || !smiles[0]) return set;
+
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) return set;
+
+        // Ionizable group definitions: SMARTS, pKa, isAcid
+        struct IonizableGroup {
+            const char *name;
+            const char *smarts;
+            double pKa;
+            bool isAcid; // true=acid (deprotonates at high pH), false=base (protonates at low pH)
+        };
+        static const IonizableGroup groups[] = {
+            {"Carboxylic acid",  "[CX3](=O)[OX2H1]",           4.0,  true},
+            {"Phosphoric acid",  "[OX2H1]P(=O)",               2.1,  true},
+            {"Sulfonamide NH",   "[NX3H1]S(=O)(=O)",          10.0,  true},
+            {"Phenol",           "[OX2H1]c",                  10.0,  true},
+            {"Thiol",            "[SX2H1]",                    8.3,  true},
+            {"Primary amine",    "[NX3H2;!$(NC=O);!$(NS=O)]", 10.5,  false},
+            {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc)]", 11.0, false},
+            {"Imidazole",        "[nH1]1cc[nH0]c1",            6.0,  false},
+            {"Guanidine",        "[NX3H2]C(=[NX2H0])[NX3H2]", 12.5,  false},
+        };
+
+        // Find ionizable sites: each site = (group index, matched atom index, is ambiguous)
+        struct IonizableSite {
+            int groupIdx;
+            int atomIdx;    // index of the ionizable atom (H-bearing for acids, N for bases)
+            std::string label;
+        };
+        std::vector<IonizableSite> ambiguousSites;
+
+        for (int g = 0; g < (int)(sizeof(groups) / sizeof(groups[0])); g++) {
+            std::unique_ptr<ROMol> pattern(SmartsToMol(groups[g].smarts));
+            if (!pattern) continue;
+
+            std::vector<MatchVectType> matches;
+            SubstructMatch(*mol, *pattern, matches);
+            for (const auto &match : matches) {
+                if (match.empty()) continue;
+                // The ionizable atom is typically the first matched atom for acids,
+                // or the nitrogen for bases
+                int aidx = match[0].second;
+
+                // Henderson-Hasselbalch: is this site ambiguous at the target pH?
+                double deltaPKa = std::abs(pH - groups[g].pKa);
+                if (deltaPKa < pkaThreshold) {
+                    ambiguousSites.push_back({g, aidx, groups[g].name});
+                }
+            }
+        }
+
+        // Generate protomers: combinatorial expansion of ambiguous sites
+        // Each site can be in state 0 (as-drawn) or state 1 (toggled)
+        int nSites = std::min((int)ambiguousSites.size(), 10); // cap to avoid explosion
+        int nCombinations = 1 << nSites;
+        nCombinations = std::min(nCombinations, (int)maxProtomers);
+
+        struct ProtomerEntry {
+            std::string smi;
+            std::unique_ptr<RWMol> rwmol;
+            double energy;
+            std::string label;
+        };
+        std::vector<ProtomerEntry> entries;
+        std::set<std::string> seen;
+
+        for (int combo = 0; combo < nCombinations; combo++) {
+            auto rw = std::make_unique<RWMol>(*mol);
+
+            std::string comboLabel;
+            for (int s = 0; s < nSites; s++) {
+                bool toggle = (combo >> s) & 1;
+                if (!toggle) continue; // keep as-drawn
+
+                const auto &site = ambiguousSites[s];
+                const auto &grp = groups[site.groupIdx];
+                Atom *atom = rw->getAtomWithIdx(site.atomIdx);
+
+                if (grp.isAcid) {
+                    // Deprotonate: remove one H, set formal charge -1
+                    int nH = atom->getTotalNumHs();
+                    if (nH > 0) {
+                        atom->setNumExplicitHs(nH - 1);
+                        atom->setFormalCharge(atom->getFormalCharge() - 1);
+                    }
+                } else {
+                    // Protonate: add one H, set formal charge +1
+                    int nH = atom->getTotalNumHs();
+                    atom->setNumExplicitHs(nH + 1);
+                    atom->setFormalCharge(atom->getFormalCharge() + 1);
+                }
+
+                if (!comboLabel.empty()) comboLabel += ", ";
+                comboLabel += std::string(grp.isAcid ? "deprot " : "prot ") + grp.name;
+            }
+
+            // Sanitize; skip if invalid
+            try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+
+            std::string protSmi = MolToSmiles(*rw);
+            if (seen.count(protSmi)) continue;
+            seen.insert(protSmi);
+
+            if (comboLabel.empty()) comboLabel = "Parent (as-drawn)";
+
+            double energy = embed_and_minimize(*rw);
+            entries.push_back({protSmi, std::move(rw), energy, comboLabel});
+        }
+
+        // Sort by energy
+        std::sort(entries.begin(), entries.end(), [](const ProtomerEntry &a, const ProtomerEntry &b) {
+            if (std::isnan(a.energy)) return false;
+            if (std::isnan(b.energy)) return true;
+            return a.energy < b.energy;
+        });
+
+        int count = std::min((int)entries.size(), (int)maxProtomers);
+        if (count == 0) return set;
+
+        set->count = count;
+        set->variants = new DruseMoleculeResult*[count];
+        set->scores = new double[count];
+        set->infos = new DruseVariantInfo[count];
+
+        for (int i = 0; i < count; i++) {
+            set->variants[i] = mol_to_result(*entries[i].rwmol, name);
+            set->scores[i] = entries[i].energy;
+            set->infos[i].kind = 1; // protomer
+            snprintf(set->infos[i].label, sizeof(set->infos[i].label),
+                     "%s", entries[i].label.c_str());
+        }
+    } catch (...) {}
+
+    return set;
+}
+
+void druse_free_variant_set(DruseVariantSet *set) {
+    if (!set) return;
+    if (set->variants) {
+        for (int i = 0; i < set->count; i++)
+            druse_free_molecule_result(set->variants[i]);
+        delete[] set->variants;
+    }
+    delete[] set->scores;
+    delete[] set->infos;
+    delete set;
+}
+
+// ============================================================================
 // Protein Preparation (PDB-based)
 // ============================================================================
 
@@ -694,6 +947,35 @@ DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock) {
     }
 }
 
+const char* druse_molblock_to_smiles(const char *molBlock) {
+    if (!molBlock || !molBlock[0]) return nullptr;
+    try {
+        std::unique_ptr<RWMol> mol(MolBlockToMol(std::string(molBlock), true, false, false));
+        if (!mol) return nullptr;
+
+        try {
+            unsigned int failedOp = 0;
+            MolOps::sanitizeMol(*mol, failedOp,
+                MolOps::SANITIZE_ALL ^ MolOps::SANITIZE_PROPERTIES);
+        } catch (...) {
+            try { MolOps::findSSSR(*mol); } catch (...) {}
+        }
+
+        std::string smi = MolToSmiles(*mol);
+        if (smi.empty()) return nullptr;
+
+        char *result = new char[smi.size() + 1];
+        std::strcpy(result, smi.c_str());
+        return result;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void druse_free_string(const char *str) {
+    delete[] str;
+}
+
 DruseMoleculeResult* druse_atoms_bonds_to_smiles(
     const DruseAtom *atoms,
     int32_t atomCount,
@@ -742,6 +1024,18 @@ DruseMoleculeResult* druse_atoms_bonds_to_smiles(
         } catch (...) {
             // If full sanitize fails, try a lighter cleanup
             try { MolOps::findSSSR(*mol); } catch (...) {}
+        }
+
+        // Infer chiral centers and E/Z bonds from 3D geometry
+        // Skip for 2D coordinates (all z ≈ 0) — can crash with degenerate geometry
+        bool is3D = false;
+        for (int32_t i = 0; i < atomCount; i++) {
+            if (std::abs(atoms[i].z) > 0.01f) { is3D = true; break; }
+        }
+        if (is3D) {
+            try {
+                MolOps::assignStereochemistryFrom3D(*mol);
+            } catch (...) {}
         }
 
         return mol_to_result(*mol, name ? name : "ligand");
@@ -1180,6 +1474,79 @@ DruseMoleculeResult* druse_minimize_lbfgs(const char *smiles, const char *name, 
 }
 
 // ============================================================================
+// MMFF94 Strain Energy
+// ============================================================================
+
+double druse_mmff_strain_energy(const char *smiles, const float *heavyPositions, int32_t numHeavy) {
+    if (!smiles || !heavyPositions || numHeavy <= 0) return NAN;
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) return NAN;
+
+        MolOps::addHs(*mol);
+        if (embed_molecule(*mol) < 0) return NAN;
+
+        // Map heavy atom positions onto the molecule's conformer
+        auto &conf = mol->getConformer();
+        int heavyIdx = 0;
+        for (unsigned i = 0; i < mol->getNumAtoms() && heavyIdx < numHeavy; i++) {
+            if (mol->getAtomWithIdx(i)->getAtomicNum() > 1) {
+                conf.setAtomPos(i, RDGeom::Point3D(
+                    heavyPositions[heavyIdx * 3],
+                    heavyPositions[heavyIdx * 3 + 1],
+                    heavyPositions[heavyIdx * 3 + 2]
+                ));
+                heavyIdx++;
+            }
+        }
+
+        // Set up MMFF and fix heavy atoms, optimize H positions only
+        MMFF::MMFFMolProperties mmffProps(*mol);
+        if (!mmffProps.isValid()) return NAN;
+
+        auto *ff = MMFF::constructForceField(*mol, &mmffProps);
+        if (!ff) return NAN;
+
+        for (unsigned i = 0; i < mol->getNumAtoms(); i++) {
+            if (mol->getAtomWithIdx(i)->getAtomicNum() > 1) {
+                ff->fixedPoints().push_back(i);
+            }
+        }
+        ff->minimize(200);  // Quick H optimization
+
+        double energy = ff->calcEnergy();
+        delete ff;
+        return energy;
+    } catch (...) {
+        return NAN;
+    }
+}
+
+double druse_mmff_reference_energy(const char *smiles) {
+    if (!smiles || !smiles[0]) return NAN;
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) return NAN;
+
+        MolOps::addHs(*mol);
+        if (embed_molecule(*mol) < 0) return NAN;
+        mmff_minimize_single(*mol);
+
+        MMFF::MMFFMolProperties mmffProps(*mol);
+        if (!mmffProps.isValid()) return NAN;
+
+        auto *ff = MMFF::constructForceField(*mol, &mmffProps);
+        if (!ff) return NAN;
+
+        double energy = ff->calcEnergy();
+        delete ff;
+        return energy;
+    } catch (...) {
+        return NAN;
+    }
+}
+
+// ============================================================================
 // mmCIF Parser
 // ============================================================================
 
@@ -1240,19 +1607,33 @@ DruseMoleculeResult** druse_batch_process_parallel(
     int32_t count,
     bool addHydrogens,
     bool minimize,
-    bool computeCharges
+    bool computeCharges,
+    const volatile int32_t *cancel_flag
 ) {
     if (!smiles_array || count <= 0) return nullptr;
 
     auto **results = new DruseMoleculeResult*[count];
+    // Zero-initialize so cancelled slots are nullptr (caller can detect skipped entries)
+    for (int i = 0; i < count; ++i) results[i] = nullptr;
 
     tbb::parallel_for(0, (int)count, [&](int i) {
+        // Early exit: if cancellation requested, skip remaining molecules
+        if (cancel_flag && __atomic_load_n(cancel_flag, __ATOMIC_ACQUIRE)) return;
+
         const char *smi = smiles_array[i];
         const char *nm = (name_array && name_array[i]) ? name_array[i] : "";
         results[i] = druse_prepare_ligand(smi, nm, 1, addHydrogens, minimize, computeCharges);
     });
 
     return results;
+}
+
+void druse_atomic_cancel_store(volatile int32_t *flag, int32_t value) {
+    __atomic_store_n(flag, value, __ATOMIC_RELEASE);
+}
+
+int32_t druse_atomic_cancel_load(const volatile int32_t *flag) {
+    return __atomic_load_n(flag, __ATOMIC_ACQUIRE);
 }
 
 // ============================================================================

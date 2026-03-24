@@ -67,7 +67,7 @@ struct InspectorPanel: View {
 
     @ViewBuilder
     private var atomSelectionContent: some View {
-        let selectedCount = viewModel.selectedAtomIndices.count
+        let selectedCount = viewModel.workspace.selectedAtomIndices.count
 
         if selectedCount == 0 {
             ContentUnavailableView {
@@ -89,7 +89,7 @@ struct InspectorPanel: View {
 
     @ViewBuilder
     private var residueSelectionContent: some View {
-        let selectedCount = viewModel.selectedResidueIndices.count
+        let selectedCount = viewModel.workspace.selectedResidueIndices.count
 
         if selectedCount == 0 {
             ContentUnavailableView {
@@ -98,9 +98,9 @@ struct InspectorPanel: View {
                 Text("Click a residue to inspect it")
             }
             .frame(height: 100)
-        } else if selectedCount == 1, let prot = viewModel.protein {
+        } else if selectedCount == 1, let prot = viewModel.molecules.protein {
             // Single residue detail
-            let resIdx = viewModel.selectedResidueIndices.first!
+            let resIdx = viewModel.workspace.selectedResidueIndices.first!
             if resIdx < prot.residues.count {
                 singleResidueInspector(prot.residues[resIdx], in: prot)
             }
@@ -159,8 +159,8 @@ struct InspectorPanel: View {
 
     @ViewBuilder
     private func multiAtomSummary(count: Int) -> some View {
-        let allAtoms = (viewModel.protein?.atoms ?? []) + (viewModel.ligand?.atoms ?? [])
-        let selected = viewModel.selectedAtomIndices.compactMap { idx in
+        let allAtoms = (viewModel.molecules.protein?.atoms ?? []) + (viewModel.molecules.ligand?.atoms ?? [])
+        let selected = viewModel.workspace.selectedAtomIndices.compactMap { idx in
             idx < allAtoms.count ? allAtoms[idx] : nil
         }
 
@@ -206,8 +206,8 @@ struct InspectorPanel: View {
 
             // Clear selection
             Button(action: {
-                viewModel.selectedAtomIndices.removeAll()
-                viewModel.selectedAtomIndex = nil
+                viewModel.workspace.selectedAtomIndices.removeAll()
+                viewModel.workspace.selectedAtomIndex = nil
                 viewModel.pushToRenderer()
             }) {
                 Label("Clear Selection", systemImage: "xmark.circle")
@@ -253,8 +253,8 @@ struct InspectorPanel: View {
 
     @ViewBuilder
     private func multiResidueSummary(count: Int) -> some View {
-        if let prot = viewModel.protein {
-            let residues = viewModel.selectedResidueIndices.compactMap { idx in
+        if let prot = viewModel.molecules.protein {
+            let residues = viewModel.workspace.selectedResidueIndices.compactMap { idx in
                 idx < prot.residues.count ? prot.residues[idx] : nil
             }
 
@@ -305,9 +305,9 @@ struct InspectorPanel: View {
                 .controlSize(.small)
 
                 Button(action: {
-                    viewModel.selectedResidueIndices.removeAll()
-                    viewModel.selectedAtomIndices.removeAll()
-                    viewModel.selectedAtomIndex = nil
+                    viewModel.workspace.selectedResidueIndices.removeAll()
+                    viewModel.workspace.selectedAtomIndices.removeAll()
+                    viewModel.workspace.selectedAtomIndex = nil
                     viewModel.pushToRenderer()
                 }) {
                     Label("Clear", systemImage: "xmark.circle")
@@ -327,7 +327,7 @@ struct InspectorPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Chains", icon: "link")
 
-            if viewModel.allChains.isEmpty && viewModel.ligand == nil {
+            if viewModel.allChains.isEmpty && viewModel.molecules.ligand == nil {
                 Text("No chains loaded")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
@@ -392,7 +392,7 @@ struct InspectorPanel: View {
                             .help("Show only this chain")
 
                             Toggle("", isOn: Binding(
-                                get: { !viewModel.hiddenChainIDs.contains(chain.id) },
+                                get: { !viewModel.workspace.hiddenChainIDs.contains(chain.id) },
                                 set: { _ in viewModel.toggleChainVisibility(chain.id) }
                             ))
                             .toggleStyle(.switch)
@@ -401,14 +401,14 @@ struct InspectorPanel: View {
                     }
                 }
 
-                if !viewModel.hiddenChainIDs.isEmpty {
+                if !viewModel.workspace.hiddenChainIDs.isEmpty {
                     Text("Hidden chains excluded from pocket detection")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange.opacity(0.8))
                         .padding(.top, 2)
                 }
 
-                if viewModel.ligand != nil {
+                if viewModel.molecules.ligand != nil {
                     HStack(spacing: 8) {
                         Circle()
                             .fill(Color.orange)
@@ -416,7 +416,7 @@ struct InspectorPanel: View {
                         Text("Ligand")
                             .font(.system(size: 12, weight: .medium))
                         Spacer()
-                        Text(viewModel.ligand?.name ?? "")
+                        Text(viewModel.molecules.ligand?.name ?? "")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -433,9 +433,9 @@ struct InspectorPanel: View {
                         .help("Define docking pocket from ligand position")
 
                         Toggle("", isOn: Binding(
-                            get: { viewModel.showLigand },
+                            get: { viewModel.workspace.showLigand },
                             set: { newValue in
-                                viewModel.showLigand = newValue
+                                viewModel.workspace.showLigand = newValue
                                 viewModel.pushToRenderer()
                             }
                         ))
@@ -463,16 +463,16 @@ struct InspectorPanel: View {
                         .clipShape(RoundedRectangle(cornerRadius: 5))
                 }
                 .buttonStyle(.plain)
-                .disabled(viewModel.selectedResidueIndices.isEmpty)
+                .disabled(viewModel.workspace.selectedResidueIndices.isEmpty)
                 .help("Create subset from selected residues")
             }
 
-            if viewModel.residueSubsets.isEmpty {
+            if viewModel.workspace.residueSubsets.isEmpty {
                 Text("Select residues and click + to create a subset")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(viewModel.residueSubsets) { subset in
+                ForEach(viewModel.workspace.residueSubsets) { subset in
                     HStack(spacing: 6) {
                         Circle()
                             .fill(Color(
@@ -534,7 +534,7 @@ struct InspectorPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Statistics", icon: "chart.bar")
 
-            if let prot = viewModel.protein {
+            if let prot = viewModel.molecules.protein {
                 Text("Protein: \(prot.name)")
                     .font(.system(size: 11, weight: .medium))
                 infoRow("Atoms", "\(prot.atomCount)")
@@ -545,17 +545,53 @@ struct InspectorPanel: View {
                 infoRow("MW", String(format: "%.1f Da", prot.molecularWeight))
             }
 
-            if let lig = viewModel.ligand {
-                if viewModel.protein != nil { Divider() }
+            if let lig = viewModel.molecules.ligand {
+                if viewModel.molecules.protein != nil { Divider() }
                 Text("Ligand: \(lig.name)")
                     .font(.system(size: 11, weight: .medium))
                 infoRow("Atoms", "\(lig.atomCount)")
                 infoRow("Heavy", "\(lig.heavyAtomCount)")
                 infoRow("Bonds", "\(lig.bondCount)")
                 infoRow("MW", String(format: "%.1f Da", lig.molecularWeight))
+
+                // Conformer picker
+                let confs = viewModel.workspace.ligandConformers
+                if confs.count > 1 {
+                    Divider()
+                    HStack(spacing: 6) {
+                        Text("Conformer")
+                            .font(.system(size: 10, weight: .medium))
+                        Spacer()
+                        Button(action: {
+                            let prev = max(viewModel.workspace.activeConformerIndex - 1, 0)
+                            viewModel.switchConformer(to: prev)
+                        }) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.workspace.activeConformerIndex == 0)
+
+                        Text("\(viewModel.workspace.activeConformerIndex + 1) / \(confs.count)")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+
+                        Button(action: {
+                            let next = min(viewModel.workspace.activeConformerIndex + 1, confs.count - 1)
+                            viewModel.switchConformer(to: next)
+                        }) {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.workspace.activeConformerIndex >= confs.count - 1)
+                    }
+
+                    let active = confs[viewModel.workspace.activeConformerIndex]
+                    infoRow("Energy", String(format: "%.2f kcal/mol", active.energy))
+                }
             }
 
-            if viewModel.protein == nil && viewModel.ligand == nil {
+            if viewModel.molecules.protein == nil && viewModel.molecules.ligand == nil {
                 Text("No molecules loaded")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
@@ -596,7 +632,7 @@ struct InspectorPanel: View {
     }
 
     private func chainAtomCount(_ chain: Chain) -> Int {
-        guard let mol = viewModel.protein else { return 0 }
+        guard let mol = viewModel.molecules.protein else { return 0 }
         return chain.residueIndices.reduce(0) { sum, resIdx in
             guard resIdx < mol.residues.count else { return sum }
             return sum + mol.residues[resIdx].atomIndices.count
@@ -605,7 +641,7 @@ struct InspectorPanel: View {
 
     private func showOnlyChain(_ chainID: String) {
         let allIDs = Set(viewModel.allChains.map(\.id))
-        viewModel.hiddenChainIDs = allIDs.subtracting([chainID])
+        viewModel.workspace.hiddenChainIDs = allIDs.subtracting([chainID])
         viewModel.pushToRenderer()
     }
 }

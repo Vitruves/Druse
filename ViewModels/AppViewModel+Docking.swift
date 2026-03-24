@@ -1,0 +1,753 @@
+import SwiftUI
+
+// MARK: - Pocket Detection, Docking, Pose Display, ML, Export
+
+extension AppViewModel {
+
+    // MARK: - Pocket Detection
+
+    func detectPockets() {
+        guard let prot = molecules.protein else { return }
+        log.info("Detecting binding pockets...", category: .dock)
+        workspace.statusMessage = "Detecting pockets..."
+
+        Task {
+            let pockets = BindingSiteDetector.detectPockets(protein: prot)
+            docking.detectedPockets = pockets
+            if let best = pockets.first {
+                docking.selectedPocket = best
+                showGridBoxForPocket(best)
+                log.success("Found \(pockets.count) pocket(s), best: \(String(format: "%.0f", best.volume)) ų, druggability: \(String(format: "%.1f", best.druggability))", category: .dock)
+                log.info("  Best pocket: \(best.residueIndices.count) residues, center=(\(String(format: "%.1f, %.1f, %.1f", best.center.x, best.center.y, best.center.z)))", category: .dock)
+            } else {
+                renderer?.clearGridBox()
+                log.warn("No pockets detected", category: .dock)
+            }
+            workspace.statusMessage = "\(pockets.count) pocket(s) found"
+        }
+    }
+
+    func detectLigandGuidedPocket() {
+        guard let prot = molecules.protein, let lig = molecules.ligand else { return }
+        log.info("Defining pocket from ligand position...", category: .dock)
+
+        if let pocket = BindingSiteDetector.ligandGuidedPocket(protein: prot, ligand: lig) {
+            docking.detectedPockets = [pocket]
+            docking.selectedPocket = pocket
+            showGridBoxForPocket(pocket)
+            log.success("Ligand-guided pocket: \(String(format: "%.0f", pocket.volume)) ų, \(pocket.residueIndices.count) residues", category: .dock)
+        }
+    }
+
+    func pocketFromSelection() {
+        guard let prot = molecules.protein, !workspace.selectedResidueIndices.isEmpty else { return }
+        let pocket = BindingSiteDetector.pocketFromResidues(
+            protein: prot, residueIndices: Array(workspace.selectedResidueIndices)
+        )
+        docking.detectedPockets = [pocket]
+        docking.selectedPocket = pocket
+        showGridBoxForPocket(pocket)
+        log.success("Manual pocket from \(workspace.selectedResidueIndices.count) residues", category: .dock)
+    }
+
+    func showGridBoxForPocket(_ pocket: BindingPocket) {
+        renderer?.gridLineWidth = workspace.gridLineWidth
+        renderer?.updateGridBox(
+            center: pocket.center,
+            halfSize: pocket.size,
+            color: workspace.gridColor
+        )
+    }
+
+    /// Focus camera on pocket with Z-slab clipping (MOE-style pocket view).
+    func focusOnPocket(_ pocket: BindingPocket) {
+        renderer?.focusOnPocket(center: pocket.center, halfExtent: pocket.size)
+        // Sync clipping state back to workspace
+        workspace.enableClipping = renderer?.enableClipping ?? false
+        workspace.clipNearZ = renderer?.clipNearZ ?? 0
+        workspace.clipFarZ = renderer?.clipFarZ ?? 100
+        showGridBoxForPocket(pocket)
+    }
+
+    func updateGridBoxVisualization(center: SIMD3<Float>, halfSize: SIMD3<Float>) {
+        renderer?.updateGridBox(
+            center: center,
+            halfSize: halfSize,
+            color: SIMD4<Float>(0.2, 1.0, 0.4, 0.6)
+        )
+    }
+
+    // MARK: - Docking
+
+    func runDocking() {
+        guard let pocket = docking.selectedPocket,
+              let prot = molecules.protein,
+              let lig = molecules.ligand
+        else {
+            log.error("Need protein, ligand, and pocket to dock", category: .dock)
+            return
+        }
+
+        docking.originalDockingLigand = Molecule(name: lig.name, atoms: lig.atoms, bonds: lig.bonds, title: lig.title)
+
+        docking.isDocking = true
+        docking.dockingGeneration = 0
+        docking.dockingTotalGenerations = docking.dockingConfig.numGenerations
+        docking.dockingResults = []
+        docking.currentInteractions = []
+        docking.dockingBestEnergy = .infinity
+        docking.dockingBestPKi = nil
+        docking.dockingStartTime = Date()
+        docking.dockingDuration = 0
+        docking.selectedPoseIndices = []
+        let cfg = docking.dockingConfig
+        log.info("Starting docking: pop=\(cfg.populationSize), gen=\(cfg.numGenerations) (\(cfg.numRuns)×\(cfg.generationsPerRun)), grid=\(String(format: "%.3f", cfg.gridSpacing)) Å", category: .dock)
+        log.info("  Ligand: \(lig.name) (\(lig.atoms.filter { $0.element != .H }.count) heavy atoms, \(lig.atoms.count) total, \(lig.bondCount) bonds)", category: .dock)
+        log.info("  Pocket: center=(\(String(format: "%.1f, %.1f, %.1f", pocket.center.x, pocket.center.y, pocket.center.z))), size=(\(String(format: "%.1f, %.1f, %.1f", pocket.size.x, pocket.size.y, pocket.size.z))), volume=\(String(format: "%.0f", pocket.volume)) ų", category: .dock)
+        log.info("  Scoring: \(docking.scoringMethod.rawValue), charges: \(docking.chargeMethod.rawValue)", category: .dock)
+        log.info("  Config: localSearchFreq=\(cfg.localSearchFrequency), localSearchSteps=\(cfg.localSearchSteps), explorationRatio=\(String(format: "%.2f", cfg.explorationPhaseRatio))", category: .dock)
+        log.info("  Config: torsionFlex=\(cfg.enableFlexibility), numRuns=\(cfg.numRuns)", category: .dock)
+
+        Task {
+            if docking.dockingEngine == nil, let device = renderer?.device {
+                docking.dockingEngine = DockingEngine(device: device)
+            }
+            guard let engine = docking.dockingEngine else {
+                log.error("Failed to initialize docking engine", category: .dock)
+                docking.isDocking = false
+                docking.dockingBestEnergy = .infinity
+                docking.dockingResults = []
+                workspace.statusMessage = "Docking engine unavailable"
+                return
+            }
+
+            let proteinAtoms = prot.atoms
+            let proteinBonds = prot.bonds
+            let dockingPH = molecules.protonationPH
+            let pdbContent = molecules.rawPDBContent
+            let preparedProtein = await Task.detached {
+                ProteinPreparation.prepareForDocking(
+                    atoms: proteinAtoms,
+                    bonds: proteinBonds,
+                    rawPDBContent: pdbContent,
+                    pH: dockingPH
+                )
+            }.value
+
+            let scoringProtein = Molecule(
+                name: prot.name,
+                atoms: preparedProtein.atoms,
+                bonds: preparedProtein.bonds,
+                title: prot.title,
+                smiles: prot.smiles
+            )
+            scoringProtein.secondaryStructureAssignments = prot.secondaryStructureAssignments
+            log.info(
+                "Using prepared receptor for scoring: +\(preparedProtein.report.hydrogensAdded) H via \(preparedProtein.report.hydrogenMethod), " +
+                "\(preparedProtein.report.nonZeroChargeAtoms) charged atoms, \(preparedProtein.report.rdkitChargeMatches) RDKit charge matches",
+                category: .dock
+            )
+
+            // Ensure grid box stays visible during docking; hide original ligand
+            // (the live ghost pose renders the moving ligand in the pocket)
+            showGridBoxForPocket(pocket)
+            pushToRenderer()
+
+            // Receptor flexibility: prepare flex buffers but keep ALL atoms in grid.
+            // The flex scoring kernel computes a delta: pairwise(rotated) - pairwise(reference).
+            // Since the grid includes flex atoms at reference positions, the delta captures
+            // exactly the energy change from sidechain rotation. When chi=0, delta=0 → rigid docking.
+            var flexConfig = docking.flexibleResidueConfig
+            let isAutoFlex = flexConfig.autoFlex
+
+            // Auto-flex: auto-select pocket-lining residues with rotatable sidechains
+            if isAutoFlex && flexConfig.flexibleResidueIndices.isEmpty {
+                let autoIndices = FlexibleResidueConfig.autoSelectResidues(
+                    protein: scoringProtein.atoms,
+                    pocket: (center: pocket.center, residueIndices: pocket.residueIndices)
+                )
+                flexConfig.flexibleResidueIndices = autoIndices
+                if !autoIndices.isEmpty {
+                    let names = autoIndices.compactMap { seq -> String? in
+                        scoringProtein.atoms.first(where: { $0.residueSeq == seq }).map { "\($0.residueName)\(seq)" }
+                    }
+                    log.info("Auto-flex: selected \(autoIndices.count) pocket-lining residue(s): \(names.joined(separator: ", "))", category: .dock)
+                }
+            }
+
+            let flexWeight = isAutoFlex ? FlexibleResidueConfig.softFlexWeight : Float(1.0)
+            let chiStep = isAutoFlex ? FlexibleResidueConfig.softChiStep : FlexibleResidueConfig.fullChiStep
+
+            if !flexConfig.flexibleResidueIndices.isEmpty {
+                if docking.flexDockingEngine == nil, let device = renderer?.device {
+                    docking.flexDockingEngine = FlexDockingEngine(device: device, commandQueue: engine.commandQueue)
+                }
+                if let flexEngine = docking.flexDockingEngine {
+                    let vinaTypes = engine.vinaTypesForProtein(scoringProtein)
+                    let exclusion = flexEngine.excludeFlexAtoms(
+                        proteinAtoms: scoringProtein.atoms,
+                        proteinBonds: scoringProtein.bonds,
+                        flexConfig: flexConfig,
+                        vinaTypes: vinaTypes
+                    )
+                    flexEngine.prepareFlexBuffers(exclusion: exclusion, flexWeight: flexWeight, chiStep: chiStep)
+                    engine.flexEngine = flexEngine
+                    let mode = isAutoFlex ? "soft" : "full"
+                    log.info(
+                        "Receptor flexibility (\(mode)): \(flexConfig.flexibleResidueIndices.count) residue(s), " +
+                        "\(exclusion.flexAtoms.count) sidechain atoms, \(exclusion.chiSlotCount) chi angles " +
+                        "(weight=\(String(format: "%.2f", flexWeight)), chiStep=\(String(format: "%.2f", chiStep)) rad)",
+                        category: .dock
+                    )
+                }
+            }
+
+            // Auto-tune: adapt config to system complexity
+            if docking.dockingConfig.autoMode {
+                let heavyAtoms = lig.atoms.filter { $0.element != .H }.count
+                let torsions = RDKitBridge.buildTorsionTree(smiles: lig.smiles ?? "")?.count ?? 0
+                let tuned = DockingConfig.autoTune(
+                    proteinAtomCount: scoringProtein.atoms.count,
+                    pocketVolume: pocket.volume,
+                    pocketBuriedness: pocket.buriedness,
+                    ligandHeavyAtoms: heavyAtoms,
+                    ligandRotatableBonds: torsions
+                )
+                // Preserve user's scoring/charge/flex choices, override search params
+                docking.dockingConfig.populationSize = tuned.populationSize
+                docking.dockingConfig.generationsPerRun = tuned.generationsPerRun
+                docking.dockingConfig.numRuns = tuned.numRuns
+                docking.dockingConfig.gridSpacing = tuned.gridSpacing
+                docking.dockingConfig.localSearchFrequency = tuned.localSearchFrequency
+                docking.dockingConfig.localSearchSteps = tuned.localSearchSteps
+                docking.dockingConfig.explorationPhaseRatio = tuned.explorationPhaseRatio
+                docking.dockingConfig.explorationTranslationStep = tuned.explorationTranslationStep
+                docking.dockingConfig.explorationMutationRate = tuned.explorationMutationRate
+                docking.dockingTotalGenerations = tuned.numGenerations
+                log.info("Auto-tune: pop=\(tuned.populationSize) gen=\(tuned.generationsPerRun) runs=\(tuned.numRuns) " +
+                         "(protein=\(scoringProtein.atoms.count) atoms, pocket=\(String(format: "%.0f", pocket.volume))ų " +
+                         "buried=\(String(format: "%.2f", pocket.buriedness)), ligand=\(heavyAtoms) heavy/\(torsions) torsions)",
+                         category: .dock)
+            }
+
+            log.info("Computing grid maps (spacing=\(String(format: "%.2f", docking.dockingConfig.gridSpacing)) Å)...", category: .dock)
+            engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
+            log.success("Grid maps computed — \(scoringProtein.atoms.count) receptor atoms", category: .dock)
+
+            let origLig = self.docking.originalDockingLigand ?? lig
+
+            let useMLLive = docking.scoringMethod == .druseAffinity && druseMLScoring.isAvailable
+            log.info("  ML live scoring: \(useMLLive ? "enabled" : "disabled") (method=\(docking.scoringMethod.rawValue), mlAvailable=\(druseMLScoring.isAvailable))", category: .dock)
+            log.info("  Original ligand: \(origLig.name), \(origLig.atoms.count) atoms, \(origLig.bonds.count) bonds", category: .dock)
+            let liveScoringProteinAtoms = scoringProtein.atoms
+            let liveScoringProteinBonds = scoringProtein.bonds
+            let livePocketCenter = pocket.center
+            let liveLigandBonds = origLig.bonds
+
+            engine.onPoseUpdate = { [weak self] result, interactions in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.docking.dockingBestEnergy = result.energy
+                    self.docking.currentInteractions = interactions
+                    // Use lightweight ghost pose pipeline — avoids full pushToRenderer() rebuild
+                    if let (newAtoms, newBonds) = self.buildTransformedLigand(result: result, originalLigand: origLig) {
+                        self.renderer?.updateGhostPose(atoms: newAtoms, bonds: newBonds)
+
+                        // Live ML affinity scoring on current best pose.
+                        // Guard with isLiveScoring to prevent overlapping CoreML tasks
+                        // from piling up and overwhelming the ANE.
+                        if useMLLive, !self.docking.isLiveScoring {
+                            self.docking.isLiveScoring = true
+                            let features = DruseScoreFeatureExtractor.extract(
+                                proteinAtoms: liveScoringProteinAtoms,
+                                ligandAtoms: newAtoms,
+                                pocketCenter: livePocketCenter,
+                                proteinBonds: liveScoringProteinBonds,
+                                ligandBonds: liveLigandBonds
+                            )
+                            if let pred = await self.druseMLScoring.score(features: features) {
+                                self.docking.dockingBestPKi = pred.pKd
+                            }
+                            self.docking.isLiveScoring = false
+                        }
+                    }
+                    if !interactions.isEmpty {
+                        self.renderer?.updateInteractionLines(interactions)
+                    }
+                }
+            }
+
+            engine.onGenerationComplete = { [weak self] gen, energy in
+                Task { @MainActor [weak self] in
+                    self?.docking.dockingGeneration = gen
+                }
+            }
+
+            // Prepare pharmacophore constraint buffers (zero-cost if no constraints)
+            let activeConstraints = docking.pharmacophoreConstraints.filter(\.isEnabled)
+            engine.prepareConstraintBuffers(
+                activeConstraints,
+                atoms: scoringProtein.atoms,
+                residues: scoringProtein.residues
+            )
+            if !activeConstraints.isEmpty {
+                log.info("Pharmacophore constraints: \(activeConstraints.count) active", category: .dock)
+            }
+
+            log.info("Launching GA docking engine...", category: .dock)
+            let results = await engine.runDocking(
+                ligand: lig, pocket: pocket,
+                config: docking.dockingConfig,
+                scoringMethod: docking.scoringMethod)
+
+            log.info("GA complete: \(results.count) poses returned", category: .dock)
+            if let best = results.first {
+                log.info("  Best pose: E=\(String(format: "%.3f", best.energy)) kcal/mol, " +
+                         "cluster=\(best.clusterID), gen=\(best.generation)", category: .dock)
+            }
+
+            // Signal that GA search is done — post-processing begins
+            workspace.statusMessage = "Post-processing docking results..."
+
+            var rankedResults: [DockingResult]
+
+            // Primary ML scoring (DruseScorePKi) — replaces Vina as the ranking function
+            if docking.scoringMethod == .druseAffinity && druseMLScoring.isAvailable, let pocket = docking.selectedPocket {
+                workspace.statusMessage = "Druse Affinity scoring..."
+                log.info("Scoring with Druse Affinity (pKi)...", category: .dock)
+                rankedResults = await druseMLScoring.scorePoses(
+                    results: results,
+                    proteinAtoms: scoringProtein.atoms,
+                    ligandAtoms: origLig.atoms,
+                    pocketCenter: pocket.center,
+                    proteinBonds: scoringProtein.bonds,
+                    ligandBonds: origLig.bonds
+                )
+                log.success("Druse Affinity scoring complete", category: .dock)
+            } else if docking.usePostDockingRefinement && druseRescoring.isAvailable, let pocket = docking.selectedPocket {
+                // Post-docking ML refinement (secondary model, blends with Vina)
+                log.info("Post-docking ML refinement...", category: .dock)
+                let reranked = await druseRescoring.rerankPoses(
+                    results: results,
+                    proteinAtoms: scoringProtein.atoms,
+                    ligandAtoms: origLig.atoms,
+                    pocketCenter: pocket.center,
+                    proteinBonds: scoringProtein.bonds,
+                    ligandBonds: origLig.bonds
+                )
+                rankedResults = reranked
+                log.success("Post-docking refinement complete", category: .dock)
+            } else {
+                rankedResults = results
+            }
+
+            let openMMRefiner = OpenMMPocketRefiner.shared
+            if openMMRefiner.isAvailable {
+                workspace.statusMessage = "OpenMM refinement..."
+                let refinement = await refineTopDockingResultsWithOpenMM(
+                    results: rankedResults,
+                    protein: scoringProtein,
+                    originalLigand: origLig,
+                    pocket: pocket
+                )
+                rankedResults = refinement.results
+                if let refinedPositions = refinement.bestProteinHeavyPositions,
+                   let updatedProteinAtoms = applyingRefinedHeavyAtomPositions(refinedPositions, to: prot.atoms) {
+                    let refinedProtein = Molecule(name: prot.name, atoms: updatedProteinAtoms, bonds: prot.bonds, title: prot.title)
+                    refinedProtein.secondaryStructureAssignments = prot.secondaryStructureAssignments
+                    molecules.protein = refinedProtein
+                    pushToRenderer()
+                }
+            } else {
+                log.info("OpenMM refinement skipped: \(openMMRefiner.availabilitySummary)", category: .dock)
+            }
+
+            // MMFF94 ligand strain penalty (post-docking, CPU-side)
+            let strainSmiles = origLig.smiles ?? (origLig.title.isEmpty ? nil : origLig.title)
+            if docking.dockingConfig.strainPenaltyEnabled, let smiles = strainSmiles {
+                rankedResults = await computeStrainPenalties(
+                    results: rankedResults, smiles: smiles, config: docking.dockingConfig
+                )
+            }
+
+            docking.dockingResults = rankedResults
+            docking.isDocking = false
+            docking.dockingDuration = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
+
+            if let best = docking.dockingResults.first {
+                applyDockingPose(best, originalLigand: origLig)
+
+                if molecules.protein != nil {
+                    let heavyAtoms = origLig.atoms.filter { $0.element != .H }
+                    let heavyBonds = buildHeavyBonds(from: origLig)
+                    docking.currentInteractions = InteractionDetector.detect(
+                        ligandAtoms: heavyAtoms,
+                        ligandPositions: best.transformedAtomPositions,
+                        proteinAtoms: scoringProtein.atoms.filter { $0.element != .H },
+                        ligandBonds: heavyBonds
+                    )
+                    renderer?.updateInteractionLines(docking.currentInteractions)
+                }
+            }
+
+            if let pocket = docking.selectedPocket {
+                showGridBoxForPocket(pocket)
+            }
+
+            let clusterCount = Set(results.map(\.clusterID)).count
+            let elapsed = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
+            if let best = rankedResults.first {
+                if docking.scoringMethod == .druseAffinity, let pKd = best.mlPKd {
+                    let display = docking.affinityDisplayUnit.format(pKd)
+                    let unit = docking.affinityDisplayUnit.unitLabel
+                    log.success(String(format: "Docking complete: best %@ %@, conf %.0f%%, %d poses, %d clusters (%.1fs)",
+                                       display, unit, (best.mlPoseConfidence ?? 0) * 100,
+                                       rankedResults.count, clusterCount, elapsed), category: .dock)
+                    workspace.statusMessage = "Best: \(display) \(unit)"
+                } else if docking.scoringMethod == .drusina {
+                    let drCorr = best.drusinaCorrection
+                    log.success(String(format: "Docking complete (Drusina): best %.1f kcal/mol (correction: %.2f), %d poses, %d clusters (%.1fs)",
+                                       best.energy, drCorr, rankedResults.count, clusterCount, elapsed), category: .dock)
+                    workspace.statusMessage = String(format: "Best: %.1f kcal/mol", best.energy)
+                } else {
+                    log.success(String(format: "Docking complete: best %.1f kcal/mol, %d poses, %d clusters (%.1fs)",
+                                       best.energy, rankedResults.count, clusterCount, elapsed), category: .dock)
+                    workspace.statusMessage = String(format: "Best: %.1f kcal/mol", best.energy)
+                }
+                if docking.currentInteractions.count > 0 {
+                    let hbonds = docking.currentInteractions.filter { $0.type == .hbond }.count
+                    let hydro = docking.currentInteractions.filter { $0.type == .hydrophobic }.count
+                    let pipi = docking.currentInteractions.filter { $0.type == .piStack }.count
+                    log.info("  Best pose interactions: \(hbonds) H-bonds, \(hydro) hydrophobic, \(pipi) π-stacking", category: .dock)
+                }
+            }
+        }
+    }
+
+    func stopDocking() {
+        docking.dockingEngine?.stopDocking()
+        docking.isDocking = false
+        docking.isLiveScoring = false
+        renderer?.clearGhostPose()
+        pushToRenderer()
+        log.info("Docking stopped", category: .dock)
+    }
+
+    func showDockingPose(at index: Int) {
+        guard index < docking.dockingResults.count else { return }
+        guard let origLig = docking.originalDockingLigand ?? molecules.ligand else { return }
+        let result = docking.dockingResults[index]
+        applyDockingPose(result, originalLigand: origLig)
+
+        if let prot = molecules.protein {
+            let heavyAtoms = origLig.atoms.filter { $0.element != .H }
+            let heavyBonds = buildHeavyBonds(from: origLig)
+            docking.currentInteractions = InteractionDetector.detect(
+                ligandAtoms: heavyAtoms,
+                ligandPositions: result.transformedAtomPositions,
+                proteinAtoms: prot.atoms.filter { $0.element != .H },
+                ligandBonds: heavyBonds
+            )
+            renderer?.updateInteractionLines(docking.currentInteractions)
+
+            if workspace.renderMode == .ribbon && workspace.sideChainDisplay == .interacting {
+                pushToRenderer()
+            }
+        }
+
+        workspace.statusMessage = String(format: "Pose #%d: %.1f kcal/mol", index + 1, result.energy)
+    }
+
+    func togglePoseSelection(at index: Int) {
+        if docking.selectedPoseIndices.contains(index) {
+            docking.selectedPoseIndices.remove(index)
+        } else {
+            docking.selectedPoseIndices.insert(index)
+        }
+    }
+
+    func showSelectedPoses() {
+        guard !docking.selectedPoseIndices.isEmpty else { return }
+        guard let origLig = docking.originalDockingLigand ?? molecules.ligand else { return }
+
+        let sortedIndices = docking.selectedPoseIndices.sorted { a, b in
+            guard a < docking.dockingResults.count, b < docking.dockingResults.count else { return a < b }
+            return docking.dockingResults[a].energy < docking.dockingResults[b].energy
+        }
+
+        if let primaryIdx = sortedIndices.first, primaryIdx < docking.dockingResults.count {
+            let result = docking.dockingResults[primaryIdx]
+            applyDockingPose(result, originalLigand: origLig)
+
+            if let prot = molecules.protein {
+                let heavyAtoms = origLig.atoms.filter { $0.element != .H }
+                let heavyBonds = buildHeavyBonds(from: origLig)
+                docking.currentInteractions = InteractionDetector.detect(
+                    ligandAtoms: heavyAtoms,
+                    ligandPositions: result.transformedAtomPositions,
+                    proteinAtoms: prot.atoms.filter { $0.element != .H },
+                    ligandBonds: heavyBonds
+                )
+                renderer?.updateInteractionLines(docking.currentInteractions)
+            }
+        }
+
+        var ghostAtoms: [Atom] = []
+        var ghostBonds: [Bond] = []
+        for idx in sortedIndices.dropFirst() {
+            guard idx < docking.dockingResults.count else { continue }
+            let result = docking.dockingResults[idx]
+            if let (atoms, bonds) = buildTransformedLigand(result: result, originalLigand: origLig) {
+                let offset = ghostAtoms.count
+                for atom in atoms {
+                    ghostAtoms.append(Atom(
+                        id: offset + atom.id, element: atom.element, position: atom.position,
+                        name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                        chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                        isHetAtom: atom.isHetAtom
+                    ))
+                }
+                for bond in bonds {
+                    ghostBonds.append(Bond(
+                        id: ghostBonds.count,
+                        atomIndex1: bond.atomIndex1 + offset,
+                        atomIndex2: bond.atomIndex2 + offset,
+                        order: bond.order
+                    ))
+                }
+            }
+        }
+
+        if !ghostAtoms.isEmpty {
+            renderer?.updateGhostPose(atoms: ghostAtoms, bonds: ghostBonds)
+        }
+
+        workspace.statusMessage = "\(docking.selectedPoseIndices.count) poses displayed"
+    }
+
+    func refineTopDockingResultsWithOpenMM(
+        results: [DockingResult],
+        protein: Molecule,
+        originalLigand: Molecule,
+        pocket: BindingPocket
+    ) async -> (results: [DockingResult], bestProteinHeavyPositions: [SIMD3<Float>]?) {
+        guard !results.isEmpty else { return (results, nil) }
+
+        var refinedResults = results
+        var refinedProteinByResultID: [Int: [SIMD3<Float>]] = [:]
+        let refiner = OpenMMPocketRefiner.shared
+        let topN = min(3, refinedResults.count)
+
+        log.info("Refining top \(topN) docking poses with OpenMM pocket minimization...", category: .dock)
+        for index in 0..<topN {
+            let result = refinedResults[index]
+            let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
+            var ligandAtoms = heavyAtoms
+            for atomIndex in 0..<min(ligandAtoms.count, result.transformedAtomPositions.count) {
+                ligandAtoms[atomIndex].position = result.transformedAtomPositions[atomIndex]
+            }
+
+            if let refined = await refiner.refine(
+                proteinAtoms: protein.atoms,
+                ligandAtoms: ligandAtoms,
+                pocketCenter: pocket.center,
+                pocketHalfExtent: pocket.size
+            ) {
+                refinedResults[index].refinementEnergy = refined.interactionEnergyKcal
+                refinedProteinByResultID[result.id] = refined.refinedHeavyAtomPositions
+            }
+        }
+
+        refinedResults.sort { lhs, rhs in
+            let lhsScore = lhs.refinementEnergy ?? lhs.energy
+            let rhsScore = rhs.refinementEnergy ?? rhs.energy
+            return lhsScore < rhsScore
+        }
+
+        let bestProteinHeavyPositions = refinedResults.first.flatMap { refinedProteinByResultID[$0.id] }
+        return (refinedResults, bestProteinHeavyPositions)
+    }
+
+    func buildTransformedLigand(result: DockingResult, originalLigand: Molecule) -> (atoms: [Atom], bonds: [Bond])? {
+        guard !result.transformedAtomPositions.isEmpty else { return nil }
+        let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
+
+        var newAtoms: [Atom] = []
+        for (i, atom) in heavyAtoms.enumerated() {
+            guard i < result.transformedAtomPositions.count else { break }
+            newAtoms.append(Atom(
+                id: i, element: atom.element, position: result.transformedAtomPositions[i],
+                name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                isHetAtom: atom.isHetAtom
+            ))
+        }
+
+        var oldToNew: [Int: Int] = [:]
+        for (newIdx, atom) in heavyAtoms.enumerated() {
+            oldToNew[atom.id] = newIdx
+        }
+        var newBonds: [Bond] = []
+        for bond in originalLigand.bonds {
+            if let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] {
+                newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+            }
+        }
+        return (newAtoms, newBonds)
+    }
+
+    func applyDockingPose(_ result: DockingResult, originalLigand: Molecule) {
+        guard let (newAtoms, newBonds) = buildTransformedLigand(result: result, originalLigand: originalLigand) else { return }
+
+        renderer?.clearGhostPose()
+        molecules.ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
+        pushToRenderer()
+
+        if !docking.currentInteractions.isEmpty {
+            renderer?.updateInteractionLines(docking.currentInteractions)
+        }
+    }
+
+    func applyLiveDockingPose(_ result: DockingResult, originalLigand: Molecule) {
+        guard let (newAtoms, newBonds) = buildTransformedLigand(result: result, originalLigand: originalLigand) else { return }
+
+        molecules.ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
+        pushToRenderer()
+
+        if !docking.currentInteractions.isEmpty {
+            renderer?.updateInteractionLines(docking.currentInteractions)
+        }
+    }
+
+    // MARK: - Export Results
+
+    func exportResultsCSV() -> String {
+        var rows: [String] = ["Rank,Cluster,Energy_kcal_mol,VdW,HBond,Torsion,StrainEnergy,Generation,ML_pKd,ML_Confidence,ML_DockingScore"]
+        rows.reserveCapacity(docking.dockingResults.count + 1)
+        for (i, r) in docking.dockingResults.enumerated() {
+            let fields: [String] = [
+                "\(i+1)",
+                "\(r.clusterID)",
+                String(format: "%.2f", r.energy),
+                String(format: "%.2f", r.vdwEnergy),
+                String(format: "%.2f", r.hbondEnergy),
+                String(format: "%.2f", r.torsionPenalty),
+                r.strainEnergy.map { String(format: "%.2f", $0) } ?? "",
+                "\(r.generation)",
+                r.mlPKd.map { String(format: "%.3f", $0) } ?? "",
+                r.mlPoseConfidence.map { String(format: "%.3f", $0) } ?? "",
+                r.mlDockingScore.map { String(format: "%.3f", $0) } ?? ""
+            ]
+            rows.append(fields.joined(separator: ","))
+        }
+        return rows.joined(separator: "\n") + "\n"
+    }
+
+    // MARK: - ML Model Loading
+
+    func loadMLModels() {
+        druseMLScoring.loadModel()
+        druseRescoring.loadModel()
+        pocketDetectorML.loadModel()
+        admetPredictor.loadModels()
+        if druseMLScoring.isAvailable {
+            log.success("Druse Affinity (pKi) model loaded", category: .dock)
+        }
+        if druseRescoring.isAvailable {
+            log.success("Post-docking refinement model loaded", category: .dock)
+        }
+        if pocketDetectorML.isAvailable {
+            log.success("PocketDetector ML model loaded", category: .dock)
+        }
+        if admetPredictor.isAvailable {
+            log.success("ADMET models loaded", category: .dock)
+        }
+    }
+
+    // MARK: - ML Pocket Detection
+
+    // MARK: - Strain Penalty
+
+    /// Compute MMFF94 strain energy for top docking poses and apply penalty to scores.
+    func computeStrainPenalties(
+        results: [DockingResult], smiles: String, config: DockingConfig
+    ) async -> [DockingResult] {
+        workspace.statusMessage = "Computing ligand strain..."
+
+        let topN = min(results.count, 50) // only compute for top 50 poses (CPU-bound)
+        let threshold = config.strainPenaltyThreshold
+        let weight = config.strainPenaltyWeight
+
+        // Compute reference energy once (free ligand, relaxed)
+        let refEnergy = await Task.detached(priority: .userInitiated) {
+            RDKitBridge.mmffReferenceEnergy(smiles: smiles)
+        }.value
+
+        guard let refEnergy else {
+            log.warn("MMFF reference energy failed for \(smiles.prefix(40)) — skipping strain", category: .dock)
+            return results
+        }
+
+        // Compute strain for each top pose
+        var updated = results
+        let positionsSlice = results.prefix(topN).map { $0.transformedAtomPositions }
+
+        let strainResults: [(Int, Float?)] = await Task.detached(priority: .userInitiated) {
+            positionsSlice.enumerated().map { (i, positions) in
+                guard !positions.isEmpty else { return (i, nil as Float?) }
+                if let dockedEnergy = RDKitBridge.mmffStrainEnergy(smiles: smiles, heavyPositions: positions) {
+                    let strain = Float(dockedEnergy - refEnergy)
+                    return (i, strain)
+                }
+                return (i, nil as Float?)
+            }
+        }.value
+
+        var strainedCount = 0
+        for (i, strain) in strainResults {
+            guard let strain else { continue }
+            updated[i].strainEnergy = strain
+            if strain > threshold {
+                let penalty = weight * (strain - threshold)
+                updated[i].energy += penalty
+                strainedCount += 1
+            }
+        }
+
+        if strainedCount > 0 {
+            // Re-sort since energies changed
+            updated.sort { $0.energy < $1.energy }
+            log.info("Strain penalty applied: \(strainedCount)/\(topN) poses exceeded \(String(format: "%.0f", threshold)) kcal/mol threshold (ref: \(String(format: "%.1f", refEnergy)) kcal/mol)", category: .dock)
+        } else {
+            log.info("Strain check: all \(topN) poses within \(String(format: "%.0f", threshold)) kcal/mol threshold (ref: \(String(format: "%.1f", refEnergy)) kcal/mol)", category: .dock)
+        }
+        return updated
+    }
+
+    // MARK: - ML Pocket Detection
+
+    func detectPocketsML() {
+        guard let prot = molecules.protein else { return }
+        guard pocketDetectorML.isAvailable else {
+            log.warn("PocketDetector model not available, falling back to geometric detection", category: .dock)
+            detectPockets()
+            return
+        }
+        log.info("Detecting pockets (ML)...", category: .dock)
+        workspace.statusMessage = "ML pocket detection..."
+
+        Task {
+            let pockets = await pocketDetectorML.detectPockets(protein: prot)
+            docking.detectedPockets = pockets
+            if let best = pockets.first {
+                docking.selectedPocket = best
+                showGridBoxForPocket(best)
+                log.success("ML found \(pockets.count) pocket(s), best: \(String(format: "%.0f", best.volume)) ų", category: .dock)
+            } else {
+                renderer?.clearGridBox()
+                log.warn("ML detected no pockets, try geometric method", category: .dock)
+            }
+            workspace.statusMessage = "\(pockets.count) pocket(s) found (ML)"
+        }
+    }
+}

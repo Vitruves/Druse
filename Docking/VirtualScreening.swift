@@ -40,6 +40,7 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         var prescreenEnergy: Float?
         var openMMEnergy: Float?
         var admet: ADMETPredictor.ADMETResult?
+        var strainEnergy: Float?
     }
 
     enum ScreeningState: Sendable {
@@ -55,7 +56,32 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
     private(set) var hits: [ScreeningHit] = []
     private(set) var progress: Float = 0
 
-    private var isCancelled = false
+    /// Cancellation token backed by heap-allocated Int32 so it can be shared
+    /// across Swift async tasks AND passed to C++ TBB parallel_for.
+    /// Uses atomic load/store via C helpers to avoid data races.
+    private let cancelToken = CancellationToken()
+
+    private var isCancelled: Bool { cancelToken.value }
+
+    final class CancellationToken: @unchecked Sendable {
+        private let ptr: UnsafeMutablePointer<Int32>
+
+        init() {
+            ptr = .allocate(capacity: 1)
+            ptr.initialize(to: 0)
+        }
+
+        deinit { ptr.deallocate() }
+
+        var value: Bool { druse_atomic_cancel_load(ptr) != 0 }
+
+        func cancel() { druse_atomic_cancel_store(ptr, 1) }
+
+        func reset() { druse_atomic_cancel_store(ptr, 0) }
+
+        /// Raw pointer for passing to C functions (atomic cancel flag).
+        var unsafePointer: UnsafePointer<Int32> { UnsafePointer(ptr) }
+    }
 
     var config = ScreeningConfig()
 
@@ -74,11 +100,18 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         dockingEngine: DockingEngine,
         protein: Molecule,
         pocket: BindingPocket,
-        mlScorer: DruseScoreInference?,
-        admetPredictor: ADMETPredictor?
+        mlScorer: DruseRescoringInference?,
+        admetPredictor: ADMETPredictor?,
+        constraints: [PharmacophoreConstraintDef] = []
     ) async {
-        isCancelled = false
+        cancelToken.reset()
         hits = []
+        let screenStartTime = CFAbsoluteTimeGetCurrent()
+        ActivityLog.shared.info("Virtual screening started: \(smilesLibrary.count) input molecules", category: .dock)
+
+        // Prepare pharmacophore constraint buffers once (shared across all ligands)
+        let activeConstraints = constraints.filter(\.isEnabled)
+        dockingEngine.prepareConstraintBuffers(activeConstraints, atoms: protein.atoms, residues: protein.residues)
 
         let total = min(smilesLibrary.count, config.maxMolecules)
         let library = Array(smilesLibrary.prefix(total))
@@ -105,28 +138,40 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
             let smilesArray = batch.map(\.smiles)
             let nameArray = batch.map(\.name)
 
+            let cancelPtr = cancelToken.unsafePointer
             let results = await Task.detached {
                 RDKitBridge.batchProcess(
                     entries: zip(smilesArray, nameArray).map { ($0, $1) },
-                    addHydrogens: true, minimize: true, computeCharges: true
+                    addHydrogens: true, minimize: true, computeCharges: true,
+                    cancelFlag: cancelPtr
                 )
             }.value
 
+            var batchRejectedParse = 0
+            var batchRejectedRotBonds = 0
             for (i, result) in results.enumerated() {
                 if let mol = result.molecule {
                     let idx = batchStart + i
                     let desc = RDKitBridge.computeDescriptors(smiles: library[idx].smiles)
                     if let d = desc, d.rotatableBonds <= config.maxRotatableBonds {
                         prepared.append((idx, library[idx].name, library[idx].smiles, mol, desc))
+                    } else {
+                        batchRejectedRotBonds += 1
                     }
+                } else {
+                    batchRejectedParse += 1
                 }
+            }
+            if batchRejectedParse > 0 || batchRejectedRotBonds > 0 {
+                ActivityLog.shared.debug("Batch \(batchStart/batchSize): rejected \(batchRejectedParse) parse failures, \(batchRejectedRotBonds) exceeded \(config.maxRotatableBonds) rotatable bonds", category: .dock)
             }
 
             state = .preparing(current: batchEnd, total: total)
             progress = Float(batchEnd) / Float(total) * 0.3
         }
 
-        ActivityLog.shared.info("Prepared \(prepared.count)/\(total) molecules for screening", category: .dock)
+        let rejected = total - prepared.count
+        ActivityLog.shared.info("Prepared \(prepared.count)/\(total) molecules for screening (\(rejected) rejected)", category: .dock)
         guard !prepared.isEmpty else {
             hits = []
             progress = 1.0
@@ -235,11 +280,30 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
                 ))
             } else if let rigidFallback {
                 allHits.append(rigidFallback)
+                ActivityLog.shared.debug("Ligand \(entry.name): GA docking failed, using rigid prescore fallback", category: .dock)
+            } else {
+                ActivityLog.shared.warn("Ligand \(entry.name): docking produced no result", category: .dock)
             }
 
             if i % 10 == 0 {
                 state = .docking(current: i, total: shortlisted.count)
                 progress = 0.3 + Float(i) / Float(max(shortlisted.count, 1)) * 0.5
+            }
+        }
+
+        // Phase 2.5: MMFF94 strain penalty for GA-docked hits
+        for i in 0..<allHits.count {
+            if isCancelled { state = .idle; return }
+            let hit = allHits[i]
+            guard !hit.bestPoseAtoms.isEmpty else { continue }
+            if let refE = RDKitBridge.mmffReferenceEnergy(smiles: hit.smiles),
+               let dockedE = RDKitBridge.mmffStrainEnergy(smiles: hit.smiles, heavyPositions: hit.bestPoseAtoms) {
+                let strain = Float(dockedE - refE)
+                allHits[i].strainEnergy = strain
+                if strain > 6.0 {
+                    allHits[i].bestEnergy += 0.5 * (strain - 6.0)
+                    allHits[i].compositeScore = allHits[i].bestEnergy
+                }
             }
         }
 
@@ -265,7 +329,9 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
                 let features = DruseScoreFeatureExtractor.extract(
                     proteinAtoms: proteinAtoms,
                     ligandAtoms: atoms,
-                    pocketCenter: pocket.center
+                    pocketCenter: pocket.center,
+                    proteinBonds: protein.bonds,
+                    ligandBonds: allHits[i].ligandBonds
                 )
 
                 if let pred = await scorer.score(features: features) {
@@ -300,11 +366,17 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         hits = allHits
         progress = 1.0
         state = .complete(hits: allHits.count, total: total)
-        ActivityLog.shared.success("Screening complete: \(allHits.count) hits from \(total) molecules", category: .dock)
+        let screenElapsed = CFAbsoluteTimeGetCurrent() - screenStartTime
+        let bestScore = allHits.first?.compositeScore
+        let bestScoreStr = bestScore.map { String(format: "%.2f", $0) } ?? "N/A"
+        ActivityLog.shared.success(
+            "Screening complete: \(allHits.count) hits from \(total) molecules in \(String(format: "%.1f", screenElapsed))s — best composite score: \(bestScoreStr)",
+            category: .dock
+        )
     }
 
     func cancel() {
-        isCancelled = true
+        cancelToken.cancel()
     }
 
     private func prescreenPreparedLigands(
@@ -426,23 +498,32 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
 
     /// Export screening results as CSV.
     func exportCSV() -> String {
-        var csv = "Rank,Name,SMILES,Energy,PrescreenEnergy,OpenMMEnergy,ML_Score,Composite,MW,LogP,HBD,HBA,TPSA,RotBonds,Lipinski,DrugLikeness\n"
+        var rows: [String] = ["Rank,Name,SMILES,Energy,StrainEnergy,PrescreenEnergy,OpenMMEnergy,ML_Score,Composite,MW,LogP,HBD,HBA,TPSA,RotBonds,Lipinski,DrugLikeness"]
+        rows.reserveCapacity(hits.count + 1)
         for (i, hit) in hits.enumerated() {
             let desc = hit.descriptors
-            csv += "\(i+1),\"\(hit.name)\",\"\(hit.smiles)\",\(String(format: "%.2f", hit.bestEnergy)),"
-            csv += "\(hit.prescreenEnergy.map { String(format: "%.2f", $0) } ?? "N/A"),"
-            csv += "\(hit.openMMEnergy.map { String(format: "%.2f", $0) } ?? "N/A"),"
-            csv += "\(hit.mlScore.map { String(format: "%.2f", $0) } ?? "N/A"),"
-            csv += "\(String(format: "%.2f", hit.compositeScore)),"
-            csv += "\(desc.map { String(format: "%.1f", $0.molecularWeight) } ?? "N/A"),"
-            csv += "\(desc.map { String(format: "%.2f", $0.logP) } ?? "N/A"),"
-            csv += "\(desc?.hbd ?? 0),\(desc?.hba ?? 0),"
-            csv += "\(desc.map { String(format: "%.1f", $0.tpsa) } ?? "N/A"),"
-            csv += "\(desc?.rotatableBonds ?? 0),"
-            csv += "\(desc?.lipinski == true ? "Yes" : "No"),"
-            csv += "\(hit.admet.map { String(format: "%.2f", $0.drugLikeness) } ?? "N/A")\n"
+            let fields: [String] = [
+                "\(i+1)",
+                "\"\(hit.name)\"",
+                "\"\(hit.smiles)\"",
+                String(format: "%.2f", hit.bestEnergy),
+                hit.strainEnergy.map { String(format: "%.2f", $0) } ?? "N/A",
+                hit.prescreenEnergy.map { String(format: "%.2f", $0) } ?? "N/A",
+                hit.openMMEnergy.map { String(format: "%.2f", $0) } ?? "N/A",
+                hit.mlScore.map { String(format: "%.2f", $0) } ?? "N/A",
+                String(format: "%.2f", hit.compositeScore),
+                desc.map { String(format: "%.1f", $0.molecularWeight) } ?? "N/A",
+                desc.map { String(format: "%.2f", $0.logP) } ?? "N/A",
+                "\(desc?.hbd ?? 0)",
+                "\(desc?.hba ?? 0)",
+                desc.map { String(format: "%.1f", $0.tpsa) } ?? "N/A",
+                "\(desc?.rotatableBonds ?? 0)",
+                desc?.lipinski == true ? "Yes" : "No",
+                hit.admet.map { String(format: "%.2f", $0.drugLikeness) } ?? "N/A"
+            ]
+            rows.append(fields.joined(separator: ","))
         }
-        return csv
+        return rows.joined(separator: "\n") + "\n"
     }
 
     /// Export top hits as multi-molecule SDF with scores.
@@ -686,59 +767,14 @@ final class OpenMMPocketRefiner {
         var refinedHeavyAtomPositions: [SIMD3<Float>]
     }
 
-    struct Availability: Sendable {
-        var pythonAvailable: Bool
-        var openMMAvailable: Bool
-        var message: String
-    }
-
-    private struct PythonCommand: Sendable {
-        var executable: String
-        var prefixArguments: [String]
-    }
-
-    private struct ProteinHeavyKey: Codable, Sendable {
-        var name: String
-        var residueName: String
-        var residueSeq: Int
-        var chainID: String
-    }
-
-    private struct LigandSite: Codable, Sendable {
-        var position: [Float]
-        var charge: Float
-        var sigmaNm: Float
-        var epsilonKJ: Float
-    }
-
-    private struct Payload: Codable, Sendable {
-        var proteinPDB: String
-        var proteinHeavyKeys: [ProteinHeavyKey]
-        var ligandSites: [LigandSite]
-        var pocketCenter: [Float]
-        var pocketHalfExtent: [Float]
-        var pocketRadiusAngstrom: Float
-        var maxIterations: Int
-    }
-
-    private struct Response: Decodable {
-        var interactionEnergyKcal: Float
-        var refinedHeavyPositions: [[Float]]
-    }
-
     nonisolated(unsafe) static let shared = OpenMMPocketRefiner()
 
-    let availability: Availability
-    var isAvailable: Bool { availability.openMMAvailable }
-    var availabilitySummary: String { availability.message }
-
-    private let command: PythonCommand?
-
-    private init() {
-        let detected = Self.detectAvailability()
-        self.command = detected.command
-        self.availability = detected.availability
+    var isAvailable: Bool { druse_openmm_available() }
+    var availabilitySummary: String {
+        isAvailable ? "Native C++ OpenMM available" : "OpenMM not compiled (DRUSE_HAS_OPENMM not set)"
     }
+
+    private init() {}
 
     func refine(
         proteinAtoms: [Atom],
@@ -746,195 +782,154 @@ final class OpenMMPocketRefiner {
         pocketCenter: SIMD3<Float>,
         pocketHalfExtent: SIMD3<Float>
     ) async -> RefinementResult? {
-        guard let command else { return nil }
-
         let heavyProteinAtoms = proteinAtoms.filter { $0.element != .H }
         let heavyLigandAtoms = ligandAtoms.filter { $0.element != .H }
         guard !heavyProteinAtoms.isEmpty, !heavyLigandAtoms.isEmpty else { return nil }
 
-        let payload = Payload(
-            proteinPDB: Self.pdbString(from: proteinAtoms),
-            proteinHeavyKeys: heavyProteinAtoms.map {
-                ProteinHeavyKey(
-                    name: $0.name,
-                    residueName: $0.residueName,
-                    residueSeq: $0.residueSeq,
-                    chainID: $0.chainID
-                )
-            },
-            ligandSites: heavyLigandAtoms.map {
-                LigandSite(
-                    position: [$0.position.x / 10.0, $0.position.y / 10.0, $0.position.z / 10.0],
-                    charge: abs($0.charge) > 0.0001 ? $0.charge : Float($0.formalCharge),
-                    sigmaNm: Self.ljSigmaNm(for: $0),
-                    epsilonKJ: Self.ljEpsilonKJ(for: $0)
-                )
-            },
-            pocketCenter: [pocketCenter.x / 10.0, pocketCenter.y / 10.0, pocketCenter.z / 10.0],
-            pocketHalfExtent: [pocketHalfExtent.x / 10.0, pocketHalfExtent.y / 10.0, pocketHalfExtent.z / 10.0],
-            pocketRadiusAngstrom: max(pocketHalfExtent.x, max(pocketHalfExtent.y, pocketHalfExtent.z)) + 4.0,
-            maxIterations: 250
+        return await refineNative(
+            heavyProteinAtoms: heavyProteinAtoms,
+            heavyLigandAtoms: heavyLigandAtoms,
+            proteinAtoms: proteinAtoms,
+            pocketCenter: pocketCenter,
+            pocketHalfExtent: pocketHalfExtent
         )
+    }
 
+    // MARK: - Native C++ OpenMM Refinement
+
+    private func refineNative(
+        heavyProteinAtoms: [Atom],
+        heavyLigandAtoms: [Atom],
+        proteinAtoms: [Atom],
+        pocketCenter: SIMD3<Float>,
+        pocketHalfExtent: SIMD3<Float>
+    ) async -> RefinementResult? {
+        let pocketRadius = max(pocketHalfExtent.x, max(pocketHalfExtent.y, pocketHalfExtent.z)) + 4.0
+        let pocketRadiusSq = pocketRadius * pocketRadius
+
+        // Build protein atom array
+        var cAtoms: [DruseOpenMMAtom] = []
+        for atom in heavyProteinAtoms {
+            // Determine if atom is in pocket (within pocketRadius of pocketCenter)
+            let dx = atom.position.x - pocketCenter.x
+            let dy = atom.position.y - pocketCenter.y
+            let dz = atom.position.z - pocketCenter.z
+            let isPocket = (dx * dx + dy * dy + dz * dz) <= pocketRadiusSq
+
+            cAtoms.append(DruseOpenMMAtom(
+                x: atom.position.x,
+                y: atom.position.y,
+                z: atom.position.z,
+                charge: abs(atom.charge) > 0.0001 ? atom.charge : Float(atom.formalCharge),
+                sigmaNm: Self.ljSigmaNm(for: atom),
+                epsilonKJ: Self.ljEpsilonKJ(for: atom),
+                mass: atom.element.mass,
+                atomicNum: Int32(atom.element.rawValue),
+                isPocket: isPocket
+            ))
+        }
+
+        // Build bond array from all protein atoms (heavy only)
+        // We need to find bonds between heavy atoms from the full atom list
+        var heavyIdMap: [Int: Int] = [:]  // original atom id → heavy-only index
+        for (newIdx, atom) in heavyProteinAtoms.enumerated() {
+            heavyIdMap[atom.id] = newIdx
+        }
+
+        var cBonds: [DruseOpenMMBond] = []
+        // Estimate bonds from distance (< 1.9 Å between bonded heavy atoms)
+        let bondCutoffSq: Float = 1.9 * 1.9
+        for i in 0..<heavyProteinAtoms.count {
+            for j in (i+1)..<heavyProteinAtoms.count {
+                let ai = heavyProteinAtoms[i]
+                let aj = heavyProteinAtoms[j]
+                // Only bond atoms in the same residue or adjacent backbone
+                let sameResidue = ai.residueSeq == aj.residueSeq && ai.chainID == aj.chainID
+                let adjacent = abs(ai.residueSeq - aj.residueSeq) <= 1 && ai.chainID == aj.chainID
+                guard sameResidue || adjacent else { continue }
+
+                let dSq = simd_distance_squared(ai.position, aj.position)
+                if dSq < bondCutoffSq && dSq > 0.5 * 0.5 {
+                    let lengthNm = sqrtf(dSq) / 10.0  // Å → nm
+                    cBonds.append(DruseOpenMMBond(
+                        atom1: Int32(i),
+                        atom2: Int32(j),
+                        lengthNm: lengthNm
+                    ))
+                }
+            }
+        }
+
+        // Build ligand site array (positions already in nm for OpenMM)
+        var cLigands: [DruseOpenMMLigandSite] = []
+        for atom in heavyLigandAtoms {
+            cLigands.append(DruseOpenMMLigandSite(
+                x: atom.position.x / 10.0,
+                y: atom.position.y / 10.0,
+                z: atom.position.z / 10.0,
+                charge: abs(atom.charge) > 0.0001 ? atom.charge : Float(atom.formalCharge),
+                sigmaNm: Self.ljSigmaNm(for: atom),
+                epsilonKJ: Self.ljEpsilonKJ(for: atom)
+            ))
+        }
+
+        // Call C++ OpenMM on background thread
+        let atomArray = cAtoms
+        let bondArray = cBonds
+        let ligandArray = cLigands
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                continuation.resume(returning: Self.runRefinement(command: command, payload: payload))
+                let result = atomArray.withUnsafeBufferPointer { atomsBuf in
+                    bondArray.withUnsafeBufferPointer { bondsBuf in
+                        ligandArray.withUnsafeBufferPointer { ligandsBuf in
+                            druse_openmm_refine(
+                                atomsBuf.baseAddress,
+                                Int32(atomArray.count),
+                                bondsBuf.baseAddress,
+                                Int32(bondArray.count),
+                                ligandsBuf.baseAddress,
+                                Int32(ligandArray.count),
+                                600.0,   // pocketK
+                                8000.0,  // backboneK
+                                250      // maxIterations
+                            )
+                        }
+                    }
+                }
+
+                defer { druse_free_openmm_result(result) }
+
+                guard let result, result.pointee.success else {
+                    if let result {
+                        let msg = withUnsafeBytes(of: result.pointee.errorMessage) { buf in
+                            String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
+                        }
+                        Task { @MainActor in ActivityLog.shared.warn("OpenMM refinement failed: \(msg)", category: .dock) }
+                    }
+                    continuation.resume(returning: nil)
+                    return
+                }
+
+                let count = Int(result.pointee.atomCount)
+                var positions: [SIMD3<Float>] = []
+                positions.reserveCapacity(count)
+                for i in 0..<count {
+                    positions.append(SIMD3<Float>(
+                        result.pointee.refinedPositionsX[i],
+                        result.pointee.refinedPositionsY[i],
+                        result.pointee.refinedPositionsZ[i]
+                    ))
+                }
+
+                continuation.resume(returning: RefinementResult(
+                    interactionEnergyKcal: result.pointee.interactionEnergyKcal,
+                    refinedHeavyAtomPositions: positions
+                ))
             }
         }
     }
 
-    private static func detectAvailability() -> (command: PythonCommand?, availability: Availability) {
-        let command = pythonCommand()
-        guard let command else {
-            return (nil, Availability(pythonAvailable: false, openMMAvailable: false, message: "python3 not found"))
-        }
-
-        let pythonProbe = run(command: command, arguments: ["-c", "import sys; print(sys.executable)"])
-        guard pythonProbe.status == 0 else {
-            return (nil, Availability(pythonAvailable: false, openMMAvailable: false, message: "python3 could not be launched"))
-        }
-
-        let openMMProbe = run(
-            command: command,
-            arguments: ["-c", "import openmm, openmm.app, openmm.unit; print('openmm-ok')"]
-        )
-        if openMMProbe.status == 0, openMMProbe.stdout.contains("openmm-ok") {
-            return (command, Availability(pythonAvailable: true, openMMAvailable: true, message: "OpenMM available"))
-        }
-
-        let stderr = openMMProbe.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        let detail = stderr.isEmpty ? "python3 is available, but OpenMM is not installed" : stderr
-        return (command, Availability(pythonAvailable: true, openMMAvailable: false, message: detail))
-    }
-
-    private static func pythonCommand() -> PythonCommand? {
-        if let explicit = ProcessInfo.processInfo.environment["DRUSE_OPENMM_PYTHON"], !explicit.isEmpty {
-            return PythonCommand(executable: explicit, prefixArguments: [])
-        }
-        return PythonCommand(executable: "/usr/bin/env", prefixArguments: ["python3"])
-    }
-
-    private static func runRefinement(command: PythonCommand, payload: Payload) -> RefinementResult? {
-        guard let scriptPath = try? ensureScriptPath(),
-              let input = try? JSONEncoder().encode(payload)
-        else {
-            return nil
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: command.executable)
-        process.arguments = command.prefixArguments + [scriptPath]
-
-        let stdinPipe = Pipe()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        stdinPipe.fileHandleForWriting.write(input)
-        try? stdinPipe.fileHandleForWriting.close()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            return nil
-        }
-
-        guard let response = try? JSONDecoder().decode(Response.self, from: stdoutPipe.fileHandleForReading.readDataToEndOfFile()) else {
-            return nil
-        }
-
-        return RefinementResult(
-            interactionEnergyKcal: response.interactionEnergyKcal,
-            refinedHeavyAtomPositions: response.refinedHeavyPositions.compactMap {
-                guard $0.count == 3 else { return nil }
-                return SIMD3<Float>($0[0], $0[1], $0[2])
-            }
-        )
-    }
-
-    private static func run(command: PythonCommand, arguments: [String]) -> (status: Int32, stdout: String, stderr: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: command.executable)
-        process.arguments = command.prefixArguments + arguments
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return (1, "", error.localizedDescription)
-        }
-
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return (process.terminationStatus, stdout, stderr)
-    }
-
-    private static func ensureScriptPath() throws -> String {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("druse_openmm_refine.py")
-        if !FileManager.default.fileExists(atPath: url.path) {
-            try script.write(to: url, atomically: true, encoding: .utf8)
-        }
-        return url.path
-    }
-
-    private static func pdbString(from atoms: [Atom]) -> String {
-        var lines: [String] = []
-        lines.reserveCapacity(atoms.count + 2)
-
-        for (serial, atom) in atoms.enumerated() {
-            let record = atom.isHetAtom ? "HETATM" : "ATOM"
-            let atomName = pdbAtomName(atom.name, element: atom.element.symbol)
-            let residueName = padded(atom.residueName.isEmpty ? "UNK" : String(atom.residueName.prefix(3)), width: 3, left: true)
-            let chainID = String((atom.chainID.isEmpty ? "A" : atom.chainID).prefix(1))
-            let resSeq = padded(String(atom.residueSeq), width: 4, left: false)
-            let x = String(format: "%8.3f", atom.position.x)
-            let y = String(format: "%8.3f", atom.position.y)
-            let z = String(format: "%8.3f", atom.position.z)
-            let occ = String(format: "%6.2f", atom.occupancy > 0 ? atom.occupancy : 1.0)
-            let temp = String(format: "%6.2f", atom.tempFactor)
-            let element = padded(atom.element.symbol, width: 2, left: false)
-
-            lines.append(
-                "\(padded(record, width: 6, left: true))\(padded(String(serial + 1), width: 5, left: false)) " +
-                "\(atomName) \(residueName) \(chainID)\(resSeq)    \(x)\(y)\(z)\(occ)\(temp)          \(element)"
-            )
-        }
-
-        lines.append("END")
-        return lines.joined(separator: "\n")
-    }
-
-    private static func pdbAtomName(_ name: String, element: String) -> String {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = trimmed.isEmpty ? element : trimmed
-        if base.count >= 4 {
-            return String(base.prefix(4))
-        }
-        if element.count == 1 {
-            return padded(base, width: 4, left: false)
-        }
-        return padded(base, width: 4, left: true)
-    }
-
-    private static func padded(_ string: String, width: Int, left: Bool) -> String {
-        if string.count >= width {
-            return String(string.prefix(width))
-        }
-        let padding = String(repeating: " ", count: width - string.count)
-        return left ? string + padding : padding + string
-    }
+    // MARK: - LJ Parameters
 
     private static func ljSigmaNm(for atom: Atom) -> Float {
         let sigmaAngstrom = max(1.2, (atom.element.vdwRadius * 2.0) / 1.122462)
@@ -953,206 +948,4 @@ final class OpenMMPocketRefiner {
         }
     }
 
-    private static let script = #"""
-import io
-import json
-import sys
-
-try:
-    import openmm as mm
-    from openmm import app, unit
-except Exception as exc:
-    sys.stderr.write(f"OpenMM import failed: {exc}\n")
-    sys.exit(2)
-
-
-def residue_key(residue):
-    return (getattr(residue.chain, "id", ""), str(getattr(residue, "id", "")), getattr(residue, "name", ""))
-
-
-def vec3_nm(position):
-    value = position.value_in_unit(unit.nanometer)
-    return (float(value[0]), float(value[1]), float(value[2]))
-
-
-def dist2(a, b):
-    dx = a[0] - b[0]
-    dy = a[1] - b[1]
-    dz = a[2] - b[2]
-    return dx * dx + dy * dy + dz * dz
-
-
-def make_forcefield():
-    candidates = [
-        ("amber14-all.xml", "amber14/tip3pfb.xml"),
-        ("amber14-all.xml",),
-        ("amber99sb.xml",),
-    ]
-    last_error = None
-    for spec in candidates:
-        try:
-            return app.ForceField(*spec)
-        except Exception as exc:
-            last_error = exc
-    raise last_error
-
-
-def match_heavy_atom_indices(topology, keys):
-    heavy_atoms = []
-    for index, atom in enumerate(topology.atoms()):
-        element = getattr(atom, "element", None)
-        if element is None or getattr(element, "symbol", "") == "H":
-            continue
-        heavy_atoms.append((index, atom))
-
-    matched = []
-    cursor = 0
-    for key in keys:
-        found = None
-        for probe in range(cursor, len(heavy_atoms)):
-            index, atom = heavy_atoms[probe]
-            if (
-                atom.name == key["name"]
-                and atom.residue.name == key["residueName"]
-                and getattr(atom.residue.chain, "id", "") == key["chainID"]
-                and str(getattr(atom.residue, "id", "")) == str(key["residueSeq"])
-            ):
-                found = index
-                cursor = probe + 1
-                break
-        if found is None:
-            raise RuntimeError(f"Failed to map heavy atom {key}")
-        matched.append(found)
-    return matched
-
-
-def collect_pocket_residues(topology, positions_nm, ligand_sites_nm, cutoff_nm):
-    cutoff2 = cutoff_nm * cutoff_nm
-    pocket_residues = set()
-    for atom_index, atom in enumerate(topology.atoms()):
-        atom_xyz = positions_nm[atom_index]
-        for ligand_xyz in ligand_sites_nm:
-            if dist2(atom_xyz, ligand_xyz) <= cutoff2:
-                pocket_residues.add(residue_key(atom.residue))
-                break
-    return pocket_residues
-
-
-def platform():
-    for name in ("CPU", "Reference"):
-        try:
-            return mm.Platform.getPlatformByName(name)
-        except Exception:
-            continue
-    return None
-
-
-payload = json.load(sys.stdin)
-pdb = app.PDBFile(io.StringIO(payload["proteinPDB"]))
-forcefield = make_forcefield()
-modeller = app.Modeller(pdb.topology, pdb.positions)
-
-try:
-    modeller.addHydrogens(forcefield)
-except Exception:
-    pass
-
-system = forcefield.createSystem(
-    modeller.topology,
-    nonbondedMethod=app.NoCutoff,
-    constraints=app.HBonds
-)
-
-protein_particle_count = system.getNumParticles()
-all_positions = list(modeller.positions)
-positions_nm = [vec3_nm(pos) for pos in all_positions]
-ligand_sites_nm = [tuple(site["position"]) for site in payload["ligandSites"]]
-heavy_atom_indices = match_heavy_atom_indices(modeller.topology, payload["proteinHeavyKeys"])
-
-nonbonded = None
-for force in system.getForces():
-    if isinstance(force, mm.NonbondedForce):
-        nonbonded = force
-        break
-if nonbonded is None:
-    raise RuntimeError("Protein system missing NonbondedForce")
-
-pocket_cutoff_nm = payload["pocketRadiusAngstrom"] / 10.0
-pocket_residues = collect_pocket_residues(modeller.topology, positions_nm, ligand_sites_nm, pocket_cutoff_nm)
-
-restraint = mm.CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-restraint.addPerParticleParameter("k")
-restraint.addPerParticleParameter("x0")
-restraint.addPerParticleParameter("y0")
-restraint.addPerParticleParameter("z0")
-restraint.setForceGroup(30)
-
-topology_atoms = list(modeller.topology.atoms())
-for index, atom in enumerate(topology_atoms):
-    xyz = positions_nm[index]
-    is_pocket = residue_key(atom.residue) in pocket_residues
-    k_value = 600.0 if is_pocket else 8000.0
-    restraint.addParticle(index, [k_value, xyz[0], xyz[1], xyz[2]])
-system.addForce(restraint)
-
-interaction = mm.CustomNonbondedForce(
-    "138.935456*charge1*charge2/r + "
-    "4*sqrt(epsilon1*epsilon2)*(pow((0.5*(sigma1+sigma2))/r, 12) - pow((0.5*(sigma1+sigma2))/r, 6))"
-)
-interaction.addPerParticleParameter("charge")
-interaction.addPerParticleParameter("sigma")
-interaction.addPerParticleParameter("epsilon")
-interaction.setNonbondedMethod(mm.CustomNonbondedForce.NoCutoff)
-interaction.setForceGroup(31)
-
-for index in range(protein_particle_count):
-    charge, sigma, epsilon = nonbonded.getParticleParameters(index)
-    interaction.addParticle([
-        float(charge.value_in_unit(unit.elementary_charge)),
-        float(sigma.value_in_unit(unit.nanometer)),
-        float(epsilon.value_in_unit(unit.kilojoule_per_mole)),
-    ])
-
-ligand_indices = []
-for site in payload["ligandSites"]:
-    ligand_index = system.addParticle(0.0)
-    ligand_indices.append(ligand_index)
-    interaction.addParticle([
-        float(site["charge"]),
-        float(site["sigmaNm"]),
-        float(site["epsilonKJ"]),
-    ])
-    all_positions.append(mm.Vec3(*site["position"]) * unit.nanometer)
-
-interaction.addInteractionGroup(set(range(protein_particle_count)), set(ligand_indices))
-system.addForce(interaction)
-
-integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
-selected_platform = platform()
-if selected_platform is None:
-    simulation = app.Simulation(modeller.topology, system, integrator)
-else:
-    simulation = app.Simulation(modeller.topology, system, integrator, selected_platform)
-
-simulation.context.setPositions(all_positions)
-simulation.minimizeEnergy(maxIterations=int(payload["maxIterations"]))
-
-interaction_state = simulation.context.getState(getEnergy=True, groups=1 << 31)
-position_state = simulation.context.getState(getPositions=True)
-
-interaction_kj = interaction_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-final_positions = position_state.getPositions()
-heavy_positions = []
-for index in heavy_atom_indices:
-    xyz = vec3_nm(final_positions[index])
-    heavy_positions.append([xyz[0] * 10.0, xyz[1] * 10.0, xyz[2] * 10.0])
-
-json.dump(
-    {
-        "interactionEnergyKcal": float(interaction_kj) * 0.239005736,
-        "refinedHeavyPositions": heavy_positions,
-    },
-    sys.stdout,
-)
-"""#
 }

@@ -27,7 +27,7 @@ struct LigandDatabaseView: View {
             }
 
             // Active ligand badge
-            if let lig = viewModel.ligand {
+            if let lig = viewModel.molecules.ligand {
                 HStack(spacing: 5) {
                     Image(systemName: "hexagon.fill")
                         .font(.system(size: 10))
@@ -157,7 +157,7 @@ struct LigandDatabaseView: View {
 
     @ViewBuilder
     private func quickPickRow(_ entry: LigandEntry) -> some View {
-        let isActive = viewModel.ligand?.name == entry.name
+        let isActive = viewModel.molecules.ligand?.name == entry.name
         HStack(spacing: 4) {
             Circle()
                 .fill(isActive ? .green : .blue.opacity(0.5))

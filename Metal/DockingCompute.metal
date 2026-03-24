@@ -40,10 +40,11 @@ inline float3 gridPosition(uint tid, constant GridParams &params) {
     return params.origin + float3(float(ix), float(iy), float(iz)) * params.spacing;
 }
 
-/// Trilinear interpolation on a 3D grid map. Returns smooth quadratic
-/// out-of-grid penalty when the query point lies outside the grid bounds.
+/// Trilinear interpolation on a 3D grid map stored in half precision.
+/// Reads as half, promotes to float for interpolation math, returns float.
+/// Returns smooth quadratic out-of-grid penalty when the query point lies outside the grid bounds.
 inline float trilinearInterpolate(
-    device const float *gridMap,
+    device const half *gridMap,
     float3 pos, float3 origin, float spacing, uint3 dims)
 {
     float3 gc = (pos - origin) / spacing;
@@ -64,14 +65,15 @@ inline float trilinearInterpolate(
 
     uint nx = dims.x;  uint ny = dims.y;
 
-    float c000 = gridMap[iz * nx * ny + iy * nx + ix];
-    float c100 = gridMap[iz * nx * ny + iy * nx + ix + 1];
-    float c010 = gridMap[iz * nx * ny + (iy+1) * nx + ix];
-    float c110 = gridMap[iz * nx * ny + (iy+1) * nx + ix + 1];
-    float c001 = gridMap[(iz+1) * nx * ny + iy * nx + ix];
-    float c101 = gridMap[(iz+1) * nx * ny + iy * nx + ix + 1];
-    float c011 = gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix];
-    float c111 = gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix + 1];
+    // Read half-precision grid values and promote to float for interpolation math
+    float c000 = float(gridMap[iz * nx * ny + iy * nx + ix]);
+    float c100 = float(gridMap[iz * nx * ny + iy * nx + ix + 1]);
+    float c010 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix]);
+    float c110 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix + 1]);
+    float c001 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix]);
+    float c101 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix + 1]);
+    float c011 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix]);
+    float c111 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix + 1]);
 
     return mix(mix(mix(c000, c100, fx), mix(c010, c110, fx), fy),
                mix(mix(c001, c101, fx), mix(c011, c111, fx), fy), fz);
@@ -109,6 +111,22 @@ inline float slopeStep(float xBad, float xGood, float x) {
         if (x <= xGood) return 1.0f;
     }
     return (x - xBad) / (xGood - xBad);
+}
+
+/// Smooth sigmoid approximation of slopeStep for continuous gradients.
+/// k=10 gives <1% deviation from piecewise linear at midpoint and endpoints.
+inline float smoothSlopeStep(float xBad, float xGood, float x) {
+    float k = 10.0f;
+    float t = k * (x - xBad) / (xGood - xBad) - k * 0.5f;
+    return 1.0f / (1.0f + exp(-t));
+}
+
+/// Derivative of smoothSlopeStep w.r.t. x.
+inline float smoothSlopeStepDeriv(float xBad, float xGood, float x) {
+    float k = 10.0f;
+    float t = k * (x - xBad) / (xGood - xBad) - k * 0.5f;
+    float s = 1.0f / (1.0f + exp(-t));
+    return k / (xGood - xBad) * s * (1.0f - s);
 }
 
 inline bool xsTypeSupported(int xsType) {
@@ -184,7 +202,7 @@ inline float vinaPairEnergy(int probeType, int proteinType, float r) {
 }
 
 inline float sampleTypedAffinityMap(
-    device const float *affinityMaps,
+    device const half *affinityMaps,
     device const int32_t *typeIndexLookup,
     int ligType,
     float3 pos,
@@ -197,8 +215,155 @@ inline float sampleTypedAffinityMap(
     if (mapIndex < 0) {
         return 0.0f;
     }
-    device const float *map = affinityMaps + uint(mapIndex) * gp.totalPoints;
+    device const half *map = affinityMaps + uint(mapIndex) * gp.totalPoints;
     return trilinearInterpolate(map, pos, gp.origin, gp.spacing, gp.dims);
+}
+
+// ============================================================================
+// MARK: - Analytical Gradient Helpers
+// ============================================================================
+
+/// Trilinear interpolation with analytical gradient w.r.t. position.
+/// Reads half-precision grid, promotes to float for math.
+/// Returns the interpolated value and writes gradient to `grad`.
+inline float trilinearInterpolateWithGrad(
+    device const half *gridMap,
+    float3 pos, float3 origin, float spacing, uint3 dims,
+    thread float3 &grad)
+{
+    float3 gc = (pos - origin) / spacing;
+
+    if (gc.x < 0 || gc.y < 0 || gc.z < 0 ||
+        gc.x >= float(dims.x - 1) || gc.y >= float(dims.y - 1) || gc.z >= float(dims.z - 1)) {
+        // Out-of-grid: quadratic penalty with gradient
+        float dx = gc.x < 0 ? -gc.x : max(gc.x - float(dims.x - 1), 0.0f);
+        float dy = gc.y < 0 ? -gc.y : max(gc.y - float(dims.y - 1), 0.0f);
+        float dz = gc.z < 0 ? -gc.z : max(gc.z - float(dims.z - 1), 0.0f);
+        float sx = gc.x < 0 ? -1.0f : 1.0f;
+        float sy = gc.y < 0 ? -1.0f : 1.0f;
+        float sz = gc.z < 0 ? -1.0f : 1.0f;
+        grad = float3(200.0f * dx * sx, 200.0f * dy * sy, 200.0f * dz * sz) / spacing;
+        return 100.0f * (dx * dx + dy * dy + dz * dz);
+    }
+
+    uint ix = uint(gc.x); uint iy = uint(gc.y); uint iz = uint(gc.z);
+    float fx = gc.x - float(ix);
+    float fy = gc.y - float(iy);
+    float fz = gc.z - float(iz);
+    uint nx = dims.x; uint ny = dims.y;
+
+    // Read half-precision grid values and promote to float for interpolation math
+    float c000 = float(gridMap[iz * nx * ny + iy * nx + ix]);
+    float c100 = float(gridMap[iz * nx * ny + iy * nx + ix + 1]);
+    float c010 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix]);
+    float c110 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix + 1]);
+    float c001 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix]);
+    float c101 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix + 1]);
+    float c011 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix]);
+    float c111 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix + 1]);
+
+    // Value
+    float val = mix(mix(mix(c000, c100, fx), mix(c010, c110, fx), fy),
+                    mix(mix(c001, c101, fx), mix(c011, c111, fx), fy), fz);
+
+    // Gradient in grid coordinates, then convert to world via /spacing
+    float invS = 1.0f / spacing;
+    grad.x = mix(mix(c100-c000, c110-c010, fy), mix(c101-c001, c111-c011, fy), fz) * invS;
+    grad.y = mix(mix(c010-c000, c110-c100, fx), mix(c011-c001, c111-c101, fx), fz) * invS;
+    grad.z = mix(mix(c001-c000, c101-c100, fx), mix(c011-c010, c111-c110, fx), fy) * invS;
+
+    return val;
+}
+
+/// Sample typed affinity map with gradient.
+inline float sampleTypedAffinityMapWithGrad(
+    device const half *affinityMaps,
+    device const int32_t *typeIndexLookup,
+    int ligType,
+    float3 pos,
+    constant GridParams &gp,
+    thread float3 &grad)
+{
+    grad = float3(0);
+    if (ligType < 0 || ligType >= int(kMaxVinaXSLookup)) return 0.0f;
+    int mapIndex = typeIndexLookup[ligType];
+    if (mapIndex < 0) return 0.0f;
+    device const half *map = affinityMaps + uint(mapIndex) * gp.totalPoints;
+    return trilinearInterpolateWithGrad(map, pos, gp.origin, gp.spacing, gp.dims, grad);
+}
+
+/// Vina pair energy with analytical derivative dE/dr.
+inline float vinaPairEnergyWithDeriv(int t1, int t2, float r, thread float &dEdr) {
+    dEdr = 0.0f;
+    if (!xsTypeSupported(t1) || !xsTypeSupported(t2) || r >= 8.0f) return 0.0f;
+
+    float d = r - optimalDistanceXS(t1, t2);
+    float E = 0.0f;
+
+    // Gauss1: w1 * exp(-4d²)
+    float g1 = exp(-4.0f * d * d);
+    E += wGauss1 * g1;
+    dEdr += wGauss1 * g1 * (-8.0f * d);
+
+    // Gauss2: w2 * exp(-((d-3)/2)²)
+    float dm3h = (d - 3.0f) * 0.5f;
+    float g2 = exp(-dm3h * dm3h);
+    E += wGauss2 * g2;
+    dEdr += wGauss2 * g2 * (-dm3h);  // chain rule: d/dd of -(dm3h²) = -dm3h
+
+    // Repulsion: w_rep * d² if d<0
+    if (d < 0.0f) {
+        E += wRepulsion * d * d;
+        dEdr += 2.0f * wRepulsion * d;
+    }
+
+    // Hydrophobic (smooth for continuous gradient)
+    if (xsIsHydrophobic(t1) && xsIsHydrophobic(t2)) {
+        E += wHydrophobic * smoothSlopeStep(1.5f, 0.5f, d);
+        dEdr += wHydrophobic * smoothSlopeStepDeriv(1.5f, 0.5f, d);
+    }
+
+    // H-bond (smooth for continuous gradient)
+    if (xsHBondPossible(t1, t2)) {
+        E += wHBond * smoothSlopeStep(0.0f, -0.7f, d);
+        dEdr += wHBond * smoothSlopeStepDeriv(0.0f, -0.7f, d);
+    }
+
+    return E;
+}
+
+/// Compute intramolecular energy with gradient w.r.t. atom positions.
+/// Accumulates dE/dpos for each atom into the gradients array.
+inline float intramolecularWithGrad(
+    thread float3         *positions,
+    thread float3         *gradients,
+    constant DockLigandAtom *ligandAtoms,
+    uint                    nAtoms,
+    constant uint32_t      *exclusionMask,
+    uint                    maxAtoms)
+{
+    float total = 0.0f;
+    for (uint i = 0; i < nAtoms; i++) {
+        for (uint j = i + 1; j < nAtoms; j++) {
+            uint pairIdx = i * maxAtoms + j;
+            uint word = pairIdx / 32;
+            uint bit  = pairIdx % 32;
+            if (exclusionMask[word] & (1u << bit)) continue;
+
+            float3 diff = positions[i] - positions[j];
+            float r = length(diff);
+            if (r < 1e-6f) continue;
+
+            float dEdr;
+            total += vinaPairEnergyWithDeriv(ligandAtoms[i].vinaType, ligandAtoms[j].vinaType, r, dEdr);
+
+            // dE/dpos_i = dE/dr * dr/dpos_i = dE/dr * (pos_i - pos_j) / r
+            float3 gradContrib = dEdr * diff / r;
+            gradients[i] += gradContrib;
+            gradients[j] -= gradContrib;
+        }
+    }
+    return total;
 }
 
 /// Apply torsion rotations to atom positions (in-place on stack array).
@@ -287,7 +452,7 @@ inline void transformAtoms(
 /// d = distance - (R_protein + R_probe), where R_probe = 1.8 (average C radius).
 /// Weighted sum: wGauss1 * exp(-(d/0.5)^2) + wGauss2 * exp(-((d-3)/2)^2) + wRepulsion * (d<0 ? d^2 : 0)
 kernel void computeStericGrid(
-    device float               *gridMap      [[buffer(0)]],
+    device half                *gridMap      [[buffer(0)]],
     constant GridProteinAtom   *proteinAtoms [[buffer(1)]],
     constant GridParams        &params       [[buffer(2)]],
     uint                        tid          [[thread_position_in_grid]],
@@ -296,21 +461,25 @@ kernel void computeStericGrid(
     if (tid >= params.totalPoints) return;
     float3 gridPos = gridPosition(tid, params);
     float totalE = 0.0f;
-    threadgroup GridProteinAtom atomTile[kAtomTileSize];
+    // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
+    threadgroup float3 tilePositions[kAtomTileSize];
+    threadgroup float  tileRadii[kAtomTileSize];
 
     for (uint base = 0; base < params.numProteinAtoms; base += kAtomTileSize) {
         uint tileCount = min(kAtomTileSize, params.numProteinAtoms - base);
         if (lid < tileCount) {
-            atomTile[lid] = proteinAtoms[base + lid];
+            uint atomIdx = base + lid;
+            tilePositions[lid] = proteinAtoms[atomIdx].position;
+            tileRadii[lid] = proteinAtoms[atomIdx].vdwRadius;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = 0; i < tileCount; i++) {
-            float r = distance(gridPos, atomTile[i].position);
+            float r = distance(gridPos, tilePositions[i]);
             if (r > 8.0f) continue;
             r = max(r, 0.1f);  // avoid singularity
 
-            float d = r - (atomTile[i].vdwRadius + kProbeRadius);
+            float d = r - (tileRadii[i] + kProbeRadius);
 
             // Gauss1: exp(-(d/0.5)^2)
             float d_over_half = d * 2.0f;  // d / 0.5 = d * 2
@@ -328,7 +497,7 @@ kernel void computeStericGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = clamp(totalE, -100.0f, 100.0f);
+    gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute hydrophobic grid map (legacy approximate Vina hydrophobic contact term).
@@ -337,7 +506,7 @@ kernel void computeStericGrid(
 /// If d < 0.5: value = 1.0; if d > 1.5: value = 0.0; else linear ramp.
 /// Weighted by wHydrophobic.
 kernel void computeHydrophobicGrid(
-    device float               *gridMap      [[buffer(0)]],
+    device half                *gridMap      [[buffer(0)]],
     constant GridProteinAtom   *proteinAtoms [[buffer(1)]],
     constant GridParams        &params       [[buffer(2)]],
     uint                        tid          [[thread_position_in_grid]],
@@ -346,24 +515,30 @@ kernel void computeHydrophobicGrid(
     if (tid >= params.totalPoints) return;
     float3 gridPos = gridPosition(tid, params);
     float totalE = 0.0f;
-    threadgroup GridProteinAtom atomTile[kAtomTileSize];
+    // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
+    threadgroup float3 tilePositions[kAtomTileSize];
+    threadgroup float  tileRadii[kAtomTileSize];
+    threadgroup int    tileVinaTypes[kAtomTileSize];
 
     for (uint base = 0; base < params.numProteinAtoms; base += kAtomTileSize) {
         uint tileCount = min(kAtomTileSize, params.numProteinAtoms - base);
         if (lid < tileCount) {
-            atomTile[lid] = proteinAtoms[base + lid];
+            uint atomIdx = base + lid;
+            tilePositions[lid] = proteinAtoms[atomIdx].position;
+            tileRadii[lid] = proteinAtoms[atomIdx].vdwRadius;
+            tileVinaTypes[lid] = proteinAtoms[atomIdx].vinaType;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = 0; i < tileCount; i++) {
-            int vt = atomTile[i].vinaType;
+            int vt = tileVinaTypes[i];
             if (!xsIsHydrophobic(vt)) continue;
 
-            float r = distance(gridPos, atomTile[i].position);
+            float r = distance(gridPos, tilePositions[i]);
             if (r > 8.0f) continue;
             r = max(r, 0.1f);
 
-            float d = r - (atomTile[i].vdwRadius + kProbeRadius);
+            float d = r - (tileRadii[i] + kProbeRadius);
 
             // Piecewise linear: 1.0 if d < 0.5, 0.0 if d > 1.5, linear ramp between
             float value;
@@ -380,7 +555,7 @@ kernel void computeHydrophobicGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = clamp(totalE, -100.0f, 100.0f);
+    gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute hydrogen bond grid map (legacy approximate Vina H-bond term).
@@ -389,7 +564,7 @@ kernel void computeHydrophobicGrid(
 /// If d < -0.7: value = 1.0; if d > 0: value = 0.0; else linear ramp.
 /// Weighted by wHBond.
 kernel void computeHBondGrid(
-    device float               *gridMap      [[buffer(0)]],
+    device half                *gridMap      [[buffer(0)]],
     constant GridProteinAtom   *proteinAtoms [[buffer(1)]],
     constant GridParams        &params       [[buffer(2)]],
     uint                        tid          [[thread_position_in_grid]],
@@ -398,25 +573,31 @@ kernel void computeHBondGrid(
     if (tid >= params.totalPoints) return;
     float3 gridPos = gridPosition(tid, params);
     float totalE = 0.0f;
-    threadgroup GridProteinAtom atomTile[kAtomTileSize];
+    // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
+    threadgroup float3 tilePositions[kAtomTileSize];
+    threadgroup float  tileRadii[kAtomTileSize];
+    threadgroup int    tileVinaTypes[kAtomTileSize];
 
     for (uint base = 0; base < params.numProteinAtoms; base += kAtomTileSize) {
         uint tileCount = min(kAtomTileSize, params.numProteinAtoms - base);
         if (lid < tileCount) {
-            atomTile[lid] = proteinAtoms[base + lid];
+            uint atomIdx = base + lid;
+            tilePositions[lid] = proteinAtoms[atomIdx].position;
+            tileRadii[lid] = proteinAtoms[atomIdx].vdwRadius;
+            tileVinaTypes[lid] = proteinAtoms[atomIdx].vinaType;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = 0; i < tileCount; i++) {
-            int vt = atomTile[i].vinaType;
+            int vt = tileVinaTypes[i];
             bool isHBondCapable = xsIsDonor(vt) || xsIsAcceptor(vt);
             if (!isHBondCapable) continue;
 
-            float r = distance(gridPos, atomTile[i].position);
+            float r = distance(gridPos, tilePositions[i]);
             if (r > 8.0f) continue;
             r = max(r, 0.1f);
 
-            float d = r - (atomTile[i].vdwRadius + kProbeRadius);
+            float d = r - (tileRadii[i] + kProbeRadius);
 
             // Piecewise linear: 1.0 if d < -0.7, 0.0 if d > 0, linear ramp between
             float value;
@@ -433,13 +614,13 @@ kernel void computeHBondGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = clamp(totalE, -100.0f, 100.0f);
+    gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute exact AutoDock Vina affinity maps for the requested ligand XS types.
 /// Each map stores the full upstream Vina pairwise potential summed over protein atoms.
 kernel void computeVinaAffinityMaps(
-    device float               *affinityMaps  [[buffer(0)]],
+    device half                *affinityMaps  [[buffer(0)]],
     constant GridProteinAtom   *proteinAtoms  [[buffer(1)]],
     constant GridParams        &params        [[buffer(2)]],
     constant int32_t           *affinityTypes [[buffer(3)]],
@@ -454,25 +635,33 @@ kernel void computeVinaAffinityMaps(
     int probeType = affinityTypes[typeIdx];
     float3 gridPos = gridPosition(pointIdx, params);
     float totalE = 0.0f;
-    threadgroup GridProteinAtom atomTile[kAtomTileSize];
+    // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
+    threadgroup float3 tilePositions[kAtomTileSize];
+    threadgroup float  tileRadii[kAtomTileSize];
+    threadgroup float  tileCharges[kAtomTileSize];
+    threadgroup int    tileVinaTypes[kAtomTileSize];
 
     for (uint base = 0; base < params.numProteinAtoms; base += kAtomTileSize) {
         uint tileCount = min(kAtomTileSize, params.numProteinAtoms - base);
         if (lid < tileCount) {
-            atomTile[lid] = proteinAtoms[base + lid];
+            uint atomIdx = base + lid;
+            tilePositions[lid] = proteinAtoms[atomIdx].position;
+            tileRadii[lid] = proteinAtoms[atomIdx].vdwRadius;
+            tileCharges[lid] = proteinAtoms[atomIdx].charge;
+            tileVinaTypes[lid] = proteinAtoms[atomIdx].vinaType;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = 0; i < tileCount; i++) {
-            float r = distance(gridPos, atomTile[i].position);
+            float r = distance(gridPos, tilePositions[i]);
             if (r > 8.0f) continue;
             r = max(r, 0.1f);
-            totalE += vinaPairEnergy(probeType, atomTile[i].vinaType, r);
+            totalE += vinaPairEnergy(probeType, tileVinaTypes[i], r);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    affinityMaps[typeIdx * params.totalPoints + pointIdx] = clamp(totalE, -100.0f, 100.0f);
+    affinityMaps[typeIdx * params.totalPoints + pointIdx] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 // ============================================================================
@@ -597,21 +786,175 @@ kernel void scorePocketBuriedness(
 }
 
 // ============================================================================
+// MARK: - Pharmacophore Constraint Evaluation
+// ============================================================================
+
+/// Compute pharmacophore constraint penalty for a pose.
+/// For each constraint group (shared groupID), finds the minimum distance from
+/// any compatible ligand atom to any constraint target in that group, then applies
+/// a smooth quadratic penalty if the distance exceeds the threshold.
+/// Group OR-logic: a group is satisfied if ANY member constraint has a compatible
+/// ligand atom within its distance threshold.
+inline float evaluateConstraintPenalty(
+    thread float3               *positions,
+    constant DockLigandAtom     *ligandAtoms,
+    uint                         nAtoms,
+    constant PharmacophoreConstraint *constraints,
+    constant PharmacophoreParams &params)
+{
+    if (params.numConstraints == 0 || params.globalScale < 1e-6f) return 0.0f;
+
+    uint nC = min(params.numConstraints, MAX_PHARMACOPHORE_CONSTRAINTS);
+    uint nG = min(params.numGroups, MAX_PHARMACOPHORE_CONSTRAINTS);
+
+    // Per-group: track best (minimum) violation and associated strength
+    float groupViolation[MAX_PHARMACOPHORE_CONSTRAINTS];
+    float groupStrength[MAX_PHARMACOPHORE_CONSTRAINTS];
+    for (uint i = 0; i < nG; i++) {
+        groupViolation[i] = 1e6f;
+        groupStrength[i] = 0.0f;
+    }
+
+    for (uint c = 0; c < nC; c++) {
+        PharmacophoreConstraint con = constraints[c];
+        uint gid = con.groupID;
+        if (gid >= nG) continue;
+
+        float bestDist = 1e6f;
+
+        if (con.ligandAtomIndex >= 0 && uint(con.ligandAtomIndex) < nAtoms) {
+            // Ligand-side constraint: only check the specified atom
+            bestDist = distance(positions[con.ligandAtomIndex], con.position);
+        } else {
+            // Receptor-side: find closest compatible ligand atom
+            for (uint a = 0; a < nAtoms; a++) {
+                uint32_t typeBit = 1u << uint32_t(ligandAtoms[a].vinaType);
+                if ((typeBit & con.compatibleVinaTypes) == 0) continue;
+                float d = distance(positions[a], con.position);
+                bestDist = min(bestDist, d);
+            }
+        }
+
+        float violation = max(bestDist - con.distanceThreshold, 0.0f);
+
+        // OR-logic within group: keep the minimum violation
+        if (violation < groupViolation[gid]) {
+            groupViolation[gid] = violation;
+            groupStrength[gid] = con.strength;
+        }
+    }
+
+    // Sum quadratic penalties across all groups
+    float totalPenalty = 0.0f;
+    for (uint g = 0; g < nG; g++) {
+        float v = groupViolation[g];
+        if (v > 0.0f && v < 1e5f) {
+            totalPenalty += groupStrength[g] * v * v;
+        }
+    }
+
+    return totalPenalty * params.globalScale;
+}
+
+/// Compute constraint penalty WITH per-atom force accumulation for analytical gradients.
+/// Returns the total penalty and adds forces (negative gradient) to the forces array.
+inline float evaluateConstraintPenaltyWithGrad(
+    thread float3               *positions,
+    thread float3               *forces,
+    constant DockLigandAtom     *ligandAtoms,
+    uint                         nAtoms,
+    constant PharmacophoreConstraint *constraints,
+    constant PharmacophoreParams &params)
+{
+    if (params.numConstraints == 0 || params.globalScale < 1e-6f) return 0.0f;
+
+    uint nC = min(params.numConstraints, MAX_PHARMACOPHORE_CONSTRAINTS);
+    uint nG = min(params.numGroups, MAX_PHARMACOPHORE_CONSTRAINTS);
+
+    // Two-pass: first find best per-group, then compute gradient for the best
+    float groupViolation[MAX_PHARMACOPHORE_CONSTRAINTS];
+    float groupStrength[MAX_PHARMACOPHORE_CONSTRAINTS];
+    uint  groupBestConstraint[MAX_PHARMACOPHORE_CONSTRAINTS];
+    uint  groupBestAtom[MAX_PHARMACOPHORE_CONSTRAINTS];
+
+    for (uint i = 0; i < nG; i++) {
+        groupViolation[i] = 1e6f;
+        groupStrength[i] = 0.0f;
+        groupBestConstraint[i] = 0;
+        groupBestAtom[i] = 0;
+    }
+
+    for (uint c = 0; c < nC; c++) {
+        PharmacophoreConstraint con = constraints[c];
+        uint gid = con.groupID;
+        if (gid >= nG) continue;
+
+        if (con.ligandAtomIndex >= 0 && uint(con.ligandAtomIndex) < nAtoms) {
+            uint ai = uint(con.ligandAtomIndex);
+            float d = distance(positions[ai], con.position);
+            float violation = max(d - con.distanceThreshold, 0.0f);
+            if (violation < groupViolation[gid]) {
+                groupViolation[gid] = violation;
+                groupStrength[gid] = con.strength;
+                groupBestConstraint[gid] = c;
+                groupBestAtom[gid] = ai;
+            }
+        } else {
+            for (uint a = 0; a < nAtoms; a++) {
+                uint32_t typeBit = 1u << uint32_t(ligandAtoms[a].vinaType);
+                if ((typeBit & con.compatibleVinaTypes) == 0) continue;
+                float d = distance(positions[a], con.position);
+                float violation = max(d - con.distanceThreshold, 0.0f);
+                if (violation < groupViolation[gid]) {
+                    groupViolation[gid] = violation;
+                    groupStrength[gid] = con.strength;
+                    groupBestConstraint[gid] = c;
+                    groupBestAtom[gid] = a;
+                }
+            }
+        }
+    }
+
+    float totalPenalty = 0.0f;
+    for (uint g = 0; g < nG; g++) {
+        float v = groupViolation[g];
+        if (v > 0.0f && v < 1e5f) {
+            float pen = groupStrength[g] * v * v * params.globalScale;
+            totalPenalty += pen;
+
+            // Gradient: d(strength * v^2)/d(pos_a) = 2 * strength * v * (pos_a - con.position) / |...|
+            uint ai = groupBestAtom[g];
+            uint ci = groupBestConstraint[g];
+            float3 diff = positions[ai] - constraints[ci].position;
+            float dist = length(diff);
+            if (dist > 1e-6f) {
+                float3 grad = 2.0f * groupStrength[g] * v * params.globalScale * (diff / dist);
+                forces[ai] -= grad;
+            }
+        }
+    }
+
+    return totalPenalty;
+}
+
+// ============================================================================
 // MARK: - Pose Scoring
 // ============================================================================
 
 /// Score all poses using exact Vina XS-type affinity maps with torsional flexibility.
-/// One thread per pose.
+/// One thread per pose. Grid maps are stored in half precision.
 kernel void scorePoses(
     device DockPose            *poses         [[buffer(0)]],
     constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
-    device const float         *affinityMaps  [[buffer(2)]],
+    device const half          *affinityMaps  [[buffer(2)]],
     device const int32_t       *typeIndexLookup [[buffer(3)]],
     constant GridParams        &gridParams    [[buffer(4)]],
     constant GAParams          &gaParams      [[buffer(5)]],
     constant TorsionEdge       *torsionEdges  [[buffer(6)]],
     constant int32_t           *movingIndices [[buffer(7)]],
     constant uint32_t          *exclusionMask [[buffer(8)]],
+    constant PharmacophoreConstraint *pharmaConstraints [[buffer(15)]],
+    constant PharmacophoreParams &pharmaParams [[buffer(16)]],
     uint                        tid           [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -651,6 +994,10 @@ kernel void scorePoses(
     float intraDelta = intramolecularLigandEnergy(positions, ligandAtoms, nA, exclusionMask, 128)
         - gaParams.referenceIntraEnergy;
 
+    // Pharmacophore constraint penalty
+    float cPen = evaluateConstraintPenalty(
+        positions, ligandAtoms, nA, pharmaConstraints, pharmaParams);
+
     // Upstream Vina applies the conf-independent torsion term as a smooth divisor:
     // e / (1 + w_rot * N_tors / 5)
     float nRotF = float(nTorsions);
@@ -664,13 +1011,17 @@ kernel void scorePoses(
     pose.hbondEnergy       = 0.0f;
     pose.torsionPenalty    = normalizedE - totalIntermolecular;
     pose.clashPenalty      = wPenalty * penalty + intraDelta;
+    pose.constraintPenalty = cPen;
 
-    // Total Vina score = normalized intermolecular + boundary penalty + referenced internal energy
-    pose.energy = normalizedE + pose.clashPenalty;
+    // Total Vina score = normalized intermolecular + boundary penalty + internal + constraint
+    pose.energy = normalizedE + pose.clashPenalty + cPen;
 }
 
 /// Rescore poses against explicit receptor atoms instead of interpolated affinity maps.
 /// This mirrors Vina's late non-cache pose rescoring more closely for top basin representatives.
+/// Uses SIMD intrinsics: each SIMD group cooperatively scores one pose by distributing
+/// the protein atom inner loop across SIMD lanes, then reducing with simd_sum.
+/// Dispatch with (populationSize * simdWidth) threads so each SIMD group maps to one pose.
 kernel void scorePosesExplicit(
     device DockPose            *poses         [[buffer(0)]],
     constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
@@ -680,11 +1031,17 @@ kernel void scorePosesExplicit(
     constant TorsionEdge       *torsionEdges  [[buffer(5)]],
     constant int32_t           *movingIndices [[buffer(6)]],
     constant uint32_t          *exclusionMask [[buffer(7)]],
-    uint                        tid           [[thread_position_in_grid]])
+    constant PharmacophoreConstraint *pharmaConstraints [[buffer(15)]],
+    constant PharmacophoreParams &pharmaParams [[buffer(16)]],
+    uint                        tid           [[thread_position_in_grid]],
+    uint                        simdLane      [[thread_index_in_simdgroup]],
+    uint                        simdSize      [[threads_per_simdgroup]])
 {
-    if (tid >= gaParams.populationSize) return;
+    // Each SIMD group handles one pose; lanes split the protein atom loop
+    uint poseIdx = tid / simdSize;
+    if (poseIdx >= gaParams.populationSize) return;
 
-    device DockPose &pose = poses[tid];
+    device DockPose &pose = poses[poseIdx];
     uint nAtoms = min(gaParams.numLigandAtoms, 128u);
     uint nTorsions = min(gaParams.numTorsions, 32u);
 
@@ -708,20 +1065,35 @@ kernel void scorePosesExplicit(
             continue;
         }
 
-        for (uint p = 0; p < gridParams.numProteinAtoms; p++) {
+        // SIMD-cooperative: distribute protein atoms across lanes, reduce with simd_sum
+        float laneSteric = 0.0f;
+        float laneHydrophobic = 0.0f;
+        float laneHBond = 0.0f;
+        for (uint p = simdLane; p < gridParams.numProteinAtoms; p += simdSize) {
             float dist = distance(r, proteinAtoms[p].position);
             if (dist < 8.0f) {
                 VinaTerms terms = vinaPairEnergyDecomposed(ligandAtoms[a].vinaType, proteinAtoms[p].vinaType, dist);
-                totalSteric += terms.steric;
-                totalHydrophobic += terms.hydrophobic;
-                totalHBond += terms.hbond;
+                laneSteric += terms.steric;
+                laneHydrophobic += terms.hydrophobic;
+                laneHBond += terms.hbond;
             }
         }
+        // Reduce partial sums across SIMD lanes
+        totalSteric += simd_sum(laneSteric);
+        totalHydrophobic += simd_sum(laneHydrophobic);
+        totalHBond += simd_sum(laneHBond);
     }
+
+    // Only lane 0 writes the final result (all lanes have identical reduced values)
+    if (simdLane != 0) return;
 
     float totalIntermolecular = totalSteric + totalHydrophobic + totalHBond;
     float intraDelta = intramolecularLigandEnergy(positions, ligandAtoms, nAtoms, exclusionMask, 128)
         - gaParams.referenceIntraEnergy;
+
+    float cPen = evaluateConstraintPenalty(
+        positions, ligandAtoms, nAtoms, pharmaConstraints, pharmaParams);
+
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
     float normalizedE = totalIntermolecular * normFactor;
@@ -731,7 +1103,252 @@ kernel void scorePosesExplicit(
     pose.hbondEnergy       = totalHBond;
     pose.torsionPenalty    = normalizedE - totalIntermolecular;
     pose.clashPenalty      = wPenalty * penalty + intraDelta;
-    pose.energy            = normalizedE + pose.clashPenalty;
+    pose.constraintPenalty = cPen;
+    pose.energy            = normalizedE + pose.clashPenalty + cPen;
+}
+
+// ============================================================================
+// MARK: - Drusina Extended Scoring
+// ============================================================================
+
+/// Compute Drusina correction terms (π-π stacking, π-cation, halogen bond, metal coordination).
+/// Returns total correction energy (kcal/mol, negative = favorable).
+inline float computeDrusinaCorrections(
+    thread float3              *positions,
+    constant DockLigandAtom    *ligandAtoms,
+    uint                        nAtoms,
+    constant ProteinRingGPU    *proteinRings,
+    constant LigandRingGPU     *ligandRings,
+    constant float4            *proteinCations,
+    constant DrusinaParams     &params,
+    constant GridProteinAtom   *proteinAtoms,
+    uint                        numProteinAtoms,
+    constant HalogenBondInfo   *halogenInfo)
+{
+    float drusinaE = 0.0f;
+
+    // ---- π-π stacking & π-cation (ligand rings) ----
+    for (uint lr = 0; lr < params.numLigandRings; lr++) {
+        LigandRingGPU ring = ligandRings[lr];
+        int nR = min(ring.numAtoms, 6);
+        if (nR < 3) continue;
+
+        // Compute centroid from transformed positions
+        float3 centroid = float3(0);
+        int valid = 0;
+        for (int i = 0; i < nR; i++) {
+            int idx = ring.atomIndices[i];
+            if (idx >= 0 && uint(idx) < nAtoms) {
+                centroid += positions[idx];
+                valid++;
+            }
+        }
+        if (valid < 3) continue;
+        centroid /= float(valid);
+
+        // Normal from cross product of first two edges
+        int i0 = ring.atomIndices[0], i1 = ring.atomIndices[1], i2 = ring.atomIndices[2];
+        if (i0 < 0 || i1 < 0 || i2 < 0 ||
+            uint(i0) >= nAtoms || uint(i1) >= nAtoms || uint(i2) >= nAtoms) continue;
+        float3 v1 = positions[i1] - positions[i0];
+        float3 v2 = positions[i2] - positions[i0];
+        float3 norm = cross(v1, v2);
+        float nLen = length(norm);
+        if (nLen < 1e-6f) continue;
+        norm /= nLen;
+
+        // π-π: check ligand ring vs each protein ring
+        for (uint pr = 0; pr < params.numProteinRings; pr++) {
+            float d = distance(centroid, proteinRings[pr].centroid);
+            if (d < 3.3f || d > 5.5f) continue;
+            float dotN = abs(dot(norm, proteinRings[pr].normal));
+
+            // Face-to-face stacking (parallel, close)
+            if (dotN > 0.85f && d < 4.2f) {
+                float dd = d - 3.7f;
+                drusinaE += params.wPiPi * exp(-dd * dd * 2.0f);
+            }
+            // Edge-to-face / T-shaped (perpendicular, moderate distance)
+            else if (dotN < 0.5f && d >= 4.0f) {
+                float dd = d - 4.8f;
+                drusinaE += params.wPiPi * 0.7f * exp(-dd * dd * 2.0f);
+            }
+        }
+
+        // π-cation: ligand ring vs protein cations
+        for (uint pc = 0; pc < params.numProteinCations; pc++) {
+            float3 cPos = proteinCations[pc].xyz;
+            float d = distance(centroid, cPos);
+            if (d > 6.0f) continue;
+            float3 toAtom = normalize(cPos - centroid);
+            float cosA = abs(dot(toAtom, norm));
+            if (cosA > 0.5f) {
+                float dd = d - 4.0f;
+                drusinaE += params.wPiCation * cosA * exp(-dd * dd);
+            }
+        }
+    }
+
+    // ---- π-cation: protein rings vs ligand cations ----
+    for (uint a = 0; a < nAtoms; a++) {
+        if (ligandAtoms[a].formalCharge <= 0) continue;
+        for (uint pr = 0; pr < params.numProteinRings; pr++) {
+            float d = distance(positions[a], proteinRings[pr].centroid);
+            if (d > 6.0f) continue;
+            float3 toAtom = normalize(positions[a] - proteinRings[pr].centroid);
+            float cosA = abs(dot(toAtom, proteinRings[pr].normal));
+            if (cosA > 0.5f) {
+                float dd = d - 4.0f;
+                drusinaE += params.wPiCation * cosA * exp(-dd * dd);
+            }
+        }
+    }
+
+    // ---- Halogen bonds: C-X...O/N with σ-hole angle check ----
+    for (uint h = 0; h < params.numHalogens; h++) {
+        int hi = halogenInfo[h].halogenAtomIndex;
+        int ci = halogenInfo[h].carbonAtomIndex;
+        if (hi < 0 || ci < 0 || uint(hi) >= nAtoms || uint(ci) >= nAtoms) continue;
+        float3 halPos = positions[hi];
+        float3 carPos = positions[ci];
+
+        for (uint p = 0; p < numProteinAtoms; p++) {
+            int pType = proteinAtoms[p].vinaType;
+            bool isAcceptor = (pType == VINA_N_A || pType == VINA_N_DA ||
+                               pType == VINA_O_A || pType == VINA_O_DA);
+            if (!isAcceptor) continue;
+
+            float d = distance(halPos, proteinAtoms[p].position);
+            if (d < 2.5f || d > 3.5f) continue;
+
+            // σ-hole directionality: C-X-A angle should be > 140° (cosine < -0.766)
+            float3 xToC = normalize(carPos - halPos);
+            float3 xToA = normalize(proteinAtoms[p].position - halPos);
+            float cosTheta = dot(xToC, xToA);
+            if (cosTheta < -0.766f) {
+                float dd = d - 3.1f;
+                float angleFactor = (-cosTheta - 0.766f) / 0.234f;
+                drusinaE += params.wHalogenBond * angleFactor * exp(-dd * dd * 3.33f);
+            }
+        }
+    }
+
+    // ---- Enhanced metal coordination ----
+    for (uint p = 0; p < numProteinAtoms; p++) {
+        if (proteinAtoms[p].vinaType != VINA_MET_D) continue;
+        for (uint a = 0; a < nAtoms; a++) {
+            int lt = ligandAtoms[a].vinaType;
+            bool isCoord = (lt == VINA_N_A || lt == VINA_N_DA ||
+                            lt == VINA_O_A || lt == VINA_O_DA || lt == VINA_S_P);
+            if (!isCoord) continue;
+            float d = distance(positions[a], proteinAtoms[p].position);
+            if (d > 3.0f) continue;
+            float dd = d - 2.1f;
+            drusinaE += params.wMetalCoord * exp(-dd * dd * 5.0f);
+        }
+    }
+
+    return drusinaE;
+}
+
+/// Score poses with Vina grid maps + Drusina extended interaction corrections.
+/// Used during GA when Drusina scoring is selected.
+kernel void scorePosesDrusina(
+    device DockPose            *poses         [[buffer(0)]],
+    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
+    device const half          *affinityMaps  [[buffer(2)]],
+    device const int32_t       *typeIndexLookup [[buffer(3)]],
+    constant GridParams        &gridParams    [[buffer(4)]],
+    constant GAParams          &gaParams      [[buffer(5)]],
+    constant TorsionEdge       *torsionEdges  [[buffer(6)]],
+    constant int32_t           *movingIndices [[buffer(7)]],
+    constant uint32_t          *exclusionMask [[buffer(8)]],
+    constant ProteinRingGPU    *proteinRings  [[buffer(9)]],
+    constant LigandRingGPU     *ligandRings   [[buffer(10)]],
+    constant float4            *proteinCations [[buffer(11)]],
+    constant DrusinaParams     &drusinaParams [[buffer(12)]],
+    constant GridProteinAtom   *proteinAtoms  [[buffer(13)]],
+    constant HalogenBondInfo   *halogenInfo   [[buffer(14)]],
+    uint                        tid           [[thread_position_in_grid]])
+{
+    if (tid >= gaParams.populationSize) return;
+
+    device DockPose &pose = poses[tid];
+    uint nAtoms = gaParams.numLigandAtoms;
+    uint nTorsions = min(gaParams.numTorsions, 32u);
+
+    float3 positions[128];
+    uint nA = min(nAtoms, 128u);
+    transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
+
+    // --- Base Vina scoring from grid maps ---
+    float3 gridMin = gridParams.origin;
+    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float totalIntermolecular = 0.0f;
+    float penalty = 0.0f;
+
+    for (uint a = 0; a < nA; a++) {
+        float3 r = positions[a];
+        float oopP = outOfGridPenalty(r, gridMin, gridMax);
+        if (oopP > 0.0f) { penalty += oopP; continue; }
+        totalIntermolecular += sampleTypedAffinityMap(
+            affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gridParams);
+    }
+
+    float intraDelta = intramolecularLigandEnergy(positions, ligandAtoms, nA, exclusionMask, 128)
+        - gaParams.referenceIntraEnergy;
+    float nRotF = float(nTorsions);
+    float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
+    float normalizedE = totalIntermolecular * normFactor;
+
+    // --- Drusina corrections ---
+    float drusinaE = computeDrusinaCorrections(
+        positions, ligandAtoms, nA,
+        proteinRings, ligandRings, proteinCations, drusinaParams,
+        proteinAtoms, gridParams.numProteinAtoms, halogenInfo);
+
+    pose.stericEnergy      = totalIntermolecular;
+    pose.hydrophobicEnergy = 0.0f;
+    pose.hbondEnergy       = 0.0f;
+    pose.torsionPenalty    = normalizedE - totalIntermolecular;
+    pose.clashPenalty      = wPenalty * penalty + intraDelta;
+    pose.drusinaCorrection = drusinaE;
+    pose.energy = normalizedE + pose.clashPenalty + drusinaE;
+}
+
+/// Apply Drusina corrections to already-scored poses (e.g., after explicit Vina rescoring).
+kernel void applyDrusinaCorrection(
+    device DockPose            *poses         [[buffer(0)]],
+    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
+    constant GAParams          &gaParams      [[buffer(2)]],
+    constant TorsionEdge       *torsionEdges  [[buffer(3)]],
+    constant int32_t           *movingIndices [[buffer(4)]],
+    constant ProteinRingGPU    *proteinRings  [[buffer(5)]],
+    constant LigandRingGPU     *ligandRings   [[buffer(6)]],
+    constant float4            *proteinCations [[buffer(7)]],
+    constant DrusinaParams     &drusinaParams [[buffer(8)]],
+    constant GridProteinAtom   *proteinAtoms  [[buffer(9)]],
+    constant GridParams        &gridParams    [[buffer(10)]],
+    constant HalogenBondInfo   *halogenInfo   [[buffer(11)]],
+    uint                        tid           [[thread_position_in_grid]])
+{
+    if (tid >= gaParams.populationSize) return;
+
+    device DockPose &pose = poses[tid];
+    uint nAtoms = gaParams.numLigandAtoms;
+    uint nTorsions = min(gaParams.numTorsions, 32u);
+
+    float3 positions[128];
+    uint nA = min(nAtoms, 128u);
+    transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
+
+    float drusinaE = computeDrusinaCorrections(
+        positions, ligandAtoms, nA,
+        proteinRings, ligandRings, proteinCations, drusinaParams,
+        proteinAtoms, gridParams.numProteinAtoms, halogenInfo);
+
+    pose.drusinaCorrection = drusinaE;
+    pose.energy += drusinaE;
 }
 
 // ============================================================================
@@ -819,9 +1436,9 @@ kernel void scoreBatchRigidPoses(
     device BatchScreenPose      *poses         [[buffer(0)]],
     constant BatchLigandInfo    *ligands       [[buffer(1)]],
     constant DockLigandAtom     *ligandAtoms   [[buffer(2)]],
-    device const float          *stericGrid    [[buffer(3)]],
-    device const float          *hydrophobGrid [[buffer(4)]],
-    device const float          *hbondGrid     [[buffer(5)]],
+    device const half           *stericGrid    [[buffer(3)]],
+    device const half           *hydrophobGrid [[buffer(4)]],
+    device const half           *hbondGrid     [[buffer(5)]],
     constant GridParams         &gridParams    [[buffer(6)]],
     constant BatchScreenParams  &params        [[buffer(7)]],
     uint                         tid           [[thread_position_in_grid]])
@@ -928,6 +1545,14 @@ kernel void initializePopulation(
     poses[tid].hbondEnergy = 0.0f;
     poses[tid].torsionPenalty = 0.0f;
     poses[tid].clashPenalty = 0.0f;
+    poses[tid].drusinaCorrection = 0.0f;
+    poses[tid].constraintPenalty = 0.0f;
+
+    // Initialize chi angles to zero (rigid receptor baseline)
+    for (uint c = 0; c < 24; c++) {
+        poses[tid].chiAngles[c] = 0.0f;
+    }
+    poses[tid].numChiAngles = 0;
 }
 
 /// GA evolution: tournament selection + arithmetic/SLERP crossover + Gaussian mutation.
@@ -1083,7 +1708,7 @@ inline float vinaScorePositions(
     constant DockLigandAtom    *ligandAtoms,
     uint                        nAtoms,
     uint                        nTorsions,
-    device const float         *affinityMaps,
+    device const half          *affinityMaps,
     device const int32_t       *typeIndexLookup,
     constant GridParams        &gp,
     float                       referenceIntraEnergy,
@@ -1136,7 +1761,7 @@ inline float evaluatePose(
     uint                        nTorsions,
     constant TorsionEdge       *torsionEdges,
     constant int32_t           *movingIndices,
-    device const float         *affinityMaps,
+    device const half          *affinityMaps,
     device const int32_t       *typeIndexLookup,
     constant GridParams        &gp,
     float                       referenceIntraEnergy,
@@ -1179,6 +1804,61 @@ inline float evaluatePose(
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
     return totalIntermolecular * normFactor + wPenalty * boundaryPenalty + intraDelta;
+}
+
+/// Constrained version of evaluatePose: includes pharmacophore penalty.
+inline float evaluatePoseConstrained(
+    device const DockPose      &pose,
+    constant DockLigandAtom    *ligandAtoms,
+    uint                        nAtoms,
+    uint                        nTorsions,
+    constant TorsionEdge       *torsionEdges,
+    constant int32_t           *movingIndices,
+    device const half          *affinityMaps,
+    device const int32_t       *typeIndexLookup,
+    constant GridParams        &gp,
+    float                       referenceIntraEnergy,
+    constant uint32_t          *exclusionMask,
+    constant PharmacophoreConstraint *constraints,
+    constant PharmacophoreParams &pharmaParams)
+{
+    float3 positions[128];
+    uint nA = min(nAtoms, 128u);
+    for (uint a = 0; a < nA; a++) {
+        positions[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
+    }
+    applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTorsions);
+
+    float3 gridMin = gp.origin;
+    float3 gridMax = gp.origin + float3(gp.dims) * gp.spacing;
+
+    float totalIntermolecular = 0.0f;
+    float boundaryPenalty = 0.0f;
+
+    for (uint a = 0; a < nA; a++) {
+        float3 r = positions[a];
+        float oopP = outOfGridPenalty(r, gridMin, gridMax);
+        if (oopP > 0.0f) {
+            boundaryPenalty += oopP;
+            continue;
+        }
+        totalIntermolecular += sampleTypedAffinityMap(
+            affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gp
+        );
+    }
+
+    float intraDelta = 0.0f;
+    if (exclusionMask) {
+        intraDelta = intramolecularLigandEnergy(positions, ligandAtoms, nA, exclusionMask, 128)
+            - referenceIntraEnergy;
+    }
+
+    float constraintPen = evaluateConstraintPenalty(
+        positions, ligandAtoms, nA, constraints, pharmaParams);
+
+    float nRotF = float(nTorsions);
+    float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
+    return totalIntermolecular * normFactor + wPenalty * boundaryPenalty + intraDelta + constraintPen;
 }
 
 /// Monte Carlo perturbation: randomly perturb translation, rotation, and torsions.
@@ -1288,13 +1968,15 @@ kernel void metropolisAccept(
 kernel void localSearch(
     device DockPose            *poses        [[buffer(0)]],
     constant DockLigandAtom    *ligandAtoms  [[buffer(1)]],
-    device const float         *affinityMaps [[buffer(2)]],
+    device const half          *affinityMaps [[buffer(2)]],
     device const int32_t       *typeIndexLookup [[buffer(3)]],
     constant GridParams        &gridParams   [[buffer(4)]],
     constant GAParams          &gaParams     [[buffer(5)]],
     constant TorsionEdge       *torsionEdges [[buffer(6)]],
     constant int32_t           *movingIndices [[buffer(7)]],
     constant uint32_t          *exclusionMask [[buffer(8)]],
+    constant PharmacophoreConstraint *pharmaConstraints [[buffer(15)]],
+    constant PharmacophoreParams &pharmaParams [[buffer(16)]],
     uint                        tid          [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1311,25 +1993,28 @@ kernel void localSearch(
     int maxSteps = max(int(gaParams.localSearchSteps), 1);
     for (int step = 0; step < maxSteps; step++) {
         // Current energy
-        float baseE = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+        float baseE = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                     torsionEdges, movingIndices,
                                     affinityMaps, typeIndexLookup, gridParams,
-                                    gaParams.referenceIntraEnergy, exclusionMask);
+                                    gaParams.referenceIntraEnergy, exclusionMask,
+                                    pharmaConstraints, pharmaParams);
 
         // ---- Translation gradient (3 DOF) ----
         float gradT[3];
         for (int dim = 0; dim < 3; dim++) {
             float3 origT = pose.translation;
             pose.translation[dim] = origT[dim] + h;
-            float ePlus = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+            float ePlus = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                         torsionEdges, movingIndices,
                                         affinityMaps, typeIndexLookup, gridParams,
-                                        gaParams.referenceIntraEnergy, exclusionMask);
+                                        gaParams.referenceIntraEnergy, exclusionMask,
+                                        pharmaConstraints, pharmaParams);
             pose.translation[dim] = origT[dim] - h;
-            float eMinus = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+            float eMinus = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                          torsionEdges, movingIndices,
                                          affinityMaps, typeIndexLookup, gridParams,
-                                         gaParams.referenceIntraEnergy, exclusionMask);
+                                         gaParams.referenceIntraEnergy, exclusionMask,
+                                         pharmaConstraints, pharmaParams);
             pose.translation = origT;
             gradT[dim] = (ePlus - eMinus) / (2.0f * h);
         }
@@ -1351,10 +2036,11 @@ kernel void localSearch(
                 dqPlus.w*origRot.z + dqPlus.x*origRot.y - dqPlus.y*origRot.x + dqPlus.z*origRot.w,
                 dqPlus.w*origRot.w - dqPlus.x*origRot.x - dqPlus.y*origRot.y - dqPlus.z*origRot.z
             ));
-            float ePlus = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+            float ePlus = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                         torsionEdges, movingIndices,
                                         affinityMaps, typeIndexLookup, gridParams,
-                                        gaParams.referenceIntraEnergy, exclusionMask);
+                                        gaParams.referenceIntraEnergy, exclusionMask,
+                                        pharmaConstraints, pharmaParams);
 
             // Apply negative rotation
             pose.rotation = normalize(float4(
@@ -1363,10 +2049,11 @@ kernel void localSearch(
                 dqMinus.w*origRot.z + dqMinus.x*origRot.y - dqMinus.y*origRot.x + dqMinus.z*origRot.w,
                 dqMinus.w*origRot.w - dqMinus.x*origRot.x - dqMinus.y*origRot.y - dqMinus.z*origRot.z
             ));
-            float eMinus = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+            float eMinus = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                          torsionEdges, movingIndices,
                                          affinityMaps, typeIndexLookup, gridParams,
-                                         gaParams.referenceIntraEnergy, exclusionMask);
+                                         gaParams.referenceIntraEnergy, exclusionMask,
+                                         pharmaConstraints, pharmaParams);
 
             pose.rotation = origRot;
             gradR[dim] = (ePlus - eMinus) / (2.0f * hRot);
@@ -1378,15 +2065,17 @@ kernel void localSearch(
         for (uint t = 0; t < nTor; t++) {
             float origTor = pose.torsions[t];
             pose.torsions[t] = origTor + hTor;
-            float ePlus = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+            float ePlus = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                         torsionEdges, movingIndices,
                                         affinityMaps, typeIndexLookup, gridParams,
-                                        gaParams.referenceIntraEnergy, exclusionMask);
+                                        gaParams.referenceIntraEnergy, exclusionMask,
+                                        pharmaConstraints, pharmaParams);
             pose.torsions[t] = origTor - hTor;
-            float eMinus = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+            float eMinus = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                          torsionEdges, movingIndices,
                                          affinityMaps, typeIndexLookup, gridParams,
-                                         gaParams.referenceIntraEnergy, exclusionMask);
+                                         gaParams.referenceIntraEnergy, exclusionMask,
+                                         pharmaConstraints, pharmaParams);
             pose.torsions[t] = origTor;
             gradTor[t] = (ePlus - eMinus) / (2.0f * hTor);
         }
@@ -1438,16 +2127,320 @@ kernel void localSearch(
             if (pose.torsions[t] < -M_PI_F) pose.torsions[t] += 2.0f * M_PI_F;
         }
 
-        float newE = evaluatePose(pose, ligandAtoms, nAtoms, nTor,
+        float newE = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
                                    torsionEdges, movingIndices,
                                    affinityMaps, typeIndexLookup, gridParams,
-                                   gaParams.referenceIntraEnergy, exclusionMask);
+                                   gaParams.referenceIntraEnergy, exclusionMask,
+                                   pharmaConstraints, pharmaParams);
 
         if (newE < baseE) {
             pose.energy = newE;
             stepSize = min(stepSize * 1.2f, 0.5f);
         } else {
             // Rollback
+            pose.translation = oldT;
+            pose.rotation = oldRot;
+            for (uint t = 0; t < nTor; t++) pose.torsions[t] = oldTorsions[t];
+            pose.energy = baseE;
+            stepSize *= 0.5f;
+        }
+        if (stepSize < 0.001f) break;
+    }
+}
+
+// ============================================================================
+// MARK: - Analytical Gradient Local Search
+// ============================================================================
+
+/// Evaluate pose energy and compute analytical gradients for all DOF in a single pass.
+/// Uses force/torque accumulation (same algorithm as AutoDock Vina tree.h).
+///
+/// For each torsion, the derivative is: dE/dθ = torque · axis
+/// where torque = Σ cross(atom_pos - pivot, force_on_atom) for all downstream atoms.
+/// Forces propagate upward leaf→root: parent accumulates child forces and torques.
+///
+/// Returns total energy. Fills gradT[3], gradR[3], gradTor[32].
+inline float evaluatePoseWithGradient(
+    device const DockPose   &pose,
+    constant DockLigandAtom *ligandAtoms,
+    uint                     nAtoms,
+    uint                     nTorsions,
+    constant TorsionEdge    *torsionEdges,
+    constant int32_t        *movingIndices,
+    device const half       *affinityMaps,
+    device const int32_t    *typeIndexLookup,
+    constant GridParams     &gp,
+    float                    referenceIntraEnergy,
+    constant uint32_t       *exclusionMask,
+    thread float            *gradT,
+    thread float            *gradR,
+    thread float            *gradTor)
+{
+    uint nA = min(nAtoms, 128u);
+    uint nTor = min(nTorsions, 32u);
+
+    // --- Forward pass: transform atoms (identical to evaluatePose) ---
+    float3 positions[128];
+    for (uint a = 0; a < nA; a++) {
+        positions[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
+    }
+    for (uint t = 0; t < nTor; t++) {
+        float angle = pose.torsions[t];
+        if (abs(angle) < 1e-6f) continue;
+        TorsionEdge edge = torsionEdges[t];
+        float3 pivot = positions[edge.atom1];
+        float3 axisVec = positions[edge.atom2] - pivot;
+        float axisLen = length(axisVec);
+        if (axisLen < 1e-6f) continue;
+        float3 axis = axisVec / axisLen;
+        float cosA = cos(angle);
+        float sinA = sin(angle);
+        for (int i = 0; i < edge.movingCount; i++) {
+            int ai = movingIndices[edge.movingStart + i];
+            if (ai < 0 || uint(ai) >= nA) continue;
+            float3 v = positions[ai] - pivot;
+            positions[ai] = pivot + v * cosA + cross(axis, v) * sinA + axis * dot(axis, v) * (1.0f - cosA);
+        }
+    }
+
+    // --- Compute energy and per-atom forces (negative gradient) ---
+    float3 forces[128];  // forces[a] = -dE/dpos[a]
+    for (uint a = 0; a < nA; a++) forces[a] = float3(0);
+
+    float nRotF = float(nTor);
+    float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
+
+    // Intermolecular: grid-based energy + gradient
+    float totalIntermolecular = 0.0f;
+    for (uint a = 0; a < nA; a++) {
+        float3 grad;
+        float e = sampleTypedAffinityMapWithGrad(
+            affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, positions[a], gp, grad
+        );
+        totalIntermolecular += e;
+        forces[a] -= grad * normFactor;  // force = -gradient
+    }
+
+    // Intramolecular energy + gradient (intramolecularWithGrad accumulates +dE/dpos)
+    float intraE = 0.0f;
+    if (exclusionMask) {
+        // Need a separate gradient array since intramolecularWithGrad adds dE/dpos (not force)
+        float3 intraGrad[128];
+        for (uint a = 0; a < nA; a++) intraGrad[a] = float3(0);
+        intraE = intramolecularWithGrad(positions, intraGrad, ligandAtoms, nA, exclusionMask, 128);
+        for (uint a = 0; a < nA; a++) forces[a] -= intraGrad[a];  // force = -gradient
+    }
+    float intraDelta = intraE - referenceIntraEnergy;
+    float totalEnergy = totalIntermolecular * normFactor + intraDelta;
+
+    // --- Torsion derivatives via force/torque accumulation (Vina algorithm) ---
+    // Process torsions leaf→root. For each torsion:
+    //   1. Sum force and torque over the torsion's moving atoms
+    //   2. dE/dθ = -(torque · axis)  (torque from forces, sign: force = -dE/dpos)
+    //   3. Propagate: parent torsion receives child's force and torque contribution
+
+    // We process in reverse order (leaf→root) since torsions are stored root→leaf.
+    // Each torsion's derivative includes contributions from all downstream torsions.
+    float3 torsionForce[32];   // accumulated force for each torsion subtree
+    float3 torsionTorque[32];  // accumulated torque for each torsion subtree
+    for (uint t = 0; t < nTor; t++) {
+        torsionForce[t] = float3(0);
+        torsionTorque[t] = float3(0);
+    }
+
+    // Step 1: Each torsion accumulates force/torque from its own moving atoms
+    for (uint t = 0; t < nTor; t++) {
+        TorsionEdge edge = torsionEdges[t];
+        float3 pivot = positions[edge.atom1];
+        for (int i = 0; i < edge.movingCount; i++) {
+            int ai = movingIndices[edge.movingStart + i];
+            if (ai < 0 || uint(ai) >= nA) continue;
+            torsionForce[t] += forces[ai];
+            torsionTorque[t] += cross(positions[ai] - pivot, forces[ai]);
+        }
+    }
+
+    // Step 2: Propagate child torsion force/torque to parent (leaf→root)
+    // A child torsion's force gets added to the parent's force,
+    // and cross(child_origin - parent_origin, child_force) + child_torque gets added to parent's torque.
+    // Since our torsion tree is flat (not explicitly hierarchical), we check containment:
+    // torsion j is a child of torsion i if torsion i's moving atoms include torsion j's pivot atom.
+    // For the flat representation, torsions are ordered root→leaf, so we process in reverse.
+    // But a simpler approach: each atom's force only needs to appear in the innermost torsion
+    // that moves it, and the flat torsion loop already handles this correctly because
+    // inner torsions' atoms are a subset of outer torsions' atoms.
+    // The above per-torsion accumulation already double-counts atoms that appear in multiple
+    // torsion moving sets. We need to subtract child contributions and add them as torque.
+
+    // Actually, the correct approach for a flat torsion list where moving sets may overlap:
+    // Skip the hierarchical propagation and compute each torsion's gradient directly as
+    // the torque about the axis from ALL atoms downstream of that torsion bond.
+    // This is what the per-torsion accumulation above already does correctly, because
+    // edge.movingCount includes all atoms downstream of the torsion (including those
+    // moved by child torsions).
+
+    for (uint t = 0; t < nTor; t++) {
+        TorsionEdge edge = torsionEdges[t];
+        float3 axisVec = positions[edge.atom2] - positions[edge.atom1];
+        float axisLen = length(axisVec);
+        if (axisLen < 1e-6f) { gradTor[t] = 0.0f; continue; }
+        float3 axis = axisVec / axisLen;
+        // dE/dθ = -(torque · axis)  because force = -dE/dpos
+        gradTor[t] = -dot(torsionTorque[t], axis);
+    }
+
+    // --- Translation gradient = -total_force = sum of dE/dpos ---
+    float3 totalForce = float3(0);
+    for (uint a = 0; a < nA; a++) totalForce += forces[a];
+    gradT[0] = -totalForce.x;  // gradient = -force
+    gradT[1] = -totalForce.y;
+    gradT[2] = -totalForce.z;
+
+    // --- Rotation gradient via torque about ligand center ---
+    // Total torque about the rigid body origin (pose.translation):
+    // τ = Σ cross(pos_a - origin, force_a)
+    // dE/dω_k = -τ_k  (axis-angle parameterization)
+    float3 totalTorque = float3(0);
+    for (uint a = 0; a < nA; a++) {
+        totalTorque += cross(positions[a] - pose.translation, forces[a]);
+    }
+    gradR[0] = -totalTorque.x;
+    gradR[1] = -totalTorque.y;
+    gradR[2] = -totalTorque.z;
+
+    return totalEnergy;
+}
+
+/// Analytical gradient local search: same structure as numerical `localSearch`,
+/// but computes exact gradients in a single forward pass instead of finite differences.
+/// ~28x fewer evaluations for a typical drug molecule.
+kernel void localSearchAnalytical(
+    device DockPose            *poses        [[buffer(0)]],
+    constant DockLigandAtom    *ligandAtoms  [[buffer(1)]],
+    device const half          *affinityMaps [[buffer(2)]],
+    device const int32_t       *typeIndexLookup [[buffer(3)]],
+    constant GridParams        &gridParams   [[buffer(4)]],
+    constant GAParams          &gaParams     [[buffer(5)]],
+    constant TorsionEdge       *torsionEdges [[buffer(6)]],
+    constant int32_t           *movingIndices [[buffer(7)]],
+    constant uint32_t          *exclusionMask [[buffer(8)]],
+    constant PharmacophoreConstraint *pharmaConstraints [[buffer(15)]],
+    constant PharmacophoreParams &pharmaParams [[buffer(16)]],
+    uint                        tid          [[thread_position_in_grid]])
+{
+    if (tid >= gaParams.populationSize) return;
+
+    device DockPose &pose = poses[tid];
+    uint nAtoms = min(gaParams.numLigandAtoms, 128u);
+    uint nTor = min(gaParams.numTorsions, 32u);
+    float3 gMin = gridParams.searchCenter - gridParams.searchHalfExtent;
+    float3 gMax = gridParams.searchCenter + gridParams.searchHalfExtent;
+
+    float stepSize = 0.08f;
+    int maxSteps = max(int(gaParams.localSearchSteps), 1);
+
+    for (int step = 0; step < maxSteps; step++) {
+        float gradT[3], gradR[3], gradTor[32];
+
+        float baseE = evaluatePoseWithGradient(
+            pose, ligandAtoms, nAtoms, nTor,
+            torsionEdges, movingIndices,
+            affinityMaps, typeIndexLookup, gridParams,
+            gaParams.referenceIntraEnergy, exclusionMask,
+            gradT, gradR, gradTor
+        );
+
+        // Add pharmacophore constraint penalty + gradient to the analytical gradient.
+        // We need the transformed positions to evaluate constraints. Re-transform (cheap).
+        if (pharmaParams.numConstraints > 0) {
+            float3 cPositions[128];
+            float3 cForces[128];
+            for (uint a = 0; a < nAtoms; a++) {
+                cPositions[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
+                cForces[a] = float3(0);
+            }
+            applyTorsions(cPositions, nAtoms, pose, torsionEdges, movingIndices, nTor);
+
+            float cPen = evaluateConstraintPenaltyWithGrad(
+                cPositions, cForces, ligandAtoms, nAtoms, pharmaConstraints, pharmaParams);
+            baseE += cPen;
+
+            // Propagate atom-level forces back to translation and rotation gradients.
+            // Translation gradient: sum of all forces (dE/d(tx) = sum_a dE/d(xa))
+            for (uint a = 0; a < nAtoms; a++) {
+                // Force is negative gradient already, so negate back
+                gradT[0] -= cForces[a].x;
+                gradT[1] -= cForces[a].y;
+                gradT[2] -= cForces[a].z;
+            }
+            // Rotation gradient: torque approximation (simplified — project onto rotation axes)
+            for (uint a = 0; a < nAtoms; a++) {
+                float3 r = cPositions[a] - pose.translation;
+                float3 f = -cForces[a];  // convert from force to gradient direction
+                float3 torque = cross(r, f);
+                gradR[0] += torque.x;
+                gradR[1] += torque.y;
+                gradR[2] += torque.z;
+            }
+        }
+
+        // Compute total gradient magnitude
+        float gradMag = 0;
+        for (int i = 0; i < 3; i++) gradMag += gradT[i] * gradT[i];
+        for (int i = 0; i < 3; i++) gradMag += gradR[i] * gradR[i];
+        for (uint t = 0; t < nTor; t++) gradMag += gradTor[t] * gradTor[t];
+        gradMag = sqrt(gradMag);
+        if (gradMag < 1e-6f) break;
+
+        float scale = min(stepSize / gradMag, stepSize);
+
+        // Apply gradient step
+        float3 newT = pose.translation;
+        for (int i = 0; i < 3; i++) newT[i] -= scale * gradT[i];
+        newT = clamp(newT, gMin, gMax);
+
+        // Apply rotation step
+        float3 rotStep = float3(-scale * gradR[0], -scale * gradR[1], -scale * gradR[2]);
+        float rotAngle = length(rotStep);
+        float4 newRot = pose.rotation;
+        if (rotAngle > 1e-6f) {
+            float3 rotAx = rotStep / rotAngle;
+            float halfRot = rotAngle * 0.5f;
+            float4 dq = float4(rotAx * sin(halfRot), cos(halfRot));
+            newRot = normalize(float4(
+                dq.w*pose.rotation.x + dq.x*pose.rotation.w + dq.y*pose.rotation.z - dq.z*pose.rotation.y,
+                dq.w*pose.rotation.y - dq.x*pose.rotation.z + dq.y*pose.rotation.w + dq.z*pose.rotation.x,
+                dq.w*pose.rotation.z + dq.x*pose.rotation.y - dq.y*pose.rotation.x + dq.z*pose.rotation.w,
+                dq.w*pose.rotation.w - dq.x*pose.rotation.x - dq.y*pose.rotation.y - dq.z*pose.rotation.z
+            ));
+        }
+
+        // Save for rollback
+        float3 oldT = pose.translation;
+        float4 oldRot = pose.rotation;
+        float oldTorsions[32];
+        for (uint t = 0; t < nTor; t++) oldTorsions[t] = pose.torsions[t];
+
+        // Apply
+        pose.translation = newT;
+        pose.rotation = newRot;
+        for (uint t = 0; t < nTor; t++) {
+            pose.torsions[t] -= scale * gradTor[t];
+            if (pose.torsions[t] > M_PI_F) pose.torsions[t] -= 2.0f * M_PI_F;
+            if (pose.torsions[t] < -M_PI_F) pose.torsions[t] += 2.0f * M_PI_F;
+        }
+
+        // Verify improvement
+        float newE = evaluatePoseConstrained(pose, ligandAtoms, nAtoms, nTor,
+                                   torsionEdges, movingIndices,
+                                   affinityMaps, typeIndexLookup, gridParams,
+                                   gaParams.referenceIntraEnergy, exclusionMask,
+                                   pharmaConstraints, pharmaParams);
+
+        if (newE < baseE) {
+            pose.energy = newE;
+            stepSize = min(stepSize * 1.2f, 0.5f);
+        } else {
             pose.translation = oldT;
             pose.rotation = oldRot;
             for (uint t = 0; t < nTor; t++) pose.torsions[t] = oldTorsions[t];

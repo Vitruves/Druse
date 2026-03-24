@@ -62,18 +62,85 @@ target_compile_options(gemmi_cpp PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-lto>
 )
 
+# OpenMM (optional — auto-fetched and built at configure time)
+option(DRUSE_ENABLE_OPENMM "Build with OpenMM refinement support" ON)
+
+set(OPENMM_SRC_DIR    "${FETCHCONTENT_BASE_DIR}/openmm-src")
+set(OPENMM_BUILD_DIR  "${FETCHCONTENT_BASE_DIR}/openmm-build")
+set(OPENMM_INSTALL_DIR "${FETCHCONTENT_BASE_DIR}/openmm-install")
+
+if(DRUSE_ENABLE_OPENMM)
+    if(NOT EXISTS "${OPENMM_INSTALL_DIR}/lib/libOpenMM.dylib")
+        message(STATUS "OpenMM not found — fetching and building (first time only, may take a few minutes)...")
+
+        # Clone source via FetchContent
+        FetchContent_Declare(openmm
+            GIT_REPOSITORY https://github.com/openmm/openmm.git
+            GIT_TAG        8.5.0
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_Populate(openmm)
+
+        # Configure, build, and install as a standalone project
+        execute_process(
+            COMMAND ${CMAKE_COMMAND}
+                -G "${CMAKE_GENERATOR}"
+                -S "${OPENMM_SRC_DIR}"
+                -B "${OPENMM_BUILD_DIR}"
+                -DCMAKE_INSTALL_PREFIX=${OPENMM_INSTALL_DIR}
+                -DCMAKE_BUILD_TYPE=Release
+                -DCMAKE_OSX_ARCHITECTURES=arm64
+                -DBUILD_TESTING=OFF
+                -DOPENMM_BUILD_PYTHON_WRAPPERS=OFF
+                -DOPENMM_BUILD_C_AND_FORTRAN_WRAPPERS=OFF
+                -DOPENMM_BUILD_EXAMPLES=OFF
+            RESULT_VARIABLE _openmm_cfg_result
+        )
+        if(_openmm_cfg_result EQUAL 0)
+            execute_process(
+                COMMAND ${CMAKE_COMMAND} --build "${OPENMM_BUILD_DIR}" --config Release -j8
+                RESULT_VARIABLE _openmm_build_result
+            )
+        endif()
+        if(_openmm_cfg_result EQUAL 0 AND _openmm_build_result EQUAL 0)
+            execute_process(
+                COMMAND ${CMAKE_COMMAND} --install "${OPENMM_BUILD_DIR}" --config Release
+            )
+        else()
+            message(WARNING "OpenMM build failed — building without OpenMM refinement")
+        endif()
+    endif()
+endif()
+
+if(DRUSE_ENABLE_OPENMM AND EXISTS "${OPENMM_INSTALL_DIR}/lib/libOpenMM.dylib")
+    set(DRUSE_HAS_OPENMM ON)
+    message(STATUS "OpenMM found at ${OPENMM_INSTALL_DIR}")
+else()
+    set(DRUSE_HAS_OPENMM OFF)
+    message(STATUS "OpenMM not available — building without OpenMM refinement")
+endif()
+
 # Build static library
-add_library(druse_core STATIC druse_core.cpp druse_2d.cpp druse_gemmi.cpp)
+add_library(druse_core STATIC druse_core.cpp druse_2d.cpp druse_gemmi.cpp druse_openmm.cpp druse_xtb.cpp)
 set_target_properties(druse_core PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION FALSE
 )
 target_compile_options(druse_core PRIVATE -fno-lto)
+target_compile_definitions(druse_core PRIVATE ACCELERATE_NEW_LAPACK)
 
 target_include_directories(druse_core PRIVATE
     ${lbfgspp_SOURCE_DIR}/include
 )
 
+if(DRUSE_HAS_OPENMM)
+    target_compile_definitions(druse_core PRIVATE DRUSE_HAS_OPENMM)
+    target_include_directories(druse_core PRIVATE "${OPENMM_INSTALL_DIR}/include")
+    target_link_directories(druse_core PRIVATE "${OPENMM_INSTALL_DIR}/lib")
+    target_link_libraries(druse_core OpenMM)
+endif()
+
 target_link_libraries(druse_core
+    "-framework Accelerate"
     gemmi_cpp
     TBB::tbb
     RDKitChemicalFeatures
@@ -98,6 +165,7 @@ target_link_libraries(druse_core
     RDKitMolDraw2D
     RDKitFileParsers
     RDKitChemTransforms
+    RDKitMolStandardize
     RDKitFingerprints
     RDKitGenericGroups
     RDKitMolChemicalFeatures

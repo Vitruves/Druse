@@ -71,12 +71,14 @@ enum RDKitBridge {
     }
 
     /// Batch process SMILES strings. Uses the TBB-backed C++ path when possible.
+    /// Pass a `cancelFlag` pointer to allow early termination of the TBB parallel loop.
     static func batchProcess(
         entries: [(smiles: String, name: String)],
         addHydrogens: Bool = true,
         minimize: Bool = true,
         computeCharges: Bool = true,
-        parallel: Bool = true
+        parallel: Bool = true,
+        cancelFlag: UnsafePointer<Int32>? = nil
     ) -> [(molecule: MoleculeData?, error: String?)] {
         guard !entries.isEmpty else { return [] }
 
@@ -84,7 +86,8 @@ enum RDKitBridge {
             entries: entries,
             addHydrogens: addHydrogens,
             minimize: minimize,
-            computeCharges: computeCharges
+            computeCharges: computeCharges,
+            cancelFlag: cancelFlag
         ) {
             return results
         }
@@ -97,34 +100,76 @@ enum RDKitBridge {
         }
     }
 
+    /// Fire-and-forget log from nonisolated context.
+    private static func logAsync(_ message: String, level: LogLevel = .info, category: LogCategory = .system) {
+        Task { @MainActor in ActivityLog.shared.log(message, level: level, category: category) }
+    }
+
     /// Add hydrogens to a protein using RDKit's PDB parser (with 3D placement).
     static func addHydrogensToPDB(pdbContent: String) -> MoleculeData? {
-        guard let result = druse_add_hydrogens_pdb(pdbContent) else { return nil }
+        guard let result = druse_add_hydrogens_pdb(pdbContent) else {
+            logAsync("[RDKit] addHydrogensToPDB: C++ call returned nil", level: .warning, category: .prep)
+            return nil
+        }
         defer { druse_free_molecule_result(result) }
-        guard result.pointee.success, result.pointee.atomCount > 0 else { return nil }
+        guard result.pointee.success, result.pointee.atomCount > 0 else {
+            logAsync("[RDKit] addHydrogensToPDB: failed or empty result", level: .warning, category: .prep)
+            return nil
+        }
         return convertResult(result.pointee)
     }
 
     /// Compute Gasteiger charges on protein atoms via RDKit's PDB parser.
     static func computeChargesPDB(pdbContent: String) -> MoleculeData? {
-        guard let result = druse_compute_charges_pdb(pdbContent) else { return nil }
+        guard let result = druse_compute_charges_pdb(pdbContent) else {
+            logAsync("[RDKit] computeChargesPDB: C++ call returned nil", level: .warning, category: .prep)
+            return nil
+        }
         defer { druse_free_molecule_result(result) }
-        guard result.pointee.success, result.pointee.atomCount > 0 else { return nil }
+        guard result.pointee.success, result.pointee.atomCount > 0 else {
+            logAsync("[RDKit] computeChargesPDB: failed or empty result", level: .warning, category: .prep)
+            return nil
+        }
         return convertResult(result.pointee)
     }
 
     /// Compute Gasteiger charges on a ligand represented as an MDL mol block.
     static func computeChargesMolBlock(_ molBlock: String) -> MoleculeData? {
-        guard let result = druse_compute_charges_molblock(molBlock) else { return nil }
+        guard let result = druse_compute_charges_molblock(molBlock) else {
+            logAsync("[RDKit] computeChargesMolBlock: C++ call returned nil", level: .debug, category: .smiles)
+            return nil
+        }
         defer { druse_free_molecule_result(result) }
-        guard result.pointee.success, result.pointee.atomCount > 0 else { return nil }
+        guard result.pointee.success, result.pointee.atomCount > 0 else {
+            logAsync("[RDKit] computeChargesMolBlock: failed or empty result", level: .debug, category: .smiles)
+            return nil
+        }
         return convertResult(result.pointee)
+    }
+
+    /// Convert an MDL mol block to canonical SMILES using RDKit's native parser.
+    /// Handles both 2D and 3D mol blocks correctly.
+    static func smilesFromMolBlock(_ molBlock: String) -> String? {
+        guard let cStr = druse_molblock_to_smiles(molBlock) else {
+            logAsync("[RDKit] smilesFromMolBlock: conversion failed", level: .debug, category: .smiles)
+            return nil
+        }
+        let smiles = String(cString: cStr)
+        druse_free_string(cStr)
+        return smiles.isEmpty ? nil : smiles
     }
 
     /// Convert atoms+bonds (with 3D coordinates) to canonical SMILES.
     /// Used for co-crystallized ligands extracted from PDB files.
     static func atomsBondsToSMILES(atoms: [Atom], bonds: [Bond]) -> String? {
-        guard !atoms.isEmpty else { return nil }
+        guard atoms.count >= 2 else { return nil }
+
+        // Validate bond indices before passing to C++ (prevents segfault on malformed data)
+        let validBonds = bonds.filter {
+            $0.atomIndex1 >= 0 && $0.atomIndex1 < atoms.count &&
+            $0.atomIndex2 >= 0 && $0.atomIndex2 < atoms.count &&
+            $0.atomIndex1 != $0.atomIndex2
+        }
 
         var druseAtoms = [DruseAtom](repeating: DruseAtom(), count: atoms.count)
         for i in 0..<atoms.count {
@@ -142,12 +187,14 @@ enum RDKitBridge {
             }
         }
 
-        var druseBonds = [DruseBond](repeating: DruseBond(), count: bonds.count)
-        for i in 0..<bonds.count {
-            druseBonds[i].atom1 = Int32(bonds[i].atomIndex1)
-            druseBonds[i].atom2 = Int32(bonds[i].atomIndex2)
-            druseBonds[i].order = Int32(bonds[i].order.rawValue)
+        var druseBonds = validBonds.map { bond in
+            var db = DruseBond()
+            db.atom1 = Int32(bond.atomIndex1)
+            db.atom2 = Int32(bond.atomIndex2)
+            db.order = Int32(bond.order.rawValue)
+            return db
         }
+        let bondCount = Int32(druseBonds.count)
 
         let result: UnsafeMutablePointer<DruseMoleculeResult>?
         if druseBonds.isEmpty {
@@ -161,13 +208,13 @@ enum RDKitBridge {
                 )
             }
         } else {
-            result = druseAtoms.withUnsafeMutableBufferPointer { atomsBuf in
-                druseBonds.withUnsafeMutableBufferPointer { bondsBuf in
+            result = druseBonds.withUnsafeMutableBufferPointer { bondsBuf in
+                druseAtoms.withUnsafeMutableBufferPointer { atomsBuf in
                     druse_atoms_bonds_to_smiles(
                         atomsBuf.baseAddress,
                         Int32(atoms.count),
                         bondsBuf.baseAddress,
-                        Int32(bonds.count),
+                        bondCount,
                         "ligand"
                     )
                 }
@@ -227,6 +274,61 @@ enum RDKitBridge {
         return results
     }
 
+    // MARK: - Tautomer & Protomer Enumeration
+
+    /// Result of tautomer/protomer enumeration from C++ core.
+    struct VariantResult: Sendable {
+        let molecule: MoleculeData
+        let smiles: String
+        let score: Double
+        let kind: VariantKind
+        let label: String
+    }
+
+    /// Enumerate tautomers for a SMILES string.
+    /// Returns array sorted by MMFF energy (lowest first).
+    static func enumerateTautomers(
+        smiles: String,
+        name: String = "",
+        maxTautomers: Int = 25,
+        energyCutoff: Double = 10.0
+    ) -> [VariantResult] {
+        guard let set = druse_enumerate_tautomers(smiles, name, Int32(maxTautomers), energyCutoff) else { return [] }
+        defer { druse_free_variant_set(set) }
+        return convertVariantSet(set)
+    }
+
+    /// Enumerate protomers (protonation states) at a target pH.
+    /// Returns array sorted by MMFF energy (lowest first).
+    static func enumerateProtomers(
+        smiles: String,
+        name: String = "",
+        maxProtomers: Int = 16,
+        pH: Double = 7.4,
+        pkaThreshold: Double = 2.0
+    ) -> [VariantResult] {
+        guard let set = druse_enumerate_protomers(smiles, name, Int32(maxProtomers), pH, pkaThreshold) else { return [] }
+        defer { druse_free_variant_set(set) }
+        return convertVariantSet(set)
+    }
+
+    /// Convert DruseVariantSet to Swift array.
+    private static func convertVariantSet(_ set: UnsafeMutablePointer<DruseVariantSet>) -> [VariantResult] {
+        var results: [VariantResult] = []
+        let n = Int(set.pointee.count)
+        for i in 0..<n {
+            guard let variant = set.pointee.variants?[i], variant.pointee.success else { continue }
+            let mol = convertResult(variant.pointee)
+            let smiles = fixedCString(variant.pointee.smiles)
+            let score = set.pointee.scores?[i] ?? 0
+            let info = set.pointee.infos?[i]
+            let kind = VariantKind(rawValue: Int(info?.kind ?? 0)) ?? .tautomer
+            let label = info.map { fixedCString($0.label) } ?? ""
+            results.append(VariantResult(molecule: mol, smiles: smiles, score: score, kind: kind, label: label))
+        }
+        return results
+    }
+
     /// Build torsion tree from SMILES. Returns rotatable bond definitions.
     static func buildTorsionTree(smiles: String) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])]? {
         guard let tree = druse_build_torsion_tree(smiles) else { return nil }
@@ -259,6 +361,29 @@ enum RDKitBridge {
             result.append((Int(edge.atom1), Int(edge.atom2), moving))
         }
         return result
+    }
+
+    // MARK: - MMFF94 Strain Energy
+
+    /// Compute MMFF94 reference energy for a free (relaxed) ligand conformation.
+    /// Returns energy in kcal/mol, or nil on failure.
+    static func mmffReferenceEnergy(smiles: String) -> Double? {
+        let e = druse_mmff_reference_energy(smiles)
+        return e.isNaN ? nil : e
+    }
+
+    /// Compute MMFF94 energy of a docked ligand pose with given heavy atom positions.
+    /// Heavy atoms are placed at the given coordinates; only hydrogens are relaxed.
+    /// Returns energy in kcal/mol, or nil on failure.
+    static func mmffStrainEnergy(smiles: String, heavyPositions: [SIMD3<Float>]) -> Double? {
+        var interleaved = [Float](repeating: 0, count: heavyPositions.count * 3)
+        for (i, pos) in heavyPositions.enumerated() {
+            interleaved[i * 3]     = pos.x
+            interleaved[i * 3 + 1] = pos.y
+            interleaved[i * 3 + 2] = pos.z
+        }
+        let e = druse_mmff_strain_energy(smiles, interleaved, Int32(heavyPositions.count))
+        return e.isNaN ? nil : e
     }
 
     // MARK: - 2D Coordinates
@@ -358,7 +483,8 @@ enum RDKitBridge {
         entries: [(smiles: String, name: String)],
         addHydrogens: Bool,
         minimize: Bool,
-        computeCharges: Bool
+        computeCharges: Bool,
+        cancelFlag: UnsafePointer<Int32>? = nil
     ) -> [(molecule: MoleculeData?, error: String?)]? {
         let smilesStorage = entries.map { strdup($0.smiles) }
         let nameStorage = entries.map { strdup($0.name) }
@@ -379,7 +505,8 @@ enum RDKitBridge {
                         Int32(entries.count),
                         addHydrogens,
                         minimize,
-                        computeCharges
+                        computeCharges,
+                        cancelFlag
                       )
                 else {
                     return nil

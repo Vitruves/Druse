@@ -6,6 +6,7 @@ struct LogConsoleView: View {
     let log = ActivityLog.shared
     @State private var filterLevel: LogLevel? = nil
     @State private var scrollToBottom = true
+    @GestureState private var dragStartHeight: CGFloat = 0
 
     var filteredEntries: [LogEntry] {
         if let level = filterLevel {
@@ -31,9 +32,13 @@ struct LogConsoleView: View {
                     }
                     .gesture(
                         DragGesture(minimumDistance: 1)
+                            .updating($dragStartHeight) { _, state, _ in
+                                if state == 0 { state = consoleHeight }
+                            }
                             .onChanged { value in
-                                let newHeight = consoleHeight - value.translation.height
-                                consoleHeight = max(60, min(500, newHeight))
+                                let initial = dragStartHeight != 0 ? dragStartHeight : consoleHeight
+                                let maxH = (NSScreen.main?.visibleFrame.height ?? 800) * 0.6
+                                consoleHeight = max(60, min(maxH, initial - value.translation.height))
                             }
                     )
                     .overlay(

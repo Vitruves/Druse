@@ -69,6 +69,13 @@ Training/runs/
 Training/checkpoints/
 Training/logs/
 
+# === Benchmark outputs ===
+Benchmark/data/
+Benchmark/manifests/
+Benchmark/results/
+Benchmark/reports/
+Benchmark/__pycache__/
+
 # === Python ===
 __pycache__/
 *.py[cod]
@@ -109,3 +116,9 @@ SUMMARY.md
 CppCore/.cache/
 buildServer.json
 TODO.md
+TODO2.md
+concat_output.txt
+
+Benchmark/data/CASF-2016/
+
+.grok/

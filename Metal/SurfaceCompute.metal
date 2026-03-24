@@ -452,8 +452,9 @@ inline float3 computeGradient(
     return len > 1e-8f ? -grad / len : float3(0.0f, 1.0f, 0.0f);
 }
 
-/// Marching cubes kernel: each thread processes one voxel.
-kernel void marchingCubes(
+/// Marching cubes single-pass kernel (legacy fallback): each thread processes one voxel.
+/// Uses atomic counters per triangle, which causes contention with millions of voxels.
+kernel void marchingCubesSinglePass(
     device const float         *scalarField    [[buffer(0)]],
     device SurfaceVertex       *vertices       [[buffer(1)]],
     device uint                *indices        [[buffer(2)]],
@@ -576,6 +577,202 @@ kernel void marchingCubes(
         indices[iBase + 0] = vBase + 0;
         indices[iBase + 1] = vBase + 1;
         indices[iBase + 2] = vBase + 2;
+    }
+}
+
+// ============================================================================
+// MARK: - Two-Pass Marching Cubes (Count + Emit)
+// ============================================================================
+
+/// Pass 1: Count triangles per voxel. Each thread processes one voxel, determines
+/// its cube index, counts the number of triangles from the triTable, and writes
+/// that count to triCountPerVoxel[tid]. Also atomically adds to a single global
+/// total counter (one atomic per voxel, not per triangle — much less contention).
+kernel void marchingCubesCount(
+    device const float         *scalarField       [[buffer(0)]],
+    device uint                *triCountPerVoxel  [[buffer(1)]],
+    device atomic_uint         *globalTriCount    [[buffer(2)]],
+    constant SurfaceGridParams &params            [[buffer(3)]],
+    uint                        tid               [[thread_position_in_grid]])
+{
+    uint nx = params.dims.x;
+    uint ny = params.dims.y;
+
+    uint voxelNx = nx - 1;
+    uint voxelNy = ny - 1;
+    uint voxelNz = params.dims.z - 1;
+    uint totalVoxels = voxelNx * voxelNy * voxelNz;
+
+    if (tid >= totalVoxels) {
+        return;
+    }
+
+    uint iz = tid / (voxelNx * voxelNy);
+    uint iy = (tid - iz * voxelNx * voxelNy) / voxelNx;
+    uint ix = tid - iz * voxelNx * voxelNy - iy * voxelNx;
+
+    float iso = params.isovalue;
+
+    // 8 corner values of this voxel
+    float v[8];
+    v[0] = scalarField[ iz      * nx * ny +  iy      * nx + ix    ];
+    v[1] = scalarField[ iz      * nx * ny +  iy      * nx + ix + 1];
+    v[2] = scalarField[ iz      * nx * ny + (iy + 1) * nx + ix + 1];
+    v[3] = scalarField[ iz      * nx * ny + (iy + 1) * nx + ix    ];
+    v[4] = scalarField[(iz + 1) * nx * ny +  iy      * nx + ix    ];
+    v[5] = scalarField[(iz + 1) * nx * ny +  iy      * nx + ix + 1];
+    v[6] = scalarField[(iz + 1) * nx * ny + (iy + 1) * nx + ix + 1];
+    v[7] = scalarField[(iz + 1) * nx * ny + (iy + 1) * nx + ix    ];
+
+    // Build cube index from corner signs
+    uint cubeIndex = 0;
+    if (v[0] >= iso) cubeIndex |= 1;
+    if (v[1] >= iso) cubeIndex |= 2;
+    if (v[2] >= iso) cubeIndex |= 4;
+    if (v[3] >= iso) cubeIndex |= 8;
+    if (v[4] >= iso) cubeIndex |= 16;
+    if (v[5] >= iso) cubeIndex |= 32;
+    if (v[6] >= iso) cubeIndex |= 64;
+    if (v[7] >= iso) cubeIndex |= 128;
+
+    if (edgeTable[cubeIndex] == 0) {
+        triCountPerVoxel[tid] = 0;
+        return;
+    }
+
+    // Count triangles from triTable
+    uint numTris = 0;
+    for (int i = 0; triTable[cubeIndex][i] != -1; i += 3) {
+        numTris++;
+    }
+
+    triCountPerVoxel[tid] = numTris;
+    atomic_fetch_add_explicit(globalTriCount, numTris, memory_order_relaxed);
+}
+
+/// Pass 2: Emit triangles using prefix-sum offsets. Each thread processes one voxel,
+/// re-computes the cube index, and writes vertices/indices at the pre-computed offset.
+/// NO atomics needed — each voxel writes to a unique, non-overlapping region.
+kernel void marchingCubesEmit(
+    device const float         *scalarField   [[buffer(0)]],
+    device SurfaceVertex       *vertices      [[buffer(1)]],
+    device uint                *indices       [[buffer(2)]],
+    device const uint          *triOffsets    [[buffer(3)]],
+    constant SurfaceGridParams &params        [[buffer(4)]],
+    uint                        tid           [[thread_position_in_grid]])
+{
+    uint nx = params.dims.x;
+    uint ny = params.dims.y;
+    uint nz = params.dims.z;
+
+    uint voxelNx = nx - 1;
+    uint voxelNy = ny - 1;
+    uint voxelNz = nz - 1;
+    uint totalVoxels = voxelNx * voxelNy * voxelNz;
+
+    if (tid >= totalVoxels) return;
+
+    uint iz = tid / (voxelNx * voxelNy);
+    uint iy = (tid - iz * voxelNx * voxelNy) / voxelNx;
+    uint ix = tid - iz * voxelNx * voxelNy - iy * voxelNx;
+
+    float iso = params.isovalue;
+
+    // 8 corner values of this voxel
+    float v[8];
+    v[0] = scalarField[ iz      * nx * ny +  iy      * nx + ix    ];
+    v[1] = scalarField[ iz      * nx * ny +  iy      * nx + ix + 1];
+    v[2] = scalarField[ iz      * nx * ny + (iy + 1) * nx + ix + 1];
+    v[3] = scalarField[ iz      * nx * ny + (iy + 1) * nx + ix    ];
+    v[4] = scalarField[(iz + 1) * nx * ny +  iy      * nx + ix    ];
+    v[5] = scalarField[(iz + 1) * nx * ny +  iy      * nx + ix + 1];
+    v[6] = scalarField[(iz + 1) * nx * ny + (iy + 1) * nx + ix + 1];
+    v[7] = scalarField[(iz + 1) * nx * ny + (iy + 1) * nx + ix    ];
+
+    // Build cube index from corner signs
+    uint cubeIndex = 0;
+    if (v[0] >= iso) cubeIndex |= 1;
+    if (v[1] >= iso) cubeIndex |= 2;
+    if (v[2] >= iso) cubeIndex |= 4;
+    if (v[3] >= iso) cubeIndex |= 8;
+    if (v[4] >= iso) cubeIndex |= 16;
+    if (v[5] >= iso) cubeIndex |= 32;
+    if (v[6] >= iso) cubeIndex |= 64;
+    if (v[7] >= iso) cubeIndex |= 128;
+
+    if (edgeTable[cubeIndex] == 0) return;
+
+    // Corner positions in world space
+    float3 origin = float3(params.origin);
+    float sp = params.spacing;
+    float3 p[8];
+    p[0] = origin + float3(float(ix),     float(iy),     float(iz))     * sp;
+    p[1] = origin + float3(float(ix + 1), float(iy),     float(iz))     * sp;
+    p[2] = origin + float3(float(ix + 1), float(iy + 1), float(iz))     * sp;
+    p[3] = origin + float3(float(ix),     float(iy + 1), float(iz))     * sp;
+    p[4] = origin + float3(float(ix),     float(iy),     float(iz + 1)) * sp;
+    p[5] = origin + float3(float(ix + 1), float(iy),     float(iz + 1)) * sp;
+    p[6] = origin + float3(float(ix + 1), float(iy + 1), float(iz + 1)) * sp;
+    p[7] = origin + float3(float(ix),     float(iy + 1), float(iz + 1)) * sp;
+
+    // Compute edge intersection positions (up to 12 edges)
+    float3 edgeVerts[12];
+    uint edges = edgeTable[cubeIndex];
+    if (edges &    1) edgeVerts[0]  = interpolateEdge(p[0], p[1], v[0], v[1], iso);
+    if (edges &    2) edgeVerts[1]  = interpolateEdge(p[1], p[2], v[1], v[2], iso);
+    if (edges &    4) edgeVerts[2]  = interpolateEdge(p[2], p[3], v[2], v[3], iso);
+    if (edges &    8) edgeVerts[3]  = interpolateEdge(p[3], p[0], v[3], v[0], iso);
+    if (edges &   16) edgeVerts[4]  = interpolateEdge(p[4], p[5], v[4], v[5], iso);
+    if (edges &   32) edgeVerts[5]  = interpolateEdge(p[5], p[6], v[5], v[6], iso);
+    if (edges &   64) edgeVerts[6]  = interpolateEdge(p[6], p[7], v[6], v[7], iso);
+    if (edges &  128) edgeVerts[7]  = interpolateEdge(p[7], p[4], v[7], v[4], iso);
+    if (edges &  256) edgeVerts[8]  = interpolateEdge(p[0], p[4], v[0], v[4], iso);
+    if (edges &  512) edgeVerts[9]  = interpolateEdge(p[1], p[5], v[1], v[5], iso);
+    if (edges & 1024) edgeVerts[10] = interpolateEdge(p[2], p[6], v[2], v[6], iso);
+    if (edges & 2048) edgeVerts[11] = interpolateEdge(p[3], p[7], v[3], v[7], iso);
+
+    // Compute normals from gradient at each edge intersection
+    float3 edgeNormals[12];
+    for (int e = 0; e < 12; e++) {
+        if (edges & (1u << e)) {
+            float3 gp = (edgeVerts[e] - origin) / sp;
+            uint gix = clamp(uint(gp.x + 0.5f), 0u, nx - 1u);
+            uint giy = clamp(uint(gp.y + 0.5f), 0u, ny - 1u);
+            uint giz = clamp(uint(gp.z + 0.5f), 0u, nz - 1u);
+            edgeNormals[e] = computeGradient(scalarField, gix, giy, giz, nx, ny, nz);
+        }
+    }
+
+    // Write triangles at the pre-computed offset (no atomics)
+    uint triOffset = triOffsets[tid];
+    uint vBase = triOffset * 3; // 3 vertices per triangle
+    uint iBase = triOffset * 3; // 3 indices per triangle
+
+    float4 defaultColor = float4(0.82f, 0.84f, 0.86f, 0.85f);
+
+    for (int i = 0; triTable[cubeIndex][i] != -1; i += 3) {
+        int e0 = triTable[cubeIndex][i];
+        int e1 = triTable[cubeIndex][i + 1];
+        int e2 = triTable[cubeIndex][i + 2];
+
+        vertices[vBase + 0].position = edgeVerts[e0];
+        vertices[vBase + 0].normal   = edgeNormals[e0];
+        vertices[vBase + 0].color    = defaultColor;
+
+        vertices[vBase + 1].position = edgeVerts[e1];
+        vertices[vBase + 1].normal   = edgeNormals[e1];
+        vertices[vBase + 1].color    = defaultColor;
+
+        vertices[vBase + 2].position = edgeVerts[e2];
+        vertices[vBase + 2].normal   = edgeNormals[e2];
+        vertices[vBase + 2].color    = defaultColor;
+
+        indices[iBase + 0] = vBase + 0;
+        indices[iBase + 1] = vBase + 1;
+        indices[iBase + 2] = vBase + 2;
+
+        vBase += 3;
+        iBase += 3;
     }
 }
 

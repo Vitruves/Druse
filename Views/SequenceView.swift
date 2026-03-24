@@ -82,7 +82,7 @@ struct SequenceView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if viewModel.protein == nil {
+            if viewModel.molecules.protein == nil {
                 ContentUnavailableView {
                     Label("No Protein", systemImage: "textformat.abc")
                 } description: {
@@ -94,18 +94,18 @@ struct SequenceView: View {
         }
         .padding(12)
         .onAppear {
-            if let prot = viewModel.protein, cachedProteinID != prot.id {
+            if let prot = viewModel.molecules.protein, cachedProteinID != prot.id {
                 rebuildSSCache(prot: prot)
             }
         }
-        .onChange(of: viewModel.protein?.id) { _, newID in
-            if let prot = viewModel.protein, let newID, cachedProteinID != newID {
+        .onChange(of: viewModel.molecules.protein?.id) { _, newID in
+            if let prot = viewModel.molecules.protein, let newID, cachedProteinID != newID {
                 rebuildSSCache(prot: prot)
             }
         }
         .sheet(isPresented: $showRenameSheet) { renameSheet }
         .sheet(isPresented: $showMergeSheet) { mergeSheet }
-        .alert("Delete \(viewModel.selectedResidueIndices.count) residues?",
+        .alert("Delete \(viewModel.workspace.selectedResidueIndices.count) residues?",
                isPresented: $showDeleteConfirm) {
             Button("Delete", role: .destructive) { viewModel.deleteSelectedResidues() }
             Button("Cancel", role: .cancel) {}
@@ -118,7 +118,7 @@ struct SequenceView: View {
 
     @ViewBuilder
     private var sequenceContent: some View {
-        if let prot = viewModel.protein {
+        if let prot = viewModel.molecules.protein {
             // Header
             HStack {
                 Label("Sequence", systemImage: "textformat.abc")
@@ -135,19 +135,19 @@ struct SequenceView: View {
             toolbar(prot)
 
             // Selection info
-            if !viewModel.selectedResidueIndices.isEmpty {
+            if !viewModel.workspace.selectedResidueIndices.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "scope")
                         .font(.system(size: 9))
                         .foregroundStyle(.cyan)
-                    Text("\(viewModel.selectedResidueIndices.count) selected")
+                    Text("\(viewModel.workspace.selectedResidueIndices.count) selected")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.cyan)
                     Spacer()
                     Button {
-                        viewModel.selectedResidueIndices.removeAll()
-                        viewModel.selectedAtomIndices.removeAll()
-                        viewModel.selectedAtomIndex = nil
+                        viewModel.workspace.selectedResidueIndices.removeAll()
+                        viewModel.workspace.selectedAtomIndices.removeAll()
+                        viewModel.workspace.selectedAtomIndex = nil
                         viewModel.pushToRenderer()
                     } label: {
                         Text("Clear")
@@ -293,7 +293,7 @@ struct SequenceView: View {
                 // instead of creating 1000+ individual SwiftUI views
                 SequenceCanvas(
                     cells: cells,
-                    selectedResidueIndices: viewModel.selectedResidueIndices,
+                    selectedResidueIndices: viewModel.workspace.selectedResidueIndices,
                     hoveredResIdx: hoveredResIdx,
                     ssCache: ssCache,
                     onTapCell: { entry in handleResidueClick(entry) },
@@ -373,12 +373,12 @@ struct SequenceView: View {
 
     @ViewBuilder
     private func residueContextMenu(_ entry: ResidueEntry, chainID: String, prot: Molecule) -> some View {
-        let isSelected = viewModel.selectedResidueIndices.contains(entry.resIdx)
-        let selCount = viewModel.selectedResidueIndices.count
+        let isSelected = viewModel.workspace.selectedResidueIndices.contains(entry.resIdx)
+        let selCount = viewModel.workspace.selectedResidueIndices.count
 
         if !isSelected {
             Button("Select Residue \(entry.name) \(entry.seqNum)") {
-                viewModel.selectedResidueIndices = [entry.resIdx]
+                viewModel.workspace.selectedResidueIndices = [entry.resIdx]
                 syncAtomSelectionFromResidues()
                 viewModel.pushToRenderer()
             }
@@ -402,6 +402,24 @@ struct SequenceView: View {
             Button("Define Pocket from Selection") {
                 viewModel.definePocketFromSelection()
             }
+
+            Button("Add Docking Constraint\u{2026}") {
+                viewModel.showConstraintSheetForResidue(entry.resIdx)
+            }
+
+            let isFlexible = viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.contains(entry.resIdx)
+            Button(isFlexible ? "Remove Flexible Residue" : "Make Flexible (Induced Fit)") {
+                if isFlexible {
+                    viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.removeAll { $0 == entry.resIdx }
+                } else if viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.count < FlexibleResidueConfig.maxFlexibleResidues {
+                    if let prot = viewModel.molecules.protein,
+                       let atom = prot.atoms.first(where: { $0.residueSeq == entry.resIdx }),
+                       RotamerLibrary.rotamers(for: atom.residueName) != nil {
+                        viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.append(entry.resIdx)
+                    }
+                }
+            }
+            .disabled(!isFlexible && viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.count >= FlexibleResidueConfig.maxFlexibleResidues)
 
             Divider()
         }
@@ -452,28 +470,28 @@ struct SequenceView: View {
 
         if isShift, let last = lastClickedResIdx {
             // Range select between last clicked and current
-            guard let prot = viewModel.protein else { return }
+            guard let prot = viewModel.molecules.protein else { return }
             // Find all residues in the same chain between the two indices
             let lo = min(last, entry.resIdx)
             let hi = max(last, entry.resIdx)
             if !isCmd {
                 // Shift without Cmd: replace selection with range
-                viewModel.selectedResidueIndices.removeAll()
+                viewModel.workspace.selectedResidueIndices.removeAll()
             }
             for i in lo...hi {
                 guard i < prot.residues.count else { continue }
-                viewModel.selectedResidueIndices.insert(i)
+                viewModel.workspace.selectedResidueIndices.insert(i)
             }
         } else if isCmd {
             // Toggle individual residue
-            if viewModel.selectedResidueIndices.contains(entry.resIdx) {
-                viewModel.selectedResidueIndices.remove(entry.resIdx)
+            if viewModel.workspace.selectedResidueIndices.contains(entry.resIdx) {
+                viewModel.workspace.selectedResidueIndices.remove(entry.resIdx)
             } else {
-                viewModel.selectedResidueIndices.insert(entry.resIdx)
+                viewModel.workspace.selectedResidueIndices.insert(entry.resIdx)
             }
         } else {
             // Single select
-            viewModel.selectedResidueIndices = [entry.resIdx]
+            viewModel.workspace.selectedResidueIndices = [entry.resIdx]
         }
 
         lastClickedResIdx = entry.resIdx
@@ -483,14 +501,14 @@ struct SequenceView: View {
 
     /// Update selectedAtomIndices to match the current residue selection.
     private func syncAtomSelectionFromResidues() {
-        guard let prot = viewModel.protein else { return }
+        guard let prot = viewModel.molecules.protein else { return }
         var atomIndices = Set<Int>()
-        for resIdx in viewModel.selectedResidueIndices {
+        for resIdx in viewModel.workspace.selectedResidueIndices {
             guard resIdx < prot.residues.count else { continue }
             atomIndices.formUnion(prot.residues[resIdx].atomIndices)
         }
-        viewModel.selectedAtomIndices = atomIndices
-        viewModel.selectedAtomIndex = atomIndices.first
+        viewModel.workspace.selectedAtomIndices = atomIndices
+        viewModel.workspace.selectedAtomIndex = atomIndices.first
     }
 
     // MARK: - SS Legend Dot
@@ -510,7 +528,7 @@ struct SequenceView: View {
 
     @ViewBuilder
     private func selectedResidueInfo(_ prot: Molecule) -> some View {
-        let sortedSelected = viewModel.selectedResidueIndices.sorted()
+        let sortedSelected = viewModel.workspace.selectedResidueIndices.sorted()
         if sortedSelected.isEmpty {
             EmptyView()
         } else if sortedSelected.count == 1, let first = sortedSelected.first, first < prot.residues.count {

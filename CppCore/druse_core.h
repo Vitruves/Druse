@@ -111,6 +111,48 @@ DruseConformerSet* druse_generate_conformers(
 void druse_free_conformer_set(DruseConformerSet *set);
 
 // ============================================================================
+// MARK: - Tautomer & Protomer Enumeration
+// ============================================================================
+
+typedef struct {
+    int32_t kind;       // 0 = tautomer, 1 = protomer
+    char label[128];    // human-readable description
+} DruseVariantInfo;
+
+typedef struct {
+    DruseMoleculeResult **variants;
+    int32_t count;
+    double *scores;             // MMFF energy or tautomer score per variant
+    DruseVariantInfo *infos;    // per-variant metadata (kind + label)
+} DruseVariantSet;
+
+/// Enumerate tautomers using RDKit MolStandardize::TautomerEnumerator.
+/// Each tautomer gets 3D coordinates (ETKDGv3 + MMFF94 minimize).
+/// maxTautomers: maximum number of tautomers to return.
+/// energyCutoff: discard tautomers with MMFF energy > best + cutoff kcal/mol (0 = no cutoff).
+DruseVariantSet* druse_enumerate_tautomers(
+    const char *smiles,
+    const char *name,
+    int32_t maxTautomers,
+    double energyCutoff
+);
+
+/// Enumerate protomers (protonation state variants) at a target pH.
+/// Uses SMARTS-based ionizable group detection with Henderson-Hasselbalch.
+/// maxProtomers: maximum total protomers to return.
+/// pH: target pH (typically 7.4).
+/// pkaThreshold: generate both states for groups where |pH - pKa| < threshold.
+DruseVariantSet* druse_enumerate_protomers(
+    const char *smiles,
+    const char *name,
+    int32_t maxProtomers,
+    double pH,
+    double pkaThreshold
+);
+
+void druse_free_variant_set(DruseVariantSet *set);
+
+// ============================================================================
 // MARK: - Protein Preparation (fragment-based)
 // ============================================================================
 
@@ -126,6 +168,14 @@ DruseMoleculeResult* druse_compute_charges_pdb(const char *pdbContent);
 /// Compute Gasteiger charges for a molecule provided as an MDL mol block.
 /// Preserves atom ordering so charges can be merged back onto an existing ligand.
 DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock);
+
+/// Convert an MDL mol block to canonical SMILES.
+/// Uses RDKit's native MolBlockToMol parser, which handles both 2D and 3D coordinates correctly.
+/// Returns a result with the SMILES string populated (atoms/bonds are NOT populated).
+const char* druse_molblock_to_smiles(const char *molBlock);
+
+/// Free the string returned by druse_molblock_to_smiles.
+void druse_free_string(const char *str);
 
 /// Convert atoms+bonds (with 3D coordinates) to SMILES.
 /// Builds an RWMol from the provided atom/bond arrays, sanitizes, and returns
@@ -269,6 +319,17 @@ float druse_compute_rmsd(const float *a, const float *b, int32_t n);
 /// The API name remains for compatibility; current implementation does not use LBFGS++ yet.
 DruseMoleculeResult* druse_minimize_lbfgs(const char *smiles, const char *name, int32_t maxIters);
 
+/// Compute MMFF94 strain energy for a ligand with specified heavy atom coordinates.
+/// Builds molecule from SMILES, places heavy atoms at given positions, optimizes H positions,
+/// then evaluates MMFF94 energy. Returns energy in kcal/mol, or NaN on failure.
+/// heavyPositions: interleaved [x0,y0,z0, x1,y1,z1, ...] for numHeavy atoms.
+double druse_mmff_strain_energy(const char *smiles, const float *heavyPositions, int32_t numHeavy);
+
+/// Compute MMFF94 energy of a molecule's current conformation (from SMILES with 3D embedding).
+/// Returns energy in kcal/mol after MMFF minimization, or NaN on failure.
+/// Use as reference energy; strain = druse_mmff_strain_energy() - reference.
+double druse_mmff_reference_energy(const char *smiles);
+
 // ============================================================================
 // MARK: - mmCIF Parser
 // ============================================================================
@@ -352,14 +413,25 @@ void druse_compute_esp(
 // ============================================================================
 
 /// TBB-parallel batch processing of SMILES strings.
+/// If cancel_flag is non-null, the loop checks it each iteration and skips
+/// remaining work once *cancel_flag becomes true.
+/// The cancel_flag is read atomically; the caller should use
+/// druse_atomic_cancel_store() to set it.
 DruseMoleculeResult** druse_batch_process_parallel(
     const char **smiles_array,
     const char **name_array,
     int32_t count,
     bool addHydrogens,
     bool minimize,
-    bool computeCharges
+    bool computeCharges,
+    const volatile int32_t *cancel_flag
 );
+
+/// Atomically store a value into a cancel flag (use value=1 to cancel, 0 to reset).
+void druse_atomic_cancel_store(volatile int32_t *flag, int32_t value);
+
+/// Atomically load the current value of a cancel flag.
+int32_t druse_atomic_cancel_load(const volatile int32_t *flag);
 
 // ============================================================================
 // MARK: - Fingerprints

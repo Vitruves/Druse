@@ -1603,6 +1603,12 @@ enum Protonation {
         }
     }
 
+    /// Ring neighbor atom names for each histidine imidazole nitrogen.
+    private static let hisRingNeighbors: [String: [String]] = [
+        "ND1": ["CG", "CE1"],
+        "NE2": ["CE1", "CD2"]
+    ]
+
     private static func histidineTautomerScore(
         atomName: String,
         residueIndices: [Int],
@@ -1614,11 +1620,41 @@ enum Protonation {
         let site = atoms[siteIndex]
         let residueSet = Set(residueIndices)
 
+        // Compute the approximate N-H direction (away from the ring center).
+        // This is: normalize(N_pos - midpoint(neighbor1, neighbor2))
+        let neighborNames = hisRingNeighbors[atomName] ?? []
+        let neighborPositions: [SIMD3<Float>] = neighborNames.compactMap { name in
+            guard let idx = residueIndices.first(where: { normalize(atoms[$0].name) == name }) else {
+                return nil
+            }
+            return atoms[idx].position
+        }
+
+        // If we can't find both ring neighbors, fall back to distance-only scoring.
+        let hDirection: SIMD3<Float>?
+        if neighborPositions.count == 2 {
+            let midpoint = (neighborPositions[0] + neighborPositions[1]) * 0.5
+            let raw = site.position - midpoint
+            let len = simd_length(raw)
+            hDirection = len > 1e-6 ? raw / len : nil
+        } else {
+            hDirection = nil
+        }
+
         return atoms.enumerated().reduce(Float.zero) { partial, entry in
             let (otherIndex, other) = entry
             guard !residueSet.contains(otherIndex), other.element != .H else { return partial }
             let distance = simd_distance(site.position, other.position)
             guard distance > 0.1 && distance < 3.5 else { return partial }
+
+            // Angle filter: candidate must be within 120° of the N-H direction.
+            if let hDir = hDirection {
+                let toCandidate = simd_normalize(other.position - site.position)
+                let cosAngle = simd_dot(toCandidate, hDir)
+                // cos(120°) = -0.5; reject atoms behind the imidazole plane
+                guard cosAngle > -0.5 else { return partial }
+            }
+
             if isAcceptorLike(other) {
                 return partial + max(0.0, 3.5 - distance) / 3.5
             }
