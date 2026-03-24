@@ -215,6 +215,8 @@ struct MolecularInteraction: Identifiable, Sendable {
         case halogen = 5      // Halogen bond: F/Cl/Br ↔ N/O, 2.5-3.5 Å
         case metalCoord = 6   // Metal coordination: Zn/Fe/Mg ↔ N/O/S, < 2.8 Å
         case chPi = 7         // CH-π: C-H ↔ aromatic ring, 3.5-4.5 Å
+        case amideStack = 8   // Amide-π: backbone amide ↔ aromatic ring, 3.0-5.0 Å
+        case chalcogen = 9    // Chalcogen bond: C-S...O/N σ-hole, 2.8-3.8 Å
 
         var color: SIMD4<Float> {
             switch self {
@@ -226,6 +228,8 @@ struct MolecularInteraction: Identifiable, Sendable {
             case .halogen:     SIMD4(0.2, 1.0, 0.5, 1.0)    // green
             case .metalCoord:  SIMD4(1.0, 0.85, 0.0, 1.0)   // gold
             case .chPi:        SIMD4(0.6, 0.5, 0.8, 0.7)    // light purple
+            case .amideStack:  SIMD4(0.9, 0.6, 0.3, 0.9)    // amber
+            case .chalcogen:   SIMD4(0.8, 0.9, 0.2, 1.0)    // yellow-green
             }
         }
 
@@ -239,6 +243,8 @@ struct MolecularInteraction: Identifiable, Sendable {
             case .halogen:     "Halogen bond"
             case .metalCoord:  "Metal coord."
             case .chPi:        "CH-π"
+            case .amideStack:  "Amide-π"
+            case .chalcogen:   "Chalcogen bond"
             }
         }
     }
@@ -296,6 +302,8 @@ final class DockingEngine {
     private var proteinCationBuffer: MTLBuffer?
     private var drusinaParamsBuffer: MTLBuffer?
     private var halogenInfoBuffer: MTLBuffer?
+    private var proteinAmideBuffer: MTLBuffer?
+    private var chalcogenInfoBuffer: MTLBuffer?
 
     // Pharmacophore constraint buffers
     private var pharmaConstraintBuffer: MTLBuffer?
@@ -881,12 +889,30 @@ final class DockingEngine {
 
         let gpuAtoms = protein.atoms.enumerated().compactMap { atomIndex, atom -> GridProteinAtom? in
             guard atom.element != .H else { return nil }
+            let atomName = atom.name.trimmingCharacters(in: .whitespaces)
+            let resName = atom.residueName.trimmingCharacters(in: .whitespaces)
+            var atomFlags: UInt32 = 0
+            // Salt bridge: positive charged atoms (Lys NZ, Arg NH1/NH2/NE/CZ, His NE2/ND1 protonated)
+            let posAtoms: Set<String> = ["NZ", "NH1", "NH2", "NE", "CZ"]
+            let posRes: Set<String> = ["LYS", "ARG"]
+            if (posRes.contains(resName) && posAtoms.contains(atomName)) || atom.formalCharge > 0 {
+                atomFlags |= UInt32(GRPROT_FLAG_POS_CHARGED)
+            }
+            if resName == "HIS" && (atomName == "NE2" || atomName == "ND1") && atom.formalCharge > 0 {
+                atomFlags |= UInt32(GRPROT_FLAG_POS_CHARGED)
+            }
+            // Salt bridge: negative charged atoms (Asp OD1/OD2, Glu OE1/OE2)
+            let negAtoms: Set<String> = ["OD1", "OD2", "OE1", "OE2"]
+            let negRes: Set<String> = ["ASP", "GLU"]
+            if negRes.contains(resName) && negAtoms.contains(atomName) {
+                atomFlags |= UInt32(GRPROT_FLAG_NEG_CHARGED)
+            }
             return GridProteinAtom(
                 position: atom.position,
                 vdwRadius: atom.element.vdwRadius,
                 charge: electrostaticCharge(for: atom),
                 vinaType: vinaProteinAtomType(for: atomIndex, in: protein),
-                _pad0: 0, _pad1: 0
+                flags: atomFlags, _pad1: 0
             )
         }
 
@@ -1230,6 +1256,95 @@ final class DockingEngine {
             length: halogens.count * MemoryLayout<HalogenBondInfo>.stride,
             options: .storageModeShared)
 
+        // --- Chalcogen bond info (ligand S bonded to C → σ-hole direction) ---
+        var chalcogens: [ChalcogenBondInfo] = []
+        for (i, gpuAtom) in gpuLigAtoms.enumerated() {
+            guard gpuAtom.vinaType == Int32(VINA_S_P.rawValue) else { continue }
+            // Find bonded carbon for σ-hole direction
+            for bond in ligandBonds {
+                let partner: Int?
+                if bond.atomIndex1 == i { partner = bond.atomIndex2 }
+                else if bond.atomIndex2 == i { partner = bond.atomIndex1 }
+                else { partner = nil }
+                if let p = partner, p < ligandAtoms.count, ligandAtoms[p].element == .C {
+                    chalcogens.append(ChalcogenBondInfo(sulfurAtomIndex: Int32(i), carbonAtomIndex: Int32(p)))
+                    break
+                }
+            }
+        }
+        if chalcogens.isEmpty {
+            chalcogens.append(ChalcogenBondInfo(sulfurAtomIndex: -1, carbonAtomIndex: -1))
+        }
+        chalcogenInfoBuffer = device.makeBuffer(
+            bytes: &chalcogens,
+            length: chalcogens.count * MemoryLayout<ChalcogenBondInfo>.stride,
+            options: .storageModeShared)
+
+        // --- Protein backbone amide planes (for amide-π stacking) ---
+        // Detect backbone amide groups: C(=O)-N triplets per residue
+        var amides: [ProteinAmideGPU] = []
+        // Group protein atoms by (chainID, residueSeq) for backbone atom lookup
+        var residueAtoms: [String: [Atom]] = [:]
+        for atom in proteinAtoms {
+            let key = "\(atom.chainID)_\(atom.residueSeq)"
+            residueAtoms[key, default: []].append(atom)
+        }
+        for (_, atoms) in residueAtoms {
+            // Find backbone C (carbonyl carbon), O, and N
+            let bbC = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "C" && !$0.isHetAtom }
+            let bbO = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "O" && !$0.isHetAtom }
+            let bbN = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "N" && !$0.isHetAtom }
+            guard let c = bbC, let o = bbO, let n = bbN else { continue }
+
+            let centroid = (c.position + o.position + n.position) / 3.0
+            let v1 = o.position - c.position
+            let v2 = n.position - c.position
+            var normal = simd_cross(v1, v2)
+            let nLen = simd_length(normal)
+            guard nLen > 1e-6 else { continue }
+            normal /= nLen
+
+            amides.append(ProteinAmideGPU(centroid: centroid, _pad0: 0, normal: normal, _pad1: 0))
+        }
+        // Also detect sidechain amides (Asn ND2/OD1/CG, Gln NE2/OE1/CD)
+        for (_, atoms) in residueAtoms {
+            let resName = atoms.first?.residueName.trimmingCharacters(in: .whitespaces) ?? ""
+            if resName == "ASN" {
+                let cg = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "CG" }
+                let od1 = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "OD1" }
+                let nd2 = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "ND2" }
+                guard let c = cg, let o = od1, let n = nd2 else { continue }
+                let centroid = (c.position + o.position + n.position) / 3.0
+                let v1 = o.position - c.position
+                let v2 = n.position - c.position
+                var normal = simd_cross(v1, v2)
+                let nLen = simd_length(normal)
+                guard nLen > 1e-6 else { continue }
+                normal /= nLen
+                amides.append(ProteinAmideGPU(centroid: centroid, _pad0: 0, normal: normal, _pad1: 0))
+            } else if resName == "GLN" {
+                let cd = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "CD" }
+                let oe1 = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "OE1" }
+                let ne2 = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "NE2" }
+                guard let c = cd, let o = oe1, let n = ne2 else { continue }
+                let centroid = (c.position + o.position + n.position) / 3.0
+                let v1 = o.position - c.position
+                let v2 = n.position - c.position
+                var normal = simd_cross(v1, v2)
+                let nLen = simd_length(normal)
+                guard nLen > 1e-6 else { continue }
+                normal /= nLen
+                amides.append(ProteinAmideGPU(centroid: centroid, _pad0: 0, normal: normal, _pad1: 0))
+            }
+        }
+        if amides.isEmpty {
+            amides.append(ProteinAmideGPU(centroid: .zero, _pad0: 0, normal: .init(0, 1, 0), _pad1: 0))
+        }
+        proteinAmideBuffer = device.makeBuffer(
+            bytes: &amides,
+            length: amides.count * MemoryLayout<ProteinAmideGPU>.stride,
+            options: .storageModeShared)
+
         // --- Drusina parameters ---
         var params = DrusinaParams(
             numProteinRings: UInt32(protRings.count),
@@ -1239,7 +1354,13 @@ final class DockingEngine {
             wPiPi: -0.40,
             wPiCation: -0.80,
             wHalogenBond: -0.50,
-            wMetalCoord: -1.00)
+            wMetalCoord: -1.00,
+            numProteinAmides: UInt32(amides.first?.centroid == .zero && amides.count == 1 ? 0 : amides.count),
+            numChalcogens: UInt32(chalcogens.first?.sulfurAtomIndex == -1 ? 0 : chalcogens.count),
+            wSaltBridge: -0.60,
+            wAmideStack: -0.40,
+            wChalcogenBond: -0.30,
+            _pad: 0)
         drusinaParamsBuffer = device.makeBuffer(
             bytes: &params,
             length: MemoryLayout<DrusinaParams>.stride,
@@ -1702,12 +1823,13 @@ final class DockingEngine {
                     dispatches.append((pipeline: activeLocalSearchPipeline, buffers: vinaScoreBuffers))
                 }
                 if useDrusina, let drusinaPipe = drusinaScorePipeline {
-                    // Drusina: grid Vina + π-π, π-cation, halogen, metal corrections
+                    // Drusina: grid Vina + π-π, π-cation, halogen, metal, salt bridge, amide-π, chalcogen
                     var drusinaBuffers = vinaScoreBuffers
                     drusinaBuffers.append(contentsOf: [
                         (proteinRingBuffer!, 9), (ligandRingBuffer!, 10),
                         (proteinCationBuffer!, 11), (drusinaParamsBuffer!, 12),
-                        (proteinAtomBuffer!, 13), (halogenInfoBuffer!, 14)
+                        (proteinAtomBuffer!, 13), (halogenInfoBuffer!, 14),
+                        (proteinAmideBuffer!, 15), (chalcogenInfoBuffer!, 16)
                     ])
                     dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
                 } else {
@@ -1985,7 +2107,8 @@ final class DockingEngine {
         guard let pipe = drusinaScorePipeline,
               let prBuf = proteinRingBuffer, let lrBuf = ligandRingBuffer,
               let pcBuf = proteinCationBuffer, let dpBuf = drusinaParamsBuffer,
-              let paBuf = proteinAtomBuffer, let hiBuf = halogenInfoBuffer else {
+              let paBuf = proteinAtomBuffer, let hiBuf = halogenInfoBuffer,
+              let amBuf = proteinAmideBuffer, let chBuf = chalcogenInfoBuffer else {
             scorePopulation(buffer: buffer, tg: tg, tgs: tgs)
             return
         }
@@ -1995,7 +2118,8 @@ final class DockingEngine {
             (gridParamsBuffer!, 4), (gaParamsBuffer, 5),
             (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
             (exclusionMaskBuffer!, 8),
-            (prBuf, 9), (lrBuf, 10), (pcBuf, 11), (dpBuf, 12), (paBuf, 13), (hiBuf, 14)
+            (prBuf, 9), (lrBuf, 10), (pcBuf, 11), (dpBuf, 12), (paBuf, 13), (hiBuf, 14),
+            (amBuf, 15), (chBuf, 16)
         ], threadGroups: tg, threadGroupSize: tgs)
     }
 

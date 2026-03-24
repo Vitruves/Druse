@@ -391,11 +391,14 @@ struct InteractionDiagramView: View {
         if types.contains(.saltBridge) {
             return Color(red: 1.0, green: 0.5, blue: 0.1)       // Salt bridge: orange
         }
-        if types.contains(.piStack) || types.contains(.piCation) {
+        if types.contains(.piStack) || types.contains(.piCation) || types.contains(.amideStack) {
             return Color(red: 0.6, green: 0.3, blue: 0.9)       // Aromatic: purple
         }
         if types.contains(.metalCoord) {
             return Color(red: 1.0, green: 0.85, blue: 0.0)      // Metal: gold
+        }
+        if types.contains(.chalcogen) {
+            return Color(red: 0.5, green: 0.8, blue: 0.2)       // Chalcogen: yellow-green
         }
         if types.contains(.hydrophobic) || types.contains(.chPi) {
             return Color(red: 0.9, green: 0.8, blue: 0.2)       // Hydrophobic: yellow
@@ -455,7 +458,9 @@ struct InteractionDiagramView: View {
         if types.contains(.metalCoord) { return .metalCoord }
         if types.contains(.piStack) { return .piStack }
         if types.contains(.piCation) { return .piCation }
+        if types.contains(.amideStack) { return .amideStack }
         if types.contains(.halogen) { return .halogen }
+        if types.contains(.chalcogen) { return .chalcogen }
         if types.contains(.chPi) { return .chPi }
         return .hydrophobic
     }
@@ -469,9 +474,9 @@ struct InteractionDiagramView: View {
             return (Color.green.opacity(0.1), Color.green.opacity(0.5))
         case .saltBridge:
             return (Color.orange.opacity(0.1), Color.orange.opacity(0.5))
-        case .piStack, .piCation:
+        case .piStack, .piCation, .amideStack:
             return (Color.purple.opacity(0.1), Color.purple.opacity(0.5))
-        case .halogen:
+        case .halogen, .chalcogen:
             return (Color.green.opacity(0.08), Color.green.opacity(0.4))
         case .metalCoord:
             return (Color.yellow.opacity(0.1), Color.yellow.opacity(0.6))
@@ -556,6 +561,18 @@ struct InteractionDiagramView: View {
             path.move(to: from)
             path.addLine(to: to)
             context.stroke(path, with: .color(color), lineWidth: 2)
+
+        case .amideStack:
+            // Dashed amber line (similar to π-stack)
+            drawDashedLine(ctx: context, from: from, to: to, color: color, dashLen: 5, lineWidth: 1.5)
+
+        case .chalcogen:
+            // Solid line with arrow (like halogen bond)
+            var path = Path()
+            path.move(to: from)
+            path.addLine(to: to)
+            context.stroke(path, with: .color(color), lineWidth: 1.5)
+            drawArrowhead(context: context, at: to, from: from, color: color, size: 4)
         }
 
         // Distance label at midpoint

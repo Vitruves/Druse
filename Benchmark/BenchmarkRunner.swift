@@ -105,15 +105,20 @@ final class BenchmarkRunner: XCTestCase {
     // ==========================================================================
 
     /// Dock all complexes with a given scoring method.
-    /// Returns results path.
+    /// - Parameter maxComplexes: If > 0, limit to first N complexes for quick validation.
     @MainActor
     private func runBenchmark(
         scoringMethod: ScoringMethod,
         label: String,
-        outputFile: String
+        outputFile: String,
+        maxComplexes: Int = 0
     ) async throws {
         let manifest = try loadManifest()
-        print("[\(label)] \(manifest.complexes.count) complexes")
+        let complexes = maxComplexes > 0
+            ? Array(manifest.complexes.prefix(maxComplexes))
+            : manifest.complexes
+        let suffix = maxComplexes > 0 ? " (first \(complexes.count))" : ""
+        print("[\(label)] \(complexes.count) complexes\(suffix)")
 
         let eng = try engine()
 
@@ -139,10 +144,10 @@ final class BenchmarkRunner: XCTestCase {
             entries: []
         )
 
-        let total = manifest.complexes.count
+        let total = complexes.count
         var succeeded = 0, failed = 0
 
-        for (idx, complex) in manifest.complexes.enumerated() {
+        for (idx, complex) in complexes.enumerated() {
             let t0 = CFAbsoluteTimeGetCurrent()
             var entry = BenchmarkResultEntry(
                 pdbId: complex.pdbId,
@@ -334,6 +339,24 @@ final class BenchmarkRunner: XCTestCase {
 
         let total = CFAbsoluteTimeGetCurrent() - t0
         print("\n=== Full benchmark completed in \(String(format: "%.1f", total / 60)) minutes ===")
+    }
+
+    // ==========================================================================
+    // MARK: - Quick Validation (first N complexes)
+    // ==========================================================================
+
+    /// Quick Vina vs Drusina comparison on first N complexes.
+    @MainActor
+    func testCASF_Quick(n: Int = 10) async throws {
+        print("=== Quick Validation: Vina vs Drusina (first \(n)) ===\n")
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: "casf_vina_quick.json", maxComplexes: n)
+        print("\n" + String(repeating: "-", count: 50) + "\n")
+        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: "casf_drusina_quick.json", maxComplexes: n)
+
+        let total = CFAbsoluteTimeGetCurrent() - t0
+        print("\n=== Quick validation completed in \(String(format: "%.1f", total / 60)) minutes ===")
     }
 }
 

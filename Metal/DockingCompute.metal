@@ -1111,7 +1111,9 @@ kernel void scorePosesExplicit(
 // MARK: - Drusina Extended Scoring
 // ============================================================================
 
-/// Compute Drusina correction terms (π-π stacking, π-cation, halogen bond, metal coordination).
+/// Compute Drusina correction terms:
+///   - π-π stacking, π-cation, halogen bond, metal coordination (original)
+///   - salt bridge, amide-π stacking, chalcogen bond (extended)
 /// Returns total correction energy (kcal/mol, negative = favorable).
 inline float computeDrusinaCorrections(
     thread float3              *positions,
@@ -1123,17 +1125,23 @@ inline float computeDrusinaCorrections(
     constant DrusinaParams     &params,
     constant GridProteinAtom   *proteinAtoms,
     uint                        numProteinAtoms,
-    constant HalogenBondInfo   *halogenInfo)
+    constant HalogenBondInfo   *halogenInfo,
+    constant ProteinAmideGPU   *proteinAmides,
+    constant ChalcogenBondInfo *chalcogenInfo)
 {
     float drusinaE = 0.0f;
 
-    // ---- π-π stacking & π-cation (ligand rings) ----
-    for (uint lr = 0; lr < params.numLigandRings; lr++) {
+    // Pre-compute ligand ring centroids and normals for reuse (π-π + amide-π)
+    const uint MAX_LIG_RINGS = 8u;
+    float3 ligRingCentroid[MAX_LIG_RINGS];
+    float3 ligRingNormal[MAX_LIG_RINGS];
+    uint numValidLigRings = 0;
+
+    for (uint lr = 0; lr < min(params.numLigandRings, MAX_LIG_RINGS); lr++) {
         LigandRingGPU ring = ligandRings[lr];
         int nR = min(ring.numAtoms, 6);
         if (nR < 3) continue;
 
-        // Compute centroid from transformed positions
         float3 centroid = float3(0);
         int valid = 0;
         for (int i = 0; i < nR; i++) {
@@ -1146,7 +1154,6 @@ inline float computeDrusinaCorrections(
         if (valid < 3) continue;
         centroid /= float(valid);
 
-        // Normal from cross product of first two edges
         int i0 = ring.atomIndices[0], i1 = ring.atomIndices[1], i2 = ring.atomIndices[2];
         if (i0 < 0 || i1 < 0 || i2 < 0 ||
             uint(i0) >= nAtoms || uint(i1) >= nAtoms || uint(i2) >= nAtoms) continue;
@@ -1156,6 +1163,16 @@ inline float computeDrusinaCorrections(
         float nLen = length(norm);
         if (nLen < 1e-6f) continue;
         norm /= nLen;
+
+        ligRingCentroid[numValidLigRings] = centroid;
+        ligRingNormal[numValidLigRings] = norm;
+        numValidLigRings++;
+    }
+
+    // ---- π-π stacking & π-cation (ligand rings vs protein rings/cations) ----
+    for (uint lr = 0; lr < numValidLigRings; lr++) {
+        float3 centroid = ligRingCentroid[lr];
+        float3 norm = ligRingNormal[lr];
 
         // π-π: check ligand ring vs each protein ring
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
@@ -1204,6 +1221,57 @@ inline float computeDrusinaCorrections(
         }
     }
 
+    // ---- Salt bridge: oppositely charged ligand ↔ protein atoms ----
+    // Donald 2011: N-O pair cutoff 4 Å, optimal ρ ~3.5 Å
+    for (uint a = 0; a < nAtoms; a++) {
+        int ligCharge = ligandAtoms[a].formalCharge;
+        if (ligCharge == 0) continue;
+
+        for (uint p = 0; p < numProteinAtoms; p++) {
+            uint pflags = proteinAtoms[p].flags;
+            bool protPos = (pflags & GRPROT_FLAG_POS_CHARGED) != 0;
+            bool protNeg = (pflags & GRPROT_FLAG_NEG_CHARGED) != 0;
+
+            // Require opposite charges
+            bool isSB = (ligCharge > 0 && protNeg) || (ligCharge < 0 && protPos);
+            if (!isSB) continue;
+
+            float d = distance(positions[a], proteinAtoms[p].position);
+            if (d > 4.5f) continue;
+
+            // Gaussian centered at 3.5 Å (optimal salt bridge distance, Donald 2011 Fig 3)
+            float dd = d - 3.5f;
+            drusinaE += params.wSaltBridge * exp(-dd * dd * 2.0f);
+        }
+    }
+
+    // ---- Amide-π stacking: protein backbone amide ↔ ligand aromatic ring ----
+    // Harder 2013: optimal d=3.4 Å interplanar, r=3.5-4.0 Å centroid, parallel (|dotN|>0.85)
+    // Energy range: -1.3 to -4.1 kcal/mol (SCS-MP2), we use correction weight
+    for (uint lr = 0; lr < numValidLigRings; lr++) {
+        float3 centroid = ligRingCentroid[lr];
+        float3 norm = ligRingNormal[lr];
+
+        for (uint am = 0; am < params.numProteinAmides; am++) {
+            float d = distance(centroid, proteinAmides[am].centroid);
+            if (d < 3.0f || d > 5.0f) continue;
+
+            float dotN = abs(dot(norm, proteinAmides[am].normal));
+
+            // Parallel stacking (Harder 2013 Fig 9: interplanar ≤30°, |dotN| > 0.85)
+            if (dotN > 0.85f && d < 4.5f) {
+                // Gaussian at 3.8 Å (centroid-centroid, Harder 2013 Fig 6: d_min=3.4 Å interplanar)
+                float dd = d - 3.8f;
+                drusinaE += params.wAmideStack * exp(-dd * dd * 2.0f);
+            }
+            // Tilted/offset stacking (weaker, broader distance range)
+            else if (dotN > 0.65f && d >= 3.5f) {
+                float dd = d - 4.2f;
+                drusinaE += params.wAmideStack * 0.5f * exp(-dd * dd * 1.5f);
+            }
+        }
+    }
+
     // ---- Halogen bonds: C-X...O/N with σ-hole angle check ----
     for (uint h = 0; h < params.numHalogens; h++) {
         int hi = halogenInfo[h].halogenAtomIndex;
@@ -1229,6 +1297,37 @@ inline float computeDrusinaCorrections(
                 float dd = d - 3.1f;
                 float angleFactor = (-cosTheta - 0.766f) / 0.234f;
                 drusinaE += params.wHalogenBond * angleFactor * exp(-dd * dd * 3.33f);
+            }
+        }
+    }
+
+    // ---- Chalcogen bonds: C-S...O/N with σ-hole angle check ----
+    // Stricter than halogen: S σ-hole is weaker, angle > 150° (cos < -0.866)
+    // Distance 2.8-3.8 Å, optimal ~3.3 Å
+    for (uint ch = 0; ch < params.numChalcogens; ch++) {
+        int si = chalcogenInfo[ch].sulfurAtomIndex;
+        int ci = chalcogenInfo[ch].carbonAtomIndex;
+        if (si < 0 || ci < 0 || uint(si) >= nAtoms || uint(ci) >= nAtoms) continue;
+        float3 sPos = positions[si];
+        float3 cPos = positions[ci];
+
+        for (uint p = 0; p < numProteinAtoms; p++) {
+            int pType = proteinAtoms[p].vinaType;
+            bool isAcceptor = (pType == VINA_N_A || pType == VINA_N_DA ||
+                               pType == VINA_O_A || pType == VINA_O_DA);
+            if (!isAcceptor) continue;
+
+            float d = distance(sPos, proteinAtoms[p].position);
+            if (d < 2.8f || d > 3.8f) continue;
+
+            // σ-hole directionality: C-S-A angle > 150° (cos < -0.866)
+            float3 sToC = normalize(cPos - sPos);
+            float3 sToA = normalize(proteinAtoms[p].position - sPos);
+            float cosTheta = dot(sToC, sToA);
+            if (cosTheta < -0.866f) {
+                float dd = d - 3.3f;
+                float angleFactor = (-cosTheta - 0.866f) / 0.134f;
+                drusinaE += params.wChalcogenBond * angleFactor * exp(-dd * dd * 2.5f);
             }
         }
     }
@@ -1269,6 +1368,8 @@ kernel void scorePosesDrusina(
     constant DrusinaParams     &drusinaParams [[buffer(12)]],
     constant GridProteinAtom   *proteinAtoms  [[buffer(13)]],
     constant HalogenBondInfo   *halogenInfo   [[buffer(14)]],
+    constant ProteinAmideGPU   *proteinAmides [[buffer(15)]],
+    constant ChalcogenBondInfo *chalcogenInfo [[buffer(16)]],
     uint                        tid           [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1305,7 +1406,8 @@ kernel void scorePosesDrusina(
     float drusinaE = computeDrusinaCorrections(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
-        proteinAtoms, gridParams.numProteinAtoms, halogenInfo);
+        proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
+        proteinAmides, chalcogenInfo);
 
     pose.stericEnergy      = totalIntermolecular;
     pose.hydrophobicEnergy = 0.0f;
@@ -1330,6 +1432,8 @@ kernel void applyDrusinaCorrection(
     constant GridProteinAtom   *proteinAtoms  [[buffer(9)]],
     constant GridParams        &gridParams    [[buffer(10)]],
     constant HalogenBondInfo   *halogenInfo   [[buffer(11)]],
+    constant ProteinAmideGPU   *proteinAmides [[buffer(12)]],
+    constant ChalcogenBondInfo *chalcogenInfo [[buffer(13)]],
     uint                        tid           [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1345,7 +1449,8 @@ kernel void applyDrusinaCorrection(
     float drusinaE = computeDrusinaCorrections(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
-        proteinAtoms, gridParams.numProteinAtoms, halogenInfo);
+        proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
+        proteinAmides, chalcogenInfo);
 
     pose.drusinaCorrection = drusinaE;
     pose.energy += drusinaE;

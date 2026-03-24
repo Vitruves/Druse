@@ -133,13 +133,17 @@ enum VinaAtomType {
     VINA_OTHER = 31
 };
 
+// Flags for GridProteinAtom (salt bridge detection in Drusina scoring)
+#define GRPROT_FLAG_POS_CHARGED  (1u << 0)  // Lys NZ, Arg NH1/NH2/NE/CZ, His+ NE2/ND1
+#define GRPROT_FLAG_NEG_CHARGED  (1u << 1)  // Asp OD1/OD2, Glu OE1/OE2
+
 // Protein atom for grid map computation (packed for GPU)
 struct GridProteinAtom {
     simd_float3 position;
     float       vdwRadius;
     float       charge;       // partial charge
     int32_t     vinaType;     // VinaAtomType enum
-    int32_t     _pad0;
+    uint32_t    flags;        // GRPROT_FLAG_POS_CHARGED, GRPROT_FLAG_NEG_CHARGED
     float       _pad1;
 };
 
@@ -284,6 +288,20 @@ struct HalogenBondInfo {
     int32_t     carbonAtomIndex;
 };
 
+// Chalcogen bond info (maps ligand sulfur to its bonded carbon for σ-hole angle check)
+struct ChalcogenBondInfo {
+    int32_t     sulfurAtomIndex;
+    int32_t     carbonAtomIndex;
+};
+
+// Protein backbone amide plane (for amide-π stacking with ligand aromatics)
+struct ProteinAmideGPU {
+    simd_float3 centroid;     // center of C-O-N triangle
+    float       _pad0;
+    simd_float3 normal;       // normal to the amide plane
+    float       _pad1;
+};
+
 // Drusina scoring parameters
 struct DrusinaParams {
     uint32_t    numProteinRings;
@@ -294,6 +312,13 @@ struct DrusinaParams {
     float       wPiCation;       // π-cation weight (default: -0.80)
     float       wHalogenBond;    // halogen bond weight (default: -0.50)
     float       wMetalCoord;     // metal coordination weight (default: -1.00)
+    // Extended interactions (salt bridge, amide-π, chalcogen bond)
+    uint32_t    numProteinAmides;
+    uint32_t    numChalcogens;
+    float       wSaltBridge;     // salt bridge weight (default: -0.60)
+    float       wAmideStack;     // amide-π stacking weight (default: -0.40)
+    float       wChalcogenBond;  // chalcogen bond weight (default: -0.30)
+    float       _pad;
 };
 
 // ============================================================================

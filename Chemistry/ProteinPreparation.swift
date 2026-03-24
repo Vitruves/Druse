@@ -335,7 +335,8 @@ enum ProteinPreparation {
         }
 
         if report.removedWaterResidues > 0 {
-            Task { @MainActor in ActivityLog.shared.info("[Prep] Removed \(report.removedWaterResidues) water residues", category: .prep) }
+            let removedCount = report.removedWaterResidues
+            Task { @MainActor in ActivityLog.shared.info("[Prep] Removed \(removedCount) water residues", category: .prep) }
         }
 
         report.chainBreaks = detectChainBreaks(in: workingAtoms, bonds: workingBonds)
@@ -631,7 +632,7 @@ enum ProteinPreparation {
                 workingAtoms = merged.atoms
                 report.rdkitChargeMatches = merged.matchedCount
             } else if workingAtoms.count > maxAtomsForRDKitCharges {
-                report.hydrogenMethod = (report.hydrogenMethod ?? "") + " (charges: fallback, too large for RDKit)"
+                report.hydrogenMethod = report.hydrogenMethod + " (charges: fallback, too large for RDKit)"
             }
 
         case .eem, .qeq, .xtb:
@@ -670,7 +671,10 @@ enum ProteinPreparation {
         }.count
         report.nonZeroChargeAtoms = workingAtoms.filter { abs($0.charge) > 0.001 }.count
 
-        Task { @MainActor in ActivityLog.shared.info("[Prep] Docking prep done: \(workingAtoms.count) atoms, \(report.hydrogensAdded) H added, \(report.nonZeroChargeAtoms) charged atoms (\(chargeMethod))", category: .prep) }
+        let finalAtomCount = workingAtoms.count
+        let finalHAdded = report.hydrogensAdded
+        let finalChargedAtoms = report.nonZeroChargeAtoms
+        Task { @MainActor in ActivityLog.shared.info("[Prep] Docking prep done: \(finalAtomCount) atoms, \(finalHAdded) H added, \(finalChargedAtoms) charged atoms (\(chargeMethod))", category: .prep) }
         return (workingAtoms, workingBonds, report)
     }
 

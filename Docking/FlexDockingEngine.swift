@@ -353,7 +353,8 @@ final class FlexDockingEngine {
               let fpb = flexParamsBuffer
         else { return }
 
-        Task { @MainActor in ActivityLog.shared.debug("Dispatching flex scoring: popSize=\(populationSize), flexAtoms=\(self.numFlexAtoms)", category: .dock) }
+        let flexAtomCount = self.numFlexAtoms
+        Task { @MainActor in ActivityLog.shared.debug("Dispatching flex scoring: popSize=\(populationSize), flexAtoms=\(flexAtomCount)", category: .dock) }
 
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
@@ -388,7 +389,8 @@ final class FlexDockingEngine {
               let fpb = flexParamsBuffer
         else { return }
 
-        Task { @MainActor in ActivityLog.shared.debug("Dispatching chi evolution: popSize=\(populationSize), chiSlots=\(self.numChiSlots)", category: .dock) }
+        let chiSlotCount = self.numChiSlots
+        Task { @MainActor in ActivityLog.shared.debug("Dispatching chi evolution: popSize=\(populationSize), chiSlots=\(chiSlotCount)", category: .dock) }
 
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
@@ -427,7 +429,8 @@ final class FlexDockingEngine {
               let fpb = flexParamsBuffer
         else { return }
 
-        Task { @MainActor in ActivityLog.shared.debug("Dispatching flex local search: popSize=\(populationSize), torsions=\(self.numFlexTorsions)", category: .dock) }
+        let flexTorsionCount = self.numFlexTorsions
+        Task { @MainActor in ActivityLog.shared.debug("Dispatching flex local search: popSize=\(populationSize), torsions=\(flexTorsionCount)", category: .dock) }
 
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }

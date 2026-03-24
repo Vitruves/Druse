@@ -293,7 +293,8 @@ class DockingTestCase: XCTestCase {
         pocket: BindingPocket,
         populationSize: Int = 200,
         generations: Int = 200,
-        flexibility: Bool = true
+        flexibility: Bool = true,
+        scoringMethod: ScoringMethod = .vina
     ) async -> [DockingResult] {
         // Compute ligand extent
         let heavyAtoms = ligand.atoms.filter { $0.element != .H }
@@ -333,9 +334,9 @@ class DockingTestCase: XCTestCase {
 
         // Run
         let dockStart = CFAbsoluteTimeGetCurrent()
-        let results = await engine.runDocking(ligand: ligand, pocket: pocket, config: config)
+        let results = await engine.runDocking(ligand: ligand, pocket: pocket, config: config, scoringMethod: scoringMethod)
         let dockTime = CFAbsoluteTimeGetCurrent() - dockStart
-        print("  [Dock] Docking completed in \(String(format: "%.3f", dockTime))s")
+        print("  [Dock] Docking completed in \(String(format: "%.3f", dockTime))s [\(scoringMethod.rawValue)]")
 
         // Print full diagnostics
         if let diag = engine.lastDiagnostics {

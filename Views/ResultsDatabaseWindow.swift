@@ -972,6 +972,8 @@ struct ResultsDatabaseWindow: View {
         case .halogen:     .mint
         case .metalCoord:  .yellow
         case .chPi:        .teal
+        case .amideStack:  .brown
+        case .chalcogen:   .cyan
         }
     }
 
@@ -985,6 +987,8 @@ struct ResultsDatabaseWindow: View {
         case .halogen:     "Halogen bond"
         case .metalCoord:  "Metal coord."
         case .chPi:        "CH-π"
+        case .amideStack:  "Amide-π"
+        case .chalcogen:   "Chalcogen bond"
         }
     }
 }
