@@ -222,11 +222,9 @@ private struct InlineColorPicker: View {
 struct InspectorPanel: View {
     @Environment(AppViewModel.self) private var viewModel
     @Binding var showInspector: Bool
-    @State private var selectionMode: SelectionMode = .atom
 
-    private enum SelectionMode: String, CaseIterable {
-        case atom = "Atom"
-        case residue = "Residue"
+    private var selectionMode: WorkspaceState.SelectionMode {
+        get { viewModel.workspace.selectionMode }
     }
 
     var body: some View {
@@ -288,8 +286,11 @@ struct InspectorPanel: View {
             HStack {
                 sectionHeader("Selection", icon: "cursorarrow.click.2")
                 Spacer()
-                Picker("", selection: $selectionMode) {
-                    ForEach(SelectionMode.allCases, id: \.self) { mode in
+                Picker("", selection: Binding(
+                    get: { viewModel.workspace.selectionMode },
+                    set: { viewModel.workspace.selectionMode = $0 }
+                )) {
+                    ForEach(WorkspaceState.SelectionMode.allCases, id: \.self) { mode in
                         Text(mode.rawValue).tag(mode)
                     }
                 }
@@ -383,8 +384,47 @@ struct InspectorPanel: View {
 
         infoRow("Residue", "\(atom.residueName) \(atom.residueSeq)")
         infoRow("Chain", atom.chainID)
-        infoRow("Charge", String(format: "%.3f", atom.charge))
+        if atom.formalCharge != 0 {
+            infoRow("Formal charge", "\(atom.formalCharge > 0 ? "+" : "")\(atom.formalCharge)")
+        }
+        infoRow("Partial charge", String(format: "%.3f", atom.charge))
         infoRow("VdW Radius", String(format: "%.2f \u{00C5}", atom.element.vdwRadius))
+        if atom.tempFactor > 0 {
+            infoRow("B-factor", String(format: "%.1f", atom.tempFactor))
+        }
+        if atom.occupancy < 1.0 {
+            infoRow("Occupancy", String(format: "%.2f", atom.occupancy))
+        }
+
+        // Connected bonds
+        let bonds = connectedBonds(for: atom)
+        if !bonds.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Bonds (\(bonds.count))")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                ForEach(bonds, id: \.id) { bond in
+                    let allAtoms = (viewModel.molecules.protein?.atoms ?? []) + (viewModel.molecules.ligand?.atoms ?? [])
+                    let otherIdx = bond.atomIndex1 == atom.id ? bond.atomIndex2 : bond.atomIndex1
+                    if otherIdx < allAtoms.count {
+                        let other = allAtoms[otherIdx]
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color(red: Double(other.element.color.x),
+                                            green: Double(other.element.color.y),
+                                            blue: Double(other.element.color.z)))
+                                .frame(width: 6, height: 6)
+                            Text("\(other.element.symbol) \(other.name)")
+                                .font(.system(size: 10, design: .monospaced))
+                            Spacer()
+                            Text(bond.order == .aromatic ? "arom" : "\(bond.order.rawValue)\u{00D7}")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+        }
 
         VStack(alignment: .leading, spacing: 3) {
             Text("Position")
@@ -396,6 +436,11 @@ struct InspectorPanel: View {
                 coordLabel("Z", atom.position.z)
             }
         }
+    }
+
+    private func connectedBonds(for atom: Atom) -> [Bond] {
+        let allBonds = (viewModel.molecules.protein?.bonds ?? []) + (viewModel.molecules.ligand?.bonds ?? [])
+        return allBonds.filter { $0.atomIndex1 == atom.id || $0.atomIndex2 == atom.id }
     }
 
     // MARK: - Multi-Atom Summary
@@ -478,18 +523,67 @@ struct InspectorPanel: View {
                     .foregroundStyle(.secondary)
             }
 
+            // Secondary structure
+            let ss = secondaryStructure(for: residue, in: prot)
+            if let ss {
+                HStack(spacing: 4) {
+                    Image(systemName: ss == .helix ? "arrow.trianglehead.turn.up.right.diamond"
+                          : ss == .sheet ? "arrow.right.to.line" : "scribble")
+                        .font(.system(size: 10))
+                        .foregroundStyle(ss == .helix ? .red : ss == .sheet ? .cyan : .secondary)
+                    Text(ss == .helix ? "Alpha Helix" : ss == .sheet ? "Beta Sheet"
+                         : ss == .turn ? "Turn" : "Coil")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(ss == .helix ? .red : ss == .sheet ? .cyan : .secondary)
+                }
+            }
+
             infoRow("Atoms", "\(residue.atomIndices.count)")
             let heavyCount = residue.atomIndices.filter { idx in
                 idx < prot.atoms.count && prot.atoms[idx].element != .H
             }.count
             infoRow("Heavy atoms", "\(heavyCount)")
 
+            // Element composition
+            let elements = Dictionary(grouping: residue.atomIndices.compactMap { idx in
+                idx < prot.atoms.count ? prot.atoms[idx].element : nil
+            }, by: \.symbol).mapValues(\.count).sorted { $0.value > $1.value }
+            HStack(spacing: 4) {
+                ForEach(elements, id: \.key) { symbol, cnt in
+                    Text("\(symbol):\(cnt)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.primary.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                }
+            }
+
             // Total charge of residue
             let totalCharge = residue.atomIndices.compactMap { idx in
                 idx < prot.atoms.count ? prot.atoms[idx].charge : nil
             }.reduce(Float(0), +)
             infoRow("Net charge", String(format: "%.2f", totalCharge))
+
+            // Average B-factor
+            let bFactors = residue.atomIndices.compactMap { idx in
+                idx < prot.atoms.count ? prot.atoms[idx].tempFactor : nil
+            }
+            if let avgB = bFactors.isEmpty ? nil : bFactors.reduce(0, +) / Float(bFactors.count), avgB > 0 {
+                infoRow("Avg B-factor", String(format: "%.1f", avgB))
+            }
         }
+    }
+
+    private func secondaryStructure(for residue: Residue, in prot: Molecule) -> SecondaryStructure? {
+        for ssa in prot.secondaryStructureAssignments {
+            if ssa.chain == residue.chainID &&
+               residue.sequenceNumber >= ssa.start &&
+               residue.sequenceNumber <= ssa.end {
+                return ssa.type
+            }
+        }
+        return nil
     }
 
     // MARK: - Multi-Residue Summary

@@ -59,7 +59,7 @@ struct SearchTabView: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Button(action: { viewModel.clearLigand() }) {
+                        Button(action: { viewModel.removeLigandFromView() }) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 14))
                                 .foregroundStyle(.secondary)

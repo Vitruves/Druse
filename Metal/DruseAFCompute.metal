@@ -416,7 +416,6 @@ kernel void druseAFScore(
     }
 
     // Pre-computed data pointers
-    device const float *prot_h   = setupBuffer + DAF_SETUP_PROT_H;
     device const float *lig_h    = setupBuffer + DAF_SETUP_LIG_H;
     device const float *preK0    = setupBuffer + DAF_SETUP_K0;
     device const float *preV0    = setupBuffer + DAF_SETUP_V0;
@@ -673,7 +672,6 @@ kernel void druseAFScoreWithGradient(
         }
     }
 
-    device const float *prot_h   = setupBuffer + DAF_SETUP_PROT_H;
     device const float *lig_h    = setupBuffer + DAF_SETUP_LIG_H;
     device const float *preK0    = setupBuffer + DAF_SETUP_K0;
     device const float *preV0    = setupBuffer + DAF_SETUP_V0;

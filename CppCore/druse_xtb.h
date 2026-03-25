@@ -262,14 +262,18 @@ void druse_xtb_free_gradient_result(DruseXTBGradientResult *result);
 
 /// Optimize molecular geometry using GFN2-xTB gradients and L-BFGS.
 ///
-/// @param positions     Nx3 initial positions in Angstrom (NOT modified)
-/// @param atomicNumbers N atomic numbers
-/// @param atomCount     Number of atoms
-/// @param totalCharge   Net molecular charge
-/// @param solvation     Solvation config
-/// @param optLevel      Convergence tightness
-/// @param maxSteps      Maximum optimization steps (0 = auto based on optLevel)
-/// @param freezeMask    Optional bool[N] array: true = freeze that atom. NULL = optimize all.
+/// @param positions          Nx3 initial positions in Angstrom (NOT modified)
+/// @param atomicNumbers      N atomic numbers
+/// @param atomCount          Number of atoms
+/// @param totalCharge        Net molecular charge
+/// @param solvation          Solvation config
+/// @param optLevel           Convergence tightness
+/// @param maxSteps           Maximum optimization steps (0 = auto based on optLevel)
+/// @param freezeMask         Optional bool[N] array: true = freeze that atom. NULL = optimize all.
+/// @param referencePositions Optional Nx3 reference positions for harmonic restraints (Angstrom).
+///                           NULL = no restraints. When set, atoms are restrained to these positions.
+/// @param restraintStrength  Harmonic spring constant in Hartree/Angstrom^2 (e.g. 0.005).
+///                           Only used when referencePositions is non-NULL.
 /// @return Heap-allocated — free with druse_xtb_free_opt_result()
 DruseXTBOptResult* druse_xtb_optimize_geometry(
     const float *positions,
@@ -279,7 +283,9 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
     DruseXTBSolvationConfig solvation,
     DruseXTBOptLevel optLevel,
     int32_t maxSteps,
-    const bool *freezeMask
+    const bool *freezeMask,
+    const float *referencePositions,
+    float restraintStrength
 );
 
 void druse_xtb_free_opt_result(DruseXTBOptResult *result);

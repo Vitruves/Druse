@@ -4,8 +4,11 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/Depictor/RDDepictor.h>
+#include <GraphMol/MolDraw2D/MolDraw2DSVG.h>
+#include <GraphMol/MolDraw2D/MolDraw2DUtils.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -77,3 +80,59 @@ void druse_free_2d_result(Druse2DResult *result) {
     delete[] result->bonds;
     delete result;
 }
+
+// ============================================================================
+// SVG Depiction (MolDraw2DSVG)
+// ============================================================================
+// Produces publication-quality 2D depictions with:
+// - Wedge/dash stereo bonds
+// - Proper aromatic ring notation
+// - Element coloring (CPK scheme)
+// - Clean CoordGen layout
+
+char* druse_mol_to_svg(const char *smiles, int32_t width, int32_t height) {
+    if (!smiles || !smiles[0]) return nullptr;
+
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) return nullptr;
+
+        // Remove explicit H for cleaner depiction, but preserve stereo info
+        MolOps::removeAllHs(*mol);
+
+        // Generate 2D coordinates
+        RDDepict::compute2DCoords(*mol);
+
+        // Assign stereo wedge/dash bonds from 3D/stereochemistry info
+        MolOps::Kekulize(*mol);
+        MolDraw2DUtils::prepareMolForDrawing(*mol);
+
+        // Draw to SVG — classic RDKit publication style
+        MolDraw2DSVG drawer(width, height);
+
+        // White background for clean, readable depiction
+        drawer.drawOptions().backgroundColour = DrawColour(1.0, 1.0, 1.0, 1.0);
+
+        // Thicker bonds and larger font for clarity
+        drawer.drawOptions().bondLineWidth = 2.0;
+        drawer.drawOptions().multipleBondOffset = 0.15;
+        drawer.drawOptions().minFontSize = 14;
+        drawer.drawOptions().annotationFontScale = 0.75;
+
+        // Use RDKit's default palette (CPK-style atom colors are already assigned)
+        // The default palette from assignDefaultPalette() already has:
+        // N=blue, O=red, F/Cl=green, S=dark yellow, Br=dark red, P=orange, etc.
+
+        drawer.drawMolecule(*mol);
+        drawer.finishDrawing();
+
+        std::string svg = drawer.getDrawingText();
+        char *result = new char[svg.size() + 1];
+        memcpy(result, svg.c_str(), svg.size() + 1);
+        return result;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// druse_free_string already defined in druse_core.cpp

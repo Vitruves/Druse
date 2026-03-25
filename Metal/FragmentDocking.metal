@@ -454,10 +454,6 @@ kernel void reconstructFullPose(
     // Each intermediate placement provides a connecting torsion angle
 
     // Walk the chain backwards
-    float torsions[32];
-    int numTorsions = 0;
-    int traceIdx = int(tid);
-
     // Collect torsion angles from leaf to root
     // We'll reverse them later
     float chainTorsions[16]; // max fragments

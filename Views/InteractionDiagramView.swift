@@ -438,8 +438,6 @@ struct InteractionDiagramView: View {
 
                     // Small "hydrophobic zone" arc near the ligand contact point
                     let arcR: CGFloat = 10
-                    let arcRect = CGRect(x: avgLig.x - arcR, y: avgLig.y - arcR,
-                                         width: arcR * 2, height: arcR * 2)
                     let contactAngle = atan2(residueCenter.y - avgLig.y, residueCenter.x - avgLig.x)
                     var zonePath = Path()
                     zonePath.addArc(center: avgLig, radius: arcR,

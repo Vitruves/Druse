@@ -10,13 +10,17 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     var batchActionPanel: some View {
-        let selectedEntries = db.entries.filter { selectedIDs.contains($0.id) }
-        let unpreparedCount = selectedEntries.filter { !$0.isPrepared }.count
-        let preparedCount = selectedEntries.filter(\.isPrepared).count
+        let selectedRows = flatRows.filter { selectedIDs.contains($0.id) }
+        let nParents = selectedRows.filter { $0.kind == .parent || $0.kind == nil }.count
+        let nTaut = selectedRows.filter { $0.kind == .tautomer || $0.kind == .tautomerProtomer }.count
+        let nProt = selectedRows.filter { $0.kind == .protomer || $0.kind == .tautomerProtomer }.count
+        let nPrepared = selectedRows.filter(\.isPrepared).count
+        // Unique parent entries for Populate & Prepare
+        let uniqueEntryIDs = Set(selectedRows.map(\.entryID))
 
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("\(selectedEntries.count) molecules selected", systemImage: "checkmark.square.fill")
+                Label("\(selectedRows.count) forms selected", systemImage: "checkmark.square.fill")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 Button("Deselect All") { selectedIDs.removeAll() }
@@ -25,19 +29,26 @@ extension LigandDatabaseWindow {
                     .foregroundStyle(.secondary)
             }
 
-            HStack(spacing: 12) {
-                HStack(spacing: 3) {
-                    Circle().fill(.orange).frame(width: 6, height: 6)
-                    Text("\(unpreparedCount) raw molecules")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                if nParents > 0 {
+                    HStack(spacing: 3) {
+                        Circle().fill(.green).frame(width: 6, height: 6)
+                        Text("\(nParents) parents").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
                 }
-                HStack(spacing: 3) {
-                    Circle().fill(.green).frame(width: 6, height: 6)
-                    Text("\(preparedCount) prepared ligands")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.green)
+                if nTaut > 0 {
+                    HStack(spacing: 3) {
+                        Circle().fill(.cyan).frame(width: 6, height: 6)
+                        Text("\(nTaut) tautomers").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
                 }
+                if nProt > 0 {
+                    HStack(spacing: 3) {
+                        Circle().fill(.orange).frame(width: 6, height: 6)
+                        Text("\(nProt) protomers").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                Text("\(nPrepared) prepared").font(.system(size: 10)).foregroundStyle(.green)
             }
 
             if isBatchProcessing {
@@ -58,7 +69,7 @@ extension LigandDatabaseWindow {
             Label("Populate & Prepare", systemImage: "wand.and.stars")
                 .font(.system(size: 11, weight: .semibold))
 
-            Text("Full pipeline for all \(selectedEntries.count) molecules: add polar H → MMFF94 minimize → Gasteiger charges → enumerate tautomers & protomers → generate conformers → filter by Boltzmann population.")
+            Text("Full pipeline for \(uniqueEntryIDs.count) molecules: add polar H → MMFF94 minimize → Gasteiger charges → enumerate tautomers & protomers → generate conformers → filter by Boltzmann population.")
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -101,38 +112,53 @@ extension LigandDatabaseWindow {
                     Text(String(format: "%.0f kcal", variantEnergyCutoff))
                         .font(.system(size: 10, design: .monospaced)).frame(width: 45)
                 }
+                GridRow {
+                    Text("Min population").font(.system(size: 10)).frame(width: 90, alignment: .leading)
+                    Slider(value: $variantMinPopulation, in: 0...20, step: 0.5).controlSize(.mini)
+                    Text(String(format: "%.1f%%", variantMinPopulation))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 45)
+                }
             }
 
-            Button(action: {
-                runPopulateAndPrepare(entries: selectedEntries)
-            }) {
-                Label(isBatchProcessing
-                      ? "Processing \(batchProgress.current)/\(batchProgress.total)..."
-                      : "Populate & Prepare All (\(selectedEntries.count))",
-                      systemImage: "play.fill")
-                    .frame(maxWidth: .infinity)
+            if isBatchProcessing {
+                Button(action: { cancelPopulateAndPrepare() }) {
+                    Label("Stop Processing", systemImage: "stop.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .controlSize(.regular)
+            } else {
+                let parentEntries = db.entries.filter { uniqueEntryIDs.contains($0.id) && $0.parentID == nil }
+                Button(action: {
+                    runPopulateAndPrepare(entries: parentEntries)
+                }) {
+                    Label("Populate & Prepare (\(parentEntries.count) molecules)",
+                          systemImage: "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .disabled(parentEntries.isEmpty)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
-            .disabled(isBatchProcessing)
 
             Divider()
 
-            // Docking action
+            // Docking action — each selected form is a docking candidate
             Button(action: { useSelectedForDocking() }) {
-                Label(preparedCount > 1
-                      ? "Queue \(preparedCount) Ligands for Batch Docking"
-                      : preparedCount == 1 ? "Use Ligand for Docking" : "No Prepared Ligands",
+                Label(nPrepared > 1
+                      ? "Dock \(nPrepared) Forms"
+                      : nPrepared == 1 ? "Use for Docking" : "No Prepared Forms",
                       systemImage: "arrow.right.circle")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(preparedCount == 0)
-            .help("Only prepared ligands (with 3D coordinates) can be sent to docking")
+            .disabled(nPrepared == 0)
+            .help("Send each selected chemical form to docking")
 
             Button(action: { deleteSelected() }) {
-                Label("Delete Selected (\(selectedEntries.count))", systemImage: "trash")
+                Label("Delete Selected (\(selectedRows.count))", systemImage: "trash")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)

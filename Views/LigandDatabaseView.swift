@@ -51,13 +51,13 @@ struct LigandDatabaseView: View {
                     Text("\(lig.atomCount) atoms")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    Button(action: { viewModel.clearLigand() }) {
+                    Button(action: { viewModel.removeLigandFromView() }) {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .help("Clear active ligand")
+                    .help("Remove ligand from view and database")
                 }
                 .padding(6)
                 .background(Color.green.opacity(0.08))

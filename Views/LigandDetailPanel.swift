@@ -36,6 +36,8 @@ extension LigandDatabaseWindow {
                         propertiesTab(entry)
                     case .populateAndPrepare:
                         populateAndPrepareTab(entry)
+                    case .ensemble:
+                        ensembleSummaryTab(entry)
                     }
                 }
             }
@@ -101,11 +103,21 @@ extension LigandDatabaseWindow {
                         .onAppear { initMiniRenderer(atoms: entry.atoms, bonds: entry.bonds) }
                 }
             } else {
-                // 2D RDKit depiction
+                // 2D RDKit depiction (prefer SVG for publication-quality rendering)
                 if isComputing2D {
                     ProgressView("Computing 2D layout...")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let svg = ligand2DSVG,
+                          let svgData = svg.data(using: .utf8),
+                          let nsImage = NSImage(data: svgData) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if let coords = ligand2DCoords {
+                    // Fallback to Canvas drawing if SVG generation failed
                     Canvas { context, size in
                         draw2DStructure(context: context, size: size, coords: coords)
                     }
@@ -122,6 +134,72 @@ extension LigandDatabaseWindow {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            }
+
+            // Form navigator (when multiple chemical forms exist)
+            if let entry = inspectedEntry, entry.forms.count > 1 {
+                Divider()
+                HStack(spacing: 6) {
+                    Button(action: {
+                        let newIdx = max(0, selectedFormIndex - 1)
+                        selectedFormIndex = newIdx
+                        selectedFormConformerIndex = 0
+                        loadFormConformers(entry: entry, formIndex: newIdx)
+                        compute2DPreview(smiles: entry.forms[newIdx].smiles)
+                        if show3DPreview, !entry.forms[newIdx].atoms.isEmpty {
+                            updateMiniRenderer(atoms: entry.forms[newIdx].atoms, bonds: entry.forms[newIdx].bonds)
+                        }
+                    }) {
+                        Image(systemName: "chevron.left")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(selectedFormIndex == 0)
+
+                    let form = entry.forms[min(selectedFormIndex, entry.forms.count - 1)]
+                    let kindColor: Color = switch form.kind {
+                    case .parent: .green
+                    case .tautomer: .cyan
+                    case .protomer: .orange
+                    case .tautomerProtomer: .purple
+                    }
+                    Text(form.kind.symbol)
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 16, height: 14)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(kindColor))
+                    Text("Form \(selectedFormIndex + 1)/\(entry.forms.count)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    Text(form.label)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+
+                    Button(action: {
+                        let newIdx = min(entry.forms.count - 1, selectedFormIndex + 1)
+                        selectedFormIndex = newIdx
+                        selectedFormConformerIndex = 0
+                        loadFormConformers(entry: entry, formIndex: newIdx)
+                        compute2DPreview(smiles: entry.forms[newIdx].smiles)
+                        if show3DPreview, !entry.forms[newIdx].atoms.isEmpty {
+                            updateMiniRenderer(atoms: entry.forms[newIdx].atoms, bonds: entry.forms[newIdx].bonds)
+                        }
+                    }) {
+                        Image(systemName: "chevron.right")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(selectedFormIndex >= entry.forms.count - 1)
+
+                    Spacer()
+
+                    if form.boltzmannWeight > 0 {
+                        Text(form.populationString)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
+                                             form.boltzmannWeight > 0.1 ? .yellow : .secondary)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .background(Color.secondary.opacity(0.05))
             }
 
             // Hint: 2D can't show conformer differences
@@ -401,7 +479,7 @@ extension LigandDatabaseWindow {
                 .font(.system(size: 11, weight: .semibold))
 
             if isChildEntry {
-                Text("Viewing variant of \(db.parent(of: entry)?.name ?? "parent"). Generate from the parent entry.")
+                Text("Viewing variant of parent entry. Generate from the parent entry.")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
@@ -523,6 +601,144 @@ extension LigandDatabaseWindow {
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .contentShape(Rectangle())
         .onTapGesture { inspectVariantChild(child) }
+    }
+
+    // MARK: - Ensemble Tab (forms + conformers overview, clickable to navigate)
+
+    @ViewBuilder
+    func ensembleSummaryTab(_ entry: LigandEntry) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if entry.forms.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.tertiary)
+                    Text("No ensemble generated yet")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text("Run Populate & Prepare to enumerate tautomers, protomers, and conformers.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+            } else {
+                // Summary header
+                HStack {
+                    Label("\(entry.forms.count) forms, \(entry.totalConformerCount) conformers",
+                          systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer()
+                    Text("Click a form to preview. Use \u{25C0} \u{25B6} in the viewer to navigate.")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                }
+
+                // Forms table
+                ForEach(Array(entry.forms.enumerated()), id: \.element.id) { idx, form in
+                    let isActive = selectedFormIndex == idx
+                    let kindColor: Color = switch form.kind {
+                    case .parent: .green
+                    case .tautomer: .cyan
+                    case .protomer: .orange
+                    case .tautomerProtomer: .purple
+                    }
+
+                    HStack(spacing: 6) {
+                        // Kind badge
+                        Text(form.kind.symbol)
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 18, height: 16)
+                            .background(RoundedRectangle(cornerRadius: 3).fill(kindColor))
+
+                        // Label + SMILES
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(form.label)
+                                .font(.system(size: 10, weight: isActive ? .semibold : .regular))
+                                .lineLimit(1)
+                            Text(form.smiles)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+
+                        // Conformer count
+                        Text("\(form.conformerCount) conf")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+
+                        // Population
+                        Text(form.populationString)
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
+                                             form.boltzmannWeight > 0.1 ? .yellow : .secondary)
+                            .frame(width: 38, alignment: .trailing)
+
+                        // Energy
+                        if form.relativeEnergy < 0.01 {
+                            Text("best")
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(.green)
+                                .frame(width: 50, alignment: .trailing)
+                        } else {
+                            Text(String(format: "+%.1f", form.relativeEnergy))
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.orange)
+                                .frame(width: 50, alignment: .trailing)
+                        }
+
+                        // Remove form
+                        Button {
+                            removeForm(entryID: entry.id, formIndex: idx)
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                                .font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.red.opacity(0.5))
+                        .help("Remove this form from the ensemble")
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+                    .background(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedFormIndex = idx
+                        selectedFormConformerIndex = 0
+                        loadFormConformers(entry: entry, formIndex: idx)
+                        compute2DPreview(smiles: form.smiles)
+                        if show3DPreview, !form.atoms.isEmpty {
+                            updateMiniRenderer(atoms: form.atoms, bonds: form.bonds)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+    }
+
+    func removeForm(entryID: UUID, formIndex: Int) {
+        guard var entry = db.entries.first(where: { $0.id == entryID }),
+              formIndex < entry.forms.count, entry.forms.count > 1 else { return }
+        entry.forms.remove(at: formIndex)
+        // Recalculate best form index
+        entry.bestFormIndex = 0
+        entry.atoms = entry.forms[0].atoms
+        entry.bonds = entry.forms[0].bonds
+        entry.conformerCount = entry.forms.reduce(0) { $0 + $1.conformerCount }
+        db.update(entry)
+        if inspectedEntry?.id == entryID {
+            inspectedEntry = entry
+        }
+        if selectedFormIndex >= entry.forms.count {
+            selectedFormIndex = max(0, entry.forms.count - 1)
+        }
+        loadFormConformers(entry: entry, formIndex: selectedFormIndex)
     }
 
     // MARK: - Conformers Tab
@@ -652,7 +868,18 @@ extension LigandDatabaseWindow {
                     Text(String(format: "%.0f kcal", variantEnergyCutoff))
                         .font(.system(size: 10, design: .monospaced)).frame(width: 50)
                 }
+                GridRow {
+                    Text("Min population").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Slider(value: $variantMinPopulation, in: 0...20, step: 0.5).controlSize(.mini)
+                    Text(String(format: "%.1f%%", variantMinPopulation))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 50)
+                }
             }
+
+            Text("Forms with Boltzmann population below \(String(format: "%.1f%%", variantMinPopulation)) will be discarded. Each molecule produces a different number of forms depending on its chemistry.")
+                .font(.system(size: 8))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
 
             Divider()
 
@@ -753,11 +980,16 @@ extension LigandDatabaseWindow {
     // MARK: - 2D Structure Drawing
 
     func compute2DPreview(smiles: String) {
-        guard !smiles.isEmpty else { ligand2DCoords = nil; return }
+        guard !smiles.isEmpty else { ligand2DCoords = nil; ligand2DSVG = nil; return }
         isComputing2D = true
         Task {
-            let result = await Task.detached { RDKitBridge.compute2DCoords(smiles: smiles) }.value
-            ligand2DCoords = result
+            let smi = smiles
+            let (coords, svg) = await Task.detached { @Sendable in
+                (RDKitBridge.compute2DCoords(smiles: smi),
+                 RDKitBridge.moleculeToSVG(smiles: smi, width: 500, height: 400))
+            }.value
+            ligand2DCoords = coords
+            ligand2DSVG = svg
             isComputing2D = false
         }
     }

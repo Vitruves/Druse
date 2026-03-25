@@ -162,7 +162,7 @@ struct DockingTabView: View {
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.secondary)
 
-                    Button(action: { viewModel.clearLigand() }) {
+                    Button(action: { viewModel.removeLigandFromView() }) {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)

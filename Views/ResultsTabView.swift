@@ -315,7 +315,6 @@ struct ResultsTabView: View {
     private func dockingPoseRow(index: Int, result: DockingResult) -> some View {
         let isSelected = viewModel.docking.selectedPoseIndices.contains(index)
         let isML = viewModel.docking.scoringMethod == .druseAffinity
-        let ligandName = viewModel.molecules.ligand?.name
 
         VStack(alignment: .leading, spacing: 4) {
             // Row 1: Selection toggle, rank, energy, cluster badge

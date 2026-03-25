@@ -3,80 +3,85 @@ import AppKit
 import UniformTypeIdentifiers
 import simd
 
-/// A tautomer or protomer variant of a ligand.
-/// Kept temporarily for backward compatibility during migration from nested variants
-/// to the flat parentID-based hierarchy.
-struct MolecularVariant: Identifiable, Sendable {
-    let id: UUID
-    var smiles: String
-    var atoms: [Atom]
-    var bonds: [Bond]
-    var relativeEnergy: Double     // kcal/mol (MMFF energy)
-    var kind: VariantKind          // .tautomer or .protomer
-    var label: String              // human-readable description
-    var isPrepared: Bool
-    var conformerCount: Int
+/// Legacy conformer type — kept for backward compat with WorkspaceState mapping.
+typealias LigandConformer = Conformer3D
 
-    init(smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
-         relativeEnergy: Double = 0, kind: VariantKind, label: String,
-         isPrepared: Bool = false, conformerCount: Int = 0) {
-        self.id = UUID()
-        self.smiles = smiles
-        self.atoms = atoms
-        self.bonds = bonds
-        self.relativeEnergy = relativeEnergy
-        self.kind = kind
-        self.label = label
-        self.isPrepared = isPrepared
-        self.conformerCount = conformerCount
-    }
-}
-
-/// A stored conformer of a ligand (persistent, survives re-selection).
-struct LigandConformer: Identifiable, Sendable {
-    let id: Int              // conformer index (0-based)
-    var atoms: [Atom]
-    var bonds: [Bond]
-    var energy: Double       // MMFF94 energy in kcal/mol
+/// Legacy variant type — kept only for v1 database migration.
+struct MolecularVariant: Sendable {
+    let smiles: String
+    let atoms: [Atom]
+    let bonds: [Bond]
+    let relativeEnergy: Double
+    let kind: VariantKind
+    let label: String
+    let isPrepared: Bool
+    let conformerCount: Int
 }
 
 /// An entry in the ligand database.
+///
+/// Each entry represents one imported molecule. After preparation, the entry contains:
+/// - `atoms`/`bonds`: best conformer of the best chemical form (for docking, rendering)
+/// - `forms`: all enumerated chemical forms (tautomers/protomers) with their conformer ensembles
+///
+/// The `forms` array is the source of truth for the chemical ensemble.
+/// `atoms`/`bonds`/`smiles` are convenience copies of the best form's best conformer.
 struct LigandEntry: Identifiable, Sendable {
     let id: UUID
     var name: String
-    var smiles: String
-    var atoms: [Atom]
-    var bonds: [Bond]
+    var originalSMILES: String              // the SMILES as originally imported
+    var atoms: [Atom]                       // best conformer of best form (for docking/rendering)
+    var bonds: [Bond]                       // best conformer of best form
     var descriptors: LigandDescriptors?
     var isPrepared: Bool
     var preparationDate: Date?
-    var conformerCount: Int
+    var conformerCount: Int                 // total conformers across all forms
 
     // Experimental binding affinity data (optional)
     var ki: Float?       // Ki in nM
     var pKi: Float?      // -log10(Ki in M)
     var ic50: Float?     // IC50 in nM
 
-    // --- Hierarchy fields (flat variant model) ---
-
-    /// nil for top-level entries; set to the parent's UUID for variant children.
-    var parentID: UUID?
-
-    /// nil for top-level entries; .tautomer or .protomer for variant children.
-    var variantKind: VariantKind?
-
-    /// Energy relative to parent (kcal/mol, from the variant enumeration step).
-    var relativeEnergy: Double?
-
-    // Persistent conformer storage (survives re-selection of the entry)
-    var conformers: [LigandConformer] = []
-
     /// Source chain ID from the protein (for co-crystallized ligands).
-    /// Used to robustly match when removing chains or re-importing.
     var sourceChainID: String?
 
-    /// Variant lineage: if this entry was created from a variant, track the parent info
-    var variantLineage: String?   // e.g., "Taut_2 of MK1" or "Prot_1 of Indinavir"
+    // --- Ensemble hierarchy ---
+
+    /// All enumerated chemical forms (parent + tautomers + protomers).
+    /// Empty until `Populate & Prepare` is run. Sorted by energy (best first).
+    var forms: [ChemicalForm] = []
+
+    /// Index of the best (lowest energy) form in `forms`.
+    var bestFormIndex: Int = 0
+
+    // --- Legacy fields (kept for v2 database migration, not used in new code) ---
+    var parentID: UUID?
+    var variantKind: VariantKind?
+    var relativeEnergy: Double?
+    var conformers: [LigandConformer] = []
+    var variantLineage: String?
+
+    // MARK: - Computed
+
+    /// Active SMILES (from best form if available, otherwise original).
+    var smiles: String {
+        get { bestForm?.smiles ?? originalSMILES }
+        set { originalSMILES = newValue }  // setter for backward compat
+    }
+
+    /// Best chemical form.
+    var bestForm: ChemicalForm? {
+        forms.indices.contains(bestFormIndex) ? forms[bestFormIndex] : forms.first
+    }
+
+    /// Number of distinct chemical forms (tautomers + protomers).
+    var totalFormCount: Int { forms.count }
+
+    /// Number of variant forms (excluding the parent form).
+    var variantCount: Int { forms.filter { $0.kind != .parent }.count }
+
+    /// Total conformers across all forms.
+    var totalConformerCount: Int { forms.reduce(0) { $0 + $1.conformerCount } }
 
     /// Computed pKi from whatever affinity data is available (pKi > Ki > IC50).
     var effectivePKi: Float? {
@@ -86,16 +91,38 @@ struct LigandEntry: Identifiable, Sendable {
         return nil
     }
 
+    // MARK: - Init
+
+    init(name: String, smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
+         descriptors: LigandDescriptors? = nil, isPrepared: Bool = false,
+         conformerCount: Int = 0, ki: Float? = nil, pKi: Float? = nil, ic50: Float? = nil,
+         sourceChainID: String? = nil) {
+        self.id = UUID()
+        self.name = name
+        self.originalSMILES = smiles
+        self.atoms = atoms
+        self.bonds = bonds
+        self.descriptors = descriptors
+        self.isPrepared = isPrepared
+        self.preparationDate = isPrepared ? Date() : nil
+        self.conformerCount = conformerCount
+        self.ki = ki
+        self.pKi = pKi
+        self.ic50 = ic50
+        self.sourceChainID = sourceChainID
+    }
+
+    // Legacy init — for backward compat with code that passes parentID/variantKind
     init(name: String, smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
          descriptors: LigandDescriptors? = nil, isPrepared: Bool = false,
          conformerCount: Int = 0, ki: Float? = nil, pKi: Float? = nil, ic50: Float? = nil,
          sourceChainID: String? = nil,
-         variantLineage: String? = nil,
-         parentID: UUID? = nil, variantKind: VariantKind? = nil,
-         relativeEnergy: Double? = nil) {
+         variantLineage: String?,
+         parentID: UUID?, variantKind: VariantKind?,
+         relativeEnergy: Double?) {
         self.id = UUID()
         self.name = name
-        self.smiles = smiles
+        self.originalSMILES = smiles
         self.atoms = atoms
         self.bonds = bonds
         self.descriptors = descriptors
@@ -137,61 +164,26 @@ final class LigandDatabase {
     // MARK: - Hierarchy Helpers
 
     /// All top-level entries (those without a parent).
+    /// With the new model, ALL entries are top-level. Kept for backward compat.
     var topLevelEntries: [LigandEntry] {
         entries.filter { $0.parentID == nil }
     }
 
-    /// Returns all child entries whose parentID matches the given UUID.
+    /// Returns child entries for legacy flat hierarchy. Returns empty for new-model entries.
     func children(of parentID: UUID) -> [LigandEntry] {
         entries.filter { $0.parentID == parentID }
     }
 
-    /// Returns the parent entry for a given child, or nil if it is top-level.
-    func parent(of entry: LigandEntry) -> LigandEntry? {
-        guard let pid = entry.parentID else { return nil }
-        return entries.first { $0.id == pid }
-    }
-
-    /// Remove an entry and all its children (cascading delete).
+    /// Remove an entry (and any legacy children).
     func removeWithChildren(id: UUID) {
-        // Collect the target plus all descendants (one level deep in practice,
-        // but handles arbitrary depth for future-proofing).
         var toRemove: Set<UUID> = [id]
-        var frontier: Set<UUID> = [id]
-        while !frontier.isEmpty {
-            let childIDs = Set(
-                entries.compactMap { entry -> UUID? in
-                    guard let pid = entry.parentID, frontier.contains(pid) else { return nil }
-                    return entry.id
-                }
-            )
-            if childIDs.isEmpty { break }
-            toRemove.formUnion(childIDs)
-            frontier = childIDs
-        }
+        // Also remove any legacy children
+        let childIDs = Set(entries.compactMap { entry -> UUID? in
+            guard entry.parentID == id else { return nil }
+            return entry.id
+        })
+        toRemove.formUnion(childIDs)
         entries.removeAll { toRemove.contains($0.id) }
-    }
-
-    /// Create a new child variant entry linked to a parent and append it to the database.
-    @discardableResult
-    func addVariant(parentID: UUID, smiles: String, atoms: [Atom], bonds: [Bond],
-                    relativeEnergy: Double, kind: VariantKind, label: String,
-                    isPrepared: Bool, conformerCount: Int) -> LigandEntry {
-        let parentName = entries.first(where: { $0.id == parentID })?.name ?? "Unknown"
-        let entry = LigandEntry(
-            name: "\(parentName)_\(label)",
-            smiles: smiles,
-            atoms: atoms,
-            bonds: bonds,
-            isPrepared: isPrepared,
-            conformerCount: conformerCount,
-            variantLineage: "\(label) of \(parentName)",
-            parentID: parentID,
-            variantKind: kind,
-            relativeEnergy: relativeEnergy
-        )
-        entries.append(entry)
-        return entry
     }
 
     /// Perform multiple mutations on the entries array as a single batch.
@@ -208,7 +200,6 @@ final class LigandDatabase {
 
     func addFromSMILES(_ smiles: String, name: String) {
         var entry = LigandEntry(name: name, smiles: smiles)
-        // Auto-compute descriptors on import so table data is immediately visible
         if let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
             entry.descriptors = desc
         }
@@ -556,7 +547,26 @@ final class LigandDatabase {
     // MARK: - Codable Helpers
 
     /// Current on-disk format version.
-    private static let currentFormatVersion = 2
+    private static let currentFormatVersion = 3
+
+    /// v3: Serialized conformer within a chemical form.
+    private struct SerializableConformer: Codable {
+        let positions: [Float]   // flat [x,y,z,x,y,z,...] for all atoms
+        let energy: Double
+    }
+
+    /// v3: Serialized chemical form within a ligand entry.
+    private struct SerializableForm: Codable {
+        let smiles: String
+        let kind: Int            // ChemicalFormKind.rawValue
+        let label: String
+        let boltzmannWeight: Double
+        let relativeEnergy: Double
+        let atomElements: [Int]?   // shared across conformers
+        let atomNames: [String]?   // shared across conformers
+        let bondData: [Int]?       // shared across conformers
+        let conformers: [SerializableConformer]
+    }
 
     /// Legacy serializable variant (v1 nested model).
     private struct SerializableVariant: Codable {
@@ -589,23 +599,23 @@ final class LigandDatabase {
         let fractionCSP3: Float?
         let lipinski: Bool?
         let veber: Bool?
-        // Experimental binding affinity
-        let ki: Float?       // nM
+        let ki: Float?
         let pKi: Float?
-        let ic50: Float?     // nM
-        // Atom coordinates stored as flat [x,y,z,x,y,z,...] for compactness
+        let ic50: Float?
         let atomData: [Float]?
         let atomElements: [Int]?
         let atomNames: [String]?
-        let bondData: [Int]?  // [a1,a2,order, a1,a2,order, ...]
-        // Legacy tautomer/protomer variants (v1 format)
+        let bondData: [Int]?
+        // Legacy v1 variants
         let variants: [SerializableVariant]?
-        // --- v2 fields ---
-        let parentID: String?              // UUID as string; nil for top-level
-        let variantKind: Int?              // VariantKind.rawValue; nil for top-level
-        let relativeEnergy: Double?        // energy relative to parent
-        let conformerPositions: [[Float]]? // per-conformer flat [x,y,z,...] arrays
-        let conformerEnergies: [Double]?   // per-conformer energies
+        // Legacy v2 hierarchy
+        let parentID: String?
+        let variantKind: Int?
+        let relativeEnergy: Double?
+        let conformerPositions: [[Float]]?
+        let conformerEnergies: [Double]?
+        // --- v3 fields ---
+        let forms: [SerializableForm]?
     }
 
     /// Top-level wrapper for versioned on-disk format.
@@ -692,18 +702,75 @@ final class LigandDatabase {
         }
     }
 
-    // MARK: - Encode (v2 format)
+    // MARK: - Encode Forms (v3)
+
+    private static func encodeForms(_ forms: [ChemicalForm]) -> [SerializableForm]? {
+        guard !forms.isEmpty else { return nil }
+        return forms.map { form in
+            let templateAtoms = form.bestConformer?.atoms ?? []
+            let atomElements = templateAtoms.map { $0.element.rawValue }
+            let atomNames = templateAtoms.map(\.name)
+            let bondData = encodeBonds(form.bestConformer?.bonds ?? [])
+
+            let conformers = form.conformers.map { conf in
+                SerializableConformer(
+                    positions: conf.atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] },
+                    energy: conf.energy
+                )
+            }
+            return SerializableForm(
+                smiles: form.smiles, kind: form.kind.rawValue, label: form.label,
+                boltzmannWeight: form.boltzmannWeight, relativeEnergy: form.relativeEnergy,
+                atomElements: atomElements.isEmpty ? nil : atomElements,
+                atomNames: atomNames.isEmpty ? nil : atomNames,
+                bondData: bondData, conformers: conformers
+            )
+        }
+    }
+
+    private static func decodeForms(_ serializedForms: [SerializableForm]?) -> [ChemicalForm] {
+        guard let sf = serializedForms, !sf.isEmpty else { return [] }
+        return sf.map { s in
+            let bonds = decodeBonds(data: s.bondData)
+            let conformers: [Conformer3D] = s.conformers.enumerated().map { idx, sc in
+                var atoms: [Atom] = []
+                if let elems = s.atomElements, let names = s.atomNames {
+                    for i in stride(from: 0, to: sc.positions.count - 2, by: 3) {
+                        let aIdx = i / 3
+                        guard aIdx < elems.count, aIdx < names.count else { break }
+                        atoms.append(Atom(
+                            id: aIdx, element: Element(rawValue: elems[aIdx]) ?? .C,
+                            position: SIMD3(sc.positions[i], sc.positions[i+1], sc.positions[i+2]),
+                            name: names[aIdx], residueName: "LIG", residueSeq: 1, chainID: "L",
+                            charge: 0, formalCharge: 0, isHetAtom: true
+                        ))
+                    }
+                }
+                return Conformer3D(id: idx, atoms: atoms, bonds: bonds, energy: sc.energy)
+            }
+            return ChemicalForm(
+                smiles: s.smiles,
+                kind: ChemicalFormKind(rawValue: s.kind) ?? .parent,
+                label: s.label,
+                boltzmannWeight: s.boltzmannWeight,
+                relativeEnergy: s.relativeEnergy,
+                conformers: conformers
+            )
+        }
+    }
+
+    // MARK: - Encode (v3 format)
 
     private func encodeToDisk() throws -> Data {
-        let serializable = entries.map { entry -> SerializableEntry in
+        // Only encode top-level entries (skip legacy children)
+        let topLevel = entries.filter { $0.parentID == nil }
+        let serializable = topLevel.map { entry -> SerializableEntry in
             let (atomData, atomElements, atomNames) = Self.encodeAtoms(entry.atoms)
             let bondData = Self.encodeBonds(entry.bonds)
-
-            // Conformer persistence
-            let (confPositions, confEnergies) = Self.encodeConformers(entry.conformers)
+            let forms = Self.encodeForms(entry.forms)
 
             return SerializableEntry(
-                name: entry.name, smiles: entry.smiles, isPrepared: entry.isPrepared,
+                name: entry.name, smiles: entry.originalSMILES, isPrepared: entry.isPrepared,
                 conformerCount: entry.conformerCount,
                 mw: entry.descriptors?.molecularWeight, logP: entry.descriptors?.logP,
                 tpsa: entry.descriptors?.tpsa, hbd: entry.descriptors?.hbd, hba: entry.descriptors?.hba,
@@ -713,52 +780,69 @@ final class LigandDatabase {
                 veber: entry.descriptors?.veber,
                 ki: entry.ki, pKi: entry.pKi, ic50: entry.ic50,
                 atomData: atomData, atomElements: atomElements, atomNames: atomNames, bondData: bondData,
-                variants: nil,
-                parentID: entry.parentID?.uuidString,
-                variantKind: entry.variantKind?.rawValue,
-                relativeEnergy: entry.relativeEnergy,
-                conformerPositions: confPositions,
-                conformerEnergies: confEnergies
+                variants: nil, parentID: nil, variantKind: nil, relativeEnergy: nil,
+                conformerPositions: nil, conformerEnergies: nil,
+                forms: forms
             )
         }
         let wrapper = DatabaseWrapper(version: Self.currentFormatVersion, entries: serializable)
         return try JSONEncoder().encode(wrapper)
     }
 
-    // MARK: - Decode (v1 + v2 format)
+    // MARK: - Decode (v1 + v2 + v3 format)
 
     private func decodeFromDisk(_ data: Data) throws {
-        // Try the new versioned wrapper first
         if let wrapper = try? JSONDecoder().decode(DatabaseWrapper.self, from: data) {
-            entries = Self.decodeEntries(wrapper.entries, migrateVariants: false)
+            if wrapper.version >= 3 {
+                entries = Self.decodeEntriesV3(wrapper.entries)
+            } else {
+                // v2 format: flat parent+child hierarchy → migrate to forms
+                entries = Self.decodeEntriesV2(wrapper.entries)
+            }
             return
         }
-
         // Fall back to legacy v1 format: plain [SerializableEntry] array
         let decoded = try JSONDecoder().decode([SerializableEntry].self, from: data)
-        entries = Self.decodeEntries(decoded, migrateVariants: true)
+        entries = Self.decodeEntriesV2(decoded)
     }
 
-    /// Shared entry decoding logic.
-    /// When `migrateVariants` is true (v1 data), nested `MolecularVariant` objects
-    /// are promoted to first-class child `LigandEntry` items linked by parentID.
-    private static func decodeEntries(_ serializableEntries: [SerializableEntry],
-                                       migrateVariants: Bool) -> [LigandEntry] {
-        var result: [LigandEntry] = []
+    /// Decode v3 entries (forms nested inside each entry).
+    private static func decodeEntriesV3(_ serializableEntries: [SerializableEntry]) -> [LigandEntry] {
+        serializableEntries.map { s in
+            let atoms = decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames)
+            let bonds = decodeBonds(data: s.bondData)
+            let desc = decodeDescriptors(s)
+            let forms = decodeForms(s.forms)
 
+            var entry = LigandEntry(
+                name: s.name, smiles: s.smiles, atoms: atoms, bonds: bonds,
+                descriptors: desc, isPrepared: s.isPrepared,
+                conformerCount: s.conformerCount ?? 0,
+                ki: s.ki, pKi: s.pKi, ic50: s.ic50
+            )
+            entry.forms = forms
+            return entry
+        }
+    }
+
+    /// Decode v2 entries (flat parent+child hierarchy) and migrate to v3 model.
+    /// Groups children by parentID and converts them to ChemicalForm arrays.
+    private static func decodeEntriesV2(_ serializableEntries: [SerializableEntry]) -> [LigandEntry] {
+        // First pass: decode all entries into LigandEntry (with legacy fields)
+        var allEntries: [LigandEntry] = []
         for s in serializableEntries {
             let atoms = decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames)
             let bonds = decodeBonds(data: s.bondData)
-            let desc: LigandDescriptors? = s.mw != nil ? LigandDescriptors(
-                molecularWeight: s.mw!, exactMW: s.mw!, logP: s.logP ?? 0, tpsa: s.tpsa ?? 0,
-                hbd: s.hbd ?? 0, hba: s.hba ?? 0, rotatableBonds: s.rotBonds ?? 0,
-                rings: s.rings ?? 0, aromaticRings: s.aromaticRings ?? 0,
-                heavyAtomCount: s.heavyAtomCount ?? 0, fractionCSP3: s.fractionCSP3 ?? 0,
-                lipinski: s.lipinski ?? false, veber: s.veber ?? false
-            ) : nil
+            let desc = decodeDescriptors(s)
+            let parentID: UUID? = s.parentID.flatMap { UUID(uuidString: $0) }
+            let variantKind: VariantKind? = s.variantKind.flatMap { VariantKind(rawValue: $0) }
+            let conformers = decodeConformers(
+                positions: s.conformerPositions, energies: s.conformerEnergies,
+                templateElements: s.atomElements, templateNames: s.atomNames, templateBonds: s.bondData
+            )
 
-            // Decode legacy nested variants (kept on the struct for compat)
-            let legacyVariants: [MolecularVariant] = (s.variants ?? []).map { sv in
+            // Also handle v1 nested variants
+            let legacyVariants = (s.variants ?? []).map { sv in
                 MolecularVariant(
                     smiles: sv.smiles,
                     atoms: decodeAtoms(data: sv.atomData, elements: sv.atomElements, names: sv.atomNames),
@@ -771,51 +855,98 @@ final class LigandDatabase {
                 )
             }
 
-            // Decode v2 hierarchy fields
-            let parentID: UUID? = s.parentID.flatMap { UUID(uuidString: $0) }
-            let variantKind: VariantKind? = s.variantKind.flatMap { VariantKind(rawValue: $0) }
-
-            // Decode persisted conformers
-            let conformers = decodeConformers(
-                positions: s.conformerPositions,
-                energies: s.conformerEnergies,
-                templateElements: s.atomElements,
-                templateNames: s.atomNames,
-                templateBonds: s.bondData
-            )
-
             var entry = LigandEntry(
                 name: s.name, smiles: s.smiles, atoms: atoms, bonds: bonds,
                 descriptors: desc, isPrepared: s.isPrepared,
                 conformerCount: s.conformerCount ?? 0,
                 ki: s.ki, pKi: s.pKi, ic50: s.ic50,
-                parentID: parentID,
-                variantKind: variantKind,
+                sourceChainID: nil,
+                variantLineage: nil,
+                parentID: parentID, variantKind: variantKind,
                 relativeEnergy: s.relativeEnergy
             )
             entry.conformers = conformers
-            result.append(entry)
+            allEntries.append(entry)
 
-            // If migrating from v1, promote nested variants to child entries
-            if migrateVariants && !legacyVariants.isEmpty {
-                for variant in legacyVariants {
-                    let child = LigandEntry(
-                        name: "\(s.name)_\(variant.label)",
-                        smiles: variant.smiles,
-                        atoms: variant.atoms,
-                        bonds: variant.bonds,
-                        isPrepared: variant.isPrepared,
-                        conformerCount: variant.conformerCount,
-                        variantLineage: "\(variant.label) of \(s.name)",
-                        parentID: entry.id,
-                        variantKind: variant.kind,
-                        relativeEnergy: variant.relativeEnergy
-                    )
-                    result.append(child)
-                }
+            // Promote v1 nested variants to flat entries for the migration below
+            for variant in legacyVariants {
+                let child = LigandEntry(
+                    name: "\(s.name)_\(variant.label)",
+                    smiles: variant.smiles, atoms: variant.atoms, bonds: variant.bonds,
+                    isPrepared: variant.isPrepared, conformerCount: variant.conformerCount,
+                    sourceChainID: nil, variantLineage: "\(variant.label) of \(s.name)",
+                    parentID: entry.id, variantKind: variant.kind,
+                    relativeEnergy: variant.relativeEnergy
+                )
+                allEntries.append(child)
             }
         }
 
-        return result
+        // Second pass: group children by parentID and migrate to forms
+        let parents = allEntries.filter { $0.parentID == nil }
+        let childrenByParent = Dictionary(grouping: allEntries.filter { $0.parentID != nil },
+                                           by: { $0.parentID! })
+
+        return parents.map { parent in
+            var entry = parent
+            let children = childrenByParent[parent.id] ?? []
+
+            if !children.isEmpty || entry.isPrepared {
+                // Build forms array from parent + children
+                var forms: [ChemicalForm] = []
+
+                // Parent form
+                if !entry.atoms.isEmpty {
+                    let parentConformers = entry.conformers.isEmpty
+                        ? [Conformer3D(id: 0, atoms: entry.atoms, bonds: entry.bonds, energy: 0)]
+                        : entry.conformers
+                    forms.append(ChemicalForm(
+                        smiles: entry.originalSMILES, kind: .parent, label: "Parent",
+                        boltzmannWeight: 0, relativeEnergy: 0,
+                        conformers: parentConformers
+                    ))
+                }
+
+                // Child forms
+                for child in children {
+                    let kind: ChemicalFormKind = switch child.variantKind {
+                    case .tautomer: .tautomer
+                    case .protomer: .protomer
+                    case nil: .parent
+                    }
+                    let conformers = child.conformers.isEmpty && !child.atoms.isEmpty
+                        ? [Conformer3D(id: 0, atoms: child.atoms, bonds: child.bonds, energy: 0)]
+                        : child.conformers
+                    forms.append(ChemicalForm(
+                        smiles: child.originalSMILES, kind: kind,
+                        label: child.variantLineage ?? child.name,
+                        boltzmannWeight: 0, relativeEnergy: child.relativeEnergy ?? 0,
+                        conformers: conformers
+                    ))
+                }
+
+                entry.forms = forms
+                entry.conformerCount = forms.reduce(0) { $0 + $1.conformerCount }
+            }
+
+            // Clear legacy fields
+            entry.parentID = nil
+            entry.variantKind = nil
+            entry.relativeEnergy = nil
+            entry.conformers = []
+            entry.variantLineage = nil
+            return entry
+        }
+    }
+
+    private static func decodeDescriptors(_ s: SerializableEntry) -> LigandDescriptors? {
+        guard let mw = s.mw else { return nil }
+        return LigandDescriptors(
+            molecularWeight: mw, exactMW: mw, logP: s.logP ?? 0, tpsa: s.tpsa ?? 0,
+            hbd: s.hbd ?? 0, hba: s.hba ?? 0, rotatableBonds: s.rotBonds ?? 0,
+            rings: s.rings ?? 0, aromaticRings: s.aromaticRings ?? 0,
+            heavyAtomCount: s.heavyAtomCount ?? 0, fractionCSP3: s.fractionCSP3 ?? 0,
+            lipinski: s.lipinski ?? false, veber: s.veber ?? false
+        )
     }
 }

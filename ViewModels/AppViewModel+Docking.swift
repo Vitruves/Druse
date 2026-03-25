@@ -770,7 +770,9 @@ extension AppViewModel {
                             totalCharge: formalCharge,
                             solvation: config.solvation,
                             optLevel: config.optLevel,
-                            maxSteps: config.maxSteps
+                            maxSteps: config.maxSteps,
+                            referencePositions: config.restraintStrength > 0 ? positions : nil,
+                            restraintStrength: config.restraintStrength
                         )
                         return (i, result)
                     } catch {
@@ -799,9 +801,21 @@ extension AppViewModel {
             updated[i].gfn2OptSteps = gfn2Result.steps
             gfn2Energies.append(gfn2Result.totalEnergy_kcal)
 
-            // Update coordinates if requested
+            // Update coordinates if requested, with RMSD guard
             if config.updateCoordinates, let optPos = gfn2Result.optimizedPositions {
-                updated[i].transformedAtomPositions = optPos
+                // Compute heavy-atom RMSD between docked and optimized pose
+                let origPos = updated[i].transformedAtomPositions
+                if origPos.count == optPos.count {
+                    var sumSq: Float = 0
+                    for j in 0..<origPos.count {
+                        sumSq += simd_distance_squared(origPos[j], optPos[j])
+                    }
+                    let rmsd = sqrt(sumSq / Float(origPos.count))
+                    if rmsd <= config.maxRMSD {
+                        updated[i].transformedAtomPositions = optPos
+                    }
+                    // else: RMSD too large, keep original docked coordinates
+                }
             }
         }
 

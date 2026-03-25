@@ -213,6 +213,63 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
 void druse_free_ensemble_result(DruseEnsembleResult *result);
 
 // ============================================================================
+// MARK: - Ionizable Site Detection & Per-Site Protomer Generation
+// ============================================================================
+
+/// An ionizable site detected in a molecule.
+typedef struct {
+    int32_t atomIdx;          // index of the ionizable atom
+    bool isAcid;              // true = deprotonates (loses H), false = protonates (gains H)
+    double defaultPKa;        // pKa from the built-in lookup table
+    char groupName[64];       // human-readable group name (e.g. "Piperazine N")
+} DruseIonSite;
+
+/// Result of ionizable site detection.
+typedef struct {
+    DruseIonSite *sites;
+    int32_t count;
+} DruseIonSiteResult;
+
+/// Detect all ionizable sites in a molecule.
+/// Unlike protomer enumeration, this does NOT filter by pH — it returns ALL sites
+/// so the caller can compute pKa for each and decide which are ambiguous.
+DruseIonSiteResult* druse_detect_ionizable_sites(const char *smiles);
+void druse_free_ion_sites(DruseIonSiteResult *result);
+
+/// A pair of 3D structures: protonated and deprotonated forms of a single ionizable site.
+typedef struct {
+    DruseMoleculeResult *protonated;      // 3D structure (H added, minimized)
+    DruseMoleculeResult *deprotonated;    // 3D structure (H removed, minimized)
+    int32_t protonatedCharge;             // total formal charge of protonated form
+    int32_t deprotonatedCharge;           // total formal charge of deprotonated form
+    bool success;
+    char errorMessage[256];
+} DruseSiteProtomerPair;
+
+/// Generate protonated and deprotonated 3D structures for a specific ionizable site.
+/// Both forms are MMFF94-minimized and have Gasteiger charges.
+/// @param smiles     Input SMILES
+/// @param atomIdx    Atom index of the ionizable site
+/// @param isAcid     If true, toggle deprotonation (remove H); if false, toggle protonation (add H)
+DruseSiteProtomerPair* druse_generate_site_protomers(
+    const char *smiles, int32_t atomIdx, bool isAcid);
+void druse_free_site_protomer_pair(DruseSiteProtomerPair *result);
+
+/// Unified ligand preparation with per-site pKa overrides.
+/// Same as druse_prepare_ligand_ensemble but uses the provided pKa values
+/// instead of the hardcoded lookup table. If sitePKa is NULL, falls back to defaults.
+/// @param sitePKa     Array of computed pKa values (one per detected ionizable site, or NULL)
+/// @param nSitePKa    Length of sitePKa array (0 = use defaults)
+DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
+    const char *smiles, const char *name,
+    double pH, double pkaThreshold,
+    int32_t maxTautomers, int32_t maxProtomers,
+    double energyCutoff, int32_t conformersPerForm,
+    double temperature,
+    const double *sitePKa, int32_t nSitePKa
+);
+
+// ============================================================================
 // MARK: - Protein Preparation (fragment-based)
 // ============================================================================
 
@@ -570,6 +627,12 @@ typedef struct {
 Druse2DResult* druse_compute_2d_coords(const char *smiles);
 
 void druse_free_2d_result(Druse2DResult *result);
+
+/// Generate an SVG depiction of a molecule from SMILES using RDKit MolDraw2DSVG.
+/// Returns a heap-allocated null-terminated C string with SVG content.
+/// Includes wedge/dash stereo bonds, aromatic notation, and element coloring.
+/// Caller must free with druse_free_string().
+char* druse_mol_to_svg(const char *smiles, int32_t width, int32_t height);
 
 #ifdef __cplusplus
 }

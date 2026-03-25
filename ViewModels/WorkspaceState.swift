@@ -104,6 +104,11 @@ struct WorkspaceState {
     var ligandRenderMode: RenderMode? = nil
 
     // Selection
+    enum SelectionMode: String, CaseIterable, Sendable {
+        case atom = "Atom"
+        case residue = "Residue"
+    }
+    var selectionMode: SelectionMode = .atom
     var selectedAtomIndex: Int? = nil
     var selectedAtomIndices: Set<Int> = []
     var selectedResidueIndices: Set<Int> = []

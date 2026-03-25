@@ -487,24 +487,96 @@ enum SideChainDisplay: String, CaseIterable, Sendable {
     static let backboneAtomNames: Set<String> = ["N", "CA", "C", "O", "OXT", "H", "HA"]
 }
 
-// MARK: - Variant Kind (Tautomer / Protomer)
-
+// MARK: - Variant Kind (Tautomer / Protomer) — legacy, kept for serialization compat
 enum VariantKind: Int, Sendable, Codable {
     case tautomer = 0
     case protomer = 1
+}
+
+// MARK: - Chemical Form (tautomer/protomer/conformer hierarchy)
+
+/// Kind of chemical form relative to the parent molecule.
+/// Maps directly to C++ `kind` field in DruseEnsembleMember.
+enum ChemicalFormKind: Int, Sendable, Codable {
+    case parent = 0
+    case tautomer = 1
+    case protomer = 2
+    case tautomerProtomer = 3
 
     var label: String {
         switch self {
+        case .parent: "Parent"
         case .tautomer: "Tautomer"
         case .protomer: "Protomer"
+        case .tautomerProtomer: "Taut+Prot"
         }
     }
 
     var symbol: String {
         switch self {
+        case .parent: "P"
         case .tautomer: "T"
-        case .protomer: "P"
+        case .protomer: "H"
+        case .tautomerProtomer: "TH"
         }
+    }
+
+    var color: String {
+        switch self {
+        case .parent: "green"
+        case .tautomer: "cyan"
+        case .protomer: "orange"
+        case .tautomerProtomer: "purple"
+        }
+    }
+}
+
+/// A single 3D conformer of a chemical form.
+struct Conformer3D: Identifiable, Sendable {
+    let id: Int              // 0-based index within parent form
+    var atoms: [Atom]
+    var bonds: [Bond]
+    var energy: Double       // MMFF94 kcal/mol
+}
+
+/// A distinct chemical form (protonation/tautomeric state) of a molecule.
+/// Contains multiple 3D conformers sorted by energy.
+struct ChemicalForm: Identifiable, Sendable {
+    let id: UUID
+    var smiles: String                      // canonical SMILES for this form
+    var kind: ChemicalFormKind              // .parent, .tautomer, .protomer, .tautomerProtomer
+    var label: String                       // e.g. "Taut2", "prot_Amine+Taut1"
+    var boltzmannWeight: Double             // population fraction (sums to ~1.0 across forms)
+    var relativeEnergy: Double              // kcal/mol vs best form (0.0 for best)
+    var conformers: [Conformer3D]           // 3D structures, sorted by energy ascending
+
+    /// Best (lowest energy) conformer.
+    var bestConformer: Conformer3D? { conformers.first }
+    /// Atoms of the best conformer.
+    var atoms: [Atom] { bestConformer?.atoms ?? [] }
+    /// Bonds of the best conformer.
+    var bonds: [Bond] { bestConformer?.bonds ?? [] }
+    /// Conformer count.
+    var conformerCount: Int { conformers.count }
+    /// Energy range string.
+    var energyRangeString: String {
+        guard let lo = conformers.first?.energy, let hi = conformers.last?.energy else { return "—" }
+        if conformers.count == 1 { return String(format: "%.1f", lo) }
+        return String(format: "%.1f–%.1f", lo, hi)
+    }
+    /// Population percentage string.
+    var populationString: String { String(format: "%.1f%%", boltzmannWeight * 100) }
+
+    init(smiles: String, kind: ChemicalFormKind, label: String,
+         boltzmannWeight: Double = 0, relativeEnergy: Double = 0,
+         conformers: [Conformer3D] = []) {
+        self.id = UUID()
+        self.smiles = smiles
+        self.kind = kind
+        self.label = label
+        self.boltzmannWeight = boltzmannWeight
+        self.relativeEnergy = relativeEnergy
+        self.conformers = conformers
     }
 }
 

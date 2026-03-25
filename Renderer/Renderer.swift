@@ -434,11 +434,46 @@ final class Renderer: NSObject {
             let cB = atomColor(a2)
 
             switch bond.order {
-            case .single, .aromatic:
+            case .single:
                 let r = bond.order.displayRadius * bondScale
                 bondInstances.append(BondInstance(
                     positionA: a1.position, radiusA: r,
                     positionB: a2.position, radiusB: r,
+                    colorA: cA, colorB: cB
+                ))
+
+            case .aromatic:
+                // Solid cylinder + thinner parallel cylinder ("1.5 bond")
+                let bondVec = a2.position - a1.position
+                let bondLen = simd_length(bondVec)
+                let r = BondOrder.single.displayRadius * bondScale
+                let rThin = r * 0.55  // thinner secondary cylinder
+                guard bondLen > 0.01 else {
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position, radiusA: r,
+                        positionB: a2.position, radiusB: r,
+                        colorA: cA, colorB: cB
+                    ))
+                    continue
+                }
+                let bondDir = bondVec / bondLen
+                let ref: SIMD3<Float> = abs(bondDir.y) < 0.99
+                    ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                let perp = simd_normalize(simd_cross(bondDir, ref))
+                let separation: Float = r * 1.3
+
+                // Primary solid cylinder (offset slightly)
+                let offA = perp * (-separation * 0.5)
+                bondInstances.append(BondInstance(
+                    positionA: a1.position + offA, radiusA: r,
+                    positionB: a2.position + offA, radiusB: r,
+                    colorA: cA, colorB: cB
+                ))
+                // Secondary thinner cylinder (aromatic partial bond)
+                let offB = perp * (separation * 0.5)
+                bondInstances.append(BondInstance(
+                    positionA: a1.position + offB, radiusA: rThin,
+                    positionB: a2.position + offB, radiusB: rThin,
                     colorA: cA, colorB: cB
                 ))
 

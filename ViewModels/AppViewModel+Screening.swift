@@ -84,7 +84,20 @@ extension AppViewModel {
 
                 docking.batchProgress = (i, prepared.count)
                 workspace.statusMessage = "Docking \(i + 1)/\(prepared.count): \(entry.name)..."
-                log.info("[Batch] Docking \(i+1)/\(prepared.count): \(entry.name) (\(entry.atoms.filter { $0.element != .H }.count) heavy atoms, smiles=\(entry.smiles.prefix(50)))", category: .dock)
+
+                // Validate ligand data before GPU dispatch
+                let heavyAtoms = entry.atoms.filter { $0.element != .H }
+                let hasNaN = entry.atoms.contains { $0.position.x.isNaN || $0.position.y.isNaN || $0.position.z.isNaN }
+                guard !heavyAtoms.isEmpty, !hasNaN else {
+                    log.warn("[Batch] Skipping \(entry.name): invalid atom data (\(heavyAtoms.count) heavy, hasNaN=\(hasNaN))", category: .dock)
+                    continue
+                }
+                guard heavyAtoms.count <= 128 else {
+                    log.warn("[Batch] Skipping \(entry.name): \(heavyAtoms.count) heavy atoms exceeds 128-atom GPU limit", category: .dock)
+                    continue
+                }
+
+                log.info("[Batch] Docking \(i+1)/\(prepared.count): \(entry.name) (\(heavyAtoms.count) heavy atoms)", category: .dock)
 
                 let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds,
                                    title: entry.smiles, smiles: entry.smiles)

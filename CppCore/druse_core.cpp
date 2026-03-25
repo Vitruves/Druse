@@ -178,6 +178,55 @@ int32_t vina_xs_type_for_atom(
     }
 }
 
+// Shared ionizable group table (used by protomer enumeration, site detection, ensemble)
+struct IonizableGroupDef {
+    const char *name;
+    const char *smarts;
+    double pKa;
+    bool isAcid;
+};
+
+static const IonizableGroupDef kIonizableGroups[] = {
+    // --- Acids (deprotonate at high pH) ---
+    {"Carboxylic acid",  "[CX3](=O)[OX2H1]",           4.0,  true},
+    {"Phosphoric acid",  "[OX2H1]P(=O)",               2.1,  true},
+    {"Sulfonamide NH",   "[NX3H1]S(=O)(=O)",          10.0,  true},
+    {"Phenol",           "[OX2H1]c",                  10.0,  true},
+    {"Thiol",            "[SX2H1]",                    8.3,  true},
+    {"Tetrazole",        "[nH1]1nnn[nH0]1",            4.9,  true},
+    {"Hydroxamic acid",  "[NX3H1]C(=O)[OX2H1]",       8.0,  true},
+    // --- Bases (protonate at low pH) ---
+    {"Piperazine N",     "[NX3H1;R1;!$(NC=O);!$(NS=O)]([CH2])[CH2]", 9.0, false},
+    {"Morpholine N",     "[NX3H1;R1;!$(NC=O)]([CH2])[CH2][OX2]", 8.3, false},
+    {"Piperidine N",     "[NX3H1;R1;!$(NC=O);!$(NS=O);!$([NR1]([CH2])[CH2][OX2])]([CH2])[CH2]", 10.5, false},
+    {"Primary amine",    "[NX3H2;!$(NC=O);!$(NS=O)]", 10.5,  false},
+    {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc);!R]", 10.5, false},
+    {"Imidazole",        "[nH1]1cc[nH0]c1",            6.0,  false},
+    {"Pyridine",         "[nH0;X2;R1]1ccccc1",         5.2,  false},
+    {"Guanidine",        "[NX3H2]C(=[NX2H0])[NX3H2]", 12.5,  false},
+};
+static constexpr int kNumIonizableGroups = sizeof(kIonizableGroups) / sizeof(kIonizableGroups[0]);
+
+/// Detect all ionizable sites in a molecule (dedup by atom index, first match wins).
+static std::vector<std::tuple<int, int, bool, double>> detectIonSitesInternal(const ROMol &mol) {
+    std::vector<std::tuple<int, int, bool, double>> sites; // (atomIdx, groupIdx, isAcid, defaultPKa)
+    std::set<int> seen;
+    for (int g = 0; g < kNumIonizableGroups; g++) {
+        std::unique_ptr<ROMol> pat(SmartsToMol(kIonizableGroups[g].smarts));
+        if (!pat) continue;
+        std::vector<MatchVectType> matches;
+        SubstructMatch(mol, *pat, matches);
+        for (const auto &m : matches) {
+            if (m.empty()) continue;
+            int aIdx = m[0].second;
+            if (seen.count(aIdx)) continue;
+            seen.insert(aIdx);
+            sites.emplace_back(aIdx, g, kIonizableGroups[g].isAcid, kIonizableGroups[g].pKa);
+        }
+    }
+    return sites;
+}
+
 } // namespace
 
 // ============================================================================
@@ -777,14 +826,22 @@ DruseVariantSet* druse_enumerate_protomers(
             bool isAcid; // true=acid (deprotonates at high pH), false=base (protonates at low pH)
         };
         static const IonizableGroup groups[] = {
+            // --- Acids (deprotonate at high pH) ---
             {"Carboxylic acid",  "[CX3](=O)[OX2H1]",           4.0,  true},
             {"Phosphoric acid",  "[OX2H1]P(=O)",               2.1,  true},
             {"Sulfonamide NH",   "[NX3H1]S(=O)(=O)",          10.0,  true},
             {"Phenol",           "[OX2H1]c",                  10.0,  true},
             {"Thiol",            "[SX2H1]",                    8.3,  true},
+            {"Tetrazole",        "[nH1]1nnn[nH0]1",            4.9,  true},
+            {"Hydroxamic acid",  "[NX3H1]C(=O)[OX2H1]",       8.0,  true},
+            // --- Bases (protonate at low pH) ---
+            {"Piperazine N",     "[NX3H1;R1;!$(NC=O);!$(NS=O)]([CH2])[CH2]", 9.0, false},
+            {"Morpholine N",     "[NX3H1;R1;!$(NC=O)]([CH2])[CH2][OX2]", 8.3, false},
+            {"Piperidine N",     "[NX3H1;R1;!$(NC=O);!$(NS=O);!$([NR1]([CH2])[CH2][OX2])]([CH2])[CH2]", 10.5, false},
             {"Primary amine",    "[NX3H2;!$(NC=O);!$(NS=O)]", 10.5,  false},
-            {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc)]", 11.0, false},
+            {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc);!R]", 10.5, false},
             {"Imidazole",        "[nH1]1cc[nH0]c1",            6.0,  false},
+            {"Pyridine",         "[nH0;X2;R1]1ccccc1",         5.2,  false},
             {"Guanidine",        "[NX3H2]C(=[NX2H0])[NX3H2]", 12.5,  false},
         };
 
@@ -795,6 +852,7 @@ DruseVariantSet* druse_enumerate_protomers(
             std::string label;
         };
         std::vector<IonizableSite> ambiguousSites;
+        std::set<int> seenAtomIdx;
 
         for (int g = 0; g < (int)(sizeof(groups) / sizeof(groups[0])); g++) {
             std::unique_ptr<ROMol> pattern(SmartsToMol(groups[g].smarts));
@@ -807,11 +865,13 @@ DruseVariantSet* druse_enumerate_protomers(
                 // The ionizable atom is typically the first matched atom for acids,
                 // or the nitrogen for bases
                 int aidx = match[0].second;
+                if (seenAtomIdx.count(aidx)) continue;  // skip duplicate atom hits
 
                 // Henderson-Hasselbalch: is this site ambiguous at the target pH?
                 double deltaPKa = std::abs(pH - groups[g].pKa);
                 if (deltaPKa < pkaThreshold) {
                     ambiguousSites.push_back({g, aidx, groups[g].name});
+                    seenAtomIdx.insert(aidx);
                 }
             }
         }
@@ -950,36 +1010,49 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         }
 
         // ===================================================================
-        // Step 1: Enumerate protomers at target pH
+        // Step 1: WASH — apply dominant protonation at target pH
         // ===================================================================
-        // Each protomer is a distinct protonation state (different formal charges)
+        // First set the dominant ionization state, then enumerate alternatives
+        // for groups near the pH-pKa boundary.
+        //
+        // - Acids with pKa << pH → deprotonate (dominant form is conjugate base)
+        // - Bases with pKa >> pH → protonate (dominant form is conjugate acid)
+        // - Groups near boundary (|pH - pKa| < threshold) → enumerate both states
 
         struct ChemicalForm {
-            std::string smi;               // canonical SMILES (dedup key)
-            std::unique_ptr<RWMol> mol;    // sanitized molecule
-            std::string label;             // human-readable description
-            int kind;                      // 0=parent, 1=tautomer, 2=protomer, 3=taut+prot
+            std::string smi;
+            std::unique_ptr<RWMol> mol;
+            std::string label;
+            int kind;  // 0=parent, 1=tautomer, 2=protomer, 3=taut+prot
         };
         std::vector<ChemicalForm> allForms;
         std::set<std::string> seenSMILES;
 
-        // Ionizable groups (same as druse_enumerate_protomers)
         struct IonGrp { const char *name; const char *smarts; double pKa; bool isAcid; };
         static const IonGrp ionGroups[] = {
+            // --- Acids (deprotonate when pH > pKa) ---
             {"Carboxylic acid",  "[CX3](=O)[OX2H1]",           4.0,  true},
             {"Phosphoric acid",  "[OX2H1]P(=O)",               2.1,  true},
             {"Sulfonamide NH",   "[NX3H1]S(=O)(=O)",          10.0,  true},
             {"Phenol",           "[OX2H1]c",                  10.0,  true},
             {"Thiol",            "[SX2H1]",                    8.3,  true},
+            {"Tetrazole",        "[nH1]1nnn[nH0]1",            4.9,  true},
+            {"Hydroxamic acid",  "[NX3H1]C(=O)[OX2H1]",       8.0,  true},
+            // --- Bases (protonate when pH < pKa) ---
+            {"Piperazine N",     "[NX3H1;R1;!$(NC=O);!$(NS=O)]([CH2])[CH2]", 9.0, false},
+            {"Morpholine N",     "[NX3H1;R1;!$(NC=O)]([CH2])[CH2][OX2]", 8.3, false},
+            {"Piperidine N",     "[NX3H1;R1;!$(NC=O);!$(NS=O);!$([NR1]([CH2])[CH2][OX2])]([CH2])[CH2]", 10.5, false},
             {"Primary amine",    "[NX3H2;!$(NC=O);!$(NS=O)]", 10.5,  false},
-            {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc)]", 11.0, false},
+            {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc);!R]", 10.5, false},
             {"Imidazole",        "[nH1]1cc[nH0]c1",            6.0,  false},
+            {"Pyridine",         "[nH0;X2;R1]1ccccc1",         5.2,  false},
             {"Guanidine",        "[NX3H2]C(=[NX2H0])[NX3H2]", 12.5,  false},
         };
 
-        // Find ambiguous ionizable sites
-        struct AmbSite { int groupIdx; int atomIdx; };
-        std::vector<AmbSite> ambSites;
+        // Detect all ionizable sites
+        struct IonSite { int groupIdx; int atomIdx; bool isAcid; double groupPKa; };
+        std::vector<IonSite> allSites;
+        std::set<int> seenAtomIdx;
         for (int g = 0; g < (int)(sizeof(ionGroups)/sizeof(ionGroups[0])); g++) {
             std::unique_ptr<ROMol> pat(SmartsToMol(ionGroups[g].smarts));
             if (!pat) continue;
@@ -987,15 +1060,57 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             SubstructMatch(*parentMol, *pat, matches);
             for (const auto &m : matches) {
                 if (m.empty()) continue;
-                if (std::abs(pH - ionGroups[g].pKa) < pkaThreshold) {
-                    ambSites.push_back({g, m[0].second});
-                }
+                int aIdx = m[0].second;
+                if (seenAtomIdx.count(aIdx)) continue;
+                seenAtomIdx.insert(aIdx);
+                allSites.push_back({g, aIdx, ionGroups[g].isAcid, ionGroups[g].pKa});
             }
         }
 
-        // Generate protomer combinations
-        int nSites = std::min((int)ambSites.size(), 10);
-        int nCombos = std::min(1 << nSites, (int)maxProtomers);
+        // Phase A: Apply dominant protonation state (WASH)
+        // For acids: deprotonate if pH > pKa + threshold (clearly ionized)
+        // For bases: protonate if pH < pKa - threshold (clearly protonated)
+        auto washedMol = std::make_unique<RWMol>(*parentMol);
+        std::string washLog;
+        for (const auto &site : allSites) {
+            Atom *atom = washedMol->getAtomWithIdx(site.atomIdx);
+            double deltaPH = pH - site.groupPKa;  // positive = pH above pKa
+
+            if (site.isAcid && deltaPH > pkaThreshold) {
+                // pH well above pKa: acid is deprotonated (dominant)
+                int nH = atom->getTotalNumHs();
+                if (nH > 0) {
+                    atom->setNumExplicitHs(nH - 1);
+                    atom->setFormalCharge(atom->getFormalCharge() - 1);
+                    if (!washLog.empty()) washLog += ", ";
+                    washLog += std::string("deprot ") + ionGroups[site.groupIdx].name;
+                }
+            } else if (!site.isAcid && deltaPH < -pkaThreshold) {
+                // pH well below pKa: base is protonated (dominant)
+                int nH = atom->getTotalNumHs();
+                atom->setNumExplicitHs(nH + 1);
+                atom->setFormalCharge(atom->getFormalCharge() + 1);
+                if (!washLog.empty()) washLog += ", ";
+                washLog += std::string("prot ") + ionGroups[site.groupIdx].name;
+            }
+            // else: site is near boundary → will be enumerated in Phase B
+        }
+        try { MolOps::sanitizeMol(*washedMol); } catch (...) {
+            // Wash failed — fall back to original
+            washedMol = std::make_unique<RWMol>(*parentMol);
+        }
+
+        // Phase B: Enumerate protomers for ambiguous sites (near pH-pKa boundary)
+        std::vector<IonSite> ambSites;
+        for (const auto &site : allSites) {
+            double deltaPH = std::abs(pH - site.groupPKa);
+            if (deltaPH <= pkaThreshold) {
+                ambSites.push_back(site);
+            }
+        }
+
+        int nAmbSites = std::min((int)ambSites.size(), 10);
+        int nCombos = std::min(1 << nAmbSites, (int)maxProtomers);
 
         struct ProtomerForm {
             std::string smi;
@@ -1004,60 +1119,75 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         };
         std::vector<ProtomerForm> protomers;
 
+        // combo=0 = washed molecule with no additional protonation changes
         for (int combo = 0; combo < nCombos; combo++) {
-            auto rw = std::make_unique<RWMol>(*parentMol);
+            auto rw = std::make_unique<RWMol>(*washedMol);
             std::string comboLabel;
 
-            for (int s = 0; s < nSites; s++) {
+            for (int s = 0; s < nAmbSites; s++) {
                 if (!((combo >> s) & 1)) continue;
                 const auto &site = ambSites[s];
-                const auto &grp = ionGroups[site.groupIdx];
                 Atom *atom = rw->getAtomWithIdx(site.atomIdx);
 
-                if (grp.isAcid) {
+                if (site.isAcid) {
+                    // Toggle: deprotonate the acid (if it still has H)
                     int nH = atom->getTotalNumHs();
                     if (nH > 0) {
                         atom->setNumExplicitHs(nH - 1);
                         atom->setFormalCharge(atom->getFormalCharge() - 1);
                     }
                 } else {
+                    // Toggle: protonate the base
                     int nH = atom->getTotalNumHs();
                     atom->setNumExplicitHs(nH + 1);
                     atom->setFormalCharge(atom->getFormalCharge() + 1);
                 }
                 if (!comboLabel.empty()) comboLabel += "+";
-                comboLabel += std::string(grp.isAcid ? "deprot_" : "prot_") + grp.name;
+                comboLabel += std::string(site.isAcid ? "deprot_" : "prot_") +
+                    ionGroups[site.groupIdx].name;
             }
 
             try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
             std::string pSmi = MolToSmiles(*rw);
             if (seenSMILES.count(pSmi)) continue;
-            seenSMILES.insert(pSmi);  // track for dedup across protomers
+            seenSMILES.insert(pSmi);
 
             if (comboLabel.empty()) comboLabel = "Parent";
             protomers.push_back({pSmi, std::move(rw), comboLabel});
         }
 
-        // If no protomers generated (no ambiguous sites), use parent as-is
+        // If no protomers generated, use washed molecule
         if (protomers.empty()) {
-            auto rw = std::make_unique<RWMol>(*parentMol);
-            protomers.push_back({MolToSmiles(*rw), std::move(rw), "Parent"});
+            auto rw = std::make_unique<RWMol>(*washedMol);
+            std::string wSmi = MolToSmiles(*rw);
+            seenSMILES.insert(wSmi);
+            protomers.push_back({wSmi, std::move(rw), "Parent"});
         }
 
         // ===================================================================
         // Step 2: For each protomer, enumerate tautomers
         // ===================================================================
-        // Cap total forms to avoid combinatorial explosion
         int maxTotalForms = maxProtomers * maxTautomers;
         if (maxTotalForms > 200) maxTotalForms = 200;
 
         for (auto &prot : protomers) {
             if ((int)allForms.size() >= maxTotalForms) break;
 
+            // Always add the protomer itself first (before tautomer enumeration)
+            if (!seenSMILES.count(prot.smi)) {
+                seenSMILES.insert(prot.smi);
+            }
+            {
+                auto rw = std::make_unique<RWMol>(*prot.mol);
+                int kind = (prot.label != "Parent") ? 2 : 0;
+                allForms.push_back({prot.smi, std::move(rw), prot.label, kind});
+            }
+
+            // Then enumerate tautomers of this protomer
             try {
                 MolStandardize::TautomerEnumerator enumerator;
                 enumerator.setMaxTautomers(std::max(maxTautomers, 2));
-                enumerator.setMaxTransforms(200); // capped to avoid hanging on complex molecules
+                enumerator.setMaxTransforms(200);
                 auto tautResult = enumerator.enumerate(*prot.mol);
 
                 int tautCount = 0;
@@ -1070,40 +1200,19 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
                     if (seenSMILES.count(tSmi)) continue;
                     seenSMILES.insert(tSmi);
 
-                    // Determine kind: is this from a non-parent protomer AND a tautomer?
                     bool isFromProtomer = (prot.label != "Parent");
-                    bool isFromTautomer = (tSmi != prot.smi);
-                    int kind = 0; // parent
-                    if (isFromProtomer && isFromTautomer) kind = 3;      // protomer+tautomer
-                    else if (isFromProtomer) kind = 2;                    // protomer only
-                    else if (isFromTautomer) kind = 1;                    // tautomer only
+                    int kind = isFromProtomer ? 3 : 1;  // taut+prot or taut only
 
                     std::string label = prot.label;
-                    if (isFromTautomer) {
-                        if (label != "Parent") label += "_";
-                        else label = "";
-                        label += "Taut" + std::to_string(tautCount + 1);
-                    }
+                    if (label != "Parent") label += "_";
+                    else label = "";
+                    label += "Taut" + std::to_string(tautCount + 1);
 
                     allForms.push_back({tSmi, std::move(rw), label, kind});
                     tautCount++;
                 }
-
-                // If enumeration produced nothing new, add the protomer itself
-                if (tautCount == 0 && !seenSMILES.count(prot.smi)) {
-                    seenSMILES.insert(prot.smi);
-                    auto rw = std::make_unique<RWMol>(*prot.mol);
-                    int kind = (prot.label != "Parent") ? 2 : 0;
-                    allForms.push_back({prot.smi, std::move(rw), prot.label, kind});
-                }
             } catch (...) {
-                // Tautomer enumeration failed; add protomer directly
-                if (!seenSMILES.count(prot.smi)) {
-                    seenSMILES.insert(prot.smi);
-                    auto rw = std::make_unique<RWMol>(*prot.mol);
-                    int kind = (prot.label != "Parent") ? 2 : 0;
-                    allForms.push_back({prot.smi, std::move(rw), prot.label, kind});
-                }
+                // Tautomer enumeration failed; protomer already added above
             }
         }
 
@@ -1138,32 +1247,79 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             auto mol = std::make_unique<RWMol>(*form.mol);
             MolOps::addHs(*mol, false, true); // addCoords=true
 
-            // Generate multiple conformers
-            auto cids = embed_multiple(*mol, conformersPerForm);
+            // Generate multiple conformers with RMSD-based pruning during embedding
+            DGeomHelpers::EmbedParameters embedParams = DGeomHelpers::ETKDGv3;
+            embedParams.randomSeed = 42;
+            embedParams.pruneRmsThresh = 0.25;  // RMSD dedup threshold (Å)
+            embedParams.numThreads = 0;         // use all cores
+            auto cids = DGeomHelpers::EmbedMultipleConfs(*mol, conformersPerForm, embedParams);
             if (cids.empty()) {
-                // Fallback: single conformer via basic embedding
-                int cid = embed_molecule(*mol);
+                // Fallback: single conformer
+                int cid = DGeomHelpers::EmbedMolecule(*mol, embedParams);
                 if (cid >= 0) cids.push_back(cid);
                 else {
-                    // Last resort: 2D coords
-                    try { RDDepict::compute2DCoords(*mol); } catch (...) {}
-                    cids.push_back(0);
+                    // Last resort: basic ETKDG without pruning
+                    cid = embed_molecule(*mol);
+                    if (cid >= 0) cids.push_back(cid);
                 }
             }
 
-            // MMFF94 minimize all conformers
+            if (cids.empty()) continue;  // skip this form if embedding completely failed
+
+            // MMFF94 minimize all conformers (maxIters=1000)
             std::vector<std::pair<int, double>> mmffResults;
-            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults); } catch (...) {}
+            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults, /*numThreads=*/0,
+                    /*maxIters=*/1000, /*mmffVariant=*/"MMFF94"); } catch (...) {}
 
             // Gasteiger charges
             try { computeGasteigerCharges(*mol); } catch (...) {}
 
-            // Extract each conformer as a separate entry
+            // Extract each conformer, filtering out failures, clashes, and bad energies
             std::vector<std::pair<int, double>> indexed;
             for (int ci = 0; ci < (int)cids.size(); ci++) {
-                double e = (ci < (int)mmffResults.size() && mmffResults[ci].first >= 0)
-                           ? mmffResults[ci].second : 0.0;
+                double e = std::numeric_limits<double>::quiet_NaN();
+                if (ci < (int)mmffResults.size()) {
+                    // mmffResults.first: 0=converged, 1=not converged, -1=setup failed
+                    if (mmffResults[ci].first == 0) {
+                        e = mmffResults[ci].second;
+                    } else {
+                        continue;  // skip non-converged and failed conformers
+                    }
+                }
+
+                if (std::isnan(e) || e > 1e6) continue;
+
+                // Steric clash check: non-bonded heavy atoms < 1.0 Å apart
+                bool hasClash = false;
+                const Conformer &conf = mol->getConformer(cids[ci]);
+                int nAtoms = mol->getNumAtoms();
+                for (int a = 0; a < nAtoms && !hasClash; a++) {
+                    if (mol->getAtomWithIdx(a)->getAtomicNum() == 1) continue;
+                    const auto &pa = conf.getAtomPos(a);
+                    // Check for degenerate coords (atom at origin or identical to another)
+                    if (pa.x == 0.0 && pa.y == 0.0 && pa.z == 0.0) { hasClash = true; break; }
+                    for (int b = a + 1; b < nAtoms && !hasClash; b++) {
+                        if (mol->getAtomWithIdx(b)->getAtomicNum() == 1) continue;
+                        if (mol->getBondBetweenAtoms(a, b)) continue;  // skip bonded pairs
+                        const auto &pb = conf.getAtomPos(b);
+                        double d2 = (pa.x-pb.x)*(pa.x-pb.x) + (pa.y-pb.y)*(pa.y-pb.y) + (pa.z-pb.z)*(pa.z-pb.z);
+                        if (d2 < 1.0) hasClash = true;  // 1.0 Å² = 1.0 Å threshold
+                    }
+                }
+                if (hasClash) continue;
+
                 indexed.push_back({ci, e});
+            }
+
+            // If all conformers rejected, try keeping best MMFF result as fallback
+            if (indexed.empty() && !cids.empty()) {
+                // Find first converged conformer
+                for (int ci = 0; ci < (int)cids.size(); ci++) {
+                    if (ci < (int)mmffResults.size() && mmffResults[ci].first == 0) {
+                        indexed.push_back({ci, mmffResults[ci].second});
+                        break;
+                    }
+                }
             }
 
             // Sort by energy within this form
@@ -2418,4 +2574,484 @@ float druse_tanimoto_similarity(const char *smiles1, const char *smiles2) {
     } catch (...) {
         return 0.0f;
     }
+}
+
+// ============================================================================
+// MARK: - Ionizable Site Detection
+// ============================================================================
+
+DruseIonSiteResult* druse_detect_ionizable_sites(const char *smiles) {
+    auto *result = new DruseIonSiteResult();
+    result->sites = nullptr;
+    result->count = 0;
+
+    if (!smiles || !smiles[0]) return result;
+
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) return result;
+
+        auto sites = detectIonSitesInternal(*mol);
+        if (sites.empty()) return result;
+
+        result->count = (int32_t)sites.size();
+        result->sites = new DruseIonSite[sites.size()];
+
+        for (size_t i = 0; i < sites.size(); i++) {
+            auto &[atomIdx, groupIdx, isAcid, defaultPKa] = sites[i];
+            auto &out = result->sites[i];
+            out.atomIdx = atomIdx;
+            out.isAcid = isAcid;
+            out.defaultPKa = defaultPKa;
+            snprintf(out.groupName, sizeof(out.groupName), "%s", kIonizableGroups[groupIdx].name);
+        }
+    } catch (...) {}
+
+    return result;
+}
+
+void druse_free_ion_sites(DruseIonSiteResult *result) {
+    if (!result) return;
+    delete[] result->sites;
+    delete result;
+}
+
+// ============================================================================
+// MARK: - Per-Site Protomer Pair Generation
+// ============================================================================
+
+DruseSiteProtomerPair* druse_generate_site_protomers(
+    const char *smiles, int32_t atomIdx, bool isAcid
+) {
+    auto *result = new DruseSiteProtomerPair();
+    memset(result, 0, sizeof(DruseSiteProtomerPair));
+
+    if (!smiles || !smiles[0]) {
+        result->success = false;
+        snprintf(result->errorMessage, sizeof(result->errorMessage), "Empty SMILES");
+        return result;
+    }
+
+    try {
+        std::unique_ptr<RWMol> parentMol(SmilesToMol(smiles));
+        if (!parentMol) {
+            result->success = false;
+            snprintf(result->errorMessage, sizeof(result->errorMessage), "Invalid SMILES");
+            return result;
+        }
+
+        // Compute total formal charge of parent
+        int parentCharge = 0;
+        for (auto atom : parentMol->atoms()) parentCharge += atom->getFormalCharge();
+
+        // --- Protonated form ---
+        auto protMol = std::make_unique<RWMol>(*parentMol);
+        // --- Deprotonated form ---
+        auto deprotMol = std::make_unique<RWMol>(*parentMol);
+
+        if (isAcid) {
+            // Acid: parent is protonated (has H). Deprotonated = remove H, charge -1
+            Atom *depAtom = deprotMol->getAtomWithIdx(atomIdx);
+            int nH = depAtom->getTotalNumHs();
+            if (nH > 0) {
+                depAtom->setNumExplicitHs(nH - 1);
+                depAtom->setFormalCharge(depAtom->getFormalCharge() - 1);
+            }
+            result->protonatedCharge = parentCharge;
+            result->deprotonatedCharge = parentCharge - 1;
+        } else {
+            // Base: parent is deprotonated (neutral). Protonated = add H, charge +1
+            Atom *protAtom = protMol->getAtomWithIdx(atomIdx);
+            int nH = protAtom->getTotalNumHs();
+            protAtom->setNumExplicitHs(nH + 1);
+            protAtom->setFormalCharge(protAtom->getFormalCharge() + 1);
+            result->protonatedCharge = parentCharge + 1;
+            result->deprotonatedCharge = parentCharge;
+        }
+
+        // Sanitize both
+        try { MolOps::sanitizeMol(*protMol); } catch (...) {}
+        try { MolOps::sanitizeMol(*deprotMol); } catch (...) {}
+
+        // Add hydrogens and generate 3D for both
+        auto prepare3D = [](RWMol &mol) {
+            MolOps::addHs(mol, false, true);
+            int cid = embed_molecule(mol);
+            if (cid < 0) {
+                try { RDDepict::compute2DCoords(mol); } catch (...) {}
+            }
+            // MMFF minimize
+            std::vector<std::pair<int,double>> mmffRes;
+            try { MMFF::MMFFOptimizeMoleculeConfs(mol, mmffRes, 0, 500); } catch (...) {}
+            // Gasteiger charges
+            try { computeGasteigerCharges(mol); } catch (...) {}
+        };
+
+        prepare3D(*protMol);
+        prepare3D(*deprotMol);
+
+        result->protonated = mol_to_result(*protMol, "protonated");
+        result->deprotonated = mol_to_result(*deprotMol, "deprotonated");
+        result->success = true;
+
+    } catch (const std::exception &e) {
+        result->success = false;
+        snprintf(result->errorMessage, sizeof(result->errorMessage), "%s", e.what());
+    } catch (...) {
+        result->success = false;
+        snprintf(result->errorMessage, sizeof(result->errorMessage), "Unknown error");
+    }
+
+    return result;
+}
+
+void druse_free_site_protomer_pair(DruseSiteProtomerPair *result) {
+    if (!result) return;
+    druse_free_molecule_result(result->protonated);
+    druse_free_molecule_result(result->deprotonated);
+    delete result;
+}
+
+// ============================================================================
+// MARK: - Ensemble with pKa Overrides
+// ============================================================================
+
+DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
+    const char *smiles, const char *name,
+    double pH, double pkaThreshold,
+    int32_t maxTautomers, int32_t maxProtomers,
+    double energyCutoff, int32_t conformersPerForm,
+    double temperature,
+    const double *sitePKa, int32_t nSitePKa
+) {
+    // If no pKa overrides, delegate to the original function
+    if (!sitePKa || nSitePKa <= 0) {
+        return druse_prepare_ligand_ensemble(smiles, name, pH, pkaThreshold,
+            maxTautomers, maxProtomers, energyCutoff, conformersPerForm, temperature);
+    }
+
+    // This version replaces the hardcoded pKa detection with caller-provided values.
+    // The algorithm is identical to druse_prepare_ligand_ensemble except for step 1.
+    auto *result = new DruseEnsembleResult();
+    memset(result, 0, sizeof(DruseEnsembleResult));
+    result->numConformersPerForm = conformersPerForm;
+
+    if (!smiles || !smiles[0]) {
+        result->success = false;
+        snprintf(result->errorMessage, 512, "Empty SMILES");
+        return result;
+    }
+
+    try {
+        std::unique_ptr<RWMol> parentMol(SmilesToMol(smiles));
+        if (!parentMol) {
+            result->success = false;
+            snprintf(result->errorMessage, 512, "Invalid SMILES: %s", smiles);
+            return result;
+        }
+
+        // Step 1: Use CALLER-PROVIDED pKa values for wash + protomer enumeration
+        auto allSites = detectIonSitesInternal(*parentMol);
+
+        // Phase A: WASH — apply dominant protonation using computed pKa
+        auto washedMol = std::make_unique<RWMol>(*parentMol);
+        struct AmbSite { int groupIdx; int atomIdx; bool isAcid; };
+        std::vector<AmbSite> ambSites;
+
+        for (size_t i = 0; i < allSites.size() && (int)i < nSitePKa; i++) {
+            auto &[atomIdx, groupIdx, isAcid, _] = allSites[i];
+            double computedPKa = sitePKa[i];
+            double deltaPH = pH - computedPKa;
+
+            if (isAcid && deltaPH > pkaThreshold) {
+                // pH well above pKa: deprotonate (dominant)
+                Atom *atom = washedMol->getAtomWithIdx(atomIdx);
+                int nH = atom->getTotalNumHs();
+                if (nH > 0) {
+                    atom->setNumExplicitHs(nH - 1);
+                    atom->setFormalCharge(atom->getFormalCharge() - 1);
+                }
+            } else if (!isAcid && deltaPH < -pkaThreshold) {
+                // pH well below pKa: protonate (dominant)
+                Atom *atom = washedMol->getAtomWithIdx(atomIdx);
+                int nH = atom->getTotalNumHs();
+                atom->setNumExplicitHs(nH + 1);
+                atom->setFormalCharge(atom->getFormalCharge() + 1);
+            } else if (std::abs(deltaPH) <= pkaThreshold) {
+                // Near boundary: enumerate both states
+                ambSites.push_back({groupIdx, atomIdx, isAcid});
+            }
+        }
+        try { MolOps::sanitizeMol(*washedMol); } catch (...) {
+            washedMol = std::make_unique<RWMol>(*parentMol);
+        }
+
+        struct ChemicalForm {
+            std::string smi;
+            std::unique_ptr<RWMol> mol;
+            std::string label;
+            int kind;
+        };
+        std::vector<ChemicalForm> allForms;
+        std::set<std::string> seenSMILES;
+
+        // Phase B: Generate protomer combinations from ambiguous sites
+        int nSites = std::min((int)ambSites.size(), 10);
+        int nCombos = std::min(1 << nSites, (int)maxProtomers);
+
+        struct ProtomerForm {
+            std::string smi;
+            std::unique_ptr<RWMol> mol;
+            std::string label;
+        };
+        std::vector<ProtomerForm> protomers;
+
+        // combo=0 = washed molecule, higher combos toggle ambiguous sites
+        for (int combo = 0; combo < nCombos; combo++) {
+            auto rw = std::make_unique<RWMol>(*washedMol);
+            std::string comboLabel;
+
+            for (int s = 0; s < nSites; s++) {
+                if (!((combo >> s) & 1)) continue;
+                const auto &site = ambSites[s];
+                Atom *atom = rw->getAtomWithIdx(site.atomIdx);
+
+                if (site.isAcid) {
+                    int nH = atom->getTotalNumHs();
+                    if (nH > 0) {
+                        atom->setNumExplicitHs(nH - 1);
+                        atom->setFormalCharge(atom->getFormalCharge() - 1);
+                    }
+                } else {
+                    int nH = atom->getTotalNumHs();
+                    atom->setNumExplicitHs(nH + 1);
+                    atom->setFormalCharge(atom->getFormalCharge() + 1);
+                }
+                if (!comboLabel.empty()) comboLabel += "+";
+                comboLabel += std::string(site.isAcid ? "deprot_" : "prot_") +
+                    kIonizableGroups[site.groupIdx].name;
+            }
+
+            try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+            std::string pSmi = MolToSmiles(*rw);
+            if (seenSMILES.count(pSmi)) continue;
+            seenSMILES.insert(pSmi);
+
+            if (comboLabel.empty()) comboLabel = "Parent";
+            protomers.push_back({pSmi, std::move(rw), comboLabel});
+        }
+
+        if (protomers.empty()) {
+            auto rw = std::make_unique<RWMol>(*washedMol);
+            std::string wSmi = MolToSmiles(*rw);
+            seenSMILES.insert(wSmi);
+            protomers.push_back({wSmi, std::move(rw), "Parent"});
+        }
+
+        // Step 2: Tautomer enumeration (always add protomer first, then its tautomers)
+        int maxTotalForms = maxProtomers * maxTautomers;
+        if (maxTotalForms > 200) maxTotalForms = 200;
+
+        for (auto &prot : protomers) {
+            if ((int)allForms.size() >= maxTotalForms) break;
+
+            // Always add the protomer itself first
+            if (!seenSMILES.count(prot.smi)) seenSMILES.insert(prot.smi);
+            {
+                auto rw = std::make_unique<RWMol>(*prot.mol);
+                int kind = (prot.label != "Parent") ? 2 : 0;
+                allForms.push_back({prot.smi, std::move(rw), prot.label, kind});
+            }
+
+            // Then enumerate tautomers
+            try {
+                MolStandardize::TautomerEnumerator enumerator;
+                enumerator.setMaxTautomers(std::max(maxTautomers, 2));
+                enumerator.setMaxTransforms(200);
+                auto tautResult = enumerator.enumerate(*prot.mol);
+
+                int tautCount = 0;
+                for (const auto &taut : tautResult) {
+                    if (tautCount >= maxTautomers || (int)allForms.size() >= maxTotalForms) break;
+                    auto rw = std::make_unique<RWMol>(*taut);
+                    try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+                    std::string tSmi = MolToSmiles(*rw);
+                    if (seenSMILES.count(tSmi)) continue;
+                    seenSMILES.insert(tSmi);
+
+                    bool isFromProtomer = (prot.label != "Parent");
+                    int kind = isFromProtomer ? 3 : 1;
+
+                    std::string label = prot.label;
+                    if (label != "Parent") label += "_";
+                    else label = "";
+                    label += "Taut" + std::to_string(tautCount + 1);
+
+                    allForms.push_back({tSmi, std::move(rw), label, kind});
+                    tautCount++;
+                }
+            } catch (...) {
+                // Tautomer enumeration failed; protomer already added above
+            }
+        }
+
+        if (allForms.empty()) {
+            result->success = false;
+            snprintf(result->errorMessage, 512, "No valid chemical forms generated");
+            return result;
+        }
+        result->numForms = (int)allForms.size();
+
+        // Steps 3-6: Conformer generation, energy filter, Boltzmann (reuse from original)
+        struct PreparedConformer {
+            std::unique_ptr<RWMol> mol;
+            double energy;
+            int formIdx;
+            int confIdx;
+            std::string label;
+            std::string smi;
+            int kind;
+        };
+        std::vector<PreparedConformer> allConformers;
+
+        for (int fi = 0; fi < (int)allForms.size(); fi++) {
+            auto &form = allForms[fi];
+            auto mol = std::make_unique<RWMol>(*form.mol);
+            MolOps::addHs(*mol, false, true);
+
+            // Conformers with RMSD pruning
+            DGeomHelpers::EmbedParameters ep = DGeomHelpers::ETKDGv3;
+            ep.randomSeed = 42;
+            ep.pruneRmsThresh = 0.25;
+            ep.numThreads = 0;
+            auto cids = DGeomHelpers::EmbedMultipleConfs(*mol, conformersPerForm, ep);
+            if (cids.empty()) {
+                int cid = DGeomHelpers::EmbedMolecule(*mol, ep);
+                if (cid >= 0) cids.push_back(cid);
+                else {
+                    cid = embed_molecule(*mol);
+                    if (cid >= 0) cids.push_back(cid);
+                }
+            }
+            if (cids.empty()) continue;
+
+            std::vector<std::pair<int, double>> mmffResults;
+            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults, 0, 1000, "MMFF94"); } catch (...) {}
+            try { computeGasteigerCharges(*mol); } catch (...) {}
+
+            std::vector<std::pair<int, double>> indexed;
+            for (int ci = 0; ci < (int)cids.size(); ci++) {
+                double e = std::numeric_limits<double>::quiet_NaN();
+                if (ci < (int)mmffResults.size()) {
+                    if (mmffResults[ci].first == 0) e = mmffResults[ci].second;
+                    else continue;  // skip non-converged
+                }
+                if (std::isnan(e) || e > 1e6) continue;
+
+                bool hasClash = false;
+                const Conformer &conf = mol->getConformer(cids[ci]);
+                int nAtoms = mol->getNumAtoms();
+                for (int a = 0; a < nAtoms && !hasClash; a++) {
+                    if (mol->getAtomWithIdx(a)->getAtomicNum() == 1) continue;
+                    const auto &pa = conf.getAtomPos(a);
+                    if (pa.x == 0.0 && pa.y == 0.0 && pa.z == 0.0) { hasClash = true; break; }
+                    for (int b = a + 1; b < nAtoms && !hasClash; b++) {
+                        if (mol->getAtomWithIdx(b)->getAtomicNum() == 1) continue;
+                        if (mol->getBondBetweenAtoms(a, b)) continue;
+                        const auto &pb = conf.getAtomPos(b);
+                        double d2 = (pa.x-pb.x)*(pa.x-pb.x) + (pa.y-pb.y)*(pa.y-pb.y) + (pa.z-pb.z)*(pa.z-pb.z);
+                        if (d2 < 1.0) hasClash = true;
+                    }
+                }
+                if (hasClash) continue;
+                indexed.push_back({ci, e});
+            }
+
+            if (indexed.empty() && !cids.empty()) {
+                for (int ci = 0; ci < (int)cids.size(); ci++) {
+                    if (ci < (int)mmffResults.size() && mmffResults[ci].first == 0) {
+                        indexed.push_back({ci, mmffResults[ci].second});
+                        break;
+                    }
+                }
+            }
+
+            std::sort(indexed.begin(), indexed.end(),
+                      [](const auto &a, const auto &b) { return a.second < b.second; });
+
+            for (int ri = 0; ri < (int)indexed.size(); ri++) {
+                int confId = cids[indexed[ri].first];
+                double energy = indexed[ri].second;
+
+                auto confMol = std::make_unique<RWMol>(*mol);
+                if (confMol->getNumConformers() > 1) {
+                    std::vector<unsigned int> toRemove;
+                    for (auto it = confMol->beginConformers(); it != confMol->endConformers(); ++it) {
+                        if ((int)(*it)->getId() != confId) toRemove.push_back((*it)->getId());
+                    }
+                    for (auto cid : toRemove) confMol->removeConformer(cid);
+                }
+
+                std::string confLabel = form.label;
+                if (indexed.size() > 1) confLabel += "_Conf" + std::to_string(ri + 1);
+
+                allConformers.push_back({std::move(confMol), energy, fi, ri, confLabel, form.smi, form.kind});
+            }
+        }
+
+        // Energy cutoff
+        if (energyCutoff > 0 && !allConformers.empty()) {
+            double bestE = 1e30;
+            for (const auto &c : allConformers)
+                if (!std::isnan(c.energy) && c.energy < bestE) bestE = c.energy;
+            allConformers.erase(
+                std::remove_if(allConformers.begin(), allConformers.end(),
+                    [&](const PreparedConformer &c) { return !std::isnan(c.energy) && c.energy > bestE + energyCutoff; }),
+                allConformers.end());
+        }
+
+        // Boltzmann weights
+        double kBT = 0.001987204 * temperature;
+        if (kBT < 1e-10) kBT = 0.593;
+        double minE = 1e30;
+        for (const auto &c : allConformers)
+            if (!std::isnan(c.energy) && c.energy < minE) minE = c.energy;
+
+        std::vector<double> boltzWeights(allConformers.size(), 0.0);
+        double partitionZ = 0.0;
+        for (size_t i = 0; i < allConformers.size(); i++) {
+            double dE = std::isnan(allConformers[i].energy) ? 50.0 : (allConformers[i].energy - minE);
+            boltzWeights[i] = std::exp(-dE / kBT);
+            partitionZ += boltzWeights[i];
+        }
+        if (partitionZ > 0) for (auto &w : boltzWeights) w /= partitionZ;
+
+        // Build result
+        int count = (int)allConformers.size();
+        result->count = count;
+        result->members = new DruseEnsembleMember[count];
+        result->success = true;
+
+        for (int i = 0; i < count; i++) {
+            auto &c = allConformers[i];
+            auto &m = result->members[i];
+            m.molecule = mol_to_result(*c.mol, name);
+            m.mmffEnergy = c.energy;
+            m.boltzmannWeight = boltzWeights[i];
+            m.kind = c.kind;
+            m.conformerIndex = c.confIdx;
+            m.formIndex = c.formIdx;
+            snprintf(m.label, sizeof(m.label), "%s", c.label.c_str());
+            snprintf(m.smiles, sizeof(m.smiles), "%s", c.smi.c_str());
+        }
+
+    } catch (const std::exception &e) {
+        result->success = false;
+        snprintf(result->errorMessage, 512, "Ensemble preparation failed: %s", e.what());
+    } catch (...) {
+        result->success = false;
+        snprintf(result->errorMessage, 512, "Ensemble preparation failed (unknown error)");
+    }
+
+    return result;
 }

@@ -436,6 +436,204 @@ enum RDKitBridge {
         )
     }
 
+    /// Convert an EnsembleResult into ChemicalForm array (the new hierarchical model).
+    ///
+    /// Groups EnsembleMember items by formIndex, creates one ChemicalForm per distinct form,
+    /// and populates conformer arrays sorted by energy.
+    static func ensembleResultToForms(_ result: EnsembleResult) -> [ChemicalForm] {
+        guard !result.members.isEmpty else { return [] }
+
+        // Group members by formIndex
+        let grouped = Dictionary(grouping: result.members, by: { $0.formIndex })
+
+        // Build one ChemicalForm per distinct form, sorted by best energy
+        var forms: [ChemicalForm] = []
+        for (_, members) in grouped.sorted(by: { a, b in
+            let aMin = a.value.map(\.mmffEnergy).filter { !$0.isNaN }.min() ?? .infinity
+            let bMin = b.value.map(\.mmffEnergy).filter { !$0.isNaN }.min() ?? .infinity
+            return aMin < bMin
+        }) {
+            guard let rep = members.first else { continue }
+
+            // Sort conformers by energy within this form
+            let sortedMembers = members.sorted(by: { $0.mmffEnergy < $1.mmffEnergy })
+
+            let conformers = sortedMembers.enumerated().map { idx, member in
+                Conformer3D(
+                    id: idx,
+                    atoms: member.molecule.atoms,
+                    bonds: member.molecule.bonds,
+                    energy: member.mmffEnergy
+                )
+            }
+
+            let kind = ChemicalFormKind(rawValue: rep.kind) ?? .parent
+
+            // Sum Boltzmann weights across conformers of this form
+            let totalWeight = members.reduce(0.0) { $0 + $1.boltzmannWeight }
+
+            forms.append(ChemicalForm(
+                smiles: rep.smiles,
+                kind: kind,
+                label: rep.label.replacingOccurrences(of: "_Conf\\d+$", with: "",
+                    options: .regularExpression), // strip conformer suffix from label
+                boltzmannWeight: totalWeight,
+                relativeEnergy: 0, // will be set below
+                conformers: conformers
+            ))
+        }
+
+        // Compute relative energies based on best conformer of each form
+        if let bestE = forms.first?.conformers.first?.energy {
+            for i in forms.indices {
+                let formBestE = forms[i].conformers.first?.energy ?? bestE
+                forms[i].relativeEnergy = formBestE - bestE
+            }
+        }
+
+        // Normalize Boltzmann weights to sum to 1.0
+        let weightSum = forms.reduce(0.0) { $0 + $1.boltzmannWeight }
+        if weightSum > 0 {
+            for i in forms.indices {
+                forms[i].boltzmannWeight /= weightSum
+            }
+        }
+
+        return forms
+    }
+
+    // MARK: - Ionizable Site Detection (for GFN2-xTB pKa Prediction)
+
+    /// A detected ionizable site in a molecule.
+    struct IonizableSite: Sendable {
+        let atomIdx: Int
+        let isAcid: Bool          // true = loses H (deprotonates), false = gains H (protonates)
+        let defaultPKa: Double    // from the built-in lookup table
+        let groupName: String     // e.g. "Piperazine N"
+    }
+
+    /// Detect all ionizable sites in a molecule (regardless of pH).
+    static func detectIonizableSites(smiles: String) -> [IonizableSite] {
+        guard let result = druse_detect_ionizable_sites(smiles) else { return [] }
+        defer { druse_free_ion_sites(result) }
+
+        let count = Int(result.pointee.count)
+        guard count > 0, let sites = result.pointee.sites else { return [] }
+
+        return (0..<count).map { i in
+            let s = sites[i]
+            let name = withUnsafePointer(to: s.groupName) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 64) { String(cString: $0) }
+            }
+            return IonizableSite(
+                atomIdx: Int(s.atomIdx),
+                isAcid: s.isAcid,
+                defaultPKa: s.defaultPKa,
+                groupName: name
+            )
+        }
+    }
+
+    /// A pair of protonated + deprotonated 3D structures for a single ionizable site.
+    struct SiteProtomerPair: Sendable {
+        let protonatedAtoms: [Atom]
+        let protonatedBonds: [Bond]
+        let protonatedCharge: Int
+        let deprotonatedAtoms: [Atom]
+        let deprotonatedBonds: [Bond]
+        let deprotonatedCharge: Int
+    }
+
+    /// Generate protonated and deprotonated 3D structures for a specific ionizable site.
+    /// Both forms are MMFF94-minimized with Gasteiger charges.
+    static func generateSiteProtomers(smiles: String, atomIdx: Int, isAcid: Bool) -> SiteProtomerPair? {
+        guard let result = druse_generate_site_protomers(smiles, Int32(atomIdx), isAcid) else { return nil }
+        defer { druse_free_site_protomer_pair(result) }
+
+        guard result.pointee.success,
+              let prot = result.pointee.protonated, prot.pointee.success,
+              let deprot = result.pointee.deprotonated, deprot.pointee.success else {
+            return nil
+        }
+
+        let protMol = convertResult(prot.pointee)
+        let deprotMol = convertResult(deprot.pointee)
+
+        return SiteProtomerPair(
+            protonatedAtoms: protMol.atoms,
+            protonatedBonds: protMol.bonds,
+            protonatedCharge: Int(result.pointee.protonatedCharge),
+            deprotonatedAtoms: deprotMol.atoms,
+            deprotonatedBonds: deprotMol.bonds,
+            deprotonatedCharge: Int(result.pointee.deprotonatedCharge)
+        )
+    }
+
+    /// Prepare ensemble with per-site pKa overrides (from GFN2-xTB prediction).
+    /// If sitePKa is empty, falls back to the default hardcoded pKa table.
+    static func prepareEnsembleWithPKa(
+        smiles: String, name: String = "",
+        pH: Double = 7.4, pkaThreshold: Double = 2.0,
+        maxTautomers: Int = 10, maxProtomers: Int = 8,
+        energyCutoff: Double = 15.0, conformersPerForm: Int = 5,
+        temperature: Double = 298.15,
+        sitePKa: [Double] = []
+    ) -> EnsembleResult {
+        let cResult: UnsafeMutablePointer<DruseEnsembleResult>?
+        if sitePKa.isEmpty {
+            cResult = druse_prepare_ligand_ensemble(
+                smiles, name, pH, pkaThreshold,
+                Int32(maxTautomers), Int32(maxProtomers),
+                energyCutoff, Int32(conformersPerForm), temperature
+            )
+        } else {
+            cResult = sitePKa.withUnsafeBufferPointer { buf in
+                druse_prepare_ligand_ensemble_v2(
+                    smiles, name, pH, pkaThreshold,
+                    Int32(maxTautomers), Int32(maxProtomers),
+                    energyCutoff, Int32(conformersPerForm), temperature,
+                    buf.baseAddress, Int32(sitePKa.count)
+                )
+            }
+        }
+        guard let cResult else {
+            return EnsembleResult(members: [], numForms: 0, conformersPerForm: conformersPerForm,
+                                  success: false, errorMessage: "Ensemble preparation returned nil")
+        }
+        defer { druse_free_ensemble_result(cResult) }
+
+        guard cResult.pointee.success else {
+            let msg = fixedCString(cResult.pointee.errorMessage)
+            return EnsembleResult(members: [], numForms: 0, conformersPerForm: conformersPerForm,
+                                  success: false, errorMessage: msg)
+        }
+
+        var members: [EnsembleMember] = []
+        let count = Int(cResult.pointee.count)
+        for i in 0..<count {
+            let m = cResult.pointee.members[i]
+            guard let molPtr = m.molecule, molPtr.pointee.success else { continue }
+            let mol = convertResult(molPtr.pointee)
+            members.append(EnsembleMember(
+                id: i, molecule: mol,
+                smiles: fixedCString(m.smiles),
+                mmffEnergy: m.mmffEnergy,
+                boltzmannWeight: m.boltzmannWeight,
+                kind: Int(m.kind),
+                label: fixedCString(m.label),
+                formIndex: Int(m.formIndex),
+                conformerIndex: Int(m.conformerIndex)
+            ))
+        }
+
+        return EnsembleResult(
+            members: members,
+            numForms: Int(cResult.pointee.numForms),
+            conformersPerForm: Int(cResult.pointee.numConformersPerForm),
+            success: true, errorMessage: ""
+        )
+    }
+
     /// Build torsion tree from SMILES. Returns rotatable bond definitions.
     static func buildTorsionTree(smiles: String) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])]? {
         guard let tree = druse_build_torsion_tree(smiles) else { return nil }
@@ -493,7 +691,18 @@ enum RDKitBridge {
         return e.isNaN ? nil : e
     }
 
-    // MARK: - 2D Coordinates
+    // MARK: - SVG 2D Depiction
+
+    /// Generate a publication-quality SVG depiction of a molecule from SMILES.
+    /// Uses RDKit MolDraw2DSVG with proper wedge/dash stereo bonds, aromatic notation,
+    /// and element coloring. Returns nil on failure.
+    static func moleculeToSVG(smiles: String, width: Int = 400, height: Int = 300) -> String? {
+        guard let cStr = druse_mol_to_svg(smiles, Int32(width), Int32(height)) else { return nil }
+        defer { druse_free_string(cStr) }
+        return String(cString: cStr)
+    }
+
+    // MARK: - 2D Coordinates (legacy, used by interaction diagram)
 
     /// Result of 2D depiction coordinate generation for a ligand.
     struct Coords2D: Sendable {

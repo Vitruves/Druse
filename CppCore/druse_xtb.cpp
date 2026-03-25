@@ -3046,7 +3046,9 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
     DruseXTBSolvationConfig solvation,
     DruseXTBOptLevel optLevel,
     int32_t maxSteps,
-    const bool *freezeMask)
+    const bool *freezeMask,
+    const float *referencePositions,
+    float restraintStrength)
 {
     auto *result = new DruseXTBOptResult();
     std::memset(result, 0, sizeof(DruseXTBOptResult));
@@ -3121,10 +3123,38 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
 
         double Etotal = ws.Eelec + ws.Erep + Edisp + Esolv;
 
+        // Add harmonic position restraints: E_restr = k/2 * Σ(r - r0)²
+        double Erestraint = 0.0;
+        if (referencePositions && restraintStrength > 0.0f) {
+            double k = (double)restraintStrength;
+            for (int i = 0; i < atomCount; i++) {
+                if (frozen[i]) continue;
+                for (int c = 0; c < 3; c++) {
+                    double dr = (double)pos[3*i + c] - (double)referencePositions[3*i + c];
+                    Erestraint += 0.5 * k * dr * dr;
+                    // Gradient in Hartree/Angstrom (positions are in Angstrom)
+                    // totalGrad is in Hartree/Bohr, so add restraint as Hartree/Ang
+                    // and let the conversion below handle the Bohr→Ang factor.
+                    // Actually, we add directly to freeGrad after extraction, see below.
+                }
+            }
+            Etotal += Erestraint;
+        }
+
         // Extract free-coordinate gradient (convert Hartree/Bohr → Hartree/Angstrom)
         std::vector<double> freeGrad(nfree);
         for (int k = 0; k < nfree; k++)
             freeGrad[k] = totalGrad[freeMap[k]] * BOHR_TO_ANG; // chain rule: dE/dR_ang = dE/dR_bohr * bohr/ang
+
+        // Add restraint gradient (already in Hartree/Angstrom, add directly)
+        if (referencePositions && restraintStrength > 0.0f) {
+            double kk = (double)restraintStrength;
+            for (int k = 0; k < nfree; k++) {
+                int posIdx = freeMap[k];
+                double dr = (double)pos[posIdx] - (double)referencePositions[posIdx];
+                freeGrad[k] += kk * dr;
+            }
+        }
 
         // Gradient norm (RMS per free atom, in Hartree/Bohr)
         double gnorm2 = 0.0;

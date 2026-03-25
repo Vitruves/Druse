@@ -8,30 +8,48 @@ extension AppViewModel {
 
     func selectAtom(_ atomIndex: Int?, toggle: Bool = false) {
         if !toggle {
+            workspace.selectedAtomIndices.removeAll()
             workspace.selectedResidueIndices.removeAll()
         }
 
         workspace.selectedAtomIndex = atomIndex
 
         if let idx = atomIndex {
-            if let prot = molecules.protein, let resIdx = prot.residueIndex(forAtom: idx) {
-                if toggle && workspace.selectedResidueIndices.contains(resIdx) {
-                    workspace.selectedResidueIndices.remove(resIdx)
+            if workspace.selectionMode == .atom {
+                // Atom mode: track individual atoms, don't auto-select residues
+                if toggle && workspace.selectedAtomIndices.contains(idx) {
+                    workspace.selectedAtomIndices.remove(idx)
                 } else {
-                    workspace.selectedResidueIndices.insert(resIdx)
+                    workspace.selectedAtomIndices.insert(idx)
                 }
-            }
-            if let lig = molecules.ligand {
-                let adjustedIdx = idx - (molecules.protein?.atoms.count ?? 0)
-                if adjustedIdx >= 0, let resIdx = lig.residueIndex(forAtom: adjustedIdx) {
+            } else {
+                // Residue mode: select the full parent residue
+                if let prot = molecules.protein, let resIdx = prot.residueIndex(forAtom: idx) {
                     if toggle && workspace.selectedResidueIndices.contains(resIdx) {
                         workspace.selectedResidueIndices.remove(resIdx)
+                        let resAtoms = Set(prot.residues[resIdx].atomIndices)
+                        workspace.selectedAtomIndices.subtract(resAtoms)
                     } else {
                         workspace.selectedResidueIndices.insert(resIdx)
+                        workspace.selectedAtomIndices.formUnion(prot.residues[resIdx].atomIndices)
+                    }
+                }
+                if let lig = molecules.ligand {
+                    let adjustedIdx = idx - (molecules.protein?.atoms.count ?? 0)
+                    if adjustedIdx >= 0, let resIdx = lig.residueIndex(forAtom: adjustedIdx) {
+                        let offset = molecules.protein?.atoms.count ?? 0
+                        if toggle && workspace.selectedResidueIndices.contains(resIdx) {
+                            workspace.selectedResidueIndices.remove(resIdx)
+                            let resAtoms = Set(lig.residues[resIdx].atomIndices.map { $0 + offset })
+                            workspace.selectedAtomIndices.subtract(resAtoms)
+                        } else {
+                            workspace.selectedResidueIndices.insert(resIdx)
+                            workspace.selectedAtomIndices.formUnion(lig.residues[resIdx].atomIndices.map { $0 + offset })
+                        }
                     }
                 }
             }
-            log.debug("[Selection] Atom \(idx) selected (toggle=\(toggle), \(workspace.selectedResidueIndices.count) residues)", category: .selection)
+            log.debug("[Selection] Atom \(idx) selected (mode=\(workspace.selectionMode.rawValue), toggle=\(toggle))", category: .selection)
         } else {
             log.debug("[Selection] Selection cleared via nil atom", category: .selection)
         }

@@ -29,6 +29,15 @@ struct GFN2RefinementConfig: Sendable {
 
     /// If true, update the docked ligand coordinates with optimized geometry.
     var updateCoordinates: Bool = true
+
+    /// Harmonic position restraint strength (Hartree/Å²) to keep ligand near docked pose.
+    /// 0.005 allows ~0.3 Å local relaxation per atom while preventing drift.
+    /// 0 = no restraints (not recommended for post-dock refinement).
+    var restraintStrength: Float = 0.005
+
+    /// Maximum heavy-atom RMSD (Å) allowed between docked and optimized pose.
+    /// Poses exceeding this are rejected (original docked coordinates kept).
+    var maxRMSD: Float = 2.0
 }
 
 /// Solvation mode for GFN2 calculations.
@@ -207,13 +216,17 @@ enum GFN2Refiner {
     ///   - optLevel: Convergence tightness.
     ///   - maxSteps: Max optimization steps (0 = auto).
     ///   - freezeMask: Per-atom freeze flags (true = don't move). nil = optimize all.
+    ///   - referencePositions: Optional reference positions for harmonic restraints.
+    ///   - restraintStrength: Spring constant in Hartree/Å² (e.g. 0.005). Only used with referencePositions.
     static func optimizeGeometry(
         atoms: [Atom],
         totalCharge: Int = 0,
         solvation: GFN2SolvationMode = .water,
         optLevel: GFN2OptLevel = .normal,
         maxSteps: Int32 = 0,
-        freezeMask: [Bool]? = nil
+        freezeMask: [Bool]? = nil,
+        referencePositions: [SIMD3<Float>]? = nil,
+        restraintStrength: Float = 0.0
     ) async throws -> GFN2RefinementResult {
         let n = atoms.count
         guard n >= 2 else { throw GFN2Error.tooFewAtoms }
@@ -229,21 +242,52 @@ enum GFN2Refiner {
             mask = freezeMask
         }
 
+        // Prepare reference positions for restraints
+        var refPos: [Float]?
+        if let referencePositions, referencePositions.count == n {
+            refPos = [Float](repeating: 0, count: n * 3)
+            for i in 0..<n {
+                refPos![i * 3]     = referencePositions[i].x
+                refPos![i * 3 + 1] = referencePositions[i].y
+                refPos![i * 3 + 2] = referencePositions[i].z
+            }
+        }
+
         return try await Task.detached(priority: .userInitiated) {
             let resultPtr: UnsafeMutablePointer<DruseXTBOptResult>?
 
             if var freezeArray = mask {
-                resultPtr = druse_xtb_optimize_geometry(
-                    &positions, &atomicNumbers,
-                    Int32(n), Int32(totalCharge),
-                    solv, cLevel, maxSteps, &freezeArray
-                )
+                if var refArray = refPos {
+                    resultPtr = druse_xtb_optimize_geometry(
+                        &positions, &atomicNumbers,
+                        Int32(n), Int32(totalCharge),
+                        solv, cLevel, maxSteps, &freezeArray,
+                        &refArray, restraintStrength
+                    )
+                } else {
+                    resultPtr = druse_xtb_optimize_geometry(
+                        &positions, &atomicNumbers,
+                        Int32(n), Int32(totalCharge),
+                        solv, cLevel, maxSteps, &freezeArray,
+                        nil, 0.0
+                    )
+                }
             } else {
-                resultPtr = druse_xtb_optimize_geometry(
-                    &positions, &atomicNumbers,
-                    Int32(n), Int32(totalCharge),
-                    solv, cLevel, maxSteps, nil
-                )
+                if var refArray = refPos {
+                    resultPtr = druse_xtb_optimize_geometry(
+                        &positions, &atomicNumbers,
+                        Int32(n), Int32(totalCharge),
+                        solv, cLevel, maxSteps, nil,
+                        &refArray, restraintStrength
+                    )
+                } else {
+                    resultPtr = druse_xtb_optimize_geometry(
+                        &positions, &atomicNumbers,
+                        Int32(n), Int32(totalCharge),
+                        solv, cLevel, maxSteps, nil,
+                        nil, 0.0
+                    )
+                }
             }
 
             guard let result = resultPtr else {
