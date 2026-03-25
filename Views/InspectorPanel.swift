@@ -344,7 +344,7 @@ struct InspectorPanel: View {
                                 Text("Chain \(chain.id)")
                                     .font(.system(size: 12, weight: .medium))
                                 HStack(spacing: 4) {
-                                    Text(chain.type == .protein ? "Protein" : chain.type == .ligand ? "Ligand" : "Other")
+                                    Text(chain.type.label)
                                         .font(.system(size: 10))
                                         .foregroundStyle(.secondary)
                                     Text("\(atomCount) atoms")
@@ -408,7 +408,7 @@ struct InspectorPanel: View {
                         .padding(.top, 2)
                 }
 
-                if viewModel.molecules.ligand != nil {
+                if let lig = viewModel.molecules.ligand {
                     HStack(spacing: 8) {
                         Circle()
                             .fill(Color.orange)
@@ -416,21 +416,37 @@ struct InspectorPanel: View {
                         Text("Ligand")
                             .font(.system(size: 12, weight: .medium))
                         Spacer()
-                        Text(viewModel.molecules.ligand?.name ?? "")
+                        Text(lig.name)
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
 
-                        Button(action: { viewModel.definePocketFromLigand() }) {
-                            Image(systemName: "scope")
-                                .font(.system(size: 11))
+                        // Only show "define pocket from ligand" for co-crystallized ligands
+                        // (ligands from the PDB structure, not generated from SMILES)
+                        if lig.atoms.first?.isHetAtom == true && lig.smiles == nil {
+                            Button(action: { viewModel.definePocketFromLigand() }) {
+                                Image(systemName: "scope")
+                                    .font(.system(size: 11))
+                                    .padding(3)
+                                    .background(Color.green.opacity(0.1))
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.green)
+                            .help("Define docking pocket from co-crystallized ligand position")
+                        }
+
+                        // Delete ligand from renderer
+                        Button(action: { viewModel.removeLigandFromView() }) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10))
                                 .padding(3)
-                                .background(Color.green.opacity(0.1))
+                                .background(Color.red.opacity(0.05))
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                         .buttonStyle(.plain)
-                        .foregroundStyle(.green)
-                        .help("Define docking pocket from ligand position")
+                        .foregroundStyle(.red.opacity(0.6))
+                        .help("Remove ligand from view and database")
 
                         Toggle("", isOn: Binding(
                             get: { viewModel.workspace.showLigand },
@@ -521,6 +537,7 @@ struct InspectorPanel: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                         .buttonStyle(.plain)
+                        .help("Delete this subset")
                     }
                 }
             }
@@ -571,6 +588,7 @@ struct InspectorPanel: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(viewModel.workspace.activeConformerIndex == 0)
+                        .help("Previous conformer")
 
                         Text("\(viewModel.workspace.activeConformerIndex + 1) / \(confs.count)")
                             .font(.system(size: 10, weight: .medium, design: .monospaced))
@@ -584,6 +602,7 @@ struct InspectorPanel: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(viewModel.workspace.activeConformerIndex >= confs.count - 1)
+                        .help("Next conformer")
                     }
 
                     let active = confs[viewModel.workspace.activeConformerIndex]

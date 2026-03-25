@@ -135,6 +135,99 @@ inline float flexVinaPairEnergy(int flexType, int ligType, float r) {
     return e;
 }
 
+/// Smooth sigmoid approximation of slopeStep for continuous gradients.
+inline float flexSmoothSlopeStep(float hi, float lo, float x) {
+    float k = 10.0f;
+    float t = k * (x - lo) / (hi - lo) - k * 0.5f;
+    // hi > lo → slope goes from 1 to 0;  hi < lo → 0 to 1
+    float s = 1.0f / (1.0f + exp(-t));
+    return (hi > lo) ? (1.0f - s) : s;
+}
+
+inline float flexSmoothSlopeStepDeriv(float hi, float lo, float x) {
+    float k = 10.0f;
+    float t = k * (x - lo) / (hi - lo) - k * 0.5f;
+    float s = 1.0f / (1.0f + exp(-t));
+    float ds = k / (hi - lo) * s * (1.0f - s);
+    return (hi > lo) ? -ds : ds;
+}
+
+/// Vina pair energy with analytical derivative dE/dr for flex atoms.
+inline float flexVinaPairEnergyWithDeriv(int flexType, int ligType, float r, thread float &dEdr) {
+    dEdr = 0.0f;
+    if (!flexXSTypeSupported(flexType) || !flexXSTypeSupported(ligType) || r >= 8.0f)
+        return 0.0f;
+
+    float d = r - flexOptimalDist(flexType, ligType);
+    float E = 0.0f;
+
+    // Gauss1
+    float g1 = exp(-4.0f * d * d);
+    E += fwGauss1 * g1;
+    dEdr += fwGauss1 * g1 * (-8.0f * d);
+
+    // Gauss2
+    float dm3h = (d - 3.0f) * 0.5f;
+    float g2 = exp(-dm3h * dm3h);
+    E += fwGauss2 * g2;
+    dEdr += fwGauss2 * g2 * (-dm3h);
+
+    // Repulsion
+    if (d < 0.0f) {
+        E += fwRepulsion * d * d;
+        dEdr += 2.0f * fwRepulsion * d;
+    }
+
+    // Hydrophobic (smooth for gradient)
+    if (flexIsHydrophobic(flexType) && flexIsHydrophobic(ligType)) {
+        E += fwHydrophobic * flexSmoothSlopeStep(1.5f, 0.5f, d);
+        dEdr += fwHydrophobic * flexSmoothSlopeStepDeriv(1.5f, 0.5f, d);
+    }
+
+    // H-bond (smooth for gradient)
+    if (flexHBondPossible(flexType, ligType)) {
+        E += fwHBond * flexSmoothSlopeStep(0.0f, -0.7f, d);
+        dEdr += fwHBond * flexSmoothSlopeStepDeriv(0.0f, -0.7f, d);
+    }
+
+    return E;
+}
+
+/// Score flex-ligand interaction and compute analytical forces on flex sidechain atoms.
+/// Returns the rotated flex-ligand energy (NOT the delta). Also accumulates forces on
+/// flex atom positions (dE/dpos, gradient direction — NOT force direction).
+inline float scoreFlexWithAnalyticalForces(
+    thread float3               *ligPositions,
+    constant DockLigandAtom     *ligandAtoms,
+    uint                         numLigAtoms,
+    thread float3               *flexPositions,
+    thread float3               *flexForces,
+    constant FlexSidechainAtom  *flexAtoms,
+    uint                         numFlexAtoms)
+{
+    float totalE = 0.0f;
+    for (uint fa = 0; fa < numFlexAtoms; fa++) flexForces[fa] = float3(0);
+
+    for (uint fa = 0; fa < numFlexAtoms; fa++) {
+        int flexType = flexAtoms[fa].vinaType;
+        if (flexType < 0) continue;
+        float3 fp = flexPositions[fa];
+
+        for (uint la = 0; la < numLigAtoms; la++) {
+            float3 diff = fp - ligPositions[la];
+            float r = length(diff);
+            if (r < 1e-6f || r >= 8.0f) continue;
+
+            float dEdr;
+            totalE += flexVinaPairEnergyWithDeriv(flexType, ligandAtoms[la].vinaType, r, dEdr);
+
+            // dE/dpos_flex = dE/dr * (pos_flex - pos_lig) / r
+            flexForces[fa] += dEdr * diff / r;
+        }
+    }
+    return totalE;
+}
+
 // ============================================================================
 // MARK: - Position Flex Sidechain Atoms
 // ============================================================================
@@ -344,9 +437,10 @@ kernel void evolveChiAngles(
 // MARK: - Flex-Aware Local Search
 // ============================================================================
 
-/// Local search with chi angle gradients. Runs AFTER the main local search
+/// Local search with analytical chi angle gradients. Runs AFTER the main local search
 /// to refine sidechain orientations.
-/// Uses numerical finite differences on chi angles.
+/// Uses torque projection (force · cross(axis, arm)) instead of finite differences.
+/// Eliminates 2×N_chi energy evaluations per step → single pass per step.
 kernel void localSearchFlex(
     device DockPose             *poses          [[buffer(0)]],
     constant DockLigandAtom     *ligandAtoms    [[buffer(1)]],
@@ -360,7 +454,7 @@ kernel void localSearchFlex(
     device const half           *affinityMaps   [[buffer(9)]],
     device const int32_t        *typeIndexLookup [[buffer(10)]],
     constant GridParams         &gridParams     [[buffer(11)]],
-    constant uint32_t           *exclusionMask  [[buffer(12)]],
+    constant uint32_t           *intraPairs     [[buffer(12)]],
     uint                         tid            [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -374,54 +468,99 @@ kernel void localSearchFlex(
 
     float3 ligPositions[128];
     float3 flexPositions[64];
+    float3 flexForces[64];
 
-    float hChi = 0.03f;   // finite difference step (radians)
-    float stepSize = 0.3f;  // initial step
-    uint maxSteps = min(gaParams.localSearchSteps, 15u);  // fewer steps for chi refinement
+    float stepSize = 0.3f;
+    uint maxSteps = min(gaParams.localSearchSteps, 15u);
+
+    // Transform ligand once (doesn't change during chi optimization)
+    flexTransformAtoms(ligPositions, ligandAtoms, nLig, pose, torsionEdges, movingIndices, nTorsions);
+
+    // Compute reference energy (chi=0 positions) once
+    float referenceE = 0.0f;
+    {
+        float3 refPos[64];
+        for (uint i = 0; i < nFlex; i++) refPos[i] = float3(flexAtoms[i].referencePosition);
+        for (uint fa = 0; fa < nFlex; fa++) {
+            int flexType = flexAtoms[fa].vinaType;
+            if (flexType < 0) continue;
+            for (uint la = 0; la < nLig; la++) {
+                referenceE += flexVinaPairEnergy(flexType, ligandAtoms[la].vinaType,
+                                                  distance(refPos[fa], ligPositions[la]));
+            }
+        }
+    }
 
     for (uint step = 0; step < maxSteps; step++) {
-        // Current energy
-        flexTransformAtoms(ligPositions, ligandAtoms, nLig, pose, torsionEdges, movingIndices, nTorsions);
+        // Position flex atoms with current chi angles
         positionFlexAtoms(flexPositions, flexAtoms, nFlex, flexEdges, flexMoving, pose, nFlexTor);
-        float baseE = scoreFlexLigandDelta(ligPositions, ligandAtoms, nLig, flexPositions, flexAtoms, nFlex);
 
-        // Compute gradient for each chi angle
+        // Compute energy + analytical forces on flex atoms in a single pass
+        float rotatedE = scoreFlexWithAnalyticalForces(
+            ligPositions, ligandAtoms, nLig,
+            flexPositions, flexForces, flexAtoms, nFlex);
+
+        float baseE = rotatedE - referenceE;
+
+        // Project forces onto chi angle axes via torque
         float gradChi[24];
         bool anyGrad = false;
         for (uint c = 0; c < nFlexTor; c++) {
             int slot = flexEdges[c].chiSlot;
             if (slot < 0 || slot >= 24) { gradChi[c] = 0; continue; }
 
-            float origChi = pose.chiAngles[slot];
+            float3 pivot = flexPositions[flexEdges[c].pivotAtom];
+            float3 axisEnd = flexPositions[flexEdges[c].axisAtom];
+            float3 axisVec = axisEnd - pivot;
+            float axisLen = length(axisVec);
+            if (axisLen < 1e-6f) { gradChi[c] = 0; continue; }
+            float3 axis = axisVec / axisLen;
 
-            pose.chiAngles[slot] = origChi + hChi;
-            positionFlexAtoms(flexPositions, flexAtoms, nFlex, flexEdges, flexMoving, pose, nFlexTor);
-            float ePlus = scoreFlexLigandDelta(ligPositions, ligandAtoms, nLig, flexPositions, flexAtoms, nFlex);
-
-            pose.chiAngles[slot] = origChi - hChi;
-            positionFlexAtoms(flexPositions, flexAtoms, nFlex, flexEdges, flexMoving, pose, nFlexTor);
-            float eMinus = scoreFlexLigandDelta(ligPositions, ligandAtoms, nLig, flexPositions, flexAtoms, nFlex);
-
-            pose.chiAngles[slot] = origChi;
-            gradChi[c] = (ePlus - eMinus) / (2.0f * hChi);
-            if (abs(gradChi[c]) > 1e-6f) anyGrad = true;
+            // dE/dchi = sum over moving atoms of: dot(cross(arm, force), axis)
+            // where arm = pos - pivot, force = dE/dpos (gradient)
+            float torque = 0.0f;
+            uint start = flexEdges[c].movingStart;
+            uint count = flexEdges[c].movingCount;
+            for (uint m = start; m < start + count; m++) {
+                int atomIdx = flexMoving[m];
+                if (atomIdx < 0 || uint(atomIdx) >= nFlex) continue;
+                float3 arm = flexPositions[atomIdx] - pivot;
+                torque += dot(cross(arm, flexForces[atomIdx]), axis);
+            }
+            gradChi[c] = torque;
+            if (abs(torque) > 1e-6f) anyGrad = true;
         }
 
         if (!anyGrad) break;
 
-        // Line search: step along negative gradient
+        // Save chi angles for rollback
+        float oldChi[24];
+        for (uint c = 0; c < nFlexTor; c++) {
+            int slot = flexEdges[c].chiSlot;
+            if (slot >= 0 && slot < 24) oldChi[c] = pose.chiAngles[slot];
+        }
+
+        // Step along negative gradient
         for (uint c = 0; c < nFlexTor; c++) {
             int slot = flexEdges[c].chiSlot;
             if (slot < 0 || slot >= 24) continue;
             pose.chiAngles[slot] -= stepSize * gradChi[c];
-            // Wrap to [-π, π]
             if (pose.chiAngles[slot] > M_PI_F) pose.chiAngles[slot] -= 2.0f * M_PI_F;
             if (pose.chiAngles[slot] < -M_PI_F) pose.chiAngles[slot] += 2.0f * M_PI_F;
         }
 
-        // Check improvement
+        // Verify improvement
         positionFlexAtoms(flexPositions, flexAtoms, nFlex, flexEdges, flexMoving, pose, nFlexTor);
-        float newE = scoreFlexLigandDelta(ligPositions, ligandAtoms, nLig, flexPositions, flexAtoms, nFlex);
+        float newRotatedE = 0.0f;
+        for (uint fa = 0; fa < nFlex; fa++) {
+            int flexType = flexAtoms[fa].vinaType;
+            if (flexType < 0) continue;
+            for (uint la = 0; la < nLig; la++) {
+                newRotatedE += flexVinaPairEnergy(flexType, ligandAtoms[la].vinaType,
+                                                   distance(flexPositions[fa], ligPositions[la]));
+            }
+        }
+        float newE = newRotatedE - referenceE;
 
         if (newE < baseE) {
             stepSize *= 1.2f;
@@ -429,18 +568,14 @@ kernel void localSearchFlex(
             // Revert
             for (uint c = 0; c < nFlexTor; c++) {
                 int slot = flexEdges[c].chiSlot;
-                if (slot < 0 || slot >= 24) continue;
-                pose.chiAngles[slot] += stepSize * gradChi[c];
-                if (pose.chiAngles[slot] > M_PI_F) pose.chiAngles[slot] -= 2.0f * M_PI_F;
-                if (pose.chiAngles[slot] < -M_PI_F) pose.chiAngles[slot] += 2.0f * M_PI_F;
+                if (slot >= 0 && slot < 24) pose.chiAngles[slot] = oldChi[c];
             }
             stepSize *= 0.5f;
             if (stepSize < 0.001f) break;
         }
     }
 
-    // Final energy update: re-score with optimized chi angles and add to pose
-    flexTransformAtoms(ligPositions, ligandAtoms, nLig, pose, torsionEdges, movingIndices, nTorsions);
+    // Final energy update
     positionFlexAtoms(flexPositions, flexAtoms, nFlex, flexEdges, flexMoving, pose, nFlexTor);
     float finalFlexE = scoreFlexLigandDelta(ligPositions, ligandAtoms, nLig, flexPositions, flexAtoms, nFlex);
     pose.energy += flexParams.flexWeight * finalFlexE;

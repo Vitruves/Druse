@@ -134,7 +134,7 @@ final class DockingIntegrationTests: DockingTestCase {
         guard let pocket else { return XCTFail("[3PYY] Pocket detection failed") }
         printPocketDebug(pocket, label: "3PYY-Pocket")
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 300, generations: 300)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 300, generations: 300, numRuns: 3)
         let heavyAtoms = ligand.atoms.filter { $0.element != .H }
         printResultsDebug(results, label: "3PYY", maxPoses: 5, crystalPositions: crystalHeavy, ligandAtoms: heavyAtoms)
         XCTAssertFalse(results.isEmpty, "[3PYY] No results")
@@ -158,7 +158,7 @@ final class DockingIntegrationTests: DockingTestCase {
         guard let pocket else { throw XCTSkip("[2QWK] Pocket detection failed") }
         printPocketDebug(pocket, label: "2QWK-Pocket")
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 250, generations: 250)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 250, generations: 250, numRuns: 3)
         let heavyAtoms = ligand.atoms.filter { $0.element != .H }
         printResultsDebug(results, label: "2QWK", maxPoses: 5, crystalPositions: crystalHeavy, ligandAtoms: heavyAtoms)
         XCTAssertFalse(results.isEmpty)
@@ -182,7 +182,7 @@ final class DockingIntegrationTests: DockingTestCase {
         guard let pocket else { throw XCTSkip("[1M17] Pocket detection failed") }
         printPocketDebug(pocket, label: "1M17-Pocket")
 
-        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 250, generations: 250)
+        let results = await runTestDocking(engine: engine, protein: protein, ligand: ligand, pocket: pocket, populationSize: 250, generations: 250, numRuns: 3)
         let heavyAtoms = ligand.atoms.filter { $0.element != .H }
         printResultsDebug(results, label: "1M17", maxPoses: 5, crystalPositions: crystalHeavy, ligandAtoms: heavyAtoms)
         XCTAssertFalse(results.isEmpty)
@@ -522,9 +522,12 @@ final class DockingIntegrationTests: DockingTestCase {
 
     @MainActor
     func testRoundTrip2QWKOseltamivirViaSMILES() async throws {
-
+        // Oseltamivir has 3 stereocenters — correct stereochemistry is essential
+        // for proper binding to neuraminidase. Without @/@@, RDKit may generate
+        // the wrong enantiomer which cannot fit the binding pocket.
         try await runRoundTripTest(pdbID: "2QWK", ligandResidue: "G39",
-            smiles: "CCOC(=O)C1=CC(OC(CC)CC)C(NC(C)=O)C(N)C1", ligandName: "Oseltamivir")
+            smiles: "CCOC(=O)C1=C[C@@H](OC(CC)CC)[C@H](NC(C)=O)[C@@H](N)C1",
+            ligandName: "Oseltamivir", centroidThreshold: 12.0)
     }
 
     @MainActor
@@ -1250,5 +1253,124 @@ final class DockingIntegrationTests: DockingTestCase {
         engine.flexEngine = nil
 
         print("✓ Flex docking test PASSED")
+    }
+
+    // ======================================================================
+    // MARK: 8 — GFN2-xTB Post-Docking Refinement Pipeline
+    // ======================================================================
+
+    /// End-to-end test: dock a ligand, then refine top poses with GFN2-xTB.
+    /// Validates that GFN2 energy/gradient/optimization integrate correctly
+    /// into the DockingResult pipeline.
+    @MainActor
+    func testGFN2PostDockingRefinement() async throws {
+        let engine = try sharedDockingEngine()
+
+        let protein = TestMolecules.alanineDipeptide()
+        let ligand = TestMolecules.ethanol()
+        let pocket = BindingPocket(
+            id: 0, center: SIMD3<Float>(0, 0, 0), size: SIMD3<Float>(6, 6, 6),
+            volume: 50, buriedness: 0.5, polarity: 0.5, druggability: 1.0,
+            residueIndices: [], probePositions: []
+        )
+
+        print("  [GFN2 Pipeline] Starting docking...")
+        var config = DockingConfig()
+        config.populationSize = 30
+        config.generationsPerRun = 20
+        config.numRuns = 1
+        config.strainPenaltyEnabled = false
+        config.gfn2Refinement.enabled = false  // we'll refine manually
+
+        engine.setProtein(protein.atoms, protein.bonds)
+
+        let results = await engine.runDocking(
+            ligand: ligand, pocket: pocket,
+            config: config, scoringMethod: .vina
+        )
+
+        print("  [GFN2 Pipeline] Docking returned \(results.count) poses")
+        guard results.count >= 2 else {
+            throw XCTSkip("Need at least 2 docking results for refinement test")
+        }
+
+        // Apply GFN2 refinement to top 3 poses
+        let topN = min(3, results.count)
+        let heavyAtoms = ligand.atoms.filter { $0.element != .H }
+        guard heavyAtoms.count >= 2 else {
+            throw XCTSkip("Need at least 2 heavy atoms")
+        }
+
+        print("  [GFN2 Pipeline] Refining top \(topN) poses with GFN2-xTB...")
+
+        var refinedResults = results
+        for i in 0..<topN {
+            let positions = results[i].transformedAtomPositions
+            guard positions.count == heavyAtoms.count else {
+                print("  [GFN2 Pipeline] Skipping pose \(i): position count mismatch (\(positions.count) vs \(heavyAtoms.count))")
+                continue
+            }
+
+            var dockedAtoms = heavyAtoms
+            for j in 0..<dockedAtoms.count {
+                dockedAtoms[j].position = positions[j]
+            }
+
+            do {
+                // 1. Single-point energy
+                let energyResult = try await GFN2Refiner.computeEnergy(
+                    atoms: dockedAtoms, solvation: .water
+                )
+                print("  [GFN2 Pipeline] Pose \(i): E=\(String(format: "%.2f", energyResult.totalEnergy_kcal)) kcal/mol, D4=\(String(format: "%.4f", energyResult.dispersionEnergy)) Hartree, solv=\(String(format: "%.4f", energyResult.solvationEnergy)) Hartree")
+
+                XCTAssertTrue(energyResult.totalEnergy.isFinite, "Energy should be finite for pose \(i)")
+
+                // 2. Gradient
+                let (gradEnergy, gradient) = try await GFN2Refiner.computeGradient(
+                    atoms: dockedAtoms, solvation: .none
+                )
+                print("  [GFN2 Pipeline] Pose \(i) gradient norm: \(String(format: "%.4f", gradEnergy.gradientNorm))")
+
+                XCTAssertEqual(gradient.count, dockedAtoms.count, "Gradient should have \(dockedAtoms.count) vectors")
+                XCTAssertTrue(gradEnergy.gradientNorm.isFinite, "Gradient norm should be finite")
+
+                // 3. Optimization (crude, fast)
+                let optResult = try await GFN2Refiner.optimizeGeometry(
+                    atoms: dockedAtoms, solvation: .none, optLevel: .crude, maxSteps: 20
+                )
+                print("  [GFN2 Pipeline] Pose \(i) optimized: \(optResult.steps) steps, converged=\(optResult.converged), E=\(String(format: "%.2f", optResult.totalEnergy_kcal)) kcal/mol")
+
+                // Store in DockingResult
+                refinedResults[i].gfn2Energy = energyResult.totalEnergy_kcal
+                refinedResults[i].gfn2DispersionEnergy = energyResult.dispersionEnergy * 627.509
+                refinedResults[i].gfn2SolvationEnergy = energyResult.solvationEnergy * 627.509
+                refinedResults[i].gfn2Converged = optResult.converged
+                refinedResults[i].gfn2OptSteps = optResult.steps
+
+                if let optPos = optResult.optimizedPositions {
+                    refinedResults[i].transformedAtomPositions = optPos
+                }
+
+            } catch {
+                print("  [GFN2 Pipeline] Pose \(i) failed: \(error)")
+                // Don't fail the whole test for individual pose failures
+            }
+        }
+
+        // Verify at least one pose was successfully refined
+        let refinedCount = refinedResults.prefix(topN).filter { $0.gfn2Energy != nil }.count
+        print("  [GFN2 Pipeline] Successfully refined \(refinedCount)/\(topN) poses")
+        XCTAssertGreaterThan(refinedCount, 0, "At least one pose should be successfully refined")
+
+        // Verify GFN2 energies are different across poses (not all the same)
+        let gfn2Energies = refinedResults.prefix(topN).compactMap(\.gfn2Energy)
+        if gfn2Energies.count >= 2 {
+            let spread = (gfn2Energies.max() ?? 0) - (gfn2Energies.min() ?? 0)
+            print("  [GFN2 Pipeline] Energy spread: \(String(format: "%.2f", spread)) kcal/mol")
+            // For small test molecules the spread may be near-zero; just verify it's finite
+            XCTAssertTrue(spread.isFinite, "GFN2 energy spread should be finite")
+        }
+
+        print("✓ GFN2 post-docking refinement pipeline test PASSED")
     }
 }

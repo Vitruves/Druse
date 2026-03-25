@@ -125,10 +125,10 @@ enum BondOrder: Int, Sendable {
 
     var displayRadius: Float {
         switch self {
-        case .single:   0.15
-        case .double:   0.12
-        case .triple:   0.10
-        case .aromatic: 0.13
+        case .single:   0.22   // thicker bonds (MOE-like)
+        case .double:   0.18
+        case .triple:   0.15
+        case .aromatic: 0.20
         }
     }
 }
@@ -146,10 +146,32 @@ enum SecondaryStructure: Sendable {
 
 enum ChainType: Sendable {
     case protein
+    case nucleicAcid   // DNA or RNA
     case ligand
     case water
     case ion
     case unknown
+
+    var label: String {
+        switch self {
+        case .protein:     "Protein"
+        case .nucleicAcid: "DNA/RNA"
+        case .ligand:      "Ligand"
+        case .water:       "Water"
+        case .ion:         "Ion"
+        case .unknown:     "Other"
+        }
+    }
+
+    /// Standard nucleic acid residue names (DNA + RNA, including common modified forms).
+    static let nucleicAcidResidues: Set<String> = [
+        // DNA
+        "DA", "DT", "DG", "DC", "DU", "DI",
+        // RNA
+        "A", "U", "G", "C", "I",
+        // PDB 3-letter (less common)
+        "ADE", "THY", "GUA", "CYT", "URA",
+    ]
 }
 
 // MARK: - Atom
@@ -466,8 +488,8 @@ enum RenderMode: String, CaseIterable, Sendable {
         switch self {
         case .ballAndStick: 0.3
         case .spaceFilling: 1.0
-        case .wireframe:    0.15
-        case .ribbon:       0.25 // thinner atoms when ribbon visible
+        case .wireframe:    0.12  // small dots at atom centers
+        case .ribbon:       0.25  // thinner atoms when ribbon visible
         }
     }
 
@@ -475,8 +497,8 @@ enum RenderMode: String, CaseIterable, Sendable {
         switch self {
         case .ballAndStick: 1.0
         case .spaceFilling: 0.0
-        case .wireframe:    0.5
-        case .ribbon:       0.0 // no bonds in ribbon mode
+        case .wireframe:    0.8   // visible bonds (0.22 × 0.8 = 0.176Å radius)
+        case .ribbon:       0.0   // no bonds in ribbon mode (side chains use ball-and-stick)
         }
     }
 }

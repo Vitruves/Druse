@@ -9,9 +9,18 @@ import simd
 /// for CoreML inference. Produces the input tensors expected by DruseScore.mlmodel.
 struct DruseScoreFeatureExtractor {
 
-    /// Atom-level features: [atomicNum one-hot(10), aromaticity, charge, hbDonor, hbAcceptor,
-    /// hybridization one-hot(4), is_protein, is_ligand] = 18 features per atom
-    static let atomFeatureSize = 18
+    /// Atom-level features (v2): [atomicNum one-hot(10), aromaticity, charge, hbDonor, hbAcceptor,
+    /// hybridization one-hot(3), is_ligand, formal_charge, in_ring] = 20 features per atom
+    static let atomFeatureSize = 20
+
+    /// Known ring atoms in standard amino acid residues (for protein ring membership feature)
+    private static let ringResidueAtoms: [String: Set<String>] = [
+        "PHE": ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+        "TYR": ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+        "TRP": ["CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"],
+        "HIS": ["CG", "ND1", "CD2", "CE1", "NE2"],
+        "PRO": ["N", "CA", "CB", "CG", "CD"],
+    ]
 
     /// Max atoms in pocket + ligand (pad/truncate to this)
     static let maxAtoms = 512
@@ -33,7 +42,7 @@ struct DruseScoreFeatureExtractor {
     /// Returns a dictionary mapping atom ID → Hybridization.
     enum Hybridization { case sp, sp2, sp3 }
 
-    private static func buildHybridizationMap(atoms: [Atom], bonds: [Bond]) -> [Int: Hybridization] {
+    static func buildHybridizationMap(atoms: [Atom], bonds: [Bond]) -> [Int: Hybridization] {
         // Build adjacency: atom index → list of bond orders
         var atomBonds: [Int: [BondOrder]] = [:]
         for bond in bonds {
@@ -126,11 +135,11 @@ struct DruseScoreFeatureExtractor {
         )
     }
 
-    /// Encode atom as 18-dimensional feature vector.
-    private static func atomFeatures(_ atom: Atom, isProtein: Bool, hybridization: Hybridization? = nil) -> [Float] {
+    /// Encode atom as 20-dimensional feature vector (v2).
+    static func atomFeatures(_ atom: Atom, isProtein: Bool, hybridization: Hybridization? = nil) -> [Float] {
         var features = [Float](repeating: 0, count: atomFeatureSize)
 
-        // One-hot encode atomic number (H, C, N, O, F, P, S, Cl, Br, other)
+        // [0-9] One-hot encode atomic number (H, C, N, O, F, P, S, Cl, Br, other)
         let atomNumBin: Int
         switch atom.element {
         case .H:                atomNumBin = 0
@@ -146,29 +155,41 @@ struct DruseScoreFeatureExtractor {
         }
         features[atomNumBin] = 1.0
 
-        // Aromaticity — inferred from hybridization (sp2 on C/N = aromatic candidate)
+        // [10] Aromaticity — inferred from hybridization (sp2 on C/N = aromatic candidate)
         let hyb = hybridization ?? .sp3
         let isAromatic = hyb == .sp2 && (atom.element == .C || atom.element == .N)
         features[10] = isAromatic ? 1.0 : 0.0
 
-        // Partial charge
+        // [11] Partial charge
         features[11] = atom.charge
 
-        // H-bond donor/acceptor (simple element-based heuristic)
+        // [12-13] H-bond donor/acceptor (simple element-based heuristic)
         let isHBDonor = atom.element == Element.N || atom.element == Element.O
         let isHBAcceptor = atom.element == Element.N || atom.element == Element.O || atom.element == Element.F
         features[12] = isHBDonor ? 1.0 : 0.0
         features[13] = isHBAcceptor ? 1.0 : 0.0
 
-        // Hybridization one-hot: [14]=sp, [15]=sp2, [16]=sp3
+        // [14-16] Hybridization one-hot: [14]=sp, [15]=sp2, [16]=sp3
         switch hyb {
         case .sp:  features[14] = 1.0
         case .sp2: features[15] = 1.0
         case .sp3: features[16] = 1.0
         }
 
-        // Is protein / is ligand
+        // [17] Is ligand flag
         features[17] = isProtein ? 0.0 : 1.0
+
+        // [18] Formal charge (v2)
+        features[18] = Float(atom.formalCharge)
+
+        // [19] Ring membership (v2)
+        if isProtein {
+            let ringAtoms = ringResidueAtoms[atom.residueName] ?? []
+            features[19] = ringAtoms.contains(atom.name) ? 1.0 : 0.0
+        } else {
+            // For ligands, use aromatic flag as proxy (matches training data)
+            features[19] = isAromatic ? 1.0 : 0.0
+        }
 
         return features
     }
@@ -183,9 +204,9 @@ struct DruseScoreFeatureExtractor {
 
 // MARK: - Druse ML Scoring (Primary Scorer)
 
-/// DruseScorePKi: primary ML scoring function that replaces Vina-style empirical scores.
+/// DruseScorePKi v2: primary ML scoring function that replaces Vina-style empirical scores.
 /// Outputs docking_score = pKd * pose_confidence for pose ranking.
-/// Trained on PDBbind refined × 8 RMSD perturbations (~42K samples).
+/// Trained on 13K+ co-crystallized structures × 8 RMSD perturbations (~152K samples).
 @MainActor
 final class DruseMLScoringInference {
 

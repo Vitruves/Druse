@@ -133,6 +133,13 @@ extension AppViewModel {
         }
     }
 
+    /// Regenerate the surface with current probe radius / grid spacing settings.
+    func regenerateSurface() {
+        if workspace.showSurface {
+            generateSurface()
+        }
+    }
+
     func generateSurface() {
         guard let prot = molecules.protein, let renderer else {
             log.debug("[Surface] generateSurface skipped: no protein or renderer", category: .selection)
@@ -156,6 +163,8 @@ extension AppViewModel {
 
             gen.fieldType = workspace.surfaceType
             gen.colorMode = workspace.surfaceColorMode
+            gen.probeRadius = workspace.surfaceProbeRadius
+            gen.gridSpacing = workspace.surfaceGridSpacing
 
             let atoms = prot.atoms.filter { $0.element != .H }
             if let result = gen.generateSurface(atoms: atoms) {

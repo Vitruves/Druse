@@ -1,6 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "ShaderTypes.h"
+
 // MARK: - EEM Matrix Construction
 
 /// Compute the (N+1)x(N+1) EEM matrix and RHS vector on GPU.
@@ -205,4 +207,141 @@ kernel void computeXTBGammaMatrix(
     }
 
     gamma[i * nshell + j] = gam;
+}
+
+// ============================================================================
+// MARK: - GFN2-xTB Born Radii (GPU)
+// ============================================================================
+
+/// Compute Born radii pairwise descreening integral on GPU.
+/// Each thread (i,j) computes atom j's contribution to atom i's psi integral.
+/// Results are atomically accumulated and the Born radius is finalized in a
+/// second pass kernel.
+///
+/// This is the dominant O(N²) cost in GBSA/ALPB solvation.
+kernel void computeBornPsi(
+    device const GFN2BornAtom *atoms     [[buffer(0)]],
+    device float              *psi       [[buffer(1)]],    // N psi values (atomic accumulate)
+    constant GFN2BornParams   &params    [[buffer(2)]],
+    uint2 tid [[thread_position_in_grid]])
+{
+    uint i = tid.x;
+    uint j = tid.y;
+    uint N = params.atomCount;
+    if (i >= N || j >= N || i == j) return;
+
+    float3 pi = atoms[i].position;
+    float3 pj = atoms[j].position;
+    float rij = max(distance(pi, pj), 0.001f);
+
+    float ri = atoms[i].vdwRadius + params.bornOffset;
+    float sj = (atoms[j].vdwRadius + params.bornOffset) * params.bornScale;
+
+    float contribution = 0.0f;
+
+    if (rij > ri + sj) {
+        // No overlap
+        float rps = rij + sj;
+        float rms = rij - sj;
+        contribution = 0.5f * (1.0f/rms - 1.0f/rps
+            + sj * 0.25f * (1.0f/(rps*rps) - 1.0f/(rms*rms))
+            + 0.5f * log(rms/rps) / rij);
+    } else if (rij > abs(ri - sj)) {
+        // Partial overlap
+        float rps = rij + sj;
+        float d = max(rij - sj, 0.001f);
+        contribution = 0.25f * (2.0f/rij - 1.0f/rps - ri/(4.0f*sj*rij)
+            + 0.25f * (1.0f/(sj*sj) - 1.0f/(ri*ri))
+            + 0.5f * log(abs(d)/rps) / rij);
+    }
+
+    // Atomic add to psi[i]
+    // Metal supports atomic_fetch_add_explicit for device float on Apple Silicon
+    atomic_fetch_add_explicit(
+        (device atomic_uint *)&psi[i],
+        as_type<uint>(contribution),
+        memory_order_relaxed);
+}
+
+/// Finalize Born radii from psi values using OBC-II correction.
+kernel void finalizeBornRadii(
+    device const GFN2BornAtom *atoms     [[buffer(0)]],
+    device const float        *psi       [[buffer(1)]],
+    device float              *brad      [[buffer(2)]],    // output Born radii
+    device float              *sasa      [[buffer(3)]],    // output SASA per atom
+    constant GFN2BornParams   &params    [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint i = tid;
+    if (i >= params.atomCount) return;
+
+    float ri = atoms[i].vdwRadius + params.bornOffset;
+    float br = psi[i] * ri;
+
+    // OBC-II three-parameter scaling
+    float alpha = 1.0f;
+    float beta  = 0.8f;
+    float gamm  = 4.85f;
+    float arg = br * (alpha - br * (beta - br * gamm));
+    float th = tanh(arg);
+
+    brad[i] = 1.0f / (1.0f/ri - th/ri);
+
+    // Approximate SASA (Gaussian burial)
+    float probe_sum = atoms[i].vdwRadius + params.probeRadius;
+    sasa[i] = 4.0f * M_PI_F * probe_sum * probe_sum;
+}
+
+// ============================================================================
+// MARK: - GFN2-xTB D4 Dispersion Pairwise (GPU)
+// ============================================================================
+
+/// Compute pairwise D4 dispersion energy contributions on GPU.
+/// Each thread handles one (i, j) pair with i > j.
+/// Energy contributions are written to a pairwise output buffer
+/// that is summed on CPU (or via parallel reduction).
+kernel void computeD4Dispersion(
+    device const GFN2DispAtom *atoms     [[buffer(0)]],
+    device float              *pairEnergy [[buffer(1)]],   // N*(N-1)/2 pair energies
+    constant GFN2DispParams   &params    [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint N = params.atomCount;
+    uint npairs = N * (N - 1) / 2;
+    if (tid >= npairs) return;
+
+    // Decode pair index: tid → (i, j) with i > j
+    // Using inverse triangular number formula
+    uint i = (uint)(0.5f + sqrt(0.25f + 2.0f * (float)tid));
+    uint j = tid - i * (i - 1) / 2;
+    if (i >= N) { i = N - 1; j = 0; }
+    if (j >= i) return;
+
+    float3 pi = atoms[i].position;
+    float3 pj = atoms[j].position;
+    float r2 = distance_squared(pi, pj);
+    float r = sqrt(r2);
+    if (r < 0.01f) { pairEnergy[tid] = 0.0f; return; }
+
+    // CN-dependent C6 weighting
+    float wi = exp(-4.0f * (atoms[i].cn - atoms[i].cnRef) * (atoms[i].cn - atoms[i].cnRef));
+    float wj = exp(-4.0f * (atoms[j].cn - atoms[j].cnRef) * (atoms[j].cn - atoms[j].cnRef));
+    float c6ij = sqrt(atoms[i].c6ref * atoms[j].c6ref) * wi * wj;
+
+    // C8 approximation
+    float c8ij = 3.0f * c6ij * sqrt(sqrt(atoms[i].c6ref) * 2.5f * sqrt(atoms[j].c6ref) * 2.5f);
+
+    // BJ damping
+    float r0 = params.a1 * sqrt(c6ij > 0 ? c8ij / c6ij : 0.0f) + params.a2_bohr;
+    float r0_2 = r0 * r0;
+    float r0_6 = r0_2 * r0_2 * r0_2;
+    float r0_8 = r0_6 * r0_2;
+
+    float r6 = r2 * r2 * r2;
+    float r8 = r6 * r2;
+
+    float e6 = -params.s6 * c6ij / (r6 + r0_6);
+    float e8 = -params.s8 * c8ij / (r8 + r0_8);
+
+    pairEnergy[tid] = e6 + e8;
 }

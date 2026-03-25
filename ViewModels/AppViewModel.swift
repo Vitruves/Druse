@@ -19,6 +19,9 @@ final class AppViewModel {
     /// Ligand database
     let ligandDB = LigandDatabase()
 
+    /// Tracks which LigandEntry is currently active in the 3D view / docking.
+    var activeLigandEntryID: UUID?
+
     /// Activity log
     let log = ActivityLog.shared
 
@@ -46,7 +49,10 @@ final class AppViewModel {
     /// Set any molecule as the active ligand for docking.
     /// ALL import paths (LigandDatabaseView, LigandDatabaseWindow,
     /// DockingTabView picker, PDB co-crystallized) MUST call this single method.
-    func setLigandForDocking(_ molecule: Molecule) {
+    /// - Parameters:
+    ///   - molecule: The molecule to set as active ligand.
+    ///   - entryID: Optional UUID of the `LigandEntry` this molecule came from.
+    func setLigandForDocking(_ molecule: Molecule, entryID: UUID? = nil) {
         let normalizedAtoms = molecule.atoms.enumerated().map { i, atom in
             Atom(id: i, element: atom.element, position: atom.position,
                  name: atom.name,
@@ -64,6 +70,7 @@ final class AppViewModel {
                                          bonds: molecule.bonds, title: molecule.title)
 
         molecules.ligand = normalizedLigand
+        activeLigandEntryID = entryID
         docking.originalDockingLigand = nil
         docking.dockingResults = []
         docking.currentInteractions = []
@@ -144,15 +151,32 @@ final class AppViewModel {
             log.info("Generated SMILES for \(ligandName): \(smiles.prefix(60))...", category: .molecule)
         }
 
-        let dbEntry = LigandEntry(
-            name: ligandName,
-            smiles: smiles,
-            atoms: ligAtoms,
-            bonds: ligBonds,
-            isPrepared: true,
-            conformerCount: 1
-        )
-        ligandDB.add(dbEntry)
+        // Check if an entry with the same sourceChainID, name, or SMILES already exists
+        // to avoid duplicates (e.g., when user re-imports the same PDB file)
+        if let existingIdx = ligandDB.entries.firstIndex(where: {
+            $0.sourceChainID == chainID ||
+            $0.name == ligandName ||
+            (!smiles.isEmpty && $0.smiles == smiles)
+        }) {
+            // Update existing entry instead of adding a duplicate
+            ligandDB.entries[existingIdx].atoms = ligAtoms
+            ligandDB.entries[existingIdx].bonds = ligBonds
+            ligandDB.entries[existingIdx].isPrepared = true
+            ligandDB.entries[existingIdx].sourceChainID = chainID
+            if !smiles.isEmpty { ligandDB.entries[existingIdx].smiles = smiles }
+            log.info("Updated existing \(ligandName) in ligand database", category: .molecule)
+        } else {
+            let dbEntry = LigandEntry(
+                name: ligandName,
+                smiles: smiles,
+                atoms: ligAtoms,
+                bonds: ligBonds,
+                isPrepared: true,
+                conformerCount: 1,
+                sourceChainID: chainID
+            )
+            ligandDB.add(dbEntry)
+        }
 
         let keepIndices = prot.atoms.indices.filter { !chainAtomIndices.contains($0) }
         let (newProtAtoms, newProtBonds) = ProteinPreparation.remapSubstructure(
@@ -179,6 +203,7 @@ final class AppViewModel {
         ) {
             docking.detectedPockets = [pocket]
             docking.selectedPocket = pocket
+            showGridBoxForPocket(pocket)
             log.success("Pocket from ligand: \(pocket.residueIndices.count) residues, \(Int(pocket.volume)) A\u{00B3}", category: .dock)
         }
     }
@@ -193,6 +218,33 @@ final class AppViewModel {
             return prot.residues[resIdx].atomIndices
         })
         guard !chainAtomIndices.isEmpty else { return }
+
+        // If the active ligand was extracted from this chain, clear it
+        if let lig = molecules.ligand {
+            let firstRes = chain.residueIndices.first.flatMap { idx in
+                idx < prot.residues.count ? prot.residues[idx] : nil
+            }
+            let chainLigandName = firstRes?.name ?? "Chain_\(chainID)"
+            if lig.name == chainLigandName {
+                molecules.ligand = nil
+                docking.originalDockingLigand = nil
+                docking.currentInteractions = []
+                renderer?.updateInteractionLines([])
+                renderer?.clearGhostPose()
+            }
+        }
+
+        // Also remove from ligand database if it was added there
+        let firstRes = chain.residueIndices.first.flatMap { idx in
+            idx < prot.residues.count ? prot.residues[idx] : nil
+        }
+        let chainLigandName = firstRes?.name ?? "Chain_\(chainID)"
+        if let dbIdx = ligandDB.entries.firstIndex(where: {
+            $0.sourceChainID == chainID || $0.name == chainLigandName
+        }) {
+            ligandDB.entries.remove(at: dbIdx)
+            log.info("Also removed \(chainLigandName) from ligand database", category: .molecule)
+        }
 
         let keepIndices = prot.atoms.indices.filter { !chainAtomIndices.contains($0) }
         if keepIndices.isEmpty {
@@ -231,13 +283,40 @@ final class AppViewModel {
     func clearLigand() {
         let name = molecules.ligand?.name ?? "ligand"
         molecules.ligand = nil
+        activeLigandEntryID = nil
         docking.originalDockingLigand = nil
         docking.dockingResults = []
         docking.currentInteractions = []
+        docking.selectedPoseIndices = []
         renderer?.updateInteractionLines([])
+        renderer?.clearGhostPose()
         pushToRenderer()
         log.info("Cleared \(name)", category: .molecule)
         workspace.statusMessage = "No ligand loaded"
+    }
+
+    /// Remove ligand from the 3D view and from the ligand database.
+    /// Also clears any ghost poses and interaction lines.
+    func removeLigandFromView() {
+        let name = molecules.ligand?.name ?? "ligand"
+
+        // Remove from database using the tracked entry ID (robust),
+        // falling back to name match for legacy callers.
+        if let entryID = activeLigandEntryID {
+            ligandDB.removeWithChildren(id: entryID)
+        } else if let entry = ligandDB.entries.first(where: { $0.name == name }) {
+            ligandDB.removeWithChildren(id: entry.id)
+        }
+
+        molecules.ligand = nil
+        activeLigandEntryID = nil
+        docking.currentInteractions = []
+        docking.selectedPoseIndices = []
+        renderer?.updateInteractionLines([])
+        renderer?.clearGhostPose()
+        pushToRenderer()
+        log.info("Removed \(name) from view and database", category: .molecule)
+        workspace.statusMessage = "Ligand removed"
     }
 
     // MARK: - Side Chain Helpers
@@ -297,11 +376,12 @@ final class AppViewModel {
             if workspace.hiddenChainIDs.isEmpty {
                 visibleProt = prot
             } else {
-                let visAtoms = prot.atoms.filter { !workspace.hiddenChainIDs.contains($0.chainID) }
-                var idMap: [Int: Int] = [:]
+                // Map by array position (bond.atomIndex is an array position)
+                var posToNew: [Int: Int] = [:]
                 var remapped: [Atom] = []
-                for atom in visAtoms {
-                    idMap[atom.id] = remapped.count
+                for (origIdx, atom) in prot.atoms.enumerated() {
+                    if workspace.hiddenChainIDs.contains(atom.chainID) { continue }
+                    posToNew[origIdx] = remapped.count
                     remapped.append(Atom(
                         id: remapped.count, element: atom.element, position: atom.position,
                         name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -311,7 +391,7 @@ final class AppViewModel {
                 }
                 var remappedBonds: [Bond] = []
                 for bond in prot.bonds {
-                    if let a = idMap[bond.atomIndex1], let b = idMap[bond.atomIndex2] {
+                    if let a = posToNew[bond.atomIndex1], let b = posToNew[bond.atomIndex2] {
                         remappedBonds.append(Bond(id: remappedBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
                     }
                 }
@@ -319,7 +399,15 @@ final class AppViewModel {
                 visibleProt.secondaryStructureAssignments = prot.secondaryStructureAssignments
             }
 
-            let (ribbonVerts, ribbonIdxs) = RibbonMeshGenerator.generateForMolecule(visibleProt)
+            // Build chain color map early so ribbon generator can use it
+            var ribbonChainColors: [String: SIMD3<Float>] = [:]
+            if workspace.colorScheme == .chainColored {
+                let palette = WorkspaceState.MoleculeColorScheme.chainPalette
+                for (i, chain) in prot.chains.enumerated() {
+                    ribbonChainColors[chain.id] = palette[i % palette.count]
+                }
+            }
+            let (ribbonVerts, ribbonIdxs) = RibbonMeshGenerator.generateForMolecule(visibleProt, chainColorMap: ribbonChainColors)
             renderer.updateRibbonMesh(vertices: ribbonVerts, indices: ribbonIdxs)
 
             var caControlPoints: [(position: SIMD3<Float>, atomID: Int)] = []
@@ -332,10 +420,11 @@ final class AppViewModel {
             renderer.updateRibbonCAControlPoints(caControlPoints)
 
             if workspace.showLigand, !docking.isDocking, let lig = molecules.ligand {
-                let filteredAtoms = workspace.showHydrogens ? lig.atoms : lig.atoms.filter { $0.element != .H }
-                var ligIdMap: [Int: Int] = [:]
-                for atom in filteredAtoms {
-                    ligIdMap[atom.id] = allAtoms.count
+                // Map by array position (bond.atomIndex is an array position, not atom.id)
+                var ligPosToNew: [Int: Int] = [:]
+                for (origIdx, atom) in lig.atoms.enumerated() {
+                    if !workspace.showHydrogens && atom.element == .H { continue }
+                    ligPosToNew[origIdx] = allAtoms.count
                     allAtoms.append(Atom(
                         id: allAtoms.count, element: atom.element, position: atom.position,
                         name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -344,7 +433,31 @@ final class AppViewModel {
                     ))
                 }
                 for bond in lig.bonds {
-                    if let a = ligIdMap[bond.atomIndex1], let b = ligIdMap[bond.atomIndex2] {
+                    if let a = ligPosToNew[bond.atomIndex1], let b = ligPosToNew[bond.atomIndex2] {
+                        allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+                    }
+                }
+            }
+
+            // Non-protein chains (nucleic acid, ions, etc.) as ball-and-stick overlay
+            // so they remain visible in ribbon mode
+            if workspace.showProtein {
+                let proteinChainIDs = Set(prot.chains.filter { $0.type == .protein }.map(\.id))
+                var npPosToNew: [Int: Int] = [:]
+                for (origIdx, atom) in prot.atoms.enumerated() {
+                    if proteinChainIDs.contains(atom.chainID) { continue } // skip protein chains (have ribbon)
+                    if workspace.hiddenChainIDs.contains(atom.chainID) { continue }
+                    if !workspace.showHydrogens && atom.element == .H { continue }
+                    npPosToNew[origIdx] = allAtoms.count
+                    allAtoms.append(Atom(
+                        id: allAtoms.count, element: atom.element, position: atom.position,
+                        name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                        chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                        isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
+                    ))
+                }
+                for bond in prot.bonds {
+                    if let a = npPosToNew[bond.atomIndex1], let b = npPosToNew[bond.atomIndex2] {
                         allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
                     }
                 }
@@ -354,7 +467,8 @@ final class AppViewModel {
             if workspace.sideChainDisplay != .none, workspace.showProtein {
                 let sideChainResidueIndices = sideChainResidueSet(protein: prot)
                 if !sideChainResidueIndices.isEmpty {
-                    var scIdMap: [Int: Int] = [:]
+                    // Map by array position (bond.atomIndex is an array position)
+                    var scPosToNew: [Int: Int] = [:]
                     for residueIdx in sideChainResidueIndices {
                         guard residueIdx < prot.residues.count else { continue }
                         let residue = prot.residues[residueIdx]
@@ -365,7 +479,7 @@ final class AppViewModel {
                             if !workspace.showHydrogens && atom.element == .H { continue }
                             let trimmedName = atom.name.trimmingCharacters(in: .whitespaces)
                             if SideChainDisplay.backboneAtomNames.contains(trimmedName) { continue }
-                            scIdMap[atom.id] = allAtoms.count
+                            scPosToNew[atomIdx] = allAtoms.count
                             allAtoms.append(Atom(
                                 id: allAtoms.count, element: atom.element, position: atom.position,
                                 name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -375,7 +489,7 @@ final class AppViewModel {
                         }
                     }
                     for bond in prot.bonds {
-                        if let a = scIdMap[bond.atomIndex1], let b = scIdMap[bond.atomIndex2] {
+                        if let a = scPosToNew[bond.atomIndex1], let b = scPosToNew[bond.atomIndex2] {
                             allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
                         }
                     }
@@ -393,12 +507,13 @@ final class AppViewModel {
         renderer.clearRibbonMesh()
 
         if workspace.showProtein, let prot = molecules.protein {
-            var protIdMap: [Int: Int] = [:]
-            for atom in prot.atoms {
+            // Map by array position (bond.atomIndex is an array position, not atom.id)
+            var protPosToNew: [Int: Int] = [:]
+            for (origIdx, atom) in prot.atoms.enumerated() {
                 if !workspace.showHydrogens && atom.element == .H { continue }
                 if workspace.hiddenChainIDs.contains(atom.chainID) { continue }
-                if workspace.hiddenAtomIndices.contains(atom.id) { continue }
-                protIdMap[atom.id] = allAtoms.count
+                if workspace.hiddenAtomIndices.contains(origIdx) { continue }
+                protPosToNew[origIdx] = allAtoms.count
                 allAtoms.append(Atom(
                     id: allAtoms.count, element: atom.element, position: atom.position,
                     name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -407,7 +522,7 @@ final class AppViewModel {
                 ))
             }
             for bond in prot.bonds {
-                if let a = protIdMap[bond.atomIndex1], let b = protIdMap[bond.atomIndex2] {
+                if let a = protPosToNew[bond.atomIndex1], let b = protPosToNew[bond.atomIndex2] {
                     allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
                 }
             }
@@ -415,11 +530,12 @@ final class AppViewModel {
 
         if workspace.showLigand, !docking.isDocking, let lig = molecules.ligand {
             let ligOffset = molecules.protein?.atoms.count ?? 0
-            var ligIdMap: [Int: Int] = [:]
-            for atom in lig.atoms {
+            // Map by array position (bond.atomIndex is an array position, not atom.id)
+            var ligPosToNew: [Int: Int] = [:]
+            for (origIdx, atom) in lig.atoms.enumerated() {
                 if !workspace.showHydrogens && atom.element == .H { continue }
-                if workspace.hiddenAtomIndices.contains(atom.id + ligOffset) { continue }
-                ligIdMap[atom.id] = allAtoms.count
+                if workspace.hiddenAtomIndices.contains(origIdx + ligOffset) { continue }
+                ligPosToNew[origIdx] = allAtoms.count
                 allAtoms.append(Atom(
                     id: allAtoms.count, element: atom.element, position: atom.position,
                     name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -428,7 +544,7 @@ final class AppViewModel {
                 ))
             }
             for bond in lig.bonds {
-                if let a = ligIdMap[bond.atomIndex1], let b = ligIdMap[bond.atomIndex2] {
+                if let a = ligPosToNew[bond.atomIndex1], let b = ligPosToNew[bond.atomIndex2] {
                     allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
                 }
             }
@@ -448,6 +564,33 @@ final class AppViewModel {
         renderer.enableClipping = workspace.enableClipping
         renderer.clipNearZ = workspace.clipNearZ
         renderer.clipFarZ = workspace.clipFarZ
+        renderer.slabHalfThickness = workspace.slabThickness / 2.0
+        renderer.slabOffset = workspace.slabOffset
+
+        // Ligand focus color overrides
+        renderer.uniformProteinColor = workspace.colorScheme.proteinColor
+        renderer.ligandCarbonColor = workspace.colorScheme.ligandCarbon
+
+        // Build chain color map for per-chain coloring
+        if workspace.colorScheme == .chainColored, let prot = molecules.protein {
+            let chainIDs = prot.chains.map(\.id)
+            var colorMap: [String: SIMD3<Float>] = [:]
+            let palette = WorkspaceState.MoleculeColorScheme.chainPalette
+            for (i, cid) in chainIDs.enumerated() {
+                colorMap[cid] = palette[i % palette.count]
+            }
+            renderer.chainColorMap = colorMap
+        } else {
+            renderer.chainColorMap = [:]
+        }
+
+        // Track how many protein atoms are in the buffer so Renderer can distinguish them
+        let protCount = workspace.showProtein ? (molecules.protein?.atoms.filter { atom in
+            if !workspace.showHydrogens && atom.element == .H { return false }
+            if workspace.hiddenChainIDs.contains(atom.chainID) { return false }
+            return true
+        }.count ?? 0) : 0
+        renderer.proteinAtomCount = protCount
 
         renderer.updateMoleculeData(atoms: allAtoms, bonds: allBonds)
 
@@ -498,14 +641,15 @@ final class AppViewModel {
 
     /// Build bonds for heavy atoms only (excludes hydrogens), with remapped indices.
     func buildHeavyBonds(from molecule: Molecule) -> [Bond] {
-        var oldToNew: [Int: Int] = [:]
+        // Map by array position (bond.atomIndex is an array position, not atom.id)
+        var posToNew: [Int: Int] = [:]
         var newIdx = 0
-        for atom in molecule.atoms where atom.element != .H {
-            oldToNew[atom.id] = newIdx
+        for (origIdx, atom) in molecule.atoms.enumerated() where atom.element != .H {
+            posToNew[origIdx] = newIdx
             newIdx += 1
         }
         return molecule.bonds.compactMap { bond in
-            guard let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] else { return nil }
+            guard let a = posToNew[bond.atomIndex1], let b = posToNew[bond.atomIndex2] else { return nil }
             return Bond(id: bond.id, atomIndex1: a, atomIndex2: b, order: bond.order)
         }
     }

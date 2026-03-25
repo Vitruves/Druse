@@ -42,6 +42,7 @@ struct CASFComplex: Codable {
 
 struct BenchmarkResults: Codable {
     let benchmark: String
+    let version: String
     let scoringMethod: String     // "vina", "drusina", or "druseAF"
     let timestamp: String
     let config: BenchmarkConfigRecord
@@ -65,6 +66,9 @@ struct BenchmarkResultEntry: Codable {
     var dockingTimeMs: Double
     var success: Bool
     var error: String?
+    var gfn2Energy: Float?            // GFN2-xTB total energy (kcal/mol)
+    var gfn2DispersionEnergy: Float?  // D4 component (kcal/mol)
+    var gfn2SolvationEnergy: Float?   // GBSA/ALPB component (kcal/mol)
 
     enum CodingKeys: String, CodingKey {
         case pdbId = "pdb_id"
@@ -75,5 +79,8 @@ struct BenchmarkResultEntry: Codable {
         case numPoses = "num_poses"
         case dockingTimeMs = "docking_time_ms"
         case success, error
+        case gfn2Energy = "gfn2_energy"
+        case gfn2DispersionEnergy = "gfn2_dispersion"
+        case gfn2SolvationEnergy = "gfn2_solvation"
     }
 }

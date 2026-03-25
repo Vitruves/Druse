@@ -45,7 +45,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Druse.entitlements
         GENERATE_INFOPLIST_FILE: YES
         CURRENT_PROJECT_VERSION: 1
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "0.1.4"  # also update VERSION file at repo root
         SWIFT_STRICT_CONCURRENCY: complete
         MTL_FAST_MATH: YES
         HEADER_SEARCH_PATHS:
@@ -113,6 +113,7 @@ targets:
         excludes:
           - "*.py"
           - "*.txt"
+          - "*.json"
           - "data/**"
           - "manifests/**"
           - "results/**"

@@ -234,6 +234,8 @@ struct GAParams {
     float       ligandRadius;
     float       mcTemperature;
     float       referenceIntraEnergy;
+    uint32_t    numIntraPairs;       // number of packed pairs in intraPairs buffer (replaces exclusion bitmask)
+    uint32_t    _pad0;
 };
 
 struct BatchLigandInfo {
@@ -261,6 +263,38 @@ struct BatchScreenParams {
     uint32_t    posesPerLigand;
     uint32_t    numLigands;
     uint32_t    seed;
+};
+
+// Per-ligand metadata for batched GA virtual screening
+struct BatchedGALigandInfo {
+    uint32_t    atomStart;            // offset into flattened DockLigandAtom array
+    uint32_t    atomCount;            // number of atoms for this ligand
+    uint32_t    torsionEdgeStart;     // offset into flattened TorsionEdge array
+    uint32_t    torsionEdgeCount;     // number of torsion edges
+    uint32_t    movingIndicesStart;   // offset into flattened moving indices array
+    uint32_t    pairListStart;        // offset into flattened intra pair list
+    uint32_t    numPairs;             // number of intramolecular pairs
+    float       referenceIntraEnergy;
+    float       ligandRadius;
+    uint32_t    movingIndicesCount;   // total moving indices for this ligand
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+};
+
+// Parameters for batched GA virtual screening (multiple ligands in parallel)
+struct BatchedGAParams {
+    uint32_t    numLigands;
+    uint32_t    populationSizePerLigand;
+    uint32_t    totalPoses;           // numLigands * populationSizePerLigand
+    uint32_t    generation;
+    uint32_t    localSearchSteps;
+    float       mutationRate;
+    float       crossoverRate;
+    float       translationStep;
+    float       rotationStep;
+    float       torsionStep;
+    float       mcTemperature;
+    uint32_t    _pad0;
 };
 
 // ============================================================================
@@ -319,6 +353,32 @@ struct DrusinaParams {
     float       wAmideStack;     // amide-π stacking weight (default: -0.40)
     float       wChalcogenBond;  // chalcogen bond weight (default: -0.30)
     float       _pad;
+};
+
+// ============================================================================
+// DruseAF ML scoring types
+// ============================================================================
+
+// Parameters for the DruseAF neural network scoring kernel
+struct DruseAFParams {
+    uint32_t    numProteinAtoms;   // actual P (<=256)
+    uint32_t    numLigandAtoms;    // actual L (<=64)
+    uint32_t    hiddenDim;         // 128
+    uint32_t    numHeads;          // 4
+    uint32_t    headDim;           // 32 (hiddenDim / numHeads)
+    uint32_t    rbfBins;           // 50
+    float       rbfGamma;          // 10.0
+    float       rbfSpacing;        // 0.2 (10.0 / 50)
+    uint32_t    numCrossAttnLayers; // 2
+    uint32_t    numWeightTensors;  // 48
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+};
+
+// Weight tensor offset entry (byte offset + element count into packed weight buffer)
+struct DruseAFWeightEntry {
+    uint32_t    offset;    // float offset into weight buffer
+    uint32_t    count;     // number of float elements
 };
 
 // ============================================================================
@@ -562,6 +622,106 @@ struct HBondAtomScore {
     uint32_t _pad0;
     uint32_t _pad1;
     uint32_t _pad2;
+};
+
+// ============================================================================
+// MARK: - GFN2-xTB GPU Types
+// ============================================================================
+
+/// Parameters for GPU-accelerated coordination number.
+struct GFN2CNParams {
+    uint32_t atomCount;
+    uint32_t _pad0;
+    uint32_t _pad1;
+    uint32_t _pad2;
+};
+
+/// Per-atom data for CN computation.
+struct GFN2CNAtom {
+    simd_float3 position;        // Bohr
+    float       covRadius;       // covalent radius (Bohr)
+};
+
+/// Parameters for GPU-accelerated Born radii computation.
+struct GFN2BornParams {
+    uint32_t atomCount;
+    float    probeRadius;        // Bohr
+    float    bornOffset;         // Bohr
+    float    bornScale;          // OBC descreening factor
+};
+
+/// Per-atom data for Born radii GPU kernel.
+struct GFN2BornAtom {
+    simd_float3 position;        // Bohr
+    float       vdwRadius;       // Bohr (Bondi)
+};
+
+/// Parameters for GPU-accelerated D4 dispersion.
+struct GFN2DispParams {
+    uint32_t atomCount;
+    float    s6;
+    float    s8;
+    float    a1;
+    float    a2_bohr;           // a2 in Bohr
+    uint32_t computeGrad;       // 0 = energy only, 1 = energy + gradient
+    uint32_t _pad0;
+    uint32_t _pad1;
+};
+
+/// Per-atom data for D4 dispersion GPU kernel.
+struct GFN2DispAtom {
+    simd_float3 position;       // Bohr
+    float       c6ref;          // reference C6 (Hartree·Bohr⁶)
+    float       cn;             // coordination number
+    float       cnRef;          // reference CN for D4 weighting
+    float       qDipole;        // sqrt(C6_ref) * 2.5, for C8 = 3*C6ij*sqrt(qi*qj)
+    float       _pad0;
+};
+
+/// Parameters for GPU-accelerated repulsion energy.
+struct GFN2RepParams {
+    uint32_t atomCount;
+    float    kexp;              // exponent (1.5 for GFN2)
+    uint32_t computeGrad;       // 0 = energy only, 1 = energy + gradient
+    uint32_t _pad0;
+};
+
+/// Per-atom data for repulsion GPU kernel.
+struct GFN2RepAtom {
+    simd_float3 position;       // Bohr
+    float       zeff;           // effective nuclear charge
+    float       arep;           // repulsion exponent
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
+};
+
+/// Parameters for GPU-accelerated GB solvation energy.
+struct GFN2GBParams {
+    uint32_t atomCount;
+    float    keps;              // (1 - 1/epsilon)
+    float    gamma_au;          // surface tension (Hartree/Bohr²)
+    uint32_t computeGrad;
+};
+
+/// Per-atom data for GB solvation GPU kernel (after Born radii computed).
+struct GFN2GBAtom {
+    simd_float3 position;       // Bohr
+    float       charge;         // negated Mulliken charge (real partial charge)
+    float       bornRadius;     // pre-computed Born radius
+    float       sasa;           // pre-computed SASA
+    float       _pad0;
+    float       _pad1;
+};
+
+/// Per-atom data for CN gradient propagation kernel.
+struct GFN2CNGradAtom {
+    simd_float3 position;       // Bohr
+    float       covRadius;      // covalent radius (Bohr)
+    float       dEdCN;          // dE/dCN_i chain rule factor
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
 };
 
 #endif /* ShaderTypes_h */

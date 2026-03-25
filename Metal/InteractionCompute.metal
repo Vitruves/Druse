@@ -28,7 +28,7 @@ kernel void detectInteractions(
     uint tgSize [[threads_per_threadgroup]]
 ) {
     // Maximum interactions a single ligand atom can produce.
-    // 6 strong (metal/salt/hbond/halogen) + 3 hydrophobic = 9 typical max,
+    // 6 strong (metal/salt/hbond/halogen) + 2 hydrophobic = 8 typical max,
     // but protein atoms can have multiple contacts; 24 is a safe upper bound.
     const uint MAX_LOCAL = 24;
     GPUInteraction localInteractions[MAX_LOCAL];
@@ -43,7 +43,7 @@ kernel void detectInteractions(
         // Track whether this ligand atom found a strong (non-hydrophobic) interaction
         bool hasStrongInteraction = false;
         uint hydroCount = 0;
-        const uint maxHydroPerAtom = 3;
+        const uint maxHydroPerAtom = 2;
 
         for (uint pi = 0; pi < params.numProteinAtoms; pi++) {
             InteractionAtomGPU protAtom = protAtoms[pi];
@@ -100,10 +100,10 @@ kernel void detectInteractions(
                 hasStrongInteraction = true;
             }
 
-            // ---- Hydrophobic: 3.3-4.5 Angstrom, C/S <-> C/S ----
-            // Allow hydrophobic contacts even if this atom has a strong interaction elsewhere, max 3 per atom
+            // ---- Hydrophobic: 3.4-4.0 Angstrom, C/S <-> C/S ----
+            // Allow hydrophobic contacts even if this atom has a strong interaction elsewhere, max 2 per atom
             if (type == 0xFFFFFFFF &&
-                d >= 3.3f && d <= 4.5f && hydroCount < maxHydroPerAtom) {
+                d >= 3.4f && d <= 4.0f && hydroCount < maxHydroPerAtom) {
                 bool ligHydro  = (ligFlags  & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
                 bool protHydro = (protFlags & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
                 if (ligHydro && protHydro) {

@@ -153,6 +153,66 @@ DruseVariantSet* druse_enumerate_protomers(
 void druse_free_variant_set(DruseVariantSet *set);
 
 // ============================================================================
+// MARK: - Unified Ligand Ensemble Preparation
+// ============================================================================
+
+/// Per-member data in the prepared ensemble.
+typedef struct {
+    DruseMoleculeResult *molecule;   // 3D structure with H, charges, minimized
+    double mmffEnergy;               // MMFF94 energy (kcal/mol)
+    double boltzmannWeight;          // population fraction (0-1, sums to 1 across ensemble)
+    int32_t kind;                    // 0=parent, 1=tautomer, 2=protomer, 3=tautomer+protomer
+    char label[256];                 // e.g. "Taut2_ProtAmineH_Conf3"
+    char smiles[512];                // canonical SMILES for this form
+    int32_t conformerIndex;          // conformer rank within its chemical form
+    int32_t formIndex;               // index of the chemical form (protomer/tautomer combo)
+} DruseEnsembleMember;
+
+/// Full ensemble result from unified preparation.
+typedef struct {
+    DruseEnsembleMember *members;    // array of all prepared forms
+    int32_t count;                   // total members
+    int32_t numForms;                // number of distinct chemical forms (before conformer expansion)
+    int32_t numConformersPerForm;    // conformers generated per form
+    bool success;
+    char errorMessage[512];
+} DruseEnsembleResult;
+
+/// Unified ligand preparation: protomer × tautomer × conformer pipeline.
+///
+/// Pipeline:
+/// 1. Enumerate protomers at target pH (Henderson-Hasselbalch, ambiguous sites)
+/// 2. For each protomer, enumerate tautomers
+/// 3. Deduplicate across the cross-product by canonical SMILES
+/// 4. For each unique form: generate conformers (ETKDGv3 + MMFF94)
+/// 5. Full preparation: add polar H, Gasteiger charges
+/// 6. Compute Boltzmann weights: w_i = exp(-E_i/kT) / Σ exp(-E_j/kT)
+///
+/// @param smiles         Input SMILES
+/// @param name           Molecule name
+/// @param pH             Target pH (e.g. 7.4)
+/// @param pkaThreshold   Henderson-Hasselbalch ambiguity window (e.g. 2.0)
+/// @param maxTautomers   Max tautomers per protomer form
+/// @param maxProtomers   Max protomers from parent
+/// @param energyCutoff   Discard forms with E > E_best + cutoff (kcal/mol, 0=no cutoff)
+/// @param conformersPerForm  Conformers to generate per unique chemical form
+/// @param temperature    Boltzmann temperature in Kelvin (298.15 = room temp)
+/// @return Heap-allocated result — free with druse_free_ensemble_result()
+DruseEnsembleResult* druse_prepare_ligand_ensemble(
+    const char *smiles,
+    const char *name,
+    double pH,
+    double pkaThreshold,
+    int32_t maxTautomers,
+    int32_t maxProtomers,
+    double energyCutoff,
+    int32_t conformersPerForm,
+    double temperature
+);
+
+void druse_free_ensemble_result(DruseEnsembleResult *result);
+
+// ============================================================================
 // MARK: - Protein Preparation (fragment-based)
 // ============================================================================
 

@@ -39,7 +39,12 @@ struct MetalView: NSViewRepresentable {
         mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.depthStencilPixelFormat = .depth32Float
         mtkView.sampleCount = 4 // 4x MSAA
-        mtkView.clearColor = MTLClearColor(red: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
+        // Match renderer theme so the very first frame doesn't flash dark on light-theme relaunch
+        if renderer.themeMode == 1 {
+            mtkView.clearColor = MTLClearColor(red: 0.96, green: 0.96, blue: 0.98, alpha: 1.0)
+        } else {
+            mtkView.clearColor = MTLClearColor(red: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
+        }
         mtkView.preferredFramesPerSecond = 60
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false

@@ -294,7 +294,8 @@ class DockingTestCase: XCTestCase {
         populationSize: Int = 200,
         generations: Int = 200,
         flexibility: Bool = true,
-        scoringMethod: ScoringMethod = .vina
+        scoringMethod: ScoringMethod = .vina,
+        numRuns: Int = 1
     ) async -> [DockingResult] {
         // Compute ligand extent
         let heavyAtoms = ligand.atoms.filter { $0.element != .H }
@@ -315,16 +316,17 @@ class DockingTestCase: XCTestCase {
         // Print atom types BEFORE docking
         printLigandAtomTypes(engine: engine, ligand: ligand)
 
-        // Compute grid maps
-        print("  [Dock] Computing grid maps (spacing=0.375, protein=\(protein.heavyAtomCount) heavy atoms)...")
-        let gridStart = CFAbsoluteTimeGetCurrent()
+        // Explicitly set the protein on the engine so runDocking() computes grid maps
+        // for the correct protein (avoids stale state from previous tests in the suite).
+        print("  [Dock] Pocket center: (\(String(format: "%.2f, %.2f, %.2f", pocket.center.x, pocket.center.y, pocket.center.z)))")
+        print("  [Dock] Pocket size: (\(String(format: "%.2f, %.2f, %.2f", pocket.size.x, pocket.size.y, pocket.size.z)))")
+        print("  [Dock] Protein heavy atoms: \(protein.atoms.filter { $0.element != .H }.count)")
         engine.computeGridMaps(protein: protein, pocket: pocket, spacing: 0.375, ligandExtent: ligExtent)
-        print("  [Dock] Grid maps computed in \(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - gridStart))s")
         printGridDebug(engine: engine)
 
         // Config
         var config = DockingConfig()
-        config.numRuns = 1
+        config.numRuns = numRuns
         config.generationsPerRun = generations
         config.populationSize = populationSize
         config.enableFlexibility = flexibility
@@ -388,7 +390,7 @@ class DockingTestCase: XCTestCase {
         let engine = try makeDockingEngine()
         let results = await runTestDocking(
             engine: engine, protein: protein, ligand: regenLigand, pocket: pocket,
-            populationSize: 250, generations: 250, flexibility: true)
+            populationSize: 250, generations: 250, flexibility: true, numRuns: 3)
 
         // Results debug
         let heavyAtoms = regenLigand.atoms.filter { $0.element != .H }

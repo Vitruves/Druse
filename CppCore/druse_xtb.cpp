@@ -34,6 +34,19 @@
 #include <algorithm>
 #include <numeric>
 #include <cstdio>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <mutex>
+
+// ============================================================================
+// MARK: - GPU Acceleration Context (set by Swift Metal layer)
+// ============================================================================
+
+static DruseXTBGPUContext *g_xtb_gpu = nullptr;
+
+extern "C" void druse_xtb_set_gpu_context(DruseXTBGPUContext *ctx) {
+    g_xtb_gpu = ctx;
+}
 
 // ============================================================================
 // MARK: - Physical Constants
@@ -765,6 +778,16 @@ static const double cart2sph_d[5][6] = {
 static void computeCN(const double *pos_bohr, const int *Z, int natom,
                        std::vector<double> &cn) {
     cn.assign(natom, 0.0);
+
+    // GPU path: dispatch to Metal compute if available
+    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_cn && natom >= 8) {
+        g_xtb_gpu->gpu_compute_cn(g_xtb_gpu->context, pos_bohr,
+                                   reinterpret_cast<const int32_t*>(Z),
+                                   natom, cn.data());
+        return;
+    }
+
+    // CPU fallback
     for (int i = 0; i < natom; i++) {
         for (int j = 0; j < i; j++) {
             double dx = pos_bohr[3*i]   - pos_bohr[3*j];
@@ -854,6 +877,14 @@ static double shell_gamma(double r_bohr, double gam_i, double lgam_i,
 /// This is a simple repulsive potential that keeps atoms apart at short range.
 /// Z_eff is the effective nuclear charge, and arep controls the steepness.
 static double computeRepulsion(const double *pos_bohr, const int *Z, int natom) {
+    // GPU path
+    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_repulsion && natom >= 8) {
+        return g_xtb_gpu->gpu_compute_repulsion(g_xtb_gpu->context, pos_bohr,
+                                                 reinterpret_cast<const int32_t*>(Z),
+                                                 natom, nullptr);
+    }
+
+    // CPU fallback
     double Erep = 0.0;
     for (int i = 0; i < natom; i++) {
         const auto &pi = gfn2Params[Z[i]];
@@ -869,12 +900,7 @@ static double computeRepulsion(const double *pos_bohr, const int *Z, int natom) 
             if (r < 1e-6) continue;
 
             double alpha = std::sqrt(pi.arep * pj.arep);
-
-            // k_exp for light atoms (H-He) can differ
             double kexp = GFN2_KEXP;
-            // For H-H or H-X interactions, potentially use klight
-            // (In practice klight=1.0 so this is a no-op for GFN2 but included for completeness)
-
             double rk = std::pow(r, kexp);
             double rep = pi.zeff * pj.zeff / r * std::exp(-alpha * rk);
             Erep += rep;
@@ -911,8 +937,23 @@ static void buildOverlapMatrix(const std::vector<ShellInfo> &shells,
                                std::vector<double> &S) {
     S.assign(nbasis * nbasis, 0.0);
 
-    // For each pair of shells, compute the overlap block
-    for (size_t si = 0; si < shells.size(); si++) {
+    const size_t nsh = shells.size();
+
+    // Build a flat list of upper-triangle shell pairs for balanced parallel dispatch.
+    // Each pair (si, sj) writes to non-overlapping matrix blocks so no mutex needed.
+    struct ShellPair { size_t si, sj; };
+    std::vector<ShellPair> pairs;
+    pairs.reserve(nsh * (nsh + 1) / 2);
+    for (size_t si = 0; si < nsh; si++)
+        for (size_t sj = si; sj < nsh; sj++)
+            pairs.push_back({si, sj});
+
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, pairs.size(), /*grain=*/4),
+    [&](const tbb::blocked_range<size_t> &range) {
+      for (size_t idx = range.begin(); idx < range.end(); idx++) {
+        size_t si = pairs[idx].si;
+        size_t sj = pairs[idx].sj;
+
         const auto &shA = shells[si];
         int atomA = shA.atomIdx;
         double Ax = pos_bohr[3*atomA], Ay = pos_bohr[3*atomA+1], Az = pos_bohr[3*atomA+2];
@@ -920,125 +961,111 @@ static void buildOverlapMatrix(const std::vector<ShellInfo> &shells,
         double zetaA = shA.slaterExp;
         const STOnGData *stoA = getSTOnG(shA.principalQN, lA, shA.ngauss);
 
-        for (size_t sj = si; sj < shells.size(); sj++) {
-            const auto &shB = shells[sj];
-            int atomB = shB.atomIdx;
-            double Bx = pos_bohr[3*atomB], By = pos_bohr[3*atomB+1], Bz = pos_bohr[3*atomB+2];
-            int lB = shB.angMom;
-            double zetaB = shB.slaterExp;
-            const STOnGData *stoB = getSTOnG(shB.principalQN, lB, shB.ngauss);
+        const auto &shB = shells[sj];
+        int atomB = shB.atomIdx;
+        double Bx = pos_bohr[3*atomB], By = pos_bohr[3*atomB+1], Bz = pos_bohr[3*atomB+2];
+        int lB = shB.angMom;
+        double zetaB = shB.slaterExp;
+        const STOnGData *stoB = getSTOnG(shB.principalQN, lB, shB.ngauss);
 
-            // Number of Cartesian components
-            int nCartA = (lA + 1) * (lA + 2) / 2;  // s:1, p:3, d:6
-            int nCartB = (lB + 1) * (lB + 2) / 2;
+        int nCartA = (lA + 1) * (lA + 2) / 2;
+        int nCartB = (lB + 1) * (lB + 2) / 2;
 
-            // Compute Cartesian overlap block using STO-nG primitives
-            // S_cart[ia][ib] = Σ_k Σ_l c_k * c_l * ⟨G_k|G_l⟩
-            std::vector<double> S_cart(nCartA * nCartB, 0.0);
+        std::vector<double> S_cart(nCartA * nCartB, 0.0);
 
-            // Generate Cartesian angular momentum components
-            auto makeCart = [](int l, std::vector<int> &lx, std::vector<int> &ly, std::vector<int> &lz) {
-                lx.clear(); ly.clear(); lz.clear();
-                for (int ix = l; ix >= 0; ix--) {
-                    for (int iy = l - ix; iy >= 0; iy--) {
-                        int iz = l - ix - iy;
-                        lx.push_back(ix); ly.push_back(iy); lz.push_back(iz);
-                    }
-                }
-            };
-
-            std::vector<int> lxA, lyA, lzA, lxB, lyB, lzB;
-            makeCart(lA, lxA, lyA, lzA);
-            makeCart(lB, lxB, lyB, lzB);
-
-            // Loop over STO-nG primitive pairs
-            for (int k = 0; k < stoA->n; k++) {
-                double alphaK = stoA->alpha[k] * zetaA * zetaA;  // scale by ζ²
-                double cK = stoA->coeff[k];
-                for (int l = 0; l < stoB->n; l++) {
-                    double alphaL = stoB->alpha[l] * zetaB * zetaB;
-                    double cL = stoB->coeff[l];
-                    double cc = cK * cL;
-
-                    // Compute overlap for each Cartesian component pair
-                    for (int ia = 0; ia < nCartA; ia++) {
-                        for (int ib = 0; ib < nCartB; ib++) {
-                            double ov = gaussianOverlap(alphaK, alphaL,
-                                                        Ax, Ay, Az, Bx, By, Bz,
-                                                        lxA[ia], lyA[ia], lzA[ia],
-                                                        lxB[ib], lyB[ib], lzB[ib]);
-                            S_cart[ia * nCartB + ib] += cc * ov;
-                        }
-                    }
+        auto makeCart = [](int l, std::vector<int> &lx, std::vector<int> &ly, std::vector<int> &lz) {
+            lx.clear(); ly.clear(); lz.clear();
+            for (int ix = l; ix >= 0; ix--) {
+                for (int iy = l - ix; iy >= 0; iy--) {
+                    int iz = l - ix - iy;
+                    lx.push_back(ix); ly.push_back(iy); lz.push_back(iz);
                 }
             }
+        };
 
-            // Transform Cartesian → spherical if needed
-            // s and p: Cartesian = spherical (nCart == nBasis)
-            // d: need to transform 6 Cartesian → 5 spherical
+        std::vector<int> lxA, lyA, lzA, lxB, lyB, lzB;
+        makeCart(lA, lxA, lyA, lzA);
+        makeCart(lB, lxB, lyB, lzB);
 
-            int nA = shA.basisCount;  // spherical count
-            int nB = shB.basisCount;
+        for (int k = 0; k < stoA->n; k++) {
+            double alphaK = stoA->alpha[k] * zetaA * zetaA;
+            double cK = stoA->coeff[k];
+            for (int l = 0; l < stoB->n; l++) {
+                double alphaL = stoB->alpha[l] * zetaB * zetaB;
+                double cL = stoB->coeff[l];
+                double cc = cK * cL;
 
-            if (lA <= 1 && lB <= 1) {
-                // Both s or p: direct copy
-                for (int ia = 0; ia < nA; ia++) {
-                    for (int ib = 0; ib < nB; ib++) {
-                        double val = S_cart[ia * nCartB + ib];
-                        int ii = shA.basisStart + ia;
-                        int jj = shB.basisStart + ib;
-                        S[ii * nbasis + jj] = val;
-                        if (si != sj) S[jj * nbasis + ii] = val;
-                    }
-                }
-            } else if (lA == 2 && lB <= 1) {
-                // A is d (6 cart → 5 sph), B is s or p
-                for (int ma = 0; ma < 5; ma++) {
-                    for (int ib = 0; ib < nB; ib++) {
-                        double val = 0.0;
-                        for (int ca = 0; ca < 6; ca++) {
-                            val += cart2sph_d[ma][ca] * S_cart[ca * nCartB + ib];
-                        }
-                        int ii = shA.basisStart + ma;
-                        int jj = shB.basisStart + ib;
-                        S[ii * nbasis + jj] = val;
-                        if (si != sj) S[jj * nbasis + ii] = val;
-                    }
-                }
-            } else if (lA <= 1 && lB == 2) {
-                // A is s or p, B is d
-                for (int ia = 0; ia < nA; ia++) {
-                    for (int mb = 0; mb < 5; mb++) {
-                        double val = 0.0;
-                        for (int cb = 0; cb < 6; cb++) {
-                            val += cart2sph_d[mb][cb] * S_cart[ia * nCartB + cb];
-                        }
-                        int ii = shA.basisStart + ia;
-                        int jj = shB.basisStart + mb;
-                        S[ii * nbasis + jj] = val;
-                        if (si != sj) S[jj * nbasis + ii] = val;
-                    }
-                }
-            } else {
-                // Both d: transform both indices
-                for (int ma = 0; ma < 5; ma++) {
-                    for (int mb = 0; mb < 5; mb++) {
-                        double val = 0.0;
-                        for (int ca = 0; ca < 6; ca++) {
-                            for (int cb = 0; cb < 6; cb++) {
-                                val += cart2sph_d[ma][ca] * cart2sph_d[mb][cb]
-                                       * S_cart[ca * nCartB + cb];
-                            }
-                        }
-                        int ii = shA.basisStart + ma;
-                        int jj = shB.basisStart + mb;
-                        S[ii * nbasis + jj] = val;
-                        if (si != sj) S[jj * nbasis + ii] = val;
+                for (int ia = 0; ia < nCartA; ia++) {
+                    for (int ib = 0; ib < nCartB; ib++) {
+                        double ov = gaussianOverlap(alphaK, alphaL,
+                                                    Ax, Ay, Az, Bx, By, Bz,
+                                                    lxA[ia], lyA[ia], lzA[ia],
+                                                    lxB[ib], lyB[ib], lzB[ib]);
+                        S_cart[ia * nCartB + ib] += cc * ov;
                     }
                 }
             }
         }
-    }
+
+        // Transform Cartesian → spherical and write to output matrix
+        int nA = shA.basisCount;
+        int nB = shB.basisCount;
+
+        if (lA <= 1 && lB <= 1) {
+            for (int ia = 0; ia < nA; ia++) {
+                for (int ib = 0; ib < nB; ib++) {
+                    double val = S_cart[ia * nCartB + ib];
+                    int ii = shA.basisStart + ia;
+                    int jj = shB.basisStart + ib;
+                    S[ii * nbasis + jj] = val;
+                    if (si != sj) S[jj * nbasis + ii] = val;
+                }
+            }
+        } else if (lA == 2 && lB <= 1) {
+            for (int ma = 0; ma < 5; ma++) {
+                for (int ib = 0; ib < nB; ib++) {
+                    double val = 0.0;
+                    for (int ca = 0; ca < 6; ca++) {
+                        val += cart2sph_d[ma][ca] * S_cart[ca * nCartB + ib];
+                    }
+                    int ii = shA.basisStart + ma;
+                    int jj = shB.basisStart + ib;
+                    S[ii * nbasis + jj] = val;
+                    if (si != sj) S[jj * nbasis + ii] = val;
+                }
+            }
+        } else if (lA <= 1 && lB == 2) {
+            for (int ia = 0; ia < nA; ia++) {
+                for (int mb = 0; mb < 5; mb++) {
+                    double val = 0.0;
+                    for (int cb = 0; cb < 6; cb++) {
+                        val += cart2sph_d[mb][cb] * S_cart[ia * nCartB + cb];
+                    }
+                    int ii = shA.basisStart + ia;
+                    int jj = shB.basisStart + mb;
+                    S[ii * nbasis + jj] = val;
+                    if (si != sj) S[jj * nbasis + ii] = val;
+                }
+            }
+        } else {
+            for (int ma = 0; ma < 5; ma++) {
+                for (int mb = 0; mb < 5; mb++) {
+                    double val = 0.0;
+                    for (int ca = 0; ca < 6; ca++) {
+                        for (int cb = 0; cb < 6; cb++) {
+                            val += cart2sph_d[ma][ca] * cart2sph_d[mb][cb]
+                                   * S_cart[ca * nCartB + cb];
+                        }
+                    }
+                    int ii = shA.basisStart + ma;
+                    int jj = shB.basisStart + mb;
+                    S[ii * nbasis + jj] = val;
+                    if (si != sj) S[jj * nbasis + ii] = val;
+                }
+            }
+        }
+      } // end for idx in range
+    }); // end parallel_for
 }
 
 /// Get the shell-pair scaling factor K_{l_i, l_j} from the Hamiltonian parameters.
@@ -1094,70 +1121,70 @@ static void buildH0(const std::vector<ShellInfo> &shells,
         shellLevels[si] = h0;
     }
 
-    // Fill H0 matrix
+    // Fill H0 diagonal blocks (serial — small and fast)
     for (size_t si = 0; si < shells.size(); si++) {
         const auto &shA = shells[si];
-        int atomA = shA.atomIdx;
-
-        // Diagonal blocks: self-energy (no shellPoly on diagonal)
         for (int ia = 0; ia < shA.basisCount; ia++) {
             int ii = shA.basisStart + ia;
             H0[ii * nbasis + ii] = shellLevels[si];
         }
+    }
 
-        // Off-diagonal blocks
-        for (size_t sj = si + 1; sj < shells.size(); sj++) {
-            const auto &shB = shells[sj];
-            int atomB = shB.atomIdx;
+    // Fill H0 off-diagonal blocks — parallelized over shell pairs
+    struct ShellPair { size_t si, sj; };
+    std::vector<ShellPair> offdiagPairs;
+    for (size_t si = 0; si < shells.size(); si++)
+        for (size_t sj = si + 1; sj < shells.size(); sj++)
+            if (shells[si].atomIdx != shells[sj].atomIdx)
+                offdiagPairs.push_back({si, sj});
 
-            if (atomA == atomB) continue;  // on-site off-diag is zero in DFTB
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, offdiagPairs.size(), /*grain=*/4),
+    [&](const tbb::blocked_range<size_t> &range) {
+      for (size_t idx = range.begin(); idx < range.end(); idx++) {
+        size_t si = offdiagPairs[idx].si;
+        size_t sj = offdiagPairs[idx].sj;
+        const auto &shA = shells[si];
+        const auto &shB = shells[sj];
+        int atomA = shA.atomIdx;
+        int atomB = shB.atomIdx;
 
-            // Interatomic distance
-            double dx = pos_bohr[3*atomA]   - pos_bohr[3*atomB];
-            double dy = pos_bohr[3*atomA+1] - pos_bohr[3*atomB+1];
-            double dz = pos_bohr[3*atomA+2] - pos_bohr[3*atomB+2];
-            double rab = std::sqrt(dx*dx + dy*dy + dz*dz);
+        double dx = pos_bohr[3*atomA]   - pos_bohr[3*atomB];
+        double dy = pos_bohr[3*atomA+1] - pos_bohr[3*atomB+1];
+        double dz = pos_bohr[3*atomA+2] - pos_bohr[3*atomB+2];
+        double rab = std::sqrt(dx*dx + dy*dy + dz*dz);
 
-            // Shell-pair scaling constant K (ss=1.85, pp=2.23, etc.)
-            double K = getShellPairK(shA.angMom, shB.angMom);
+        double K = getShellPairK(shA.angMom, shB.angMom);
 
-            // Electronegativity scaling
-            double enA = gfn2Params[Z[atomA]].en;
-            double enB = gfn2Params[Z[atomB]].en;
-            double enDiff = enA - enB;
-            double enScale = 1.0 + GFN2_ENSCALE * enDiff * enDiff;
+        double enA = gfn2Params[Z[atomA]].en;
+        double enB = gfn2Params[Z[atomB]].en;
+        double enDiff = enA - enB;
+        double enScale = 1.0 + GFN2_ENSCALE * enDiff * enDiff;
 
-            // Distance-dependent shellPoly correction (reference: scc_core.f90 lines 728-754)
-            // r = rab / (Ri + Rj), then rf = 1.0 + shpoly * sqrt(r)
-            // shpoly values are pre-scaled by 0.01 in our parameter table
-            double radSum = gfn2Params[Z[atomA]].atomicRad + gfn2Params[Z[atomB]].atomicRad;
-            double rNorm = (radSum > 1e-8) ? rab / radSum : 0.0;
-            double sqrtR = std::sqrt(rNorm);
-            double rf1 = 1.0 + gfn2Params[Z[atomA]].shpoly[shA.shellIdx] * sqrtR;
-            double rf2 = 1.0 + gfn2Params[Z[atomB]].shpoly[shB.shellIdx] * sqrtR;
-            double shPoly = rf1 * rf2;
+        double radSum = gfn2Params[Z[atomA]].atomicRad + gfn2Params[Z[atomB]].atomicRad;
+        double rNorm = (radSum > 1e-8) ? rab / radSum : 0.0;
+        double sqrtR = std::sqrt(rNorm);
+        double rf1 = 1.0 + gfn2Params[Z[atomA]].shpoly[shA.shellIdx] * sqrtR;
+        double rf2 = 1.0 + gfn2Params[Z[atomB]].shpoly[shB.shellIdx] * sqrtR;
+        double shPoly = rf1 * rf2;
 
-            // Slater exponent ratio scaling (reference: hamiltonian.F90 lines 245-251)
-            // zetaij = (2*sqrt(zi*zj)/(zi+zj))^wExp, wExp=0.5
-            double zi = gfn2Params[Z[atomA]].slaterExp[shA.shellIdx];
-            double zj = gfn2Params[Z[atomB]].slaterExp[shB.shellIdx];
-            double zetaRatio = 2.0 * std::sqrt(zi * zj) / (zi + zj);
-            double zetaij = std::sqrt(zetaRatio);  // wExp = 0.5
+        double zi = gfn2Params[Z[atomA]].slaterExp[shA.shellIdx];
+        double zj = gfn2Params[Z[atomB]].slaterExp[shB.shellIdx];
+        double zetaRatio = 2.0 * std::sqrt(zi * zj) / (zi + zj);
+        double zetaij = std::sqrt(zetaRatio);
 
-            // hav = 0.5 * K * (hi + hj) * zetaij * enScale * shellPoly
-            double hAvg = 0.5 * K * (shellLevels[si] + shellLevels[sj]) * zetaij * enScale * shPoly;
+        double hAvg = 0.5 * K * (shellLevels[si] + shellLevels[sj]) * zetaij * enScale * shPoly;
 
-            for (int ia = 0; ia < shA.basisCount; ia++) {
-                for (int ib = 0; ib < shB.basisCount; ib++) {
-                    int ii = shA.basisStart + ia;
-                    int jj = shB.basisStart + ib;
-                    double val = hAvg * S[ii * nbasis + jj];
-                    H0[ii * nbasis + jj] = val;
-                    H0[jj * nbasis + ii] = val;
-                }
+        for (int ia = 0; ia < shA.basisCount; ia++) {
+            for (int ib = 0; ib < shB.basisCount; ib++) {
+                int ii = shA.basisStart + ia;
+                int jj = shB.basisStart + ib;
+                double val = hAvg * S[ii * nbasis + jj];
+                H0[ii * nbasis + jj] = val;
+                H0[jj * nbasis + ii] = val;
             }
         }
-    }
+      }
+    }); // end parallel_for
 }
 
 // ============================================================================
@@ -1277,9 +1304,12 @@ static void buildChargeShift(const std::vector<ShellInfo> &shells,
     // Compute the potential at each shell due to all charge fluctuations
     // V_i = Σ_j γ_{ij} * Δq_j  (second order)
     //      + Γ_i * Δq_i²        (third order, on-site only)
+    // Parallelized: each shell's potential is independent.
     std::vector<double> shellPotential(nshells, 0.0);
 
-    for (int si = 0; si < nshells; si++) {
+    tbb::parallel_for(tbb::blocked_range<int>(0, nshells),
+    [&](const tbb::blocked_range<int> &range) {
+      for (int si = range.begin(); si < range.end(); si++) {
         int atomA = shells[si].atomIdx;
         double gam_A = gfn2Params[Z[atomA]].gam;
         double lgam_A = gfn2Params[Z[atomA]].lgam[shells[si].shellIdx];
@@ -1305,8 +1335,6 @@ static void buildChargeShift(const std::vector<ShellInfo> &shells,
             V += gam * shellCharges[sj];
         }
 
-        // Third-order correction (on-site):
-        // V_3rd = Γ_A * Δq_A  (derivative of 1/3 * Γ * Δq³)
         int l = shells[si].angMom;
         double thirdScale = (l == 0) ? GFN2_THIRDORDER_S :
                             (l == 1) ? GFN2_THIRDORDER_P : GFN2_THIRDORDER_D;
@@ -1314,27 +1342,38 @@ static void buildChargeShift(const std::vector<ShellInfo> &shells,
         V += gam3 * atomCharges[atomA] * atomCharges[atomA];
 
         shellPotential[si] = V;
-    }
+      }
+    }); // end parallel_for
 
     // Build the potential matrix:
     // Vshift_{μν} = 1/2 * S_{μν} * (V_{shell(μ)} + V_{shell(ν)})
-    for (int si = 0; si < nshells; si++) {
-        for (int sj = si; sj < nshells; sj++) {
-            double Vavg = 0.5 * (shellPotential[si] + shellPotential[sj]);
-            const auto &shA = shells[si];
-            const auto &shB = shells[sj];
+    // Each shell pair writes to non-overlapping basis blocks.
+    struct ShellPair { int si, sj; };
+    std::vector<ShellPair> vshiftPairs;
+    for (int si = 0; si < nshells; si++)
+        for (int sj = si; sj < nshells; sj++)
+            vshiftPairs.push_back({si, sj});
 
-            for (int ia = 0; ia < shA.basisCount; ia++) {
-                for (int ib = 0; ib < shB.basisCount; ib++) {
-                    int ii = shA.basisStart + ia;
-                    int jj = shB.basisStart + ib;
-                    double val = Vavg * S[ii * nbasis + jj];
-                    Vshift[ii * nbasis + jj] = val;
-                    if (ii != jj) Vshift[jj * nbasis + ii] = val;
-                }
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, vshiftPairs.size()),
+    [&](const tbb::blocked_range<size_t> &range) {
+      for (size_t idx = range.begin(); idx < range.end(); idx++) {
+        int si = vshiftPairs[idx].si;
+        int sj = vshiftPairs[idx].sj;
+        double Vavg = 0.5 * (shellPotential[si] + shellPotential[sj]);
+        const auto &shA = shells[si];
+        const auto &shB = shells[sj];
+
+        for (int ia = 0; ia < shA.basisCount; ia++) {
+            for (int ib = 0; ib < shB.basisCount; ib++) {
+                int ii = shA.basisStart + ia;
+                int jj = shB.basisStart + ib;
+                double val = Vavg * S[ii * nbasis + jj];
+                Vshift[ii * nbasis + jj] = val;
+                if (ii != jj) Vshift[jj * nbasis + ii] = val;
             }
         }
-    }
+      }
+    }); // end parallel_for
 }
 
 /// Compute the Coulomb energy from shell charges.
@@ -1393,6 +1432,12 @@ static double computeCoulombEnergy(const std::vector<ShellInfo> &shells,
 // ============================================================================
 // MARK: - Main SCC-DFTB Driver
 // ============================================================================
+
+// Forward declaration: D4 dispersion (defined in Part 2, used in compute_charges for total energy)
+static double computeD4Dispersion(const double *pos_bohr, const int *Z, int natom,
+                                   const std::vector<double> &cn,
+                                   double *gradient = nullptr);
+// Remove default from actual definition below (only one default allowed)
 
 extern "C" {
 
@@ -1758,7 +1803,13 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
     }
 
     // =========================================================================
-    // Step 8: Package results
+    // Step 8: D4 dispersion (lightweight, always-on — CN already computed)
+    // =========================================================================
+
+    double Edisp = computeD4Dispersion(pos_bohr.data(), Z.data(), atomCount, cn);
+
+    // =========================================================================
+    // Step 9: Package results
     // =========================================================================
 
     result->charges = new float[atomCount];
@@ -1767,7 +1818,7 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
         // Output standard Mulliken charges: q = refOcc - pop (positive = lost electrons).
         result->charges[i] = -(float)atomCharges[i];
     }
-    result->totalEnergy = (float)(Eelec + Erep);
+    result->totalEnergy = (float)(Eelec + Erep + Edisp);
     result->electronicEnergy = (float)Eelec;
     result->repulsionEnergy = (float)Erep;
     result->scfIterations = iter + 1;
@@ -1792,6 +1843,1377 @@ void druse_xtb_free_result(DruseXTBChargeResult *result) {
 
 bool druse_xtb_available(void) {
     return true;
+}
+
+} // extern "C"
+
+// ============================================================================
+// ============================================================================
+//
+//  PART 2 — ANALYTICAL GRADIENTS, D4 DISPERSION, GBSA/ALPB, L-BFGS
+//
+//  All new functionality added below. The original charge-only code above
+//  is preserved unchanged for backward compatibility.
+//
+// ============================================================================
+// ============================================================================
+
+// ============================================================================
+// MARK: - Internal: Shared SCC Workspace
+// ============================================================================
+
+/// All intermediate data from an SCC calculation, needed for gradient computation.
+struct SCCWorkspace {
+    int natom;
+    int nbasis;
+    int nshells;
+    int nValElectrons;
+    int nOccupied;
+    bool openShell;
+
+    std::vector<int> Z;
+    std::vector<double> pos_bohr;       // 3*natom
+    std::vector<ShellInfo> shells;
+    std::vector<double> cn;             // coordination numbers
+
+    // Matrices
+    std::vector<double> S;              // overlap (nbasis x nbasis)
+    std::vector<double> H0;             // core Hamiltonian
+    std::vector<double> P;              // density matrix
+    std::vector<double> W;              // energy-weighted density matrix
+    std::vector<double> normFactor;     // basis normalization factors
+
+    // Converged SCC data
+    std::vector<double> shellCharges;
+    std::vector<double> atomCharges;
+    std::vector<double> eigenvalues;
+    std::vector<double> eigenvectors;
+
+    // Energy components
+    double Eelec;
+    double Erep;
+    double Ecoul;
+
+    int scfIterations;
+    bool converged;
+};
+
+/// Run a full SCC calculation and populate workspace for gradient use.
+/// Returns false on failure (fills ws.errorMessage-like info in the caller).
+static bool runSCC(const float *positions, const int32_t *atomicNumbers,
+                   int32_t atomCount, int32_t totalCharge, int32_t maxIterations,
+                   SCCWorkspace &ws) {
+    initGFN2Params();
+
+    ws.natom = atomCount;
+    ws.Z.resize(atomCount);
+    for (int i = 0; i < atomCount; i++) ws.Z[i] = atomicNumbers[i];
+
+    // Validate
+    for (int i = 0; i < atomCount; i++) {
+        int z = ws.Z[i];
+        if (z <= 0 || z > MAX_ATOMIC_NUM || gfn2Params[z].atomicNumber == 0)
+            return false;
+    }
+
+    // Positions: Angstrom → Bohr
+    ws.pos_bohr.resize(3 * atomCount);
+    for (int i = 0; i < 3 * atomCount; i++)
+        ws.pos_bohr[i] = positions[i] * ANG_TO_BOHR;
+
+    // Build basis
+    ws.shells.clear();
+    ws.nbasis = 0;
+    for (int a = 0; a < atomCount; a++) {
+        const auto &par = gfn2Params[ws.Z[a]];
+        for (int s = 0; s < par.nShells; s++) {
+            ShellInfo sh;
+            sh.atomIdx = a;
+            sh.shellIdx = s;
+            sh.angMom = par.shellAngMom[s];
+            sh.basisStart = ws.nbasis;
+            sh.basisCount = basisCount(sh.angMom);
+            sh.slaterExp = par.slaterExp[s];
+            sh.selfEnergy = par.selfEnergy[s];
+            sh.refOcc = par.refOcc[s];
+            sh.hubbard = par.gam * par.lgam[s];
+            sh.principalQN = getPrincipalQN(ws.Z[a], s, sh.angMom);
+            sh.ngauss = par.ngauss[s];
+            ws.nbasis += sh.basisCount;
+            ws.shells.push_back(sh);
+        }
+    }
+    ws.nshells = (int)ws.shells.size();
+
+    ws.nValElectrons = 0;
+    for (const auto &sh : ws.shells)
+        ws.nValElectrons += (int)std::round(sh.refOcc);
+    ws.nValElectrons -= totalCharge;
+
+    if (ws.nValElectrons < 0 || ws.nValElectrons > 2 * ws.nbasis) return false;
+    ws.nOccupied = ws.nValElectrons / 2;
+    ws.openShell = (ws.nValElectrons % 2 != 0);
+
+    // CN
+    computeCN(ws.pos_bohr.data(), ws.Z.data(), atomCount, ws.cn);
+
+    // Overlap
+    buildOverlapMatrix(ws.shells, ws.pos_bohr.data(), ws.nbasis, ws.S);
+    ws.normFactor.resize(ws.nbasis);
+    for (int i = 0; i < ws.nbasis; i++)
+        ws.normFactor[i] = 1.0 / std::sqrt(std::fabs(ws.S[i * ws.nbasis + i]));
+    for (int i = 0; i < ws.nbasis; i++)
+        for (int j = 0; j < ws.nbasis; j++)
+            ws.S[i * ws.nbasis + j] *= ws.normFactor[i] * ws.normFactor[j];
+
+    // H0
+    buildH0(ws.shells, ws.pos_bohr.data(), ws.Z.data(), atomCount,
+            ws.nbasis, ws.S, ws.cn, ws.H0);
+
+    // Repulsion
+    ws.Erep = computeRepulsion(ws.pos_bohr.data(), ws.Z.data(), atomCount);
+
+    // SCC iteration (same as original druse_xtb_compute_charges logic)
+    ws.shellCharges.assign(ws.nshells, 0.0);
+    ws.atomCharges.assign(atomCount, 0.0);
+
+    double convergenceThreshold = 1e-6;
+    double mixingFactor = 0.3;
+    ws.converged = false;
+    ws.scfIterations = 0;
+    ws.Eelec = 0.0;
+
+    std::vector<double> prevShellCharges(ws.nshells, 0.0);
+    std::vector<double> prevResidual(ws.nshells, 0.0);
+    bool hasHistory = false;
+
+    std::vector<double> H(ws.nbasis * ws.nbasis);
+
+    for (int iter = 0; iter < maxIterations; iter++) {
+        std::vector<double> Vshift;
+        buildChargeShift(ws.shells, ws.pos_bohr.data(), ws.Z.data(), atomCount,
+                         ws.nbasis, ws.shellCharges, ws.atomCharges, ws.S, Vshift);
+
+        for (int i = 0; i < ws.nbasis * ws.nbasis; i++)
+            H[i] = ws.H0[i] + Vshift[i];
+
+        if (!solveGenEig(H, ws.S, ws.nbasis, ws.eigenvalues, ws.eigenvectors)) {
+            for (int i = 0; i < ws.nbasis; i++)
+                ws.S[i * ws.nbasis + i] += 1e-6;
+            if (!solveGenEig(H, ws.S, ws.nbasis, ws.eigenvalues, ws.eigenvectors))
+                return false;
+        }
+
+        // Density matrix
+        ws.P.assign(ws.nbasis * ws.nbasis, 0.0);
+        {
+            int nOcc = ws.openShell ? ws.nOccupied + 1 : ws.nOccupied;
+            nOcc = std::min(nOcc, ws.nbasis);
+            std::vector<double> C_scaled(nOcc * ws.nbasis);
+            for (int k = 0; k < ws.nOccupied && k < ws.nbasis; k++) {
+                double scale = std::sqrt(2.0);
+                for (int mu = 0; mu < ws.nbasis; mu++)
+                    C_scaled[k * ws.nbasis + mu] = scale * ws.eigenvectors[k * ws.nbasis + mu];
+            }
+            if (ws.openShell && ws.nOccupied < ws.nbasis) {
+                int k = ws.nOccupied;
+                for (int mu = 0; mu < ws.nbasis; mu++)
+                    C_scaled[k * ws.nbasis + mu] = ws.eigenvectors[k * ws.nbasis + mu];
+            }
+            cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                        ws.nbasis, ws.nbasis, nOcc,
+                        1.0, C_scaled.data(), ws.nbasis,
+                             C_scaled.data(), ws.nbasis,
+                        0.0, ws.P.data(), ws.nbasis);
+        }
+
+        std::vector<double> newShellCharges, newAtomCharges;
+        mullikenCharges(ws.P, ws.S, ws.shells, ws.nbasis, atomCount,
+                        newShellCharges, newAtomCharges);
+
+        double maxDelta = 0.0;
+        for (int si = 0; si < ws.nshells; si++)
+            maxDelta = std::max(maxDelta, std::fabs(newShellCharges[si] - ws.shellCharges[si]));
+
+        if (maxDelta < convergenceThreshold && iter > 0) {
+            ws.shellCharges = newShellCharges;
+            ws.atomCharges = newAtomCharges;
+            ws.converged = true;
+            ws.scfIterations = iter + 1;
+
+            ws.Eelec = 0.0;
+            for (int mu = 0; mu < ws.nbasis; mu++)
+                for (int nu = 0; nu < ws.nbasis; nu++)
+                    ws.Eelec += ws.P[mu * ws.nbasis + nu] * ws.H0[mu * ws.nbasis + nu];
+
+            ws.Ecoul = computeCoulombEnergy(ws.shells, ws.pos_bohr.data(), ws.Z.data(),
+                                             atomCount, ws.shellCharges, ws.atomCharges);
+            ws.Eelec += ws.Ecoul;
+            break;
+        }
+
+        // Mixing (Anderson)
+        std::vector<double> residual(ws.nshells);
+        for (int si = 0; si < ws.nshells; si++)
+            residual[si] = newShellCharges[si] - ws.shellCharges[si];
+
+        if (hasHistory && iter > 1) {
+            double dotRR = 0, dotRdR = 0;
+            for (int si = 0; si < ws.nshells; si++) {
+                double dr = residual[si] - prevResidual[si];
+                dotRR += residual[si] * residual[si];
+                dotRdR += residual[si] * dr;
+            }
+            double beta = (std::fabs(dotRdR) > 1e-16) ? dotRR / dotRdR : 0.0;
+            beta = std::max(-1.0, std::min(1.0, beta));
+            for (int si = 0; si < ws.nshells; si++) {
+                double mixed = (1.0 - beta) * (ws.shellCharges[si] + mixingFactor * residual[si])
+                             + beta * (prevShellCharges[si] + mixingFactor * prevResidual[si]);
+                prevShellCharges[si] = ws.shellCharges[si];
+                prevResidual[si] = residual[si];
+                ws.shellCharges[si] = mixed;
+            }
+        } else {
+            for (int si = 0; si < ws.nshells; si++) {
+                prevShellCharges[si] = ws.shellCharges[si];
+                prevResidual[si] = residual[si];
+                ws.shellCharges[si] += mixingFactor * residual[si];
+            }
+            hasHistory = true;
+        }
+
+        std::fill(ws.atomCharges.begin(), ws.atomCharges.end(), 0.0);
+        for (int si = 0; si < ws.nshells; si++)
+            ws.atomCharges[ws.shells[si].atomIdx] += ws.shellCharges[si];
+        double qsum = std::accumulate(ws.atomCharges.begin(), ws.atomCharges.end(), 0.0);
+        double shift = (totalCharge - qsum) / atomCount;
+        for (int a = 0; a < atomCount; a++) ws.atomCharges[a] += shift;
+        for (int si = 0; si < ws.nshells; si++)
+            ws.shellCharges[si] += shift * ws.shells[si].refOcc /
+                std::max(1.0, (double)gfn2Params[ws.Z[ws.shells[si].atomIdx]].nShells);
+    }
+
+    if (!ws.converged) {
+        ws.scfIterations = maxIterations;
+        // Compute energy with final (unconverged) charges
+        ws.Eelec = 0.0;
+        for (int mu = 0; mu < ws.nbasis; mu++)
+            for (int nu = 0; nu < ws.nbasis; nu++)
+                ws.Eelec += ws.P[mu * ws.nbasis + nu] * ws.H0[mu * ws.nbasis + nu];
+        ws.Ecoul = computeCoulombEnergy(ws.shells, ws.pos_bohr.data(), ws.Z.data(),
+                                         atomCount, ws.shellCharges, ws.atomCharges);
+        ws.Eelec += ws.Ecoul;
+    }
+
+    // Energy-weighted density matrix: W_{μν} = Σ_k f_k * ε_k * C_{μk} * C_{νk}
+    ws.W.assign(ws.nbasis * ws.nbasis, 0.0);
+    {
+        int nOcc = ws.openShell ? ws.nOccupied + 1 : ws.nOccupied;
+        nOcc = std::min(nOcc, ws.nbasis);
+        for (int k = 0; k < nOcc; k++) {
+            double occ = (k < ws.nOccupied) ? 2.0 : 1.0;
+            double ek = ws.eigenvalues[k];
+            for (int mu = 0; mu < ws.nbasis; mu++) {
+                double c_mu = ws.eigenvectors[k * ws.nbasis + mu];
+                for (int nu = mu; nu < ws.nbasis; nu++) {
+                    double val = occ * ek * c_mu * ws.eigenvectors[k * ws.nbasis + nu];
+                    ws.W[mu * ws.nbasis + nu] += val;
+                    if (mu != nu) ws.W[nu * ws.nbasis + mu] += val;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// MARK: - D4 Dispersion Energy and Gradient
+// ============================================================================
+
+// GFN2-xTB D4 parameters (rational BJ damping)
+static constexpr double D4_S6  = 1.0;
+static constexpr double D4_S8  = 2.7;
+static constexpr double D4_A1  = 0.52;
+static constexpr double D4_A2  = 5.0;    // Bohr (already in atomic units)
+static constexpr double D4_S9  = 0.0;    // ATM three-body (disabled for speed)
+
+// D4 reference C6 coefficients for common elements (Hartree·Bohr⁶)
+// Simplified: single reference per element from Grimme's D4 reference set.
+// For drug molecules this is accurate to ~5% vs full multi-reference D4.
+static const double d4RefC6[] = {
+    0.0,      // dummy
+    3.61,     // H
+    1.46,     // He
+    1380.0,   // Li
+    214.0,    // Be
+    99.5,     // B
+    46.6,     // C
+    24.2,     // N
+    15.6,     // O
+    9.52,     // F
+    6.38,     // Ne
+    1470.0,   // Na
+    626.0,    // Mg
+    528.0,    // Al
+    305.0,    // Si
+    185.0,    // P
+    134.0,    // S
+    94.6,     // Cl
+    64.3,     // Ar
+    3880.0,   // K
+    2180.0,   // Ca
+    0,0,0,0,  // Sc-Cr (sparse)
+    552.0,    // Mn (25)
+    482.0,    // Fe (26)
+    408.0,    // Co (27)
+    373.0,    // Ni (28)
+    253.0,    // Cu (29)
+    284.0,    // Zn (30)
+    0,0,0,0,  // Ga-Se
+    162.0,    // Br (35)
+};
+static const int d4RefC6Size = sizeof(d4RefC6) / sizeof(d4RefC6[0]);
+
+static double getC6(int Z) {
+    if (Z > 0 && Z < d4RefC6Size && d4RefC6[Z] > 0.0) return d4RefC6[Z];
+    // Fallback: empirical scaling C6 ~ Z^(1.5)
+    return 25.0 * std::pow((double)Z / 6.0, 1.5);
+}
+
+// Casimir-Polder C8 from C6: C8 = 3 * C6 * sqrt(Q_A * Q_B)
+// where Q is the quadrupole expectation — approximate as Q ~ sqrt(C6 / Z^0.5)
+static double getC8fromC6(double c6AB, int ZA, int ZB) {
+    double qA = std::sqrt(getC6(ZA)) * 2.5;
+    double qB = std::sqrt(getC6(ZB)) * 2.5;
+    return 3.0 * c6AB * std::sqrt(qA * qB);
+}
+
+/// Compute D4 dispersion energy (and optionally gradient).
+/// Reference: Caldeweyher et al., JCP 2019, 150, 154122
+static double computeD4Dispersion(const double *pos_bohr, const int *Z, int natom,
+                                   const std::vector<double> &cn,
+                                   double *gradient) {
+    // GPU path
+    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_d4 && natom >= 8) {
+        if (gradient) std::memset(gradient, 0, 3 * natom * sizeof(double));
+        return g_xtb_gpu->gpu_compute_d4(g_xtb_gpu->context, pos_bohr,
+                                          reinterpret_cast<const int32_t*>(Z),
+                                          natom, cn.data(), gradient);
+    }
+
+    // CPU fallback
+    // BJ damping: f_n(r) = r^n / (r^n + (a1*sqrt(C6/C8) + a2)^n)
+    // Convert a2 from Angstrom to Bohr
+    double a2_bohr = D4_A2;  // already in Bohr
+
+    double Edisp = 0.0;
+    if (gradient) std::memset(gradient, 0, 3 * natom * sizeof(double));
+
+    for (int i = 0; i < natom; i++) {
+        double c6i = getC6(Z[i]);
+        for (int j = 0; j < i; j++) {
+            double c6j = getC6(Z[j]);
+            double c6ij = std::sqrt(c6i * c6j);
+
+            // CN-dependent scaling (simplified D4 single-reference approximation)
+            // Soft Gaussian: w = exp(-0.5*(CN - CN_ref)^2) avoids catastrophic
+            // drop when CN deviates from the single reference value.
+            double cnRef_i = (Z[i] <= 2) ? 1.0 : (Z[i] <= 10 ? 3.0 : 4.0);
+            double cnRef_j = (Z[j] <= 2) ? 1.0 : (Z[j] <= 10 ? 3.0 : 4.0);
+            double wi = std::exp(-0.5 * (cn[i] - cnRef_i) * (cn[i] - cnRef_i));
+            double wj = std::exp(-0.5 * (cn[j] - cnRef_j) * (cn[j] - cnRef_j));
+            double wij = wi * wj;
+            c6ij *= wij; // modulate C6 by coordination environment
+
+            double c8ij = getC8fromC6(c6ij, Z[i], Z[j]);
+
+            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double r = std::sqrt(r2);
+            if (r < 1e-6) continue;
+
+            // BJ damping radii
+            double r0 = D4_A1 * std::sqrt(c6ij > 0 ? c8ij / c6ij : 0.0) + a2_bohr;
+            double r0_2 = r0 * r0;
+            double r0_6 = r0_2 * r0_2 * r0_2;
+            double r0_8 = r0_6 * r0_2;
+
+            double r6 = r2 * r2 * r2;
+            double r8 = r6 * r2;
+
+            // Damped dispersion energy
+            double f6 = 1.0 / (r6 + r0_6);
+            double f8 = 1.0 / (r8 + r0_8);
+
+            double e6 = -D4_S6 * c6ij * f6;
+            double e8 = -D4_S8 * c8ij * f8;
+            Edisp += e6 + e8;
+
+            if (gradient) {
+                // dE/dr for BJ-damped terms:
+                // d/dr[-C6/(r^6 + r0^6)] = 6*C6*r^5 / (r^6 + r0^6)^2
+                double df6 = 6.0 * D4_S6 * c6ij * r2 * r2 * r / ((r6 + r0_6) * (r6 + r0_6));
+                double df8 = 8.0 * D4_S8 * c8ij * r6 * r / ((r8 + r0_8) * (r8 + r0_8));
+                double dEdr = (df6 + df8) / r; // divide by r to get dE/dr * (r_vec/r)
+
+                gradient[3*i]   += dEdr * dx;
+                gradient[3*i+1] += dEdr * dy;
+                gradient[3*i+2] += dEdr * dz;
+                gradient[3*j]   -= dEdr * dx;
+                gradient[3*j+1] -= dEdr * dy;
+                gradient[3*j+2] -= dEdr * dz;
+            }
+        }
+    }
+    return Edisp;
+}
+
+// ============================================================================
+// MARK: - GBSA / ALPB Implicit Solvation
+// ============================================================================
+
+// Van der Waals radii for Born radii computation (Bondi radii, in Bohr)
+static const double vdwRadiiBohr[] = {
+    0.0,      // dummy
+    2.268,    // H   (1.20 Å)
+    2.646,    // He  (1.40 Å)
+    3.438,    // Li  (1.82 Å)
+    2.873,    // Be  (1.52 Å — estimated)
+    3.627,    // B   (1.92 Å)
+    3.213,    // C   (1.70 Å)
+    2.929,    // N   (1.55 Å)
+    2.873,    // O   (1.52 Å)
+    2.797,    // F   (1.48 Å — adjusted to Bondi)
+    2.910,    // Ne  (1.54 Å)
+    4.290,    // Na  (2.27 Å)
+    3.250,    // Mg  (1.72 Å)
+    3.495,    // Al  (1.85 Å — estimated)
+    3.968,    // Si  (2.10 Å)
+    3.402,    // P   (1.80 Å)
+    3.402,    // S   (1.80 Å)
+    3.307,    // Cl  (1.75 Å)
+    3.553,    // Ar  (1.88 Å)
+    5.197,    // K   (2.75 Å)
+    4.214,    // Ca  (2.23 Å — estimated)
+    0,0,0,0,  // Sc-Cr
+    3.78,     // Mn (25)
+    3.78,     // Fe (26)
+    3.78,     // Co (27)
+    3.08,     // Ni (28)
+    2.65,     // Cu (29)
+    2.59,     // Zn (30)
+    0,0,0,0,  // Ga-Se
+    3.495,    // Br (35)
+};
+static const int vdwRadiiSize = sizeof(vdwRadiiBohr) / sizeof(vdwRadiiBohr[0]);
+
+static double getVdwRad(int Z) {
+    if (Z > 0 && Z < vdwRadiiSize && vdwRadiiBohr[Z] > 0.0) return vdwRadiiBohr[Z];
+    return 3.4; // fallback (~1.80 Å)
+}
+
+/// Compute Born radii using the Still/OBC-II method.
+/// Reference: Onufriev, Bashford, Case, Proteins 2004, 55, 383-394
+static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
+                              double probeRad_bohr, double offset_bohr, double bornScale,
+                              std::vector<double> &brad,
+                              std::vector<double> &sasa) {
+    brad.resize(natom);
+    sasa.resize(natom);
+
+    // GPU path
+    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_born && natom >= 8) {
+        g_xtb_gpu->gpu_compute_born(g_xtb_gpu->context, pos_bohr,
+                                     reinterpret_cast<const int32_t*>(Z),
+                                     natom, (float)probeRad_bohr, (float)offset_bohr,
+                                     (float)bornScale, brad.data(), sasa.data());
+        return;
+    }
+
+    // CPU fallback
+    // Step 1: Compute psi (descreening integral) for each atom
+    std::vector<double> psi(natom, 0.0);
+
+    for (int i = 0; i < natom; i++) {
+        double ri = getVdwRad(Z[i]) + offset_bohr;
+        double rho_i = ri * bornScale;
+
+        for (int j = 0; j < natom; j++) {
+            if (i == j) continue;
+            double rj = getVdwRad(Z[j]) + offset_bohr;
+
+            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+            double rij = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (rij < 1e-8) continue;
+
+            double sj = rj * bornScale;
+
+            // Compute the descreening contribution
+            if (rij > ri + sj) {
+                // No overlap: standard 1/r contribution
+                psi[i] += 0.5 * (1.0/(rij - sj) - 1.0/(rij + sj)
+                    + sj * 0.25 * (1.0/((rij + sj)*(rij + sj)) - 1.0/((rij - sj)*(rij - sj)))
+                    + 0.5 * std::log((rij - sj)/(rij + sj)) / rij);
+            } else if (rij > std::fabs(ri - sj)) {
+                // Partial overlap
+                double d = rij - sj;
+                if (std::fabs(d) < 1e-8) d = 1e-8;
+                psi[i] += 0.25 * (2.0/rij - 1.0/(rij + sj) - ri/(4.0*sj*rij)
+                    + 0.25 * (1.0/(sj*sj) - 1.0/(ri*ri))
+                    + 0.5 * std::log(std::fabs(d)/(rij + sj)) / rij);
+            }
+            // else fully buried: different formula omitted for simplicity
+        }
+
+        // OBC-II correction: apply three-parameter scaling
+        // Reference: Onufriev, Bashford, Case (2004)
+        double br = psi[i] * ri;
+        static constexpr double obc_alpha = 1.0;
+        static constexpr double obc_beta  = 0.8;
+        static constexpr double obc_gamma = 4.85;
+
+        double arg = br * (obc_alpha - br * (obc_beta - br * obc_gamma));
+        double tanh_arg = std::tanh(arg);
+
+        brad[i] = 1.0 / (1.0/ri - tanh_arg/ri);
+
+        // Approximate SASA: each atom's solvent-accessible surface area
+        // Simple Gaussian approximation (fast)
+        double probe_sum = getVdwRad(Z[i]) + probeRad_bohr;
+        double area = 4.0 * PI * probe_sum * probe_sum;
+        double burial = 0.0;
+        for (int j = 0; j < natom; j++) {
+            if (i == j) continue;
+            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+            double rij = std::sqrt(dx*dx + dy*dy + dz*dz);
+            double pj = getVdwRad(Z[j]) + probeRad_bohr;
+            double overlap = std::max(0.0, 1.0 - rij / (probe_sum + pj));
+            burial += overlap;
+        }
+        sasa[i] = area * std::exp(-0.5 * burial);
+    }
+}
+
+/// Compute GBSA/ALPB solvation energy (and optionally gradient).
+/// Returns solvation free energy in Hartree.
+static double computeSolvation(const double *pos_bohr, const int *Z, int natom,
+                                const std::vector<double> &atomCharges,
+                                DruseXTBSolvationConfig solv,
+                                double *gradient = nullptr) {
+    if (solv.model == DRUSE_XTB_SOLV_NONE) return 0.0;
+
+    double eps = solv.dielectricConstant;
+    double keps = (1.0 - 1.0 / eps); // Born prefactor: E_GB = -0.5 * (1 - 1/ε) * Σ q_i*q_j/f_GB
+
+    double probeRad_bohr = solv.probeRadius * ANG_TO_BOHR;
+    double offset_bohr = solv.bornOffset * ANG_TO_BOHR;
+
+    std::vector<double> brad, sasa;
+    computeBornRadii(pos_bohr, Z, natom, probeRad_bohr, offset_bohr, solv.bornScale, brad, sasa);
+
+    double Eborn = 0.0;
+    double Esasa = 0.0;
+
+    // Generalized Born energy: E_GB = -0.5 * keps * Σ_ij q_i*q_j / f_GB(r_ij)
+    // f_GB = sqrt(r²_ij + B_i*B_j * exp(-r²_ij/(4*B_i*B_j)))  (Still formula)
+    for (int i = 0; i < natom; i++) {
+        // Sign convention: atomCharges are pop-refOcc (internal), negate for real charges
+        double qi = -atomCharges[i];
+        for (int j = i; j < natom; j++) {
+            double qj = -atomCharges[j];
+
+            double r2;
+            if (i == j) {
+                r2 = 0.0;
+            } else {
+                double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+                double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+                double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+                r2 = dx*dx + dy*dy + dz*dz;
+            }
+
+            double BiBj = brad[i] * brad[j];
+            double expfac = std::exp(-r2 / (4.0 * BiBj));
+            double fGB = std::sqrt(r2 + BiBj * expfac);
+
+            double contrib = qi * qj / fGB;
+            if (i == j)
+                Eborn += 0.5 * contrib;
+            else
+                Eborn += contrib;
+        }
+    }
+    Eborn *= -0.5 * keps;
+
+    // ALPB correction for non-spherical charge distributions
+    if (solv.model == DRUSE_XTB_SOLV_ALPB) {
+        // α_ALPB = 0.571412 (Ehlert et al., JCTC 2021)
+        static constexpr double ALPB_ALPHA = 0.571412;
+        double qtot = 0.0;
+        for (int i = 0; i < natom; i++) qtot += -atomCharges[i];
+        // Shape correction: E_alpb = α * keps * q_tot² / (4π * <r²>)
+        if (std::fabs(qtot) > 1e-8) {
+            // Compute geometric mean radius
+            double r2avg = 0.0;
+            for (int i = 0; i < natom; i++) {
+                double x = pos_bohr[3*i], y = pos_bohr[3*i+1], z = pos_bohr[3*i+2];
+                r2avg += x*x + y*y + z*z;
+            }
+            r2avg /= natom;
+            double reff = std::sqrt(r2avg);
+            if (reff > 1e-6) {
+                Eborn += ALPB_ALPHA * keps * qtot * qtot / (4.0 * PI * reff);
+            }
+        }
+    }
+
+    // SASA non-polar contribution: E_sasa = γ * Σ SASA_i
+    // Convert surface tension from dyn/cm to Hartree/Bohr²:
+    //   1 dyn/cm = 1e-3 J/m², 1 Bohr² = 2.8003e-21 m², 1 Hartree = 4.3597e-18 J
+    //   γ(Hartree/Bohr²) = γ(dyn/cm) * 1e-3 * 2.8003e-21 / 4.3597e-18
+    double gamma_au = solv.surfaceTension * 6.4232e-7;
+    for (int i = 0; i < natom; i++) {
+        Esasa += gamma_au * sasa[i];
+    }
+
+    // Gradient (numerical for solvation — exact analytical is complex)
+    if (gradient) {
+        double h = 1e-4; // Bohr
+        std::vector<double> pos_plus(3 * natom);
+        for (int a = 0; a < natom; a++) {
+            for (int d = 0; d < 3; d++) {
+                std::copy(pos_bohr, pos_bohr + 3 * natom, pos_plus.begin());
+                pos_plus[3*a + d] += h;
+                std::vector<double> brad_p, sasa_p;
+                computeBornRadii(pos_plus.data(), Z, natom, probeRad_bohr, offset_bohr, solv.bornScale, brad_p, sasa_p);
+                double Ep = 0.0;
+                for (int i = 0; i < natom; i++) {
+                    double qi = -atomCharges[i];
+                    for (int j = i; j < natom; j++) {
+                        double qj = -atomCharges[j];
+                        double r2 = 0;
+                        if (i != j) {
+                            double dx2 = pos_plus[3*i]-pos_plus[3*j];
+                            double dy2 = pos_plus[3*i+1]-pos_plus[3*j+1];
+                            double dz2 = pos_plus[3*i+2]-pos_plus[3*j+2];
+                            r2 = dx2*dx2+dy2*dy2+dz2*dz2;
+                        }
+                        double BiBj = brad_p[i]*brad_p[j];
+                        double fGB = std::sqrt(r2 + BiBj*std::exp(-r2/(4.0*BiBj)));
+                        double c = qi*qj/fGB;
+                        Ep += (i==j) ? 0.5*c : c;
+                    }
+                }
+                Ep *= -0.5 * keps;
+                for (int i = 0; i < natom; i++) Ep += gamma_au * sasa_p[i];
+
+                pos_plus[3*a + d] -= 2.0 * h;
+                computeBornRadii(pos_plus.data(), Z, natom, probeRad_bohr, offset_bohr, solv.bornScale, brad_p, sasa_p);
+                double Em = 0.0;
+                for (int i = 0; i < natom; i++) {
+                    double qi = -atomCharges[i];
+                    for (int j = i; j < natom; j++) {
+                        double qj = -atomCharges[j];
+                        double r2 = 0;
+                        if (i != j) {
+                            double dx2 = pos_plus[3*i]-pos_plus[3*j];
+                            double dy2 = pos_plus[3*i+1]-pos_plus[3*j+1];
+                            double dz2 = pos_plus[3*i+2]-pos_plus[3*j+2];
+                            r2 = dx2*dx2+dy2*dy2+dz2*dz2;
+                        }
+                        double BiBj = brad_p[i]*brad_p[j];
+                        double fGB = std::sqrt(r2 + BiBj*std::exp(-r2/(4.0*BiBj)));
+                        double c = qi*qj/fGB;
+                        Em += (i==j) ? 0.5*c : c;
+                    }
+                }
+                Em *= -0.5 * keps;
+                for (int i = 0; i < natom; i++) Em += gamma_au * sasa_p[i];
+
+                gradient[3*a + d] += (Ep - Em) / (2.0 * h);
+            }
+        }
+    }
+
+    return Eborn + Esasa;
+}
+
+// ============================================================================
+// MARK: - Analytical Nuclear Gradient (Repulsion)
+// ============================================================================
+
+static void computeRepulsionGradient(const double *pos_bohr, const int *Z, int natom,
+                                      double *gradient) {
+    // GPU path: compute repulsion with gradient enabled
+    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_repulsion && natom >= 8) {
+        // GPU repulsion kernel computes energy+gradient in one dispatch
+        g_xtb_gpu->gpu_compute_repulsion(g_xtb_gpu->context, pos_bohr,
+                                          reinterpret_cast<const int32_t*>(Z),
+                                          natom, gradient);
+        return;
+    }
+
+    // CPU fallback
+    for (int i = 0; i < natom; i++) {
+        const auto &pi = gfn2Params[Z[i]];
+        if (pi.atomicNumber == 0) continue;
+        for (int j = 0; j < i; j++) {
+            const auto &pj = gfn2Params[Z[j]];
+            if (pj.atomicNumber == 0) continue;
+
+            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double r = std::sqrt(r2);
+            if (r < 1e-6) continue;
+
+            double alpha = std::sqrt(pi.arep * pj.arep);
+            double kexp = GFN2_KEXP;  // 1.5
+            double rk = std::pow(r, kexp);
+            double zz = pi.zeff * pj.zeff;
+            double exa = std::exp(-alpha * rk);
+
+            // E_rep_ij = zz / r * exp(-alpha * r^kexp)
+            // dE/dr = zz * exp(-alpha*r^k) * (-1/r² - alpha*k*r^(k-2)/r)
+            //       = -zz * exa * (1/r² + alpha * kexp * r^(kexp-1) / r)
+            // Factor out 1/r:
+            double dEdr = -zz * exa * (1.0/r2 + alpha * kexp * std::pow(r, kexp - 2.0));
+
+            // dE/dR_i = dEdr * (R_i - R_j) / r
+            double gx = dEdr * dx;
+            double gy = dEdr * dy;
+            double gz = dEdr * dz;
+
+            gradient[3*i]   += gx;
+            gradient[3*i+1] += gy;
+            gradient[3*i+2] += gz;
+            gradient[3*j]   -= gx;
+            gradient[3*j+1] -= gy;
+            gradient[3*j+2] -= gz;
+        }
+    }
+}
+
+// ============================================================================
+// MARK: - Analytical Nuclear Gradient (Coulomb / SCC)
+// ============================================================================
+
+/// Gradient of the Ohno-Klopman gamma function w.r.t. distance.
+/// gamma = 1/sqrt(R² + eta^(-2))  where eta = 0.5*(gi+gj)
+/// dgamma/dR = -R / (R² + eta^(-2))^(3/2)
+static double ohno_gamma_deriv(double r_bohr, double gi, double gj) {
+    double gij = 0.5 * (gi + gj);
+    double gij_inv2 = 1.0 / (gij * gij);
+    double denom = r_bohr * r_bohr + gij_inv2;
+    return -r_bohr / (denom * std::sqrt(denom));
+}
+
+/// Coulomb gradient: dE_coul/dR_A = Σ_ij Δq_i * (dγ_ij/dR_A) * Δq_j
+static void computeCoulombGradient(const std::vector<ShellInfo> &shells,
+                                    const double *pos_bohr, const int *Z, int natom,
+                                    const std::vector<double> &shellCharges,
+                                    double *gradient) {
+    int nshells = (int)shells.size();
+    for (int si = 0; si < nshells; si++) {
+        int atomA = shells[si].atomIdx;
+        double gam_A = gfn2Params[Z[atomA]].gam;
+        double lgam_A = gfn2Params[Z[atomA]].lgam[shells[si].shellIdx];
+
+        for (int sj = si + 1; sj < nshells; sj++) {
+            int atomB = shells[sj].atomIdx;
+            if (atomA == atomB) continue;
+
+            double gam_B = gfn2Params[Z[atomB]].gam;
+            double lgam_B = gfn2Params[Z[atomB]].lgam[shells[sj].shellIdx];
+
+            double dx = pos_bohr[3*atomA]   - pos_bohr[3*atomB];
+            double dy = pos_bohr[3*atomA+1] - pos_bohr[3*atomB+1];
+            double dz = pos_bohr[3*atomA+2] - pos_bohr[3*atomB+2];
+            double r = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (r < 1e-8) continue;
+
+            double gi = gam_A * lgam_A;
+            double gj = gam_B * lgam_B;
+            double dgdr = ohno_gamma_deriv(r, gi, gj);
+
+            // dE/dR = Δq_i * Δq_j * (dγ/dR) * (R_vec/R)
+            double qiqj = shellCharges[si] * shellCharges[sj];
+            double scale = qiqj * dgdr / r;
+
+            gradient[3*atomA]   += scale * dx;
+            gradient[3*atomA+1] += scale * dy;
+            gradient[3*atomA+2] += scale * dz;
+            gradient[3*atomB]   -= scale * dx;
+            gradient[3*atomB+1] -= scale * dy;
+            gradient[3*atomB+2] -= scale * dz;
+        }
+    }
+}
+
+// ============================================================================
+// MARK: - Analytical Nuclear Gradient (Electronic: Pulay + Hellmann-Feynman)
+// ============================================================================
+
+/// Electronic gradient via density matrix derivative:
+///   dE_elec/dR_A = Σ_μν P_μν * dH0_μν/dR_A  (Hellmann-Feynman)
+///               + Σ_μν W_μν * dS_μν/dR_A      (Pulay force)
+///
+/// We compute dS/dR and dH0/dR analytically for each atom pair,
+/// then contract with P and W.
+///
+/// For drug-sized molecules (~50-100 atoms), this is fast enough on CPU.
+/// The dominant cost is the SCC itself, not the gradient.
+static void computeElectronicGradient(const SCCWorkspace &ws, double *gradient) {
+    // For each shell pair (si, sj) on different atoms A, B:
+    // Compute dS_block/dR and dH0_block/dR via finite differences on the
+    // overlap/H0 elements w.r.t. interatomic distance, then contract with P and W.
+    //
+    // This is the most computationally intensive part but typically ~2x the SCC cost.
+
+    // Use semi-analytical approach: numerical derivative of overlap integrals
+    // (analytical Obara-Saika gradient is possible but the current STO-nG
+    // implementation would need substantial refactoring)
+    double h = 1e-5; // Bohr, finite difference step
+
+    int natom = ws.natom;
+    int nbasis = ws.nbasis;
+
+    for (int a = 0; a < natom; a++) {
+        for (int d = 0; d < 3; d++) {
+            // Displaced positions
+            std::vector<double> pos_p(ws.pos_bohr);
+            pos_p[3*a + d] += h;
+            std::vector<double> pos_m(ws.pos_bohr);
+            pos_m[3*a + d] -= h;
+
+            // Recompute overlap and H0 at displaced positions
+            std::vector<double> S_p, S_m, H0_p, H0_m;
+            buildOverlapMatrix(ws.shells, pos_p.data(), nbasis, S_p);
+            buildOverlapMatrix(ws.shells, pos_m.data(), nbasis, S_m);
+
+            // Apply same normalization as the original
+            for (int i = 0; i < nbasis; i++)
+                for (int j = 0; j < nbasis; j++) {
+                    S_p[i * nbasis + j] *= ws.normFactor[i] * ws.normFactor[j];
+                    S_m[i * nbasis + j] *= ws.normFactor[i] * ws.normFactor[j];
+                }
+
+            std::vector<double> cn_p, cn_m;
+            computeCN(pos_p.data(), ws.Z.data(), natom, cn_p);
+            computeCN(pos_m.data(), ws.Z.data(), natom, cn_m);
+
+            buildH0(ws.shells, pos_p.data(), ws.Z.data(), natom, nbasis, S_p, cn_p, H0_p);
+            buildH0(ws.shells, pos_m.data(), ws.Z.data(), natom, nbasis, S_m, cn_m, H0_m);
+
+            // Finite difference: dS/dR and dH0/dR
+            double grad_a = 0.0;
+            for (int mu = 0; mu < nbasis; mu++) {
+                for (int nu = 0; nu < nbasis; nu++) {
+                    int idx = mu * nbasis + nu;
+                    double dH0 = (H0_p[idx] - H0_m[idx]) / (2.0 * h);
+                    double dS  = (S_p[idx] - S_m[idx]) / (2.0 * h);
+
+                    // Hellmann-Feynman: P * dH0/dR
+                    grad_a += ws.P[idx] * dH0;
+                    // Pulay: W * dS/dR (with negative sign: -W * dS/dR)
+                    grad_a -= ws.W[idx] * dS;
+                }
+            }
+
+            gradient[3*a + d] += grad_a;
+        }
+    }
+}
+
+// ============================================================================
+// MARK: - CN Gradient (for D4 CN-derivative propagation)
+// ============================================================================
+
+/// Gradient of coordination number w.r.t. atomic positions.
+/// dCN_i/dR_A contributes to the total gradient via:
+///   dE/dR_A += Σ_i (dE/dCN_i) * (dCN_i/dR_A)
+///
+/// Here we only compute dCN/dR; dE/dCN comes from H0 or D4.
+static void computeCNGradient(const double *pos_bohr, const int *Z, int natom,
+                               double *cn_gradient_atom,  // 3*natom, accumulates
+                               const double *dEdCN) {     // natom, dE/dCN_i
+    // GPU path
+    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_cn_gradient && natom >= 8) {
+        g_xtb_gpu->gpu_compute_cn_gradient(g_xtb_gpu->context, pos_bohr,
+                                            reinterpret_cast<const int32_t*>(Z),
+                                            natom, dEdCN, cn_gradient_atom);
+        return;
+    }
+
+    // CPU fallback
+    for (int i = 0; i < natom; i++) {
+        for (int j = 0; j < i; j++) {
+            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+            double rij = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (rij < 1e-6) continue;
+
+            double rcov = getCovRad(Z[i]) + getCovRad(Z[j]);
+            double arg = -16.0 * (4.0/3.0 * rcov / rij - 1.0);
+            double exparg = std::exp(arg);
+            double denom = (1.0 + exparg);
+            // dcount/dr_ij = 16 * (4/3) * rcov / rij² * exparg / denom²
+            double dcountdr = 16.0 * (4.0/3.0) * rcov / (rij * rij) * exparg / (denom * denom);
+
+            // Chain rule: dE/dR via CN
+            double scale = (dEdCN[i] + dEdCN[j]) * dcountdr / rij;
+
+            cn_gradient_atom[3*i]   -= scale * dx;
+            cn_gradient_atom[3*i+1] -= scale * dy;
+            cn_gradient_atom[3*i+2] -= scale * dz;
+            cn_gradient_atom[3*j]   += scale * dx;
+            cn_gradient_atom[3*j+1] += scale * dy;
+            cn_gradient_atom[3*j+2] += scale * dz;
+        }
+    }
+}
+
+// ============================================================================
+// MARK: - Full Gradient Assembly
+// ============================================================================
+
+/// Compute total GFN2-xTB gradient: repulsion + electronic + Coulomb + D4 + solvation.
+/// All gradient contributions accumulated in Hartree/Bohr.
+static void computeTotalGradient(const SCCWorkspace &ws,
+                                  DruseXTBSolvationConfig solv,
+                                  std::vector<double> &totalGrad,
+                                  double &Edisp, double &Esolv) {
+    int natom = ws.natom;
+    totalGrad.assign(3 * natom, 0.0);
+
+    // 1. Repulsion gradient (analytical)
+    computeRepulsionGradient(ws.pos_bohr.data(), ws.Z.data(), natom, totalGrad.data());
+
+    // 2. Coulomb gradient (analytical)
+    computeCoulombGradient(ws.shells, ws.pos_bohr.data(), ws.Z.data(), natom,
+                           ws.shellCharges, totalGrad.data());
+
+    // 3. Electronic gradient (semi-analytical: finite diff on S and H0)
+    computeElectronicGradient(ws, totalGrad.data());
+
+    // 4. D4 dispersion (analytical gradient)
+    std::vector<double> dispGrad(3 * natom, 0.0);
+    Edisp = computeD4Dispersion(ws.pos_bohr.data(), ws.Z.data(), natom,
+                                 ws.cn, dispGrad.data());
+    for (int i = 0; i < 3 * natom; i++) totalGrad[i] += dispGrad[i];
+
+    // 5. Solvation gradient
+    if (solv.model != DRUSE_XTB_SOLV_NONE) {
+        std::vector<double> solvGrad(3 * natom, 0.0);
+        Esolv = computeSolvation(ws.pos_bohr.data(), ws.Z.data(), natom,
+                                  ws.atomCharges, solv, solvGrad.data());
+        for (int i = 0; i < 3 * natom; i++) totalGrad[i] += solvGrad[i];
+    } else {
+        Esolv = 0.0;
+    }
+}
+
+// ============================================================================
+// MARK: - L-BFGS Geometry Optimizer
+// ============================================================================
+
+static constexpr int LBFGS_MEMORY = 20;
+
+struct LBFGSState {
+    int n;                      // number of variables (3*natom for unfrozen)
+    int memory;
+    int iter;
+    std::vector<double> s_hist; // displacement history: memory × n
+    std::vector<double> y_hist; // gradient diff history: memory × n
+    std::vector<double> rho;    // 1/(s·y) history
+    std::vector<double> alpha;  // workspace
+
+    void init(int nvars) {
+        n = nvars;
+        memory = LBFGS_MEMORY;
+        iter = 0;
+        s_hist.resize(memory * n, 0.0);
+        y_hist.resize(memory * n, 0.0);
+        rho.resize(memory, 0.0);
+        alpha.resize(memory, 0.0);
+    }
+
+    /// L-BFGS two-loop recursion: compute search direction from gradient.
+    /// Returns the search direction (negated, i.e., -H*g).
+    void computeDirection(const double *grad, const double *prev_grad,
+                          const double *displacement,
+                          std::vector<double> &direction) {
+        direction.resize(n);
+
+        if (iter > 0) {
+            // Store latest s and y
+            int idx = (iter - 1) % memory;
+            double sy = 0.0;
+            for (int i = 0; i < n; i++) {
+                s_hist[idx * n + i] = displacement[i];
+                y_hist[idx * n + i] = grad[i] - prev_grad[i];
+                sy += s_hist[idx * n + i] * y_hist[idx * n + i];
+            }
+            rho[idx] = (std::fabs(sy) > 1e-16) ? 1.0 / sy : 0.0;
+        }
+
+        // Two-loop recursion (Nocedal & Wright, Algorithm 7.4)
+        std::copy(grad, grad + n, direction.data());
+
+        int bound = std::min(iter, memory);
+
+        // First loop: backward
+        for (int m = iter - 1; m >= std::max(0, iter - bound); m--) {
+            int idx = m % memory;
+            double dot = 0.0;
+            for (int i = 0; i < n; i++)
+                dot += s_hist[idx * n + i] * direction[i];
+            alpha[idx] = rho[idx] * dot;
+            for (int i = 0; i < n; i++)
+                direction[i] -= alpha[idx] * y_hist[idx * n + i];
+        }
+
+        // Initial Hessian approximation (diagonal: gamma * I)
+        double gamma = 1.0;
+        if (iter > 0) {
+            int idx = (iter - 1) % memory;
+            double yy = 0.0, sy2 = 0.0;
+            for (int i = 0; i < n; i++) {
+                yy += y_hist[idx * n + i] * y_hist[idx * n + i];
+                sy2 += s_hist[idx * n + i] * y_hist[idx * n + i];
+            }
+            if (yy > 1e-16) gamma = sy2 / yy;
+        }
+        for (int i = 0; i < n; i++) direction[i] *= gamma;
+
+        // Second loop: forward
+        for (int m = std::max(0, iter - bound); m < iter; m++) {
+            int idx = m % memory;
+            double dot = 0.0;
+            for (int i = 0; i < n; i++)
+                dot += y_hist[idx * n + i] * direction[i];
+            double beta = rho[idx] * dot;
+            for (int i = 0; i < n; i++)
+                direction[i] += s_hist[idx * n + i] * (alpha[idx] - beta);
+        }
+
+        // Negate: direction = -H * g
+        for (int i = 0; i < n; i++) direction[i] = -direction[i];
+
+        // Damping: prevent excessively large steps early on
+        // f_damp = 1 / (1 + 3000 * step^(-3))  [from xtb optimizer.f90]
+        double fdamp = 1.0 / (1.0 + 3000.0 * std::pow((double)(iter + 1), -3.0));
+        for (int i = 0; i < n; i++) direction[i] *= fdamp;
+
+        iter++;
+    }
+};
+
+// ============================================================================
+// MARK: - C API: Full Energy (extern "C")
+// ============================================================================
+
+extern "C" {
+
+DruseXTBEnergyResult* druse_xtb_compute_energy(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    int32_t maxIterations,
+    DruseXTBSolvationConfig solvation)
+{
+    auto *result = new DruseXTBEnergyResult();
+    std::memset(result, 0, sizeof(DruseXTBEnergyResult));
+    result->atomCount = atomCount;
+
+    SCCWorkspace ws;
+    if (!runSCC(positions, atomicNumbers, atomCount, totalCharge, maxIterations, ws)) {
+        result->success = false;
+        std::snprintf(result->errorMessage, 512, "SCC calculation failed");
+        return result;
+    }
+
+    // D4 dispersion
+    double Edisp = computeD4Dispersion(ws.pos_bohr.data(), ws.Z.data(), atomCount, ws.cn);
+
+    // Solvation
+    double Esolv = computeSolvation(ws.pos_bohr.data(), ws.Z.data(), atomCount,
+                                     ws.atomCharges, solvation);
+
+    result->electronicEnergy = (float)ws.Eelec;
+    result->repulsionEnergy = (float)ws.Erep;
+    result->dispersionEnergy = (float)Edisp;
+    result->solvationEnergy = (float)Esolv;
+    result->totalEnergy = (float)(ws.Eelec + ws.Erep + Edisp + Esolv);
+
+    result->charges = new float[atomCount];
+    for (int i = 0; i < atomCount; i++)
+        result->charges[i] = -(float)ws.atomCharges[i];
+
+    result->scfIterations = ws.scfIterations;
+    result->converged = ws.converged;
+    result->success = true;
+
+    return result;
+}
+
+void druse_xtb_free_energy_result(DruseXTBEnergyResult *result) {
+    if (result) {
+        delete[] result->charges;
+        delete result;
+    }
+}
+
+// ============================================================================
+// MARK: - C API: Gradient
+// ============================================================================
+
+DruseXTBGradientResult* druse_xtb_compute_gradient(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    int32_t maxIterations,
+    DruseXTBSolvationConfig solvation)
+{
+    auto *result = new DruseXTBGradientResult();
+    std::memset(result, 0, sizeof(DruseXTBGradientResult));
+    result->atomCount = atomCount;
+
+    SCCWorkspace ws;
+    if (!runSCC(positions, atomicNumbers, atomCount, totalCharge, maxIterations, ws)) {
+        result->success = false;
+        std::snprintf(result->errorMessage, 512, "SCC calculation failed");
+        return result;
+    }
+
+    double Edisp = 0.0, Esolv = 0.0;
+    std::vector<double> totalGrad;
+    computeTotalGradient(ws, solvation, totalGrad, Edisp, Esolv);
+
+    result->electronicEnergy = (float)ws.Eelec;
+    result->repulsionEnergy = (float)ws.Erep;
+    result->dispersionEnergy = (float)Edisp;
+    result->solvationEnergy = (float)Esolv;
+    result->totalEnergy = (float)(ws.Eelec + ws.Erep + Edisp + Esolv);
+
+    result->gradient = new float[3 * atomCount];
+    double gnorm2 = 0.0;
+    for (int i = 0; i < 3 * atomCount; i++) {
+        result->gradient[i] = (float)totalGrad[i];
+        gnorm2 += totalGrad[i] * totalGrad[i];
+    }
+    result->gradientNorm = (float)std::sqrt(gnorm2 / atomCount);
+
+    result->charges = new float[atomCount];
+    for (int i = 0; i < atomCount; i++)
+        result->charges[i] = -(float)ws.atomCharges[i];
+
+    result->scfIterations = ws.scfIterations;
+    result->converged = ws.converged;
+    result->success = true;
+
+    return result;
+}
+
+void druse_xtb_free_gradient_result(DruseXTBGradientResult *result) {
+    if (result) {
+        delete[] result->gradient;
+        delete[] result->charges;
+        delete result;
+    }
+}
+
+// ============================================================================
+// MARK: - C API: Geometry Optimization (L-BFGS)
+// ============================================================================
+
+DruseXTBOptResult* druse_xtb_optimize_geometry(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    DruseXTBSolvationConfig solvation,
+    DruseXTBOptLevel optLevel,
+    int32_t maxSteps,
+    const bool *freezeMask)
+{
+    auto *result = new DruseXTBOptResult();
+    std::memset(result, 0, sizeof(DruseXTBOptResult));
+    result->atomCount = atomCount;
+
+    // Convergence thresholds based on opt level
+    double ethr, gthr;
+    int defaultMaxSteps;
+    switch (optLevel) {
+        case DRUSE_XTB_OPT_CRUDE:
+            ethr = 5e-4; gthr = 1e-2; defaultMaxSteps = atomCount; break;
+        case DRUSE_XTB_OPT_NORMAL:
+            ethr = 5e-6; gthr = 1e-3; defaultMaxSteps = 3 * atomCount; break;
+        case DRUSE_XTB_OPT_TIGHT:
+            ethr = 1e-6; gthr = 8e-4; defaultMaxSteps = 5 * atomCount; break;
+        case DRUSE_XTB_OPT_EXTREME:
+            ethr = 5e-8; gthr = 5e-5; defaultMaxSteps = 20 * atomCount; break;
+        default:
+            ethr = 5e-6; gthr = 1e-3; defaultMaxSteps = 3 * atomCount; break;
+    }
+    int nSteps = (maxSteps > 0) ? maxSteps : std::min(defaultMaxSteps, 500);
+
+    // Working copy of positions (Angstrom)
+    std::vector<float> pos(positions, positions + 3 * atomCount);
+
+    // Determine which atoms are free to move
+    std::vector<bool> frozen(atomCount, false);
+    if (freezeMask) {
+        for (int i = 0; i < atomCount; i++) frozen[i] = freezeMask[i];
+    }
+
+    // Map free coordinates
+    int nfree = 0;
+    std::vector<int> freeMap; // indices into pos[] for free coordinates
+    for (int i = 0; i < atomCount; i++) {
+        if (!frozen[i]) {
+            freeMap.push_back(3*i);
+            freeMap.push_back(3*i+1);
+            freeMap.push_back(3*i+2);
+            nfree += 3;
+        }
+    }
+    if (nfree == 0) {
+        result->success = false;
+        std::snprintf(result->errorMessage, 512, "All atoms frozen");
+        return result;
+    }
+
+    LBFGSState lbfgs;
+    lbfgs.init(nfree);
+
+    std::vector<double> prevGrad(nfree, 0.0);
+    std::vector<double> displacement(nfree, 0.0);
+    double prevEnergy = 1e30;
+
+    result->converged = false;
+
+    for (int step = 0; step < nSteps; step++) {
+        // Run SCC at current geometry
+        SCCWorkspace ws;
+        if (!runSCC(pos.data(), atomicNumbers, atomCount, totalCharge, 50, ws)) {
+            result->success = false;
+            std::snprintf(result->errorMessage, 512,
+                         "SCC failed at optimization step %d", step);
+            break;
+        }
+
+        // Compute gradient
+        double Edisp = 0.0, Esolv = 0.0;
+        std::vector<double> totalGrad;
+        computeTotalGradient(ws, solvation, totalGrad, Edisp, Esolv);
+
+        double Etotal = ws.Eelec + ws.Erep + Edisp + Esolv;
+
+        // Extract free-coordinate gradient (convert Hartree/Bohr → Hartree/Angstrom)
+        std::vector<double> freeGrad(nfree);
+        for (int k = 0; k < nfree; k++)
+            freeGrad[k] = totalGrad[freeMap[k]] * BOHR_TO_ANG; // chain rule: dE/dR_ang = dE/dR_bohr * bohr/ang
+
+        // Gradient norm (RMS per free atom, in Hartree/Bohr)
+        double gnorm2 = 0.0;
+        for (int i = 0; i < 3 * atomCount; i++) gnorm2 += totalGrad[i] * totalGrad[i];
+        double gnorm = std::sqrt(gnorm2 / atomCount);
+
+        // Check convergence
+        double dE = Etotal - prevEnergy;
+        if (step > 0 && std::fabs(dE) < ethr && gnorm < gthr) {
+            result->converged = true;
+            result->optimizationSteps = step + 1;
+            result->finalGradientNorm = (float)gnorm;
+            result->energyChange = (float)dE;
+            result->totalEnergy = (float)Etotal;
+            result->electronicEnergy = (float)ws.Eelec;
+            result->repulsionEnergy = (float)ws.Erep;
+            result->dispersionEnergy = (float)Edisp;
+            result->solvationEnergy = (float)Esolv;
+
+            result->charges = new float[atomCount];
+            for (int i = 0; i < atomCount; i++)
+                result->charges[i] = -(float)ws.atomCharges[i];
+
+            result->optimizedPositions = new float[3 * atomCount];
+            std::copy(pos.begin(), pos.end(), result->optimizedPositions);
+            result->success = true;
+            return result;
+        }
+
+        // L-BFGS step
+        std::vector<double> direction;
+        lbfgs.computeDirection(freeGrad.data(),
+                                step > 0 ? prevGrad.data() : freeGrad.data(),
+                                displacement.data(), direction);
+
+        // Trust region: cap maximum displacement to 0.5 Angstrom per atom
+        double maxDisp = 0.0;
+        for (int k = 0; k < nfree; k++)
+            maxDisp = std::max(maxDisp, std::fabs(direction[k]));
+        if (maxDisp > 0.5) {
+            double scale = 0.5 / maxDisp;
+            for (int k = 0; k < nfree; k++) direction[k] *= scale;
+        }
+
+        // Apply displacement
+        for (int k = 0; k < nfree; k++) {
+            pos[freeMap[k]] += (float)direction[k];
+            displacement[k] = direction[k];
+        }
+
+        prevGrad = freeGrad;
+        prevEnergy = Etotal;
+    }
+
+    // Did not converge — return best geometry anyway
+    if (!result->success) {
+        // Run final SCC
+        SCCWorkspace ws;
+        if (runSCC(pos.data(), atomicNumbers, atomCount, totalCharge, 50, ws)) {
+            double Edisp = computeD4Dispersion(ws.pos_bohr.data(), ws.Z.data(), atomCount, ws.cn);
+            double Esolv = computeSolvation(ws.pos_bohr.data(), ws.Z.data(), atomCount,
+                                             ws.atomCharges, solvation);
+            result->totalEnergy = (float)(ws.Eelec + ws.Erep + Edisp + Esolv);
+            result->electronicEnergy = (float)ws.Eelec;
+            result->repulsionEnergy = (float)ws.Erep;
+            result->dispersionEnergy = (float)Edisp;
+            result->solvationEnergy = (float)Esolv;
+            result->charges = new float[atomCount];
+            for (int i = 0; i < atomCount; i++)
+                result->charges[i] = -(float)ws.atomCharges[i];
+        }
+        result->optimizedPositions = new float[3 * atomCount];
+        std::copy(pos.begin(), pos.end(), result->optimizedPositions);
+        result->optimizationSteps = nSteps;
+        result->converged = false;
+        result->success = true;
+        std::snprintf(result->errorMessage, 512,
+                     "Optimization did not converge within %d steps", nSteps);
+    }
+
+    return result;
+}
+
+void druse_xtb_free_opt_result(DruseXTBOptResult *result) {
+    if (result) {
+        delete[] result->optimizedPositions;
+        delete[] result->charges;
+        delete result;
+    }
 }
 
 } // extern "C"

@@ -75,6 +75,7 @@ Benchmark/manifests/
 Benchmark/results/
 Benchmark/reports/
 Benchmark/__pycache__/
+Benchmark/.bench_config.json
 
 # === Python ===
 __pycache__/

@@ -2,7 +2,7 @@
 
 Druse uses two complementary ML scoring models, each serving a distinct role in the docking pipeline.
 
-## DruseScorePKi — Primary Scoring Function
+## DruseScorePKi — Primary Scoring Function -> alias Druse AF now
 
 **CoreML model:** `DruseScorePKi.mlpackage`
 **Training script:** `train_druse_pKi.py`

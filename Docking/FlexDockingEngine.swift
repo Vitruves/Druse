@@ -418,7 +418,7 @@ final class FlexDockingEngine {
         affinityGridBuffer: MTLBuffer,
         typeIndexBuffer: MTLBuffer,
         gridParamsBuffer: MTLBuffer,
-        exclusionMaskBuffer: MTLBuffer,
+        intraPairsBuffer: MTLBuffer,
         populationSize: Int
     ) {
         guard isEnabled,
@@ -448,7 +448,7 @@ final class FlexDockingEngine {
         enc.setBuffer(affinityGridBuffer, offset: 0, index: 9)
         enc.setBuffer(typeIndexBuffer, offset: 0, index: 10)
         enc.setBuffer(gridParamsBuffer, offset: 0, index: 11)
-        enc.setBuffer(exclusionMaskBuffer, offset: 0, index: 12)
+        enc.setBuffer(intraPairsBuffer, offset: 0, index: 12)
 
         let tgs = MTLSize(width: min(populationSize, 256), height: 1, depth: 1)
         let tgc = MTLSize(width: (populationSize + tgs.width - 1) / tgs.width, height: 1, depth: 1)

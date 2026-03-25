@@ -232,9 +232,12 @@ enum RibbonMeshGenerator {
     }
 
     /// Generate ribbon mesh for all chains of a molecule using its SS assignments.
+    /// When `chainColorMap` is non-empty, each chain is colored by its map entry
+    /// instead of using secondary-structure-based colors.
     @MainActor
     static func generateForMolecule(
-        _ molecule: Molecule
+        _ molecule: Molecule,
+        chainColorMap: [String: SIMD3<Float>] = [:]
     ) -> (vertices: [RibbonVertex], indices: [UInt32]) {
         var allVertices: [RibbonVertex] = []
         var allIndices: [UInt32] = []
@@ -265,9 +268,18 @@ enum RibbonMeshGenerator {
 
             let (verts, idxs) = generate(caPositions: caPositions, ssAssignments: ssAssignments)
 
+            // Override vertex colors with per-chain color when chain coloring is active
+            var finalVerts = verts
+            if let chainColor = chainColorMap[chain.id] {
+                let color4 = SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                for i in finalVerts.indices {
+                    finalVerts[i].color = color4
+                }
+            }
+
             // Offset indices for multi-chain merge
             let vertexOffset = UInt32(allVertices.count)
-            allVertices.append(contentsOf: verts)
+            allVertices.append(contentsOf: finalVerts)
             allIndices.append(contentsOf: idxs.map { $0 + vertexOffset })
         }
 

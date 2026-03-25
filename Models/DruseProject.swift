@@ -67,6 +67,8 @@ enum DruseProjectIO {
             enableClipping: ws.enableClipping,
             clipNearZ: ws.clipNearZ,
             clipFarZ: ws.clipFarZ,
+            slabThickness: ws.slabThickness,
+            slabOffset: ws.slabOffset,
             showSurface: ws.showSurface,
             surfaceColorMode: ws.surfaceColorMode.rawValue
         )
@@ -192,6 +194,8 @@ struct ProjectSettings: Codable {
     var enableClipping: Bool
     var clipNearZ: Float
     var clipFarZ: Float
+    var slabThickness: Float?
+    var slabOffset: Float?
     var showSurface: Bool
     var surfaceColorMode: String
 
@@ -205,6 +209,8 @@ struct ProjectSettings: Codable {
         ws.enableClipping = enableClipping
         ws.clipNearZ = clipNearZ
         ws.clipFarZ = clipFarZ
+        if let t = slabThickness { ws.slabThickness = t }
+        if let o = slabOffset { ws.slabOffset = o }
         ws.showSurface = showSurface
         ws.surfaceColorMode = SurfaceColorMode(rawValue: surfaceColorMode) ?? ws.surfaceColorMode
     }

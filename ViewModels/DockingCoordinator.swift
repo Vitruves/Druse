@@ -71,6 +71,6 @@ struct DockingCoordinator {
     var chargeMethod: ChargeMethod = .gasteiger
     var affinityDisplayUnit: AffinityDisplayUnit = .pKi
 
-    // Live ML scoring guard: prevents overlapping CoreML predictions from piling up
-    var isLiveScoring: Bool = false
+    // Live ML scoring: cancellable task prevents stale predictions from blocking updates
+    var liveScoringTask: Task<Void, Never>?
 }

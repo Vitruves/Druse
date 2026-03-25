@@ -45,6 +45,7 @@ struct LigandDatabaseView: View {
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .help("Clear active ligand")
                 }
                 .padding(6)
                 .background(Color.green.opacity(0.08))
@@ -68,11 +69,21 @@ struct LigandDatabaseView: View {
                 TextField("SMILES", text: $smilesInput)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 10, design: .monospaced))
+                    .onSubmit { if !smilesInput.isEmpty { addFromSMILES() } }
 
-                Button("Add") { addFromSMILES() }
-                    .controlSize(.mini)
-                    .disabled(smilesInput.isEmpty)
+                if showAddConfirmation {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.green)
+                        .transition(.scale.combined(with: .opacity))
+                } else {
+                    Button("Add") { addFromSMILES() }
+                        .controlSize(.mini)
+                        .disabled(smilesInput.isEmpty)
+                        .help("Add SMILES to ligand database")
+                }
             }
+            .animation(.easeInOut(duration: 0.2), value: showAddConfirmation)
 
             // Open full database manager
             Button(action: { openWindow(id: "ligand-database") }) {
@@ -95,6 +106,7 @@ struct LigandDatabaseView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .disabled(db.count == 0)
+                .help("Save ligand database to disk")
 
                 Button(action: {
                     db.load()
@@ -104,6 +116,7 @@ struct LigandDatabaseView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
+                .help("Load ligand database from disk")
             }
 
             Divider()
@@ -192,10 +205,17 @@ struct LigandDatabaseView: View {
 
     // MARK: - Actions
 
+    @State private var showAddConfirmation = false
+
     private func addFromSMILES() {
         let name = "Ligand_\(db.count + 1)"
         db.addFromSMILES(smilesInput, name: name)
         smilesInput = ""
+        // Flash confirmation
+        showAddConfirmation = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            showAddConfirmation = false
+        }
     }
 
     private func useAsLigand(_ entry: LigandEntry) {
@@ -204,6 +224,6 @@ struct LigandDatabaseView: View {
             return
         }
         let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds, title: entry.smiles, smiles: entry.smiles)
-        viewModel.setLigandForDocking(mol)
+        viewModel.setLigandForDocking(mol, entryID: entry.id)
     }
 }

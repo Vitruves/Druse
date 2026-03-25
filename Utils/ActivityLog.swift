@@ -353,6 +353,15 @@ final class ActivityLog {
     private var fileWriter: FileLogWriter?
     private(set) var currentLogFileURL: URL?
 
+    /// When true, every log entry is also printed to stdout (for benchmark CLI monitoring).
+    /// Activated by BenchmarkRunner when it reads stdoutLogs=true from .bench_config.json.
+    private var mirrorToStdout = false
+
+    /// Enable stdout log mirroring (called by benchmark runner).
+    func enableStdoutMirroring() {
+        mirrorToStdout = true
+    }
+
     private init() {
         startFileLogging()
         CrashReporter.install()
@@ -427,6 +436,12 @@ final class ActivityLog {
         let entry = LogEntry(timestamp: Date(), level: level, category: category, message: message)
         pendingEntries.append(entry)
         scheduleFlush()
+
+        // Mirror to stdout for benchmark CLI monitoring (--druse-logs flag)
+        if mirrorToStdout {
+            print(entry.fileLine)
+            fflush(stdout)
+        }
 
         // Write-through: errors and warnings are always flushed immediately to survive crashes.
         // Docking category is also write-through since crashes most often occur during GPU docking.

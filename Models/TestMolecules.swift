@@ -200,4 +200,59 @@ enum TestMolecules {
         let mol = Molecule(name: "Ala Dipeptide", atoms: atoms, bonds: bonds, title: "Ace-Ala-NMe")
         return mol
     }
+
+    // MARK: - Ethanol (C2H6O) — 9 atoms, 8 bonds
+    // Coordinates from MMFF94-minimized geometry
+
+    @MainActor
+    static func ethanol() -> Molecule {
+        var atoms: [Atom] = []
+        var bonds: [Bond] = []
+
+        func addAtom(_ elem: Element, _ x: Float, _ y: Float, _ z: Float, name: String = "") {
+            atoms.append(Atom(
+                id: atoms.count,
+                element: elem,
+                position: SIMD3<Float>(x, y, z),
+                name: name.isEmpty ? "\(elem.symbol)\(atoms.count)" : name,
+                residueName: "ETH",
+                residueSeq: 1,
+                chainID: "A",
+                isHetAtom: true
+            ))
+        }
+
+        func addBond(_ a: Int, _ b: Int, _ order: BondOrder = .single) {
+            bonds.append(Bond(id: bonds.count, atomIndex1: a, atomIndex2: b, order: order))
+        }
+
+        // Heavy atoms
+        addAtom(.C, -0.748,  0.015,  0.024, name: "C1")   // 0: methyl C
+        addAtom(.C,  0.748, -0.015, -0.024, name: "C2")   // 1: CH2
+        addAtom(.O,  1.173,  0.015,  1.332, name: "O1")   // 2: hydroxyl O
+
+        // Hydrogens on C1
+        addAtom(.H, -1.149,  1.019, -0.138, name: "H1")   // 3
+        addAtom(.H, -1.093, -0.354, -0.946, name: "H2")   // 4
+        addAtom(.H, -1.149, -0.630,  0.819, name: "H3")   // 5
+
+        // Hydrogens on C2
+        addAtom(.H,  1.149, -1.003, -0.286, name: "H4")   // 6
+        addAtom(.H,  1.093,  0.755, -0.722, name: "H5")   // 7
+
+        // Hydroxyl H
+        addAtom(.H,  2.136,  0.041,  1.360, name: "HO")   // 8
+
+        // Bonds
+        addBond(0, 1)   // C-C
+        addBond(1, 2)   // C-O
+        addBond(0, 3)   // C-H
+        addBond(0, 4)   // C-H
+        addBond(0, 5)   // C-H
+        addBond(1, 6)   // C-H
+        addBond(1, 7)   // C-H
+        addBond(2, 8)   // O-H
+
+        return Molecule(name: "Ethanol", atoms: atoms, bonds: bonds, title: "EtOH")
+    }
 }

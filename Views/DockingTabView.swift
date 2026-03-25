@@ -26,6 +26,9 @@ struct DockingTabView: View {
             // 3. Grid box (always available)
             gridBoxSection
             Divider()
+            // 3b. Pocket view / Z-slab controls
+            pocketViewSection
+            Divider()
             // 4. Docking parameters
             dockingConfigSection
             // 4b. Pharmacophore constraints (only shown when constraints exist)
@@ -354,6 +357,7 @@ struct DockingTabView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .help("Center grid on ligand position")
                 }
 
                 if !viewModel.workspace.selectedResidueIndices.isEmpty {
@@ -363,6 +367,7 @@ struct DockingTabView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .help("Center grid on selected residues")
                 }
 
                 if viewModel.docking.selectedPocket != nil {
@@ -372,6 +377,7 @@ struct DockingTabView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .help("Reset grid to detected pocket")
                 }
             }
         }
@@ -394,6 +400,125 @@ struct DockingTabView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 44, alignment: .trailing)
         }
+    }
+
+    // MARK: - Pocket View / Z-Slab
+
+    @ViewBuilder
+    private var pocketViewSection: some View {
+        @Bindable var vm = viewModel
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Pocket View", systemImage: "rectangle.split.3x1")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { vm.workspace.enableClipping },
+                    set: { newValue in
+                        vm.workspace.enableClipping = newValue
+                        vm.renderer?.enableClipping = newValue
+                        if newValue, let pocket = vm.docking.selectedPocket {
+                            // Set object-space slab center on the renderer
+                            let pocketRadius = max(pocket.size.x, max(pocket.size.y, pocket.size.z))
+                            let thickness = (pocketRadius + 6.0) * 2.0
+                            vm.workspace.slabThickness = thickness
+                            vm.workspace.slabOffset = 0
+                            vm.renderer?.slabCenter = pocket.center
+                            vm.renderer?.slabHalfThickness = thickness / 2.0
+                            vm.renderer?.slabOffset = 0
+                        }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+            }
+
+            if vm.workspace.enableClipping {
+                VStack(alignment: .leading, spacing: 4) {
+                    // Slab thickness slider
+                    HStack(spacing: 4) {
+                        Text("Thickness")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 52, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { vm.workspace.slabThickness },
+                                set: { newVal in
+                                    vm.workspace.slabThickness = newVal
+                                    vm.renderer?.slabHalfThickness = newVal / 2.0
+                                }
+                            ),
+                            in: 2...40,
+                            step: 0.5
+                        )
+                        .controlSize(.mini)
+                        Text(String(format: "%.1f \u{00C5}", vm.workspace.slabThickness))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(vm.workspace.slabThickness < 10 ? .orange : .secondary)
+                            .frame(width: 44, alignment: .trailing)
+                    }
+
+                    // Slab offset slider
+                    HStack(spacing: 4) {
+                        Text("Offset")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 52, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { vm.workspace.slabOffset },
+                                set: { newVal in
+                                    vm.workspace.slabOffset = newVal
+                                    vm.renderer?.slabOffset = newVal
+                                }
+                            ),
+                            in: -20...20,
+                            step: 0.5
+                        )
+                        .controlSize(.mini)
+                        Text(String(format: "%+.1f \u{00C5}", vm.workspace.slabOffset))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, alignment: .trailing)
+                    }
+
+                    // Quick presets
+                    HStack(spacing: 4) {
+                        ForEach(["Tight", "Medium", "Wide"], id: \.self) { preset in
+                            Button(preset) {
+                                applySlabPreset(preset)
+                            }
+                            .font(.system(size: 9))
+                            .controlSize(.mini)
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+            } else {
+                Text("Enable to clip the view around the pocket for clean binding site visualization")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func applySlabPreset(_ preset: String) {
+        guard let pocket = viewModel.docking.selectedPocket else { return }
+        let pocketRadius = max(pocket.size.x, max(pocket.size.y, pocket.size.z))
+
+        let thickness: Float
+        switch preset {
+        case "Tight": thickness = pocketRadius * 1.5
+        case "Medium": thickness = pocketRadius * 2.5
+        default: thickness = pocketRadius * 4.0 // Wide
+        }
+
+        viewModel.workspace.slabThickness = thickness
+        viewModel.workspace.slabOffset = 0
+        viewModel.renderer?.slabCenter = pocket.center
+        viewModel.renderer?.slabHalfThickness = thickness / 2.0
+        viewModel.renderer?.slabOffset = 0
     }
 
     // MARK: - Docking Configuration
@@ -741,6 +866,7 @@ struct DockingTabView: View {
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .help("Remove this constraint")
                 }
             }
         }
@@ -791,20 +917,124 @@ struct DockingTabView: View {
                     .foregroundStyle(.secondary)
             }
 
-            // Post-docking ML refinement (only for Vina/Drusina mode)
-            if viewModel.druseRescoring.isAvailable &&
-               (viewModel.docking.scoringMethod == .vina || viewModel.docking.scoringMethod == .drusina) {
-                Toggle(isOn: $vm.docking.usePostDockingRefinement) {
+            // Post-docking refinement options
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Post-docking Refinement")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+
+                // ML rescoring
+                if viewModel.druseRescoring.isAvailable &&
+                   (viewModel.docking.scoringMethod == .vina || viewModel.docking.scoringMethod == .drusina) {
+                    Toggle(isOn: $vm.docking.usePostDockingRefinement) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "brain")
+                                .font(.system(size: 10))
+                            Text("ML rescoring")
+                                .font(.system(size: 11))
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.mini)
+                    .help("Refine pose ranking with a secondary neural network (blends ML + physics energies)")
+                }
+
+                // GFN2-xTB rescoring
+                Toggle(isOn: Binding(
+                    get: { viewModel.docking.dockingConfig.gfn2Refinement.enabled },
+                    set: { viewModel.docking.dockingConfig.gfn2Refinement.enabled = $0 }
+                )) {
                     HStack(spacing: 4) {
-                        Image(systemName: "brain")
+                        Image(systemName: "atom")
                             .font(.system(size: 10))
-                        Text("Post-docking ML refinement")
+                        Text("GFN2-xTB rescoring")
                             .font(.system(size: 11))
                     }
                 }
                 .toggleStyle(.checkbox)
                 .controlSize(.mini)
-                .help("After scoring, refine pose ranking with a secondary neural network (blends ML + physics energies in kcal/mol)")
+                .help("Geometry optimization of top poses with semi-empirical QM: D4 dispersion (π-stacking, CH-π) + implicit solvation (ALPB). ~15ms/pose for top 20.")
+
+                // GFN2 options (shown when enabled)
+                if viewModel.docking.dockingConfig.gfn2Refinement.enabled {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Solvation")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { viewModel.docking.dockingConfig.gfn2Refinement.solvation },
+                                set: { viewModel.docking.dockingConfig.gfn2Refinement.solvation = $0 }
+                            )) {
+                                ForEach(GFN2SolvationMode.allCases, id: \.self) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .frame(width: 110)
+                            .controlSize(.mini)
+                        }
+                        .help("Implicit solvation: ALPB (recommended) or GBSA for aqueous environment")
+
+                        HStack {
+                            Text("Opt Level")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { viewModel.docking.dockingConfig.gfn2Refinement.optLevel },
+                                set: { viewModel.docking.dockingConfig.gfn2Refinement.optLevel = $0 }
+                            )) {
+                                ForEach(GFN2OptLevel.allCases, id: \.self) { level in
+                                    Text(level.rawValue).tag(level)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .frame(width: 80)
+                            .controlSize(.mini)
+                        }
+                        .help("Convergence: Crude (~5ms/pose), Normal (~15ms), Tight (~30ms)")
+
+                        HStack {
+                            Text("Top poses")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            TextField("", value: Binding(
+                                get: { viewModel.docking.dockingConfig.gfn2Refinement.topPosesToRefine },
+                                set: { viewModel.docking.dockingConfig.gfn2Refinement.topPosesToRefine = max(1, $0) }
+                            ), format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 10, design: .monospaced))
+                            .frame(width: 45)
+                        }
+                        .help("Number of top-ranked poses to optimize with GFN2-xTB")
+
+                        HStack {
+                            Text("Blend")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                            Slider(
+                                value: Binding(
+                                    get: { viewModel.docking.dockingConfig.gfn2Refinement.blendWeight },
+                                    set: { viewModel.docking.dockingConfig.gfn2Refinement.blendWeight = $0 }
+                                ),
+                                in: 0...1.0, step: 0.05
+                            )
+                            .controlSize(.mini)
+                            Text(String(format: "%.0f%%", viewModel.docking.dockingConfig.gfn2Refinement.blendWeight * 100))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 28)
+                        }
+                        .help("How much GFN2 energy influences final ranking: 0% = scoring function only, 100% = GFN2 only")
+                    }
+                    .padding(.leading, 20)
+                }
             }
 
             Button(action: {
@@ -888,53 +1118,31 @@ struct DockingTabView: View {
     @ViewBuilder
     private var dockingProgressSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Running", systemImage: "bolt.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.yellow)
-
-            // Overall batch progress bar (ligand X/Y)
-            if viewModel.docking.isBatchDocking {
-                let (current, total) = viewModel.docking.batchProgress
-                ProgressView(
-                    value: total > 0 ? Double(current) / Double(total) : 0
-                )
-                .progressViewStyle(.linear)
-                .tint(.cyan)
-
-                Text("Ligand \(current + 1)/\(total)")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.cyan)
+            HStack {
+                Label("Docking in progress", systemImage: "bolt.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.yellow)
+                Spacer()
+                // Compact generation counter
+                let gen = viewModel.docking.dockingGeneration + 1
+                let total = viewModel.docking.dockingTotalGenerations
+                Text("Gen \(gen)/\(total)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
 
-            // Per-ligand generation progress
+            // Compact progress bar
             ProgressView(
-                value: min(Double(viewModel.docking.dockingGeneration),
+                value: min(Double(viewModel.docking.dockingGeneration + 1),
                            Double(max(viewModel.docking.dockingTotalGenerations, 1))),
                 total: Double(max(viewModel.docking.dockingTotalGenerations, 1))
             )
             .progressViewStyle(.linear)
+            .tint(.cyan)
 
-            HStack {
-                Text("Gen \(viewModel.docking.dockingGeneration)/\(viewModel.docking.dockingTotalGenerations)")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if viewModel.docking.scoringMethod == .druseAffinity, let pKi = viewModel.docking.dockingBestPKi {
-                    let display = viewModel.docking.affinityDisplayUnit.format(pKi)
-                    let unit = viewModel.docking.affinityDisplayUnit.unitLabel
-                    Text("\(display) \(unit)")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(pKi > 6 ? .green : pKi > 4 ? .yellow : .orange)
-                } else if viewModel.docking.scoringMethod == .druseAffinity {
-                    Text("scoring...")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(String(format: "%.2f kcal/mol", viewModel.docking.dockingBestEnergy))
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(viewModel.docking.dockingBestEnergy < 0 ? .green : .orange)
-                }
-            }
+            Text("Live scores visible in viewport (top-right)")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
 
             Button(action: {
                 if viewModel.docking.isBatchDocking {
@@ -970,14 +1178,20 @@ struct DockingTabView: View {
 
             // Key statistics grid
             let results = viewModel.docking.dockingResults
-            let energies = results.map(\.energy)
+            let isMLScoring = viewModel.docking.scoringMethod == .druseAffinity
             let clusterIDs = Set(results.map(\.clusterID))
 
             HStack(spacing: 8) {
-                statCell("Best", String(format: "%.1f", energies.min() ?? 0),
-                         color: (energies.min() ?? 0) < -6 ? .green : .yellow)
-                statCell("Mean", String(format: "%.1f", energies.isEmpty ? 0 : energies.reduce(0, +) / Float(energies.count)),
-                         color: .secondary)
+                if isMLScoring, let best = results.first, let pKd = best.mlPKd {
+                    let display = viewModel.docking.affinityDisplayUnit.format(pKd)
+                    statCell("Best", display, color: pKd > 8 ? .green : pKd > 5 ? .yellow : .orange)
+                } else {
+                    let energies = results.map(\.energy)
+                    statCell("Best", String(format: "%.1f", energies.min() ?? 0),
+                             color: (energies.min() ?? 0) < -6 ? .green : .yellow)
+                    statCell("Mean", String(format: "%.1f", energies.isEmpty ? 0 : energies.reduce(0, +) / Float(energies.count)),
+                             color: .secondary)
+                }
                 statCell("Poses", "\(results.count)", color: .blue)
                 statCell("Clusters", "\(clusterIDs.count)", color: .cyan)
             }

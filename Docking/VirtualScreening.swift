@@ -23,6 +23,7 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         var mlRerankTopN: Int = 10_000
         var admetFilter: Bool = true
         var openMMRefineTopN: Int = 25
+        var gfn2RefineTopN: Int = 0  // 0 = disabled; >0 = refine top N hits with GFN2-xTB (D4 + solvation)
         var maxRotatableBonds: Int = 15 // skip very flexible molecules
     }
 
@@ -41,6 +42,7 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         var openMMEnergy: Float?
         var admet: ADMETPredictor.ADMETResult?
         var strainEnergy: Float?
+        var gfn2Energy: Float?            // GFN2-xTB total energy (kcal/mol)
     }
 
     enum ScreeningState: Sendable {
@@ -228,66 +230,100 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
 
         var allHits: [ScreeningHit] = []
 
-        for (i, entry) in shortlisted.enumerated() {
-            if isCancelled { state = .idle; return }
+        // Phase 2: Batched GA docking — process multiple ligands simultaneously on GPU
+        let batchedGA = gridSnapshot.flatMap { snap in
+            snap.vinaAffinityGridBuffer != nil ? BatchedGAAccelerator(device: snap.stericGridBuffer.device) : nil
+        }
 
-            let mol = Molecule(
-                name: entry.name,
-                atoms: entry.molecule.atoms,
-                bonds: entry.molecule.bonds,
-                title: entry.smiles
-            )
+        if let batchedGA, let snap = gridSnapshot {
+            // Prepare all ligands for batched GA
+            let batchSize = 32  // ligands per GPU batch
+            for batchStart in stride(from: 0, to: shortlisted.count, by: batchSize) {
+                if isCancelled { state = .idle; return }
+                let batchEnd = min(batchStart + batchSize, shortlisted.count)
+                let batch = Array(shortlisted[batchStart..<batchEnd])
 
-            let result = await dockSingleMolecule(mol, engine: dockingEngine, protein: protein, pocket: pocket)
-            let rigidFallback: ScreeningHit? = entry.prescreen.map { result in
-                let preparedLigand = dockingEngine.prepareLigandGeometry(mol)
-                return ScreeningHit(
-                    id: allHits.count,
-                    name: entry.name,
-                    smiles: entry.smiles,
-                    bestEnergy: result.energy,
-                    mlScore: nil,
-                    compositeScore: result.energy,
-                    bestPoseAtoms: transformedPositions(
-                        for: preparedLigand.heavyAtoms,
-                        centroid: preparedLigand.centroid,
-                        prescore: result
-                    ),
-                    ligandAtoms: preparedLigand.heavyAtoms,
-                    ligandBonds: entry.molecule.bonds,
-                    descriptors: entry.descriptors,
-                    prescreenEnergy: result.energy,
-                    openMMEnergy: nil,
-                    admet: nil
+                var gaData = [LigandGAData?]()
+                var molecules = [Molecule]()
+                for entry in batch {
+                    let mol = Molecule(name: entry.name, atoms: entry.molecule.atoms, bonds: entry.molecule.bonds, title: entry.smiles)
+                    molecules.append(mol)
+                    gaData.append(dockingEngine.prepareLigandGA(mol))
+                }
+
+                let validData = gaData.compactMap { $0 }
+                let validIndices = gaData.enumerated().compactMap { $0.element != nil ? $0.offset : nil }
+
+                let gaResults = batchedGA.runBatchedGA(
+                    ligands: validData, gridSnapshot: snap,
+                    populationSize: max(20, config.populationSize),
+                    generations: max(10, config.numGenerations),
+                    localSearchSteps: 8
                 )
-            }
 
-            if let best = result {
-                allHits.append(ScreeningHit(
-                    id: allHits.count,
-                    name: entry.name,
-                    smiles: entry.smiles,
-                    bestEnergy: best.energy,
-                    mlScore: nil,
-                    compositeScore: best.energy,
-                    bestPoseAtoms: best.transformedAtomPositions,
-                    ligandAtoms: entry.molecule.atoms.filter { $0.element != .H },
-                    ligandBonds: entry.molecule.bonds,
-                    descriptors: entry.descriptors,
-                    prescreenEnergy: entry.prescreen?.energy,
-                    openMMEnergy: nil,
-                    admet: nil
-                ))
-            } else if let rigidFallback {
-                allHits.append(rigidFallback)
-                ActivityLog.shared.debug("Ligand \(entry.name): GA docking failed, using rigid prescore fallback", category: .dock)
-            } else {
-                ActivityLog.shared.warn("Ligand \(entry.name): docking produced no result", category: .dock)
-            }
+                for (resultIdx, localIdx) in validIndices.enumerated() {
+                    let entry = batch[localIdx]
+                    if let gaResult = gaResults[resultIdx] {
+                        // Transform atoms using the GA result pose
+                        let data = validData[resultIdx]
+                        let positions = data.gpuAtoms.map { atom in
+                            gaResult.rotation.act(atom.position) + gaResult.translation
+                        }
+                        allHits.append(ScreeningHit(
+                            id: allHits.count, name: entry.name, smiles: entry.smiles,
+                            bestEnergy: gaResult.energy, mlScore: nil, compositeScore: gaResult.energy,
+                            bestPoseAtoms: positions,
+                            ligandAtoms: data.heavyAtoms, ligandBonds: entry.molecule.bonds,
+                            descriptors: entry.descriptors, prescreenEnergy: entry.prescreen?.energy,
+                            openMMEnergy: nil, admet: nil
+                        ))
+                    } else if let prescore = entry.prescreen {
+                        let prepLig = dockingEngine.prepareLigandGeometry(molecules[localIdx])
+                        allHits.append(ScreeningHit(
+                            id: allHits.count, name: entry.name, smiles: entry.smiles,
+                            bestEnergy: prescore.energy, mlScore: nil, compositeScore: prescore.energy,
+                            bestPoseAtoms: transformedPositions(for: prepLig.heavyAtoms, centroid: prepLig.centroid, prescore: prescore),
+                            ligandAtoms: prepLig.heavyAtoms, ligandBonds: entry.molecule.bonds,
+                            descriptors: entry.descriptors, prescreenEnergy: prescore.energy,
+                            openMMEnergy: nil, admet: nil
+                        ))
+                    }
+                }
 
-            if i % 10 == 0 {
-                state = .docking(current: i, total: shortlisted.count)
-                progress = 0.3 + Float(i) / Float(max(shortlisted.count, 1)) * 0.5
+                state = .docking(current: min(batchEnd, shortlisted.count), total: shortlisted.count)
+                progress = 0.3 + Float(batchEnd) / Float(max(shortlisted.count, 1)) * 0.5
+            }
+        } else {
+            // Fallback: sequential GA docking per ligand
+            for (i, entry) in shortlisted.enumerated() {
+                if isCancelled { state = .idle; return }
+                let mol = Molecule(name: entry.name, atoms: entry.molecule.atoms, bonds: entry.molecule.bonds, title: entry.smiles)
+                let result = await dockSingleMolecule(mol, engine: dockingEngine, protein: protein, pocket: pocket)
+
+                if let best = result {
+                    allHits.append(ScreeningHit(
+                        id: allHits.count, name: entry.name, smiles: entry.smiles,
+                        bestEnergy: best.energy, mlScore: nil, compositeScore: best.energy,
+                        bestPoseAtoms: best.transformedAtomPositions,
+                        ligandAtoms: entry.molecule.atoms.filter { $0.element != .H },
+                        ligandBonds: entry.molecule.bonds, descriptors: entry.descriptors,
+                        prescreenEnergy: entry.prescreen?.energy, openMMEnergy: nil, admet: nil
+                    ))
+                } else if let prescore = entry.prescreen {
+                    let prepLig = dockingEngine.prepareLigandGeometry(mol)
+                    allHits.append(ScreeningHit(
+                        id: allHits.count, name: entry.name, smiles: entry.smiles,
+                        bestEnergy: prescore.energy, mlScore: nil, compositeScore: prescore.energy,
+                        bestPoseAtoms: transformedPositions(for: prepLig.heavyAtoms, centroid: prepLig.centroid, prescore: prescore),
+                        ligandAtoms: prepLig.heavyAtoms, ligandBonds: entry.molecule.bonds,
+                        descriptors: entry.descriptors, prescreenEnergy: prescore.energy,
+                        openMMEnergy: nil, admet: nil
+                    ))
+                }
+                if i % 10 == 0 {
+                    state = .docking(current: i, total: shortlisted.count)
+                    progress = 0.3 + Float(i) / Float(max(shortlisted.count, 1)) * 0.5
+                }
             }
         }
 
@@ -354,6 +390,27 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
                 protein: protein,
                 pocket: pocket
             )
+        }
+
+        // GFN2-xTB refinement of top screening hits (optional, ~15ms/hit)
+        if config.gfn2RefineTopN > 0 {
+            let topN = min(config.gfn2RefineTopN, allHits.count)
+            ActivityLog.shared.info("GFN2-xTB refining top \(topN) screening hits...", category: .dock)
+            for i in 0..<topN {
+                let atoms = allHits[i].ligandAtoms
+                let positions = allHits[i].bestPoseAtoms
+                guard atoms.count >= 2, positions.count == atoms.count else { continue }
+                var dockedAtoms = atoms
+                for j in 0..<dockedAtoms.count { dockedAtoms[j].position = positions[j] }
+                let charge = atoms.reduce(0) { $0 + $1.formalCharge }
+                if let result = try? await GFN2Refiner.computeEnergy(
+                    atoms: dockedAtoms, totalCharge: charge, solvation: .water
+                ) {
+                    allHits[i].gfn2Energy = result.totalEnergy_kcal
+                }
+            }
+            let refined = allHits.prefix(topN).filter { $0.gfn2Energy != nil }.count
+            ActivityLog.shared.info("GFN2-xTB: \(refined)/\(topN) hits scored", category: .dock)
         }
 
         // Phase 4: ADMET filtering
@@ -755,6 +812,253 @@ final class BatchedDockingMetalAccelerator {
                     clashPenalty: 1_000_000
                 )
             }
+        }
+
+        return results
+    }
+}
+
+/// GPU-batched GA docking: runs the full genetic algorithm for multiple ligands simultaneously.
+/// Uses batched Metal kernels (mcPerturbBatched, scorePosesBatched, metropolisAcceptBatched)
+/// to process K ligands × populationSize poses in a single GPU dispatch.
+final class BatchedGAAccelerator {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let scorePipeline: MTLComputePipelineState
+    private let perturbPipeline: MTLComputePipelineState
+    private let acceptPipeline: MTLComputePipelineState
+    private let initPopPipeline: MTLComputePipelineState
+
+    init?(device: MTLDevice) {
+        self.device = device
+        guard let queue = device.makeCommandQueue(),
+              let lib = device.makeDefaultLibrary(),
+              let scoreF = lib.makeFunction(name: "scorePosesBatched"),
+              let perturbF = lib.makeFunction(name: "mcPerturbBatched"),
+              let acceptF = lib.makeFunction(name: "metropolisAcceptBatched"),
+              let initF = lib.makeFunction(name: "initializePopulation")
+        else { return nil }
+        self.commandQueue = queue
+        do {
+            scorePipeline = try device.makeComputePipelineState(function: scoreF)
+            perturbPipeline = try device.makeComputePipelineState(function: perturbF)
+            acceptPipeline = try device.makeComputePipelineState(function: acceptF)
+            initPopPipeline = try device.makeComputePipelineState(function: initF)
+        } catch { return nil }
+    }
+
+    struct BatchGAResult {
+        var energy: Float
+        var translation: SIMD3<Float>
+        var rotation: simd_quatf
+        var torsions: [Float]
+    }
+
+    /// Run batched GA for multiple ligands simultaneously.
+    /// Returns per-ligand best pose or nil on failure.
+    func runBatchedGA(
+        ligands: [LigandGAData],
+        gridSnapshot: DockingGridSnapshot,
+        populationSize: Int = 32,
+        generations: Int = 40,
+        localSearchSteps: Int = 8,
+        temperature: Float = 1.2
+    ) -> [BatchGAResult?] {
+        guard !ligands.isEmpty,
+              let affinityBuf = gridSnapshot.vinaAffinityGridBuffer,
+              let typeIdxBuf = gridSnapshot.vinaTypeIndexBuffer
+        else { return Array(repeating: nil, count: ligands.count) }
+
+        let popSize = max(populationSize, 8)
+        let totalPoses = ligands.count * popSize
+        var results = [BatchGAResult?](repeating: nil, count: ligands.count)
+
+        // Flatten per-ligand data into contiguous GPU buffers
+        var allAtoms = [DockLigandAtom]()
+        var allEdges = [TorsionEdge]()
+        var allMoving = [Int32]()
+        var allPairs = [UInt32]()
+        var infos = [BatchedGALigandInfo]()
+
+        for lig in ligands {
+            // Remap torsion edge movingStart to global offset
+            var edges = lig.torsionEdges
+            let movingBase = Int32(allMoving.count)
+            for i in 0..<edges.count {
+                edges[i].movingStart += movingBase
+            }
+
+            infos.append(BatchedGALigandInfo(
+                atomStart: UInt32(allAtoms.count),
+                atomCount: UInt32(lig.gpuAtoms.count),
+                torsionEdgeStart: UInt32(allEdges.count),
+                torsionEdgeCount: UInt32(min(lig.torsionEdges.count, 32)),
+                movingIndicesStart: UInt32(allMoving.count),
+                pairListStart: UInt32(allPairs.count),
+                numPairs: UInt32(lig.pairList.count),
+                referenceIntraEnergy: lig.referenceIntraEnergy,
+                ligandRadius: lig.ligandRadius,
+                movingIndicesCount: UInt32(lig.movingIndices.count),
+                _pad0: 0, _pad1: 0
+            ))
+            allAtoms.append(contentsOf: lig.gpuAtoms)
+            allEdges.append(contentsOf: edges)
+            allMoving.append(contentsOf: lig.movingIndices)
+            allPairs.append(contentsOf: lig.pairList)
+        }
+
+        // Ensure non-empty arrays for buffer creation
+        if allEdges.isEmpty { allEdges.append(TorsionEdge(atom1: 0, atom2: 0, movingStart: 0, movingCount: 0)) }
+        if allMoving.isEmpty { allMoving.append(0) }
+        if allPairs.isEmpty { allPairs.append(0) }
+
+        guard let atomBuf = device.makeBuffer(bytes: allAtoms, length: allAtoms.count * MemoryLayout<DockLigandAtom>.stride, options: .storageModeShared),
+              let edgeBuf = device.makeBuffer(bytes: allEdges, length: allEdges.count * MemoryLayout<TorsionEdge>.stride, options: .storageModeShared),
+              let movBuf = device.makeBuffer(bytes: allMoving, length: allMoving.count * MemoryLayout<Int32>.stride, options: .storageModeShared),
+              let pairBuf = device.makeBuffer(bytes: allPairs, length: allPairs.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let infoBuf = device.makeBuffer(bytes: infos, length: infos.count * MemoryLayout<BatchedGALigandInfo>.stride, options: .storageModeShared),
+              let popBuf = device.makeBuffer(length: totalPoses * MemoryLayout<DockPose>.stride, options: .storageModeShared),
+              let offBuf = device.makeBuffer(length: totalPoses * MemoryLayout<DockPose>.stride, options: .storageModeShared),
+              let bestBuf = device.makeBuffer(length: totalPoses * MemoryLayout<DockPose>.stride, options: .storageModeShared)
+        else { return results }
+
+        // Initialize best buffer to infinity
+        memset(bestBuf.contents(), 0, totalPoses * MemoryLayout<DockPose>.stride)
+        let bestPoses = bestBuf.contents().bindMemory(to: DockPose.self, capacity: totalPoses)
+        for i in 0..<totalPoses { bestPoses[i].energy = .infinity }
+
+        var batchParams = BatchedGAParams(
+            numLigands: UInt32(ligands.count),
+            populationSizePerLigand: UInt32(popSize),
+            totalPoses: UInt32(totalPoses),
+            generation: 0,
+            localSearchSteps: UInt32(localSearchSteps),
+            mutationRate: 0.3,
+            crossoverRate: 0.6,
+            translationStep: 0.8,
+            rotationStep: 0.3,
+            torsionStep: 0.5,
+            mcTemperature: temperature,
+            _pad0: 0
+        )
+        guard let batchParamsBuf = device.makeBuffer(bytes: &batchParams, length: MemoryLayout<BatchedGAParams>.stride, options: .storageModeShared)
+        else { return results }
+
+        let tgWidth = 256
+        let tgSize = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let tgCount = MTLSize(width: (totalPoses + tgWidth - 1) / tgWidth, height: 1, depth: 1)
+
+        // Initialize population using per-ligand initializePopulation (reuse existing kernel)
+        // We need per-ligand GAParams for init. Instead, manually init via batched perturb from zero.
+        // Set all poses to random within search box by running perturbBatched from zeroed state.
+        memset(popBuf.contents(), 0, totalPoses * MemoryLayout<DockPose>.stride)
+        let poses = popBuf.contents().bindMemory(to: DockPose.self, capacity: totalPoses)
+        for i in 0..<totalPoses {
+            poses[i].energy = .infinity
+            poses[i].rotation = SIMD4<Float>(0, 0, 0, 1)
+            poses[i].translation = gridSnapshot.gridParams.searchCenter
+        }
+
+        // Run batched perturbation to randomize initial population
+        batchParams.generation = 0
+        batchParams.mutationRate = 1.0  // force full mutation for init
+        batchParamsBuf.contents().copyMemory(from: &batchParams, byteCount: MemoryLayout<BatchedGAParams>.stride)
+
+        if let cb = commandQueue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(perturbPipeline)
+            enc.setBuffer(offBuf, offset: 0, index: 0)
+            enc.setBuffer(popBuf, offset: 0, index: 1)
+            enc.setBuffer(batchParamsBuf, offset: 0, index: 2)
+            enc.setBuffer(gridSnapshot.gridParamsBuffer, offset: 0, index: 3)
+            enc.setBuffer(infoBuf, offset: 0, index: 4)
+            enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+        }
+        // Copy randomized offspring → population
+        memcpy(popBuf.contents(), offBuf.contents(), totalPoses * MemoryLayout<DockPose>.stride)
+
+        // Restore mutation rate
+        batchParams.mutationRate = 0.3
+
+        // === GA loop ===
+        for gen in 0..<generations {
+            batchParams.generation = UInt32(gen)
+            batchParamsBuf.contents().copyMemory(from: &batchParams, byteCount: MemoryLayout<BatchedGAParams>.stride)
+
+            guard let cb = commandQueue.makeCommandBuffer() else { continue }
+
+            // 1. Perturb
+            if let enc = cb.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(perturbPipeline)
+                enc.setBuffer(offBuf, offset: 0, index: 0)
+                enc.setBuffer(popBuf, offset: 0, index: 1)
+                enc.setBuffer(batchParamsBuf, offset: 0, index: 2)
+                enc.setBuffer(gridSnapshot.gridParamsBuffer, offset: 0, index: 3)
+                enc.setBuffer(infoBuf, offset: 0, index: 4)
+                enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+                enc.endEncoding()
+            }
+
+            // 2. Score
+            if let enc = cb.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(scorePipeline)
+                enc.setBuffer(offBuf, offset: 0, index: 0)
+                enc.setBuffer(atomBuf, offset: 0, index: 1)
+                enc.setBuffer(affinityBuf, offset: 0, index: 2)
+                enc.setBuffer(typeIdxBuf, offset: 0, index: 3)
+                enc.setBuffer(gridSnapshot.gridParamsBuffer, offset: 0, index: 4)
+                enc.setBuffer(batchParamsBuf, offset: 0, index: 5)
+                enc.setBuffer(edgeBuf, offset: 0, index: 6)
+                enc.setBuffer(movBuf, offset: 0, index: 7)
+                enc.setBuffer(pairBuf, offset: 0, index: 8)
+                enc.setBuffer(infoBuf, offset: 0, index: 9)
+                enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+                enc.endEncoding()
+            }
+
+            // 3. Accept
+            if let enc = cb.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(acceptPipeline)
+                enc.setBuffer(popBuf, offset: 0, index: 0)
+                enc.setBuffer(offBuf, offset: 0, index: 1)
+                enc.setBuffer(bestBuf, offset: 0, index: 2)
+                enc.setBuffer(batchParamsBuf, offset: 0, index: 3)
+                enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+                enc.endEncoding()
+            }
+
+            cb.commit()
+            // Don't wait every generation — batch submit and wait periodically
+            if gen == generations - 1 || gen % 10 == 9 {
+                cb.waitUntilCompleted()
+            }
+        }
+
+        // Extract best poses per ligand
+        let bestResults = bestBuf.contents().bindMemory(to: DockPose.self, capacity: totalPoses)
+        for ligIdx in 0..<ligands.count {
+            var bestE: Float = .infinity
+            var bestPoseIdx = -1
+            let start = ligIdx * popSize
+            for p in 0..<popSize {
+                let e = bestResults[start + p].energy
+                if e < bestE { bestE = e; bestPoseIdx = start + p }
+            }
+            guard bestPoseIdx >= 0, bestE < 1e9 else { continue }
+            let bp = bestResults[bestPoseIdx]
+            var torsions = [Float]()
+            withUnsafePointer(to: bp.torsions) { ptr in
+                ptr.withMemoryRebound(to: Float.self, capacity: 32) { buf in
+                    for t in 0..<min(Int(bp.numTorsions), 32) { torsions.append(buf[t]) }
+                }
+            }
+            results[ligIdx] = BatchGAResult(
+                energy: bp.energy,
+                translation: bp.translation,
+                rotation: simd_quatf(ix: bp.rotation.x, iy: bp.rotation.y, iz: bp.rotation.z, r: bp.rotation.w),
+                torsions: torsions
+            )
         }
 
         return results

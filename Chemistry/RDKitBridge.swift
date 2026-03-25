@@ -329,6 +329,113 @@ enum RDKitBridge {
         return results
     }
 
+    // MARK: - Unified Ensemble Preparation
+
+    /// One member of a prepared ligand ensemble (protomer × tautomer × conformer).
+    struct EnsembleMember: Sendable, Identifiable {
+        let id: Int                    // index in the ensemble
+        let molecule: MoleculeData     // fully prepared 3D structure (H, charges, minimized)
+        let smiles: String             // canonical SMILES for this chemical form
+        let mmffEnergy: Double         // MMFF94 energy (kcal/mol)
+        let boltzmannWeight: Double    // population fraction (0-1)
+        let kind: Int                  // 0=parent, 1=tautomer, 2=protomer, 3=taut+prot
+        let label: String              // e.g. "Taut2_ProtAmineH_Conf3"
+        let formIndex: Int             // which chemical form this conformer belongs to
+        let conformerIndex: Int        // conformer rank within its form
+
+        var kindLabel: String {
+            switch kind {
+            case 0: return "Parent"
+            case 1: return "Tautomer"
+            case 2: return "Protomer"
+            case 3: return "Taut+Prot"
+            default: return "Unknown"
+            }
+        }
+
+        var populationPercent: Double { boltzmannWeight * 100.0 }
+    }
+
+    /// Result of unified ensemble preparation.
+    struct EnsembleResult: Sendable {
+        let members: [EnsembleMember]
+        let numForms: Int              // distinct chemical forms (before conformer expansion)
+        let conformersPerForm: Int
+        let success: Bool
+        let errorMessage: String
+    }
+
+    /// Unified ligand preparation pipeline: protomers × tautomers × conformers.
+    ///
+    /// Produces a chemically realistic batch of molecular forms at the target pH.
+    /// Each member is fully prepared: polar H, MMFF94 minimized, Gasteiger charges.
+    /// Boltzmann weights reflect population fractions based on MMFF94 energetics.
+    ///
+    /// - Parameters:
+    ///   - smiles: Input SMILES
+    ///   - name: Molecule name
+    ///   - pH: Target pH (default 7.4)
+    ///   - pkaThreshold: Ambiguity window for Henderson-Hasselbalch (default 2.0)
+    ///   - maxTautomers: Max tautomers per protomer (default 10)
+    ///   - maxProtomers: Max protomers from parent (default 8)
+    ///   - energyCutoff: Discard forms with E > E_best + cutoff kcal/mol (default 15)
+    ///   - conformersPerForm: 3D conformers per chemical form (default 5)
+    ///   - temperature: Boltzmann temperature in K (default 298.15)
+    static func prepareEnsemble(
+        smiles: String,
+        name: String = "",
+        pH: Double = 7.4,
+        pkaThreshold: Double = 2.0,
+        maxTautomers: Int = 10,
+        maxProtomers: Int = 8,
+        energyCutoff: Double = 15.0,
+        conformersPerForm: Int = 5,
+        temperature: Double = 298.15
+    ) -> EnsembleResult {
+        guard let cResult = druse_prepare_ligand_ensemble(
+            smiles, name, pH, pkaThreshold,
+            Int32(maxTautomers), Int32(maxProtomers),
+            energyCutoff, Int32(conformersPerForm), temperature
+        ) else {
+            return EnsembleResult(members: [], numForms: 0, conformersPerForm: conformersPerForm,
+                                  success: false, errorMessage: "Ensemble preparation returned nil")
+        }
+        defer { druse_free_ensemble_result(cResult) }
+
+        guard cResult.pointee.success else {
+            let msg = fixedCString(cResult.pointee.errorMessage)
+            return EnsembleResult(members: [], numForms: 0, conformersPerForm: conformersPerForm,
+                                  success: false, errorMessage: msg)
+        }
+
+        var members: [EnsembleMember] = []
+        let count = Int(cResult.pointee.count)
+        for i in 0..<count {
+            let m = cResult.pointee.members[i]
+            guard let molPtr = m.molecule, molPtr.pointee.success else { continue }
+            let mol = convertResult(molPtr.pointee)
+            members.append(EnsembleMember(
+                id: i,
+                molecule: mol,
+                smiles: fixedCString(m.smiles),
+                mmffEnergy: m.mmffEnergy,
+                boltzmannWeight: m.boltzmannWeight,
+                kind: Int(m.kind),
+                label: fixedCString(m.label),
+                formIndex: Int(m.formIndex),
+                conformerIndex: Int(m.conformerIndex)
+            ))
+        }
+
+        return EnsembleResult(
+            members: members,
+            numForms: Int(cResult.pointee.numForms),
+            conformersPerForm: Int(cResult.pointee.numConformersPerForm),
+            success: true,
+            errorMessage: ""
+        )
+    }
+
     /// Build torsion tree from SMILES. Returns rotatable bond definitions.
     static func buildTorsionTree(smiles: String) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])]? {
         guard let tree = druse_build_torsion_tree(smiles) else { return nil }

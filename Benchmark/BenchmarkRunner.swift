@@ -21,9 +21,10 @@ import MetalKit
 
 final class BenchmarkRunner: XCTestCase {
 
-    // MARK: - Shared Engine
+    // MARK: - Shared Engine & DruseAF Scorer
 
     @MainActor private static var _engine: DockingEngine?
+    @MainActor private static var _druseAF: DruseMLScoringInference?
 
     @MainActor
     private func engine() throws -> DockingEngine {
@@ -35,6 +36,17 @@ final class BenchmarkRunner: XCTestCase {
         Self._engine = e
         print("[Benchmark] DockingEngine on \(device.name)")
         return e
+    }
+
+    /// DruseAF primary scorer (DruseScorePKi.mlpackage) — scores poses in pKd units.
+    @MainActor
+    private func druseAFScorer() -> DruseMLScoringInference {
+        if let s = Self._druseAF { return s }
+        let s = DruseMLScoringInference()
+        s.loadModel()
+        Self._druseAF = s
+        print("[Benchmark] DruseAF scorer: \(s.isAvailable ? "loaded (pKd scoring)" : "UNAVAILABLE")")
+        return s
     }
 
     private var projectRoot: URL {
@@ -111,7 +123,8 @@ final class BenchmarkRunner: XCTestCase {
         scoringMethod: ScoringMethod,
         label: String,
         outputFile: String,
-        maxComplexes: Int = 0
+        maxComplexes: Int = 0,
+        enableGFN2Scoring: Bool = false
     ) async throws {
         let manifest = try loadManifest()
         let complexes = maxComplexes > 0
@@ -123,16 +136,17 @@ final class BenchmarkRunner: XCTestCase {
         let eng = try engine()
 
         var config = DockingConfig()
-        config.populationSize = 200
-        config.generationsPerRun = 200
-        config.numRuns = 1
-        config.gridSpacing = 0.375
-        config.localSearchFrequency = 3
-        config.liveUpdateFrequency = 100
+        config = Self.configFromFile(base: config)
+        // Override GFN2 scoring flag from function parameter
+        if enableGFN2Scoring {
+            config.gfn2Refinement.enabled = config.gfn2Refinement.enabled // preserve opt setting
+        }
 
         let resultsPath = resolve("Benchmark/results/\(outputFile)")
+        let version = (try? String(contentsOfFile: resolve("VERSION"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
         var bench = BenchmarkResults(
             benchmark: "casf-2016",
+            version: version,
             scoringMethod: label,
             timestamp: ISO8601DateFormatter().string(from: Date()),
             config: BenchmarkConfigRecord(
@@ -201,21 +215,51 @@ final class BenchmarkRunner: XCTestCase {
                 //    This matches standard redocking benchmarks (Vina, Glide, GOLD).
                 let ligand = crystalLig
 
-                // 5. Grid maps + dock with the specified scoring method
-                print("    grid maps...")
-                eng.computeGridMaps(protein: protein, pocket: pocket, spacing: config.gridSpacing)
+                // 5. Set protein on engine (required for grid map computation)
+                eng.setProtein(protein.atoms, protein.bonds)
+
+                // 6. Dock (Vina GA search finds diverse poses)
                 print("    docking (pop=\(config.populationSize) gen=\(config.generationsPerRun))...")
-                let results = await eng.runDocking(
+                fflush(stdout)
+                let gaResults = await eng.runDocking(
                     ligand: ligand, pocket: pocket,
                     config: config, scoringMethod: scoringMethod
                 )
+
+                // 7. DruseAF scoring: evaluate GA poses with ML model in pKd units
+                //    (Vina search heuristic → DruseAF evaluator, same pipeline as the app)
+                let results: [DockingResult]
+                if scoringMethod == .druseAffinity {
+                    let scorer = druseAFScorer()
+                    if scorer.isAvailable {
+                        results = await scorer.scorePoses(
+                            results: gaResults,
+                            proteinAtoms: protein.atoms,
+                            ligandAtoms: ligand.atoms,
+                            pocketCenter: pocket.center,
+                            proteinBonds: protein.bonds,
+                            ligandBonds: ligand.bonds
+                        )
+                    } else {
+                        throw BenchmarkError.step("DruseAF model unavailable")
+                    }
+                } else {
+                    results = gaResults
+                }
+
                 let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
 
                 entry.numPoses = results.count
                 entry.dockingTimeMs = elapsed
 
                 if let best = results.first {
-                    entry.bestEnergy = best.energy
+                    // DruseAF: use ML docking_score (pKd × confidence); others: Vina energy
+                    if scoringMethod == .druseAffinity {
+                        entry.bestEnergy = best.mlDockingScore ?? best.energy
+                        entry.mlRescorePKd = best.mlPKd
+                    } else {
+                        entry.bestEnergy = best.energy
+                    }
                     entry.success = true
 
                     // RMSD
@@ -225,8 +269,31 @@ final class BenchmarkRunner: XCTestCase {
                         entry.bestRmsd = computeRMSD(crystal, docked)
                     }
 
+                    // GFN2-xTB single-point scoring (optional, ~2ms per complex)
+                    if enableGFN2Scoring {
+                        let heavyAtoms = ligand.atoms.filter { $0.element != .H }
+                        if heavyAtoms.count >= 2, docked.count == heavyAtoms.count {
+                            var spAtoms = heavyAtoms
+                            for j in 0..<spAtoms.count { spAtoms[j].position = docked[j] }
+                            let charge = heavyAtoms.reduce(0) { $0 + $1.formalCharge }
+                            if let sp = try? await GFN2Refiner.computeEnergy(
+                                atoms: spAtoms, totalCharge: charge, solvation: .water
+                            ) {
+                                entry.gfn2Energy = sp.totalEnergy_kcal
+                                entry.gfn2DispersionEnergy = sp.dispersionEnergy * 627.509
+                                entry.gfn2SolvationEnergy = sp.solvationEnergy * 627.509
+                            }
+                        }
+                    }
+
                     let rmsd = entry.bestRmsd.map { String(format: "%.2f", $0) } ?? "N/A"
-                    print("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A  \(String(format: "%.0f", elapsed))ms")
+                    let gfn2Str = entry.gfn2Energy.map { String(format: "  GFN2=%.0f", $0) } ?? ""
+                    if scoringMethod == .druseAffinity, let pKd = best.mlPKd, let conf = best.mlPoseConfidence {
+                        print("  [\(idx+1)/\(total)] \(complex.pdbId)  pKd=\(String(format: "%.2f", pKd))  conf=\(String(format: "%.0f%%", conf * 100))  RMSD=\(rmsd)A  \(String(format: "%.0f", elapsed))ms")
+                    } else {
+                        print("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
+                    }
+                    fflush(stdout)
                     succeeded += 1
                 } else {
                     entry.error = "0 poses"
@@ -239,10 +306,13 @@ final class BenchmarkRunner: XCTestCase {
                 entry.dockingTimeMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
                 failed += 1
                 print("  [\(idx+1)/\(total)] \(complex.pdbId)  FAILED: \(e.message)")
+                fflush(stdout)
             } catch {
                 entry.error = "\(error)"
                 entry.dockingTimeMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
                 failed += 1
+                print("  [\(idx+1)/\(total)] \(complex.pdbId)  FAILED: \(error)")
+                fflush(stdout)
             }
 
             bench.entries.append(entry)
@@ -281,9 +351,27 @@ final class BenchmarkRunner: XCTestCase {
 
         let scored = ok.filter { $0.experimentalPKd != nil }
         if scored.count > 10 {
-            let r = pearsonR(scored.map { $0.experimentalPKd! }, scored.map(\.bestEnergy))
             print("\n  Scoring Power:")
+
+            // ML pKd correlation (DruseAF)
+            let mlScored = scored.filter { $0.mlRescorePKd != nil }
+            if mlScored.count > 10 {
+                let rML = pearsonR(mlScored.map { $0.experimentalPKd! },
+                                    mlScored.map { $0.mlRescorePKd! })
+                print("    Pearson r (DruseAF pKd vs exp): \(String(format: "%.4f", rML))  (n=\(mlScored.count))")
+            }
+
+            // Vina/Drusina energy correlation
+            let r = pearsonR(scored.map { $0.experimentalPKd! }, scored.map(\.bestEnergy))
             print("    Pearson r (score vs pKd): \(String(format: "%.4f", r))  (n=\(scored.count))")
+
+            // GFN2 correlation if available
+            let gfn2Scored = scored.filter { $0.gfn2Energy != nil }
+            if gfn2Scored.count > 10 {
+                let rGFN2 = pearsonR(gfn2Scored.map { $0.experimentalPKd! },
+                                      gfn2Scored.map { $0.gfn2Energy! })
+                print("    Pearson r (GFN2 vs pKd): \(String(format: "%.4f", rGFN2))  (n=\(gfn2Scored.count))")
+            }
         }
 
         let totalMs = bench.entries.reduce(0.0) { $0 + $1.dockingTimeMs }
@@ -292,16 +380,131 @@ final class BenchmarkRunner: XCTestCase {
     }
 
     // ==========================================================================
+    // MARK: - File-Driven Configuration
+    // ==========================================================================
+
+    /// Benchmark config written by run_benchmark.py as Benchmark/.bench_config.json.
+    /// Using a file avoids the xcodebuild test-host env var propagation issue.
+    private static var _cachedFileConfig: [String: Any]?
+
+    private static func loadFileConfig() -> [String: Any] {
+        if let cached = _cachedFileConfig { return cached }
+
+        // Locate config relative to this source file (works from both xcodebuild and Xcode)
+        let configPath = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()  // Benchmark/
+            .appendingPathComponent(".bench_config.json")
+
+        if let data = try? Data(contentsOf: configPath),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            _cachedFileConfig = dict
+            print("[Benchmark] Config loaded from \(configPath.lastPathComponent)")
+
+            // Enable stdout log mirroring if configured
+            if dict["stdoutLogs"] as? Bool == true {
+                Task { @MainActor in
+                    ActivityLog.shared.enableStdoutMirroring()
+                }
+            }
+
+            return dict
+        }
+
+        print("[Benchmark] No .bench_config.json found — using defaults")
+        _cachedFileConfig = [:]
+        return [:]
+    }
+
+    /// Read DockingConfig from Benchmark/.bench_config.json.
+    /// Falls back to sensible benchmark defaults when config file is absent.
+    private static func configFromFile(base: DockingConfig) -> DockingConfig {
+        var c = base
+        let cfg = loadFileConfig()
+
+        func cfgInt(_ key: String) -> Int? { cfg[key] as? Int }
+        func cfgFloat(_ key: String) -> Float? { (cfg[key] as? Double).map(Float.init) }
+        func cfgBool(_ key: String) -> Bool? { cfg[key] as? Bool }
+
+        // GA parameters
+        c.populationSize = cfgInt("population") ?? 200
+        c.generationsPerRun = cfgInt("generations") ?? 200
+        c.numRuns = cfgInt("runs") ?? 1
+        c.gridSpacing = cfgFloat("gridSpacing") ?? 0.375
+        c.mutationRate = cfgFloat("mutationRate") ?? c.mutationRate
+        c.mcTemperature = cfgFloat("mcTemperature") ?? c.mcTemperature
+        c.autoMode = cfgBool("autoMode") ?? false
+
+        // Local search
+        c.localSearchFrequency = cfgInt("localSearchFreq") ?? 3
+        c.localSearchSteps = cfgInt("localSearchSteps") ?? 30
+        c.useAnalyticalGradients = cfgBool("analyticalGradients") ?? true
+        c.liveUpdateFrequency = 100  // always high for benchmarks (fewer GPU syncs)
+
+        // Flexibility
+        c.enableFlexibility = cfgBool("ligandFlex") ?? true
+        c.flexRefinementSteps = cfgInt("flexRefineSteps") ?? 50
+
+        // Strain penalty
+        c.strainPenaltyEnabled = cfgBool("strainPenalty") ?? true
+        c.strainPenaltyThreshold = cfgFloat("strainThreshold") ?? 6.0
+        c.strainPenaltyWeight = cfgFloat("strainWeight") ?? 0.5
+
+        // Exploration
+        c.explorationPhaseRatio = cfgFloat("explorationRatio") ?? c.explorationPhaseRatio
+        c.explorationTranslationStep = cfgFloat("explorationTranslation") ?? c.explorationTranslationStep
+        c.explorationRotationStep = cfgFloat("explorationRotation") ?? c.explorationRotationStep
+
+        // Reranking
+        c.explicitRerankTopClusters = cfgInt("rerankTop") ?? 12
+        c.explicitRerankVariantsPerCluster = cfgInt("rerankVariants") ?? 4
+
+        // GFN2-xTB refinement
+        c.gfn2Refinement.enabled = cfgBool("gfn2Opt") ?? false
+        c.gfn2Refinement.topPosesToRefine = cfgInt("gfn2TopPoses") ?? 20
+        c.gfn2Refinement.blendWeight = cfgFloat("gfn2BlendWeight") ?? 0.3
+        c.gfn2Refinement.maxSteps = Int32(cfgInt("gfn2MaxSteps") ?? 0)
+        if let solvStr = cfg["gfn2Solvation"] as? String {
+            switch solvStr {
+            case "none":  c.gfn2Refinement.solvation = .none
+            case "gbsa":  c.gfn2Refinement.solvation = .gbsa
+            default:      c.gfn2Refinement.solvation = .water
+            }
+        }
+        if let optStr = cfg["gfn2OptLevel"] as? String {
+            switch optStr {
+            case "crude": c.gfn2Refinement.optLevel = .crude
+            case "tight": c.gfn2Refinement.optLevel = .tight
+            default:      c.gfn2Refinement.optLevel = .normal
+            }
+        }
+
+        return c
+    }
+
+    /// Read max complexes from config file (0 = all).
+    private static var cfgMaxComplexes: Int {
+        (loadFileConfig()["maxComplexes"] as? Int) ?? 0
+    }
+
+    /// Read GFN2 scoring flag from config file.
+    private static var cfgGFN2Scoring: Bool {
+        (loadFileConfig()["gfn2Scoring"] as? Bool) ?? false
+    }
+
+    // ==========================================================================
     // MARK: - Test Methods (one per scoring method)
     // ==========================================================================
 
     /// Dock with Vina scoring (baseline grid-based Vina).
+    /// Reads config from .bench_config.json (written by run_benchmark.py).
     @MainActor
     func testCASF_Vina() async throws {
         try await runBenchmark(
             scoringMethod: .vina,
             label: "Vina",
-            outputFile: "casf_vina.json"
+            outputFile: "casf_vina.json",
+            maxComplexes: Self.cfgMaxComplexes,
+            enableGFN2Scoring: Self.cfgGFN2Scoring
         )
     }
 
@@ -311,7 +514,9 @@ final class BenchmarkRunner: XCTestCase {
         try await runBenchmark(
             scoringMethod: .drusina,
             label: "Drusina",
-            outputFile: "casf_drusina.json"
+            outputFile: "casf_drusina.json",
+            maxComplexes: Self.cfgMaxComplexes,
+            enableGFN2Scoring: Self.cfgGFN2Scoring
         )
     }
 
@@ -321,21 +526,39 @@ final class BenchmarkRunner: XCTestCase {
         try await runBenchmark(
             scoringMethod: .druseAffinity,
             label: "DruseAF",
-            outputFile: "casf_druseaf.json"
+            outputFile: "casf_druseaf.json",
+            maxComplexes: Self.cfgMaxComplexes,
+            enableGFN2Scoring: Self.cfgGFN2Scoring
         )
     }
 
-    /// Run ALL three scoring methods sequentially (full overnight benchmark).
+    /// Dock with Drusina + GFN2-xTB single-point scoring (D4 dispersion + ALPB solvation).
+    @MainActor
+    func testCASF_DrusinaGFN2() async throws {
+        try await runBenchmark(
+            scoringMethod: .drusina,
+            label: "Drusina+GFN2",
+            outputFile: "casf_drusina_gfn2.json",
+            maxComplexes: Self.cfgMaxComplexes,
+            enableGFN2Scoring: true
+        )
+    }
+
+    /// Run ALL scoring methods sequentially (full overnight benchmark).
     @MainActor
     func testCASF_All() async throws {
-        print("=== Full CASF-2016 Benchmark (all 3 scoring methods) ===\n")
+        let n = Self.cfgMaxComplexes
+        let suffix = n > 0 ? " (first \(n))" : ""
+        print("=== Full CASF-2016 Benchmark (all scoring methods)\(suffix) ===\n")
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: "casf_vina.json")
+        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: "casf_vina.json", maxComplexes: n)
         print("\n" + String(repeating: "=", count: 60) + "\n")
-        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: "casf_drusina.json")
+        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: "casf_drusina.json", maxComplexes: n)
         print("\n" + String(repeating: "=", count: 60) + "\n")
-        try await runBenchmark(scoringMethod: .druseAffinity, label: "DruseAF", outputFile: "casf_druseaf.json")
+        try await runBenchmark(scoringMethod: .druseAffinity, label: "DruseAF", outputFile: "casf_druseaf.json", maxComplexes: n)
+        print("\n" + String(repeating: "=", count: 60) + "\n")
+        try await runBenchmark(scoringMethod: .drusina, label: "Drusina+GFN2", outputFile: "casf_drusina_gfn2.json", maxComplexes: n, enableGFN2Scoring: true)
 
         let total = CFAbsoluteTimeGetCurrent() - t0
         print("\n=== Full benchmark completed in \(String(format: "%.1f", total / 60)) minutes ===")

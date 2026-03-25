@@ -17,6 +17,7 @@ struct ResultsTabView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
+                .help("Open full results database window for detailed analysis")
                 Divider()
             }
 
@@ -89,13 +90,23 @@ struct ResultsTabView: View {
             HStack {
                 Label("Docking Results", systemImage: "chart.bar.xaxis")
                     .font(.system(size: 12, weight: .semibold))
-                if let ligandName = viewModel.molecules.ligand?.name, !ligandName.isEmpty {
-                    Text(ligandName)
+                if let ligand = viewModel.molecules.ligand, !ligand.name.isEmpty {
+                    // Show ligand name with variant lineage if available
+                    let displayName: String = {
+                        if let entry = viewModel.ligandDB.entries.first(where: { $0.name == ligand.name || $0.smiles == (ligand.smiles ?? "") }) {
+                            if let lineage = entry.variantLineage {
+                                return "\(ligand.name) (\(lineage))"
+                            }
+                        }
+                        return ligand.name
+                    }()
+                    Text(displayName)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Capsule().fill(Color.accentColor.opacity(0.1)))
+                        .lineLimit(1)
                 }
             }
 
@@ -144,6 +155,22 @@ struct ResultsTabView: View {
                 .padding(.vertical, 4)
             }
 
+            // Clear poses from view
+            if viewModel.molecules.ligand != nil && !viewModel.docking.dockingResults.isEmpty {
+                HStack {
+                    Spacer()
+                    Button {
+                        viewModel.clearPosesFromView()
+                    } label: {
+                        Label("Clear Poses from View", systemImage: "eye.slash")
+                            .font(.system(size: 10))
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.bordered)
+                    .help("Remove all displayed poses and interaction lines from the 3D viewport")
+                }
+            }
+
             // Scrollable pose list (up to 50)
             ForEach(Array(viewModel.docking.dockingResults.prefix(50).enumerated()), id: \.offset) { idx, result in
                 dockingPoseRow(index: idx, result: result)
@@ -187,12 +214,21 @@ struct ResultsTabView: View {
         let results = viewModel.docking.dockingResults
         let isML = viewModel.docking.scoringMethod == .druseAffinity
         let scores: [Float] = isML ? results.map { $0.mlDockingScore ?? $0.energy } : results.map(\.energy)
-        let minE = scores.min() ?? 0
-        let maxE = scores.max() ?? 0
-        let range = max(abs(maxE - minE), 0.1)
         let selectedIdx = viewModel.docking.selectedPoseIndices.count == 1 ? viewModel.docking.selectedPoseIndices.first : nil
         let chartTitle = isML ? "Scoring Landscape" : "Energy Landscape"
         let unitLabel = isML ? viewModel.docking.affinityDisplayUnit.unitLabel : "kcal/mol"
+
+        // Clamp outliers: use interquartile range to determine useful display range
+        let sorted = scores.sorted()
+        let q1 = sorted[sorted.count / 4]
+        let q3 = sorted[sorted.count * 3 / 4]
+        let iqr = q3 - q1
+        let clampLow = q1 - iqr * 1.5
+        let clampHigh = q3 + iqr * 1.5
+        let clampedScores = scores.map { max(clampLow, min(clampHigh, $0)) }
+        let minE = clampedScores.min() ?? 0
+        let maxE = clampedScores.max() ?? 0
+        let range = max(abs(maxE - minE), 0.1)
 
         VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -218,15 +254,13 @@ struct ResultsTabView: View {
 
                 HStack(alignment: .bottom, spacing: spacing) {
                     ForEach(0..<barCount, id: \.self) { idx in
-                        let score = scores[idx]
-                        let normalized: CGFloat = isML
-                            ? CGFloat((score - minE) / range)  // ML: higher = better, tall bars on left
-                            : CGFloat((score - minE) / range)
+                        let score = clampedScores[idx]
+                        let normalized: CGFloat = CGFloat((score - minE) / range)
                         let barHeight = max(3, (isML ? normalized : (1.0 - normalized)) * (chartHeight - 4) + 4)
                         let isSelected = selectedIdx == idx
 
                         Rectangle()
-                            .fill(barColor(energy: isML ? -score : score, isSelected: isSelected))
+                            .fill(barColor(energy: isML ? -scores[idx] : scores[idx], isSelected: isSelected))
                             .frame(width: barWidth, height: barHeight)
                             .clipShape(RoundedRectangle(cornerRadius: 1.5))
                             .overlay(
@@ -279,111 +313,148 @@ struct ResultsTabView: View {
 
     @ViewBuilder
     private func dockingPoseRow(index: Int, result: DockingResult) -> some View {
-        HStack(spacing: 6) {
-            // Multi-pose selection toggle
-            Button(action: { viewModel.togglePoseSelection(at: index) }) {
-                Image(systemName: viewModel.docking.selectedPoseIndices.contains(index)
-                      ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 13))
-                    .foregroundStyle(viewModel.docking.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.4))
-            }
-            .buttonStyle(.plain)
-            .help("Select for multi-pose overlay")
+        let isSelected = viewModel.docking.selectedPoseIndices.contains(index)
+        let isML = viewModel.docking.scoringMethod == .druseAffinity
+        let ligandName = viewModel.molecules.ligand?.name
 
-            Text("#\(index + 1)")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .frame(width: 24, alignment: .trailing)
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 4) {
+            // Row 1: Selection toggle, rank, energy, cluster badge
+            HStack(spacing: 6) {
+                Button(action: { viewModel.togglePoseSelection(at: index) }) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 13))
+                        .foregroundStyle(isSelected ? Color.blue : Color.gray.opacity(0.4))
+                }
+                .buttonStyle(.plain)
+                .help("Select for multi-pose overlay")
 
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 4) {
-                    if viewModel.docking.scoringMethod == .druseAffinity, let pKd = result.mlPKd {
-                        Text(viewModel.docking.affinityDisplayUnit.format(pKd))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
-                        Text(viewModel.docking.affinityDisplayUnit.unitLabel)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                        if let conf = result.mlPoseConfidence {
-                            Text(String(format: "%.0f%%", conf * 100))
-                                .font(.system(size: 9, weight: .medium, design: .monospaced))
-                                .foregroundStyle(conf > 0.7 ? Color.green.opacity(0.8) : .secondary)
-                        }
-                    } else {
-                        Text(String(format: "%.2f", result.energy))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(energyColor(result.energy))
-                        Text("kcal/mol")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
+                Text("#\(index + 1)")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, alignment: .trailing)
+
+                if isML, let pKd = result.mlPKd {
+                    Text(viewModel.docking.affinityDisplayUnit.format(pKd))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
+                    Text(viewModel.docking.affinityDisplayUnit.unitLabel)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                    if let conf = result.mlPoseConfidence {
+                        Text(String(format: "%.0f%%", conf * 100))
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(conf > 0.7 ? Color.green.opacity(0.8) : .secondary)
                     }
+                } else {
+                    Text(String(format: "%.2f", result.energy))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(energyColor(result.energy))
+                    Text("kcal/mol")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
                 }
 
-                HStack(spacing: 6) {
-                    Text(String(format: "vdW:%.1f", result.vdwEnergy))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    Text(String(format: "elec:%.1f", result.elecEnergy))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    Text(String(format: "hb:%.1f", result.hbondEnergy))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    if let strain = result.strainEnergy, strain > 4.0 {
-                        Text(String(format: "str:%.0f", strain))
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
-                            .foregroundStyle(strain > 10.0 ? .red : .orange)
-                            .help("MMFF94 strain energy: \(String(format: "%.1f", strain)) kcal/mol")
-                    }
-                    if result.constraintPenalty > 0.01 {
-                        Text(String(format: "cst:%.1f", result.constraintPenalty))
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.orange)
-                    }
-                    if result.clusterID >= 0 {
-                        Text("C\(result.clusterID)")
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(Color.cyan.opacity(0.15)))
-                            .foregroundStyle(.cyan)
-                    }
+                Spacer()
+
+                if result.clusterID >= 0 {
+                    Text("C\(result.clusterID)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.cyan.opacity(0.15)))
+                        .foregroundStyle(.cyan)
                 }
             }
 
-            Spacer()
-
-            Button {
-                viewModel.showDockingPose(at: index)
-                viewModel.docking.interactionDiagramPoseIndex = index
-                viewModel.docking.showInteractionDiagram = true
-            } label: {
-                Image(systemName: "circle.hexagongrid")
-                    .font(.system(size: 11))
+            // Row 2: Energy decomposition (compact grid-like layout)
+            HStack(spacing: 0) {
+                energyTag("vdW", result.vdwEnergy, color: .secondary)
+                energyTag("elec", result.elecEnergy, color: .secondary)
+                energyTag("hb", result.hbondEnergy, color: .secondary)
+                if let strain = result.strainEnergy, strain > 4.0 {
+                    energyTag("str", strain, color: strain > 10.0 ? .red : .orange)
+                        .help("MMFF94 strain energy: \(String(format: "%.1f", strain)) kcal/mol")
+                }
+                if let gfn2 = result.gfn2Energy {
+                    energyTag("xtb", gfn2, color: .purple)
+                        .help(String(format: "GFN2-xTB: %.1f kcal/mol (D4:%.1f, solv:%.1f)%@",
+                                     gfn2,
+                                     result.gfn2DispersionEnergy ?? 0,
+                                     result.gfn2SolvationEnergy ?? 0,
+                                     result.gfn2Converged == true ? "" : " [not converged]"))
+                }
+                if result.constraintPenalty > 0.01 {
+                    energyTag("cst", result.constraintPenalty, color: .orange)
+                }
+                Spacer()
             }
-            .controlSize(.small)
-            .buttonStyle(.bordered)
-            .help("2D Interaction Diagram")
 
-            Button("View") {
-                viewModel.showDockingPose(at: index)
-            }
-            .controlSize(.small)
-            .buttonStyle(.bordered)
+            // Row 3: Action buttons (aligned right)
+            HStack(spacing: 4) {
+                Spacer()
 
-            if let lig = viewModel.docking.originalDockingLigand ?? viewModel.molecules.ligand {
                 Button {
-                    viewModel.selectReferenceForOptimization(result: result, ligand: lig)
+                    viewModel.showDockingPose(at: index)
+                    viewModel.docking.interactionDiagramPoseIndex = index
+                    viewModel.docking.showInteractionDiagram = true
                 } label: {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.system(size: 11))
+                    Label("Diagram", systemImage: "circle.hexagongrid")
+                        .font(.system(size: 10))
                 }
-                .controlSize(.small)
+                .controlSize(.mini)
                 .buttonStyle(.bordered)
-                .help("Optimize — use as reference for lead optimization")
+                .help("2D Interaction Diagram")
+
+                Button {
+                    viewModel.showDockingPose(at: index)
+                } label: {
+                    Label("View", systemImage: "eye")
+                        .font(.system(size: 10))
+                }
+                .controlSize(.mini)
+                .buttonStyle(.bordered)
+                .help("Show this pose in 3D viewport")
+
+                if let lig = viewModel.docking.originalDockingLigand ?? viewModel.molecules.ligand {
+                    Button {
+                        viewModel.selectReferenceForOptimization(result: result, ligand: lig)
+                    } label: {
+                        Label("Optimize", systemImage: "arrow.triangle.branch")
+                            .font(.system(size: 10))
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.bordered)
+                    .help("Use as reference for lead optimization")
+                }
             }
         }
+        .padding(6)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(isSelected ? Color.blue.opacity(0.06) : Color.primary.opacity(0.02))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .stroke(isSelected ? Color.blue.opacity(0.2) : Color.clear, lineWidth: 1)
+        )
+    }
+
+    /// Compact energy decomposition tag
+    @ViewBuilder
+    private func energyTag(_ label: String, _ value: Float, color: Color) -> some View {
+        HStack(spacing: 2) {
+            Text(label)
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(color.opacity(0.7))
+            Text(String(format: "%.1f", value))
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(color)
+        }
+        .padding(.horizontal, 4)
         .padding(.vertical, 2)
+        .background(Color.primary.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 3))
+        .padding(.trailing, 3)
     }
 
     // MARK: - Docking Export
@@ -401,6 +472,7 @@ struct ResultsTabView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("Export all poses as SDF file")
 
                 Button(action: { viewModel.exportDockingResultsCSV() }) {
                     Label("Export CSV", systemImage: "tablecells")
@@ -408,6 +480,7 @@ struct ResultsTabView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("Export results table as CSV")
             }
         }
     }
@@ -577,6 +650,7 @@ struct ResultsTabView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .disabled(viewModel.docking.screeningHits.isEmpty)
+            .help("Export screening hits as CSV and SDF files")
         }
     }
 

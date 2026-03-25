@@ -9,6 +9,16 @@ private let threeToOne: [String: String] = [
     "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
 ]
 
+/// One-letter nucleotide code lookup (DNA and RNA residue names).
+private let nucleotideToOne: [String: String] = [
+    // DNA
+    "DA": "A", "DT": "T", "DG": "G", "DC": "C", "DU": "U", "DI": "I",
+    // RNA (single-letter residue names in PDB)
+    "A": "A", "U": "U", "G": "G", "C": "C", "I": "I",
+    // Longer PDB names
+    "ADE": "A", "THY": "T", "GUA": "G", "CYT": "C", "URA": "U",
+]
+
 /// Secondary structure color mapping.
 private func ssColor(_ ss: SecondaryStructure) -> Color {
     switch ss {
@@ -160,8 +170,9 @@ struct SequenceView: View {
 
             // Chain sections
             let proteinChains = prot.chains.filter { $0.type == .protein }
-            if proteinChains.isEmpty {
-                Text("No protein chains found")
+            let naChains = prot.chains.filter { $0.type == .nucleicAcid }
+            if proteinChains.isEmpty && naChains.isEmpty {
+                Text("No protein or nucleic acid chains found")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             } else {
@@ -169,6 +180,15 @@ struct SequenceView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(proteinChains, id: \.id) { chain in
                             chainSection(chain, prot: prot)
+                        }
+                        if !naChains.isEmpty {
+                            Divider().padding(.vertical, 2)
+                            Label("Nucleic Acid", systemImage: "helix")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.orange)
+                            ForEach(naChains, id: \.id) { chain in
+                                naChainSection(chain, prot: prot)
+                            }
                         }
                     }
                 }
@@ -211,9 +231,20 @@ struct SequenceView: View {
 
             Spacer()
 
-            Text("\(prot.residues.filter(\.isStandard).count) residues")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
+            let aaCount = prot.residues.filter(\.isStandard).count
+            let naCount = prot.chains.filter { $0.type == .nucleicAcid }
+                .flatMap(\.residueIndices)
+                .filter { $0 < prot.residues.count && nucleotideToOne[prot.residues[$0].name] != nil }
+                .count
+            if naCount > 0 {
+                Text("\(aaCount) aa + \(naCount) nt")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("\(aaCount) residues")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -349,6 +380,109 @@ struct SequenceView: View {
             )
         }
         .sorted { $0.seqNum < $1.seqNum }
+    }
+
+    /// Build ResidueEntry list for a nucleic acid chain.
+    private func naChainResidues(_ chain: Chain, prot: Molecule) -> [ResidueEntry] {
+        chain.residueIndices.compactMap { idx -> ResidueEntry? in
+            guard idx < prot.residues.count else { return nil }
+            let res = prot.residues[idx]
+            let code = nucleotideToOne[res.name]
+            guard let code else { return nil }  // skip non-nucleotide residues
+            return ResidueEntry(
+                resIdx: idx, name: res.name, oneLetterCode: code,
+                seqNum: res.sequenceNumber, chainID: res.chainID, ss: .coil
+            )
+        }
+        .sorted { $0.seqNum < $1.seqNum }
+    }
+
+    // MARK: - Nucleic Acid Chain Section
+
+    @ViewBuilder
+    private func naChainSection(_ chain: Chain, prot: Molecule) -> some View {
+        let isCollapsed = collapsedChains.contains(chain.id)
+        let residueEntries = naChainResidues(chain, prot: prot)
+        let isDNA = residueEntries.contains { $0.name.hasPrefix("D") }
+
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if isCollapsed {
+                            collapsedChains.remove(chain.id)
+                        } else {
+                            collapsedChains.insert(chain.id)
+                        }
+                    }
+                } label: {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 10))
+                        .frame(width: 12)
+                }
+                .buttonStyle(.plain)
+
+                Text("Chain \(chain.id)")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(chain.displayColor)
+
+                Text(isDNA ? "DNA" : "RNA")
+                    .font(.system(size: 9, weight: .medium))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.orange.opacity(0.2)))
+                    .foregroundStyle(.orange)
+
+                Text("\(residueEntries.count) nt")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+
+                Spacer()
+            }
+            .padding(.horizontal, 2)
+
+            if !isCollapsed && !residueEntries.isEmpty {
+                // Simple text-based sequence for nucleic acids (no SS coloring)
+                let seqString = residueEntries.map(\.oneLetterCode).joined()
+                let chunks = stride(from: 0, to: seqString.count, by: 10).map { start in
+                    let s = seqString.index(seqString.startIndex, offsetBy: start)
+                    let e = seqString.index(s, offsetBy: min(10, seqString.count - start))
+                    return String(seqString[s..<e])
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(stride(from: 0, to: chunks.count, by: 6).enumerated()), id: \.offset) { _, rowStart in
+                        HStack(spacing: 6) {
+                            // Position label
+                            let pos = rowStart * 10 + 1
+                            Text("\(pos)")
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 30, alignment: .trailing)
+
+                            ForEach(rowStart..<min(rowStart + 6, chunks.count), id: \.self) { ci in
+                                Text(chunks[ci])
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(naBaseColor(chunks[ci]))
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(6)
+            }
+        }
+        .padding(.vertical, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.orange.opacity(0.05))
+        )
+    }
+
+    /// Color nucleotide bases: A=green, T/U=red, G=yellow, C=blue
+    private func naBaseColor(_ chunk: String) -> Color {
+        // Return a neutral color for mixed chunks; individual coloring would need per-char rendering
+        .primary.opacity(0.85)
     }
 
     private func cachedSS(chainID: String, seqNum: Int) -> SecondaryStructure {

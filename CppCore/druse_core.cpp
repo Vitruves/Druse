@@ -9,6 +9,7 @@
 #include <GraphMol/PartialCharges/GasteigerCharges.h>
 #include <GraphMol/Descriptors/MolDescriptors.h>
 #include <GraphMol/Descriptors/Lipinski.h>
+#include <GraphMol/Depictor/RDDepictor.h>
 #include <GraphMol/MolChemicalFeatures/MolChemicalFeature.h>
 #include <GraphMol/MolChemicalFeatures/MolChemicalFeatureFactory.h>
 #include <GraphMol/MonomerInfo.h>
@@ -286,7 +287,8 @@ static DruseMoleculeResult* mol_to_result(RWMol &mol, const char *name) {
         return res;
     }
 
-    const auto &conf = mol.getConformer(0);
+    // Use the first available conformer (ID may not be 0 after conformer pruning)
+    const auto &conf = *mol.beginConformers()->get();
     int natoms = (int)mol.getNumAtoms();
     res->atomCount = natoms;
     res->atoms = new DruseAtom[natoms];
@@ -649,7 +651,11 @@ void druse_free_conformer_set(DruseConformerSet *set) {
 static double embed_and_minimize(RWMol &mol) {
     MolOps::addHs(mol, false, true);
     int cid = embed_molecule(mol);
-    if (cid < 0) return NAN;
+    if (cid < 0) {
+        // Fallback: compute 2D coordinates so atoms aren't empty
+        try { RDDepict::compute2DCoords(mol); } catch (...) {}
+        return NAN;
+    }
     std::vector<std::pair<int, double>> results;
     MMFF::MMFFOptimizeMoleculeConfs(mol, results);
     if (!results.empty() && results[0].first >= 0)
@@ -664,19 +670,16 @@ DruseVariantSet* druse_enumerate_tautomers(
     auto *set = new DruseVariantSet();
     memset(set, 0, sizeof(DruseVariantSet));
 
+    (void)energyCutoff; // ranking now uses tautomer score instead of MMFF energy
+
     if (!smiles || !smiles[0]) return set;
 
     try {
         std::unique_ptr<ROMol> mol(SmilesToMol(smiles));
         if (!mol) return set;
 
-        // Enumerate tautomers
-        MolStandardize::TautomerEnumerator enumerator;
-        enumerator.setMaxTautomers(std::max(maxTautomers, (int32_t)2));
-        enumerator.setMaxTransforms(1000);
-        auto result = enumerator.enumerate(*mol);
-
-        // Collect unique tautomers by canonical SMILES
+        // Collect unique tautomers — use Kekulized SMILES for dedup so aromatic
+        // tautomers (e.g. guanine keto/enol) aren't collapsed to the same string.
         struct TautEntry {
             std::string smi;
             std::unique_ptr<RWMol> rwmol;
@@ -686,33 +689,52 @@ DruseVariantSet* druse_enumerate_tautomers(
         std::vector<TautEntry> entries;
         std::set<std::string> seen;
 
-        for (const auto &taut : result) {
-            std::string tautSmi = MolToSmiles(*taut);
-            if (seen.count(tautSmi)) continue;
-            seen.insert(tautSmi);
+        // Try enumeration (may throw for certain aromatic heterocycles)
+        try {
+            MolStandardize::TautomerEnumerator enumerator;
+            enumerator.setMaxTautomers(std::max(maxTautomers, (int32_t)2));
+            enumerator.setMaxTransforms(200);
+            auto result = enumerator.enumerate(*mol);
 
-            auto rw = std::make_unique<RWMol>(*taut);
-            int score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw);
-            double energy = embed_and_minimize(*rw);
+            for (const auto &taut : result) {
+                // Kekulize a copy to get explicit bond-order SMILES for dedup
+                std::string dedupSmi;
+                try {
+                    RWMol kekulized(*taut);
+                    MolOps::Kekulize(kekulized);
+                    dedupSmi = MolToSmiles(kekulized);
+                } catch (...) {
+                    dedupSmi = MolToSmiles(*taut);
+                }
+                if (seen.count(dedupSmi)) continue;
+                seen.insert(dedupSmi);
 
-            entries.push_back({tautSmi, std::move(rw), energy, score});
-            if ((int)entries.size() >= maxTautomers) break;
+                auto rw = std::make_unique<RWMol>(*taut);
+                int score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw);
+
+                // Use tautomer score for ranking instead of expensive 3D embedding.
+                // Higher score = more stable tautomer, so negate for energy-like sorting.
+                double energy = -score;
+
+                std::string displaySmi = MolToSmiles(*taut);
+                entries.push_back({displaySmi, std::move(rw), energy, score});
+                if ((int)entries.size() >= maxTautomers) break;
+            }
+        } catch (...) {
+            // Enumeration failed — fall through to fallback below
         }
 
-        // Sort by energy (lowest first); NaN goes to end
+        // Always include the input molecule if nothing was found
+        if (entries.empty()) {
+            auto rw = std::make_unique<RWMol>(*mol);
+            int score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw);
+            entries.push_back({MolToSmiles(*mol), std::move(rw), (double)-score, score});
+        }
+
+        // Sort by energy (lowest = most stable tautomer first)
         std::sort(entries.begin(), entries.end(), [](const TautEntry &a, const TautEntry &b) {
-            if (std::isnan(a.energy)) return false;
-            if (std::isnan(b.energy)) return true;
             return a.energy < b.energy;
         });
-
-        // Apply energy cutoff
-        double bestE = entries.empty() || std::isnan(entries[0].energy) ? 0 : entries[0].energy;
-        if (energyCutoff > 0) {
-            entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const TautEntry &e) {
-                return !std::isnan(e.energy) && e.energy > bestE + energyCutoff;
-            }), entries.end());
-        }
 
         int count = (int)entries.size();
         if (count == 0) return set;
@@ -889,6 +911,381 @@ void druse_free_variant_set(DruseVariantSet *set) {
     delete[] set->scores;
     delete[] set->infos;
     delete set;
+}
+
+// ============================================================================
+// Unified Ligand Ensemble Preparation
+// ============================================================================
+//
+// Pipeline: SMILES → protomers(pH) → tautomers(each) → dedup → conformers(each)
+//           → addH + MMFF minimize + Gasteiger charges → Boltzmann weights
+//
+// This produces a chemically realistic batch of molecular forms at the target pH,
+// where tautomeric, protonation, and conformational diversity are all represented
+// in realistic proportions based on MMFF94 energetics.
+
+DruseEnsembleResult* druse_prepare_ligand_ensemble(
+    const char *smiles, const char *name,
+    double pH, double pkaThreshold,
+    int32_t maxTautomers, int32_t maxProtomers,
+    double energyCutoff, int32_t conformersPerForm,
+    double temperature
+) {
+    auto *result = new DruseEnsembleResult();
+    memset(result, 0, sizeof(DruseEnsembleResult));
+    result->numConformersPerForm = conformersPerForm;
+
+    if (!smiles || !smiles[0]) {
+        result->success = false;
+        snprintf(result->errorMessage, 512, "Empty SMILES");
+        return result;
+    }
+
+    try {
+        std::unique_ptr<RWMol> parentMol(SmilesToMol(smiles));
+        if (!parentMol) {
+            result->success = false;
+            snprintf(result->errorMessage, 512, "Invalid SMILES: %s", smiles);
+            return result;
+        }
+
+        // ===================================================================
+        // Step 1: Enumerate protomers at target pH
+        // ===================================================================
+        // Each protomer is a distinct protonation state (different formal charges)
+
+        struct ChemicalForm {
+            std::string smi;               // canonical SMILES (dedup key)
+            std::unique_ptr<RWMol> mol;    // sanitized molecule
+            std::string label;             // human-readable description
+            int kind;                      // 0=parent, 1=tautomer, 2=protomer, 3=taut+prot
+        };
+        std::vector<ChemicalForm> allForms;
+        std::set<std::string> seenSMILES;
+
+        // Ionizable groups (same as druse_enumerate_protomers)
+        struct IonGrp { const char *name; const char *smarts; double pKa; bool isAcid; };
+        static const IonGrp ionGroups[] = {
+            {"Carboxylic acid",  "[CX3](=O)[OX2H1]",           4.0,  true},
+            {"Phosphoric acid",  "[OX2H1]P(=O)",               2.1,  true},
+            {"Sulfonamide NH",   "[NX3H1]S(=O)(=O)",          10.0,  true},
+            {"Phenol",           "[OX2H1]c",                  10.0,  true},
+            {"Thiol",            "[SX2H1]",                    8.3,  true},
+            {"Primary amine",    "[NX3H2;!$(NC=O);!$(NS=O)]", 10.5,  false},
+            {"Secondary amine",  "[NX3H1;!$(NC=O);!$(NS=O);!$(Nc)]", 11.0, false},
+            {"Imidazole",        "[nH1]1cc[nH0]c1",            6.0,  false},
+            {"Guanidine",        "[NX3H2]C(=[NX2H0])[NX3H2]", 12.5,  false},
+        };
+
+        // Find ambiguous ionizable sites
+        struct AmbSite { int groupIdx; int atomIdx; };
+        std::vector<AmbSite> ambSites;
+        for (int g = 0; g < (int)(sizeof(ionGroups)/sizeof(ionGroups[0])); g++) {
+            std::unique_ptr<ROMol> pat(SmartsToMol(ionGroups[g].smarts));
+            if (!pat) continue;
+            std::vector<MatchVectType> matches;
+            SubstructMatch(*parentMol, *pat, matches);
+            for (const auto &m : matches) {
+                if (m.empty()) continue;
+                if (std::abs(pH - ionGroups[g].pKa) < pkaThreshold) {
+                    ambSites.push_back({g, m[0].second});
+                }
+            }
+        }
+
+        // Generate protomer combinations
+        int nSites = std::min((int)ambSites.size(), 10);
+        int nCombos = std::min(1 << nSites, (int)maxProtomers);
+
+        struct ProtomerForm {
+            std::string smi;
+            std::unique_ptr<RWMol> mol;
+            std::string label;
+        };
+        std::vector<ProtomerForm> protomers;
+
+        for (int combo = 0; combo < nCombos; combo++) {
+            auto rw = std::make_unique<RWMol>(*parentMol);
+            std::string comboLabel;
+
+            for (int s = 0; s < nSites; s++) {
+                if (!((combo >> s) & 1)) continue;
+                const auto &site = ambSites[s];
+                const auto &grp = ionGroups[site.groupIdx];
+                Atom *atom = rw->getAtomWithIdx(site.atomIdx);
+
+                if (grp.isAcid) {
+                    int nH = atom->getTotalNumHs();
+                    if (nH > 0) {
+                        atom->setNumExplicitHs(nH - 1);
+                        atom->setFormalCharge(atom->getFormalCharge() - 1);
+                    }
+                } else {
+                    int nH = atom->getTotalNumHs();
+                    atom->setNumExplicitHs(nH + 1);
+                    atom->setFormalCharge(atom->getFormalCharge() + 1);
+                }
+                if (!comboLabel.empty()) comboLabel += "+";
+                comboLabel += std::string(grp.isAcid ? "deprot_" : "prot_") + grp.name;
+            }
+
+            try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+            std::string pSmi = MolToSmiles(*rw);
+            if (seenSMILES.count(pSmi)) continue;
+            seenSMILES.insert(pSmi);  // track for dedup across protomers
+
+            if (comboLabel.empty()) comboLabel = "Parent";
+            protomers.push_back({pSmi, std::move(rw), comboLabel});
+        }
+
+        // If no protomers generated (no ambiguous sites), use parent as-is
+        if (protomers.empty()) {
+            auto rw = std::make_unique<RWMol>(*parentMol);
+            protomers.push_back({MolToSmiles(*rw), std::move(rw), "Parent"});
+        }
+
+        // ===================================================================
+        // Step 2: For each protomer, enumerate tautomers
+        // ===================================================================
+        // Cap total forms to avoid combinatorial explosion
+        int maxTotalForms = maxProtomers * maxTautomers;
+        if (maxTotalForms > 200) maxTotalForms = 200;
+
+        for (auto &prot : protomers) {
+            if ((int)allForms.size() >= maxTotalForms) break;
+
+            try {
+                MolStandardize::TautomerEnumerator enumerator;
+                enumerator.setMaxTautomers(std::max(maxTautomers, 2));
+                enumerator.setMaxTransforms(200); // capped to avoid hanging on complex molecules
+                auto tautResult = enumerator.enumerate(*prot.mol);
+
+                int tautCount = 0;
+                for (const auto &taut : tautResult) {
+                    if (tautCount >= maxTautomers || (int)allForms.size() >= maxTotalForms) break;
+                    auto rw = std::make_unique<RWMol>(*taut);
+                    try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+                    std::string tSmi = MolToSmiles(*rw);
+
+                    if (seenSMILES.count(tSmi)) continue;
+                    seenSMILES.insert(tSmi);
+
+                    // Determine kind: is this from a non-parent protomer AND a tautomer?
+                    bool isFromProtomer = (prot.label != "Parent");
+                    bool isFromTautomer = (tSmi != prot.smi);
+                    int kind = 0; // parent
+                    if (isFromProtomer && isFromTautomer) kind = 3;      // protomer+tautomer
+                    else if (isFromProtomer) kind = 2;                    // protomer only
+                    else if (isFromTautomer) kind = 1;                    // tautomer only
+
+                    std::string label = prot.label;
+                    if (isFromTautomer) {
+                        if (label != "Parent") label += "_";
+                        else label = "";
+                        label += "Taut" + std::to_string(tautCount + 1);
+                    }
+
+                    allForms.push_back({tSmi, std::move(rw), label, kind});
+                    tautCount++;
+                }
+
+                // If enumeration produced nothing new, add the protomer itself
+                if (tautCount == 0 && !seenSMILES.count(prot.smi)) {
+                    seenSMILES.insert(prot.smi);
+                    auto rw = std::make_unique<RWMol>(*prot.mol);
+                    int kind = (prot.label != "Parent") ? 2 : 0;
+                    allForms.push_back({prot.smi, std::move(rw), prot.label, kind});
+                }
+            } catch (...) {
+                // Tautomer enumeration failed; add protomer directly
+                if (!seenSMILES.count(prot.smi)) {
+                    seenSMILES.insert(prot.smi);
+                    auto rw = std::make_unique<RWMol>(*prot.mol);
+                    int kind = (prot.label != "Parent") ? 2 : 0;
+                    allForms.push_back({prot.smi, std::move(rw), prot.label, kind});
+                }
+            }
+        }
+
+        if (allForms.empty()) {
+            result->success = false;
+            snprintf(result->errorMessage, 512, "No valid chemical forms generated");
+            return result;
+        }
+
+        result->numForms = (int)allForms.size();
+
+        // ===================================================================
+        // Step 3: For each form, generate conformers + full preparation
+        // ===================================================================
+        // Each form: addH → embed N conformers → MMFF minimize → Gasteiger charges
+
+        struct PreparedConformer {
+            std::unique_ptr<RWMol> mol;
+            double energy;
+            int formIdx;
+            int confIdx;
+            std::string label;
+            std::string smi;
+            int kind;
+        };
+        std::vector<PreparedConformer> allConformers;
+
+        for (int fi = 0; fi < (int)allForms.size(); fi++) {
+            auto &form = allForms[fi];
+
+            // Clone and add hydrogens
+            auto mol = std::make_unique<RWMol>(*form.mol);
+            MolOps::addHs(*mol, false, true); // addCoords=true
+
+            // Generate multiple conformers
+            auto cids = embed_multiple(*mol, conformersPerForm);
+            if (cids.empty()) {
+                // Fallback: single conformer via basic embedding
+                int cid = embed_molecule(*mol);
+                if (cid >= 0) cids.push_back(cid);
+                else {
+                    // Last resort: 2D coords
+                    try { RDDepict::compute2DCoords(*mol); } catch (...) {}
+                    cids.push_back(0);
+                }
+            }
+
+            // MMFF94 minimize all conformers
+            std::vector<std::pair<int, double>> mmffResults;
+            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults); } catch (...) {}
+
+            // Gasteiger charges
+            try { computeGasteigerCharges(*mol); } catch (...) {}
+
+            // Extract each conformer as a separate entry
+            std::vector<std::pair<int, double>> indexed;
+            for (int ci = 0; ci < (int)cids.size(); ci++) {
+                double e = (ci < (int)mmffResults.size() && mmffResults[ci].first >= 0)
+                           ? mmffResults[ci].second : 0.0;
+                indexed.push_back({ci, e});
+            }
+
+            // Sort by energy within this form
+            std::sort(indexed.begin(), indexed.end(),
+                      [](const auto &a, const auto &b) { return a.second < b.second; });
+
+            for (int ri = 0; ri < (int)indexed.size(); ri++) {
+                int confId = cids[indexed[ri].first];
+                double energy = indexed[ri].second;
+
+                // Create a single-conformer copy for this entry
+                auto confMol = std::make_unique<RWMol>(*mol);
+
+                // Keep only the target conformer
+                if (confMol->getNumConformers() > 1) {
+                    std::vector<unsigned int> toRemove;
+                    for (auto it = confMol->beginConformers(); it != confMol->endConformers(); ++it) {
+                        if ((int)(*it)->getId() != confId) {
+                            toRemove.push_back((*it)->getId());
+                        }
+                    }
+                    for (auto cid : toRemove) {
+                        confMol->removeConformer(cid);
+                    }
+                }
+
+                std::string confLabel = form.label;
+                if (indexed.size() > 1) {
+                    confLabel += "_Conf" + std::to_string(ri + 1);
+                }
+
+                allConformers.push_back({
+                    std::move(confMol), energy, fi, ri,
+                    confLabel, form.smi, form.kind
+                });
+            }
+        }
+
+        // ===================================================================
+        // Step 4: Energy cutoff filter
+        // ===================================================================
+        if (energyCutoff > 0 && !allConformers.empty()) {
+            double bestE = 1e30;
+            for (const auto &c : allConformers) {
+                if (!std::isnan(c.energy) && c.energy < bestE) bestE = c.energy;
+            }
+            allConformers.erase(
+                std::remove_if(allConformers.begin(), allConformers.end(),
+                    [&](const PreparedConformer &c) {
+                        return !std::isnan(c.energy) && c.energy > bestE + energyCutoff;
+                    }),
+                allConformers.end()
+            );
+        }
+
+        // ===================================================================
+        // Step 5: Compute Boltzmann weights
+        // ===================================================================
+        // w_i = exp(-E_i / (kB * T)) / Z, where Z = sum of all weights
+        // kB in kcal/(mol·K) = 0.001987204
+        double kBT = 0.001987204 * temperature;
+        if (kBT < 1e-10) kBT = 0.593; // room temperature fallback
+
+        // Find minimum energy for numerical stability
+        double minE = 1e30;
+        for (const auto &c : allConformers) {
+            if (!std::isnan(c.energy) && c.energy < minE) minE = c.energy;
+        }
+
+        std::vector<double> boltzWeights(allConformers.size(), 0.0);
+        double partitionZ = 0.0;
+        for (size_t i = 0; i < allConformers.size(); i++) {
+            double dE = std::isnan(allConformers[i].energy) ? 50.0 : (allConformers[i].energy - minE);
+            boltzWeights[i] = std::exp(-dE / kBT);
+            partitionZ += boltzWeights[i];
+        }
+        if (partitionZ > 0) {
+            for (auto &w : boltzWeights) w /= partitionZ;
+        }
+
+        // ===================================================================
+        // Step 6: Build result
+        // ===================================================================
+        int count = (int)allConformers.size();
+        result->count = count;
+        result->members = new DruseEnsembleMember[count];
+        result->success = true;
+
+        for (int i = 0; i < count; i++) {
+            auto &c = allConformers[i];
+            auto &m = result->members[i];
+
+            m.molecule = mol_to_result(*c.mol, name);
+            m.mmffEnergy = c.energy;
+            m.boltzmannWeight = boltzWeights[i];
+            m.kind = c.kind;
+            m.conformerIndex = c.confIdx;
+            m.formIndex = c.formIdx;
+            snprintf(m.label, sizeof(m.label), "%s", c.label.c_str());
+            snprintf(m.smiles, sizeof(m.smiles), "%s", c.smi.c_str());
+        }
+
+    } catch (const std::exception &e) {
+        result->success = false;
+        snprintf(result->errorMessage, 512, "Ensemble preparation failed: %s", e.what());
+    } catch (...) {
+        result->success = false;
+        snprintf(result->errorMessage, 512, "Ensemble preparation failed (unknown error)");
+    }
+
+    return result;
+}
+
+void druse_free_ensemble_result(DruseEnsembleResult *result) {
+    if (!result) return;
+    if (result->members) {
+        for (int i = 0; i < result->count; i++) {
+            druse_free_molecule_result(result->members[i].molecule);
+        }
+        delete[] result->members;
+    }
+    delete result;
 }
 
 // ============================================================================

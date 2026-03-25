@@ -29,12 +29,12 @@ struct LeadOptimizationState {
 
     // MARK: ADMET Filters
 
-    var filterLipinski: Bool = true
+    var filterLipinski: Bool = false     // off by default — too restrictive for initial exploration
     var filterVeber: Bool = false
-    var filterHERG: Bool = false      // reject if hERG risk > 0.5
-    var filterCYP: Bool = false       // reject if CYP2D6 or CYP3A4 > 0.5
-    var maxLogP: Float = 5.0
-    var minSolubility: Float = -6.0   // log S
+    var filterHERG: Bool = false        // reject if hERG risk > 0.5
+    var filterCYP: Bool = false         // reject if CYP2D6 or CYP3A4 > 0.5
+    var maxLogP: Float = 7.0            // generous default — user can tighten
+    var minSolubility: Float = -8.0     // generous default
 
     // MARK: Generation State
 

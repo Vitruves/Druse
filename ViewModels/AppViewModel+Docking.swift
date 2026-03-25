@@ -59,13 +59,14 @@ extension AppViewModel {
         )
     }
 
-    /// Focus camera on pocket with Z-slab clipping (MOE-style pocket view).
+    /// Focus camera on pocket — stores object-space slab center but does NOT auto-enable clipping.
     func focusOnPocket(_ pocket: BindingPocket) {
         renderer?.focusOnPocket(center: pocket.center, halfExtent: pocket.size)
-        // Sync clipping state back to workspace
-        workspace.enableClipping = renderer?.enableClipping ?? false
+        // Sync slab values (but not enableClipping) so they're ready if user toggles clipping
         workspace.clipNearZ = renderer?.clipNearZ ?? 0
         workspace.clipFarZ = renderer?.clipFarZ ?? 100
+        workspace.slabThickness = (renderer?.slabHalfThickness ?? 10.0) * 2.0
+        workspace.slabOffset = renderer?.slabOffset ?? 0
         showGridBoxForPocket(pocket)
     }
 
@@ -254,21 +255,26 @@ extension AppViewModel {
                         self.renderer?.updateGhostPose(atoms: newAtoms, bonds: newBonds)
 
                         // Live ML affinity scoring on current best pose.
-                        // Guard with isLiveScoring to prevent overlapping CoreML tasks
-                        // from piling up and overwhelming the ANE.
-                        if useMLLive, !self.docking.isLiveScoring {
-                            self.docking.isLiveScoring = true
-                            let features = DruseScoreFeatureExtractor.extract(
-                                proteinAtoms: liveScoringProteinAtoms,
-                                ligandAtoms: newAtoms,
-                                pocketCenter: livePocketCenter,
-                                proteinBonds: liveScoringProteinBonds,
-                                ligandBonds: liveLigandBonds
-                            )
-                            if let pred = await self.druseMLScoring.score(features: features) {
-                                self.docking.dockingBestPKi = pred.pKd
+                        // Cancel any in-flight prediction and start a fresh one so the
+                        // displayed pKi always reflects the latest best pose.
+                        if useMLLive {
+                            self.docking.liveScoringTask?.cancel()
+                            let capturedAtoms = newAtoms
+                            self.docking.liveScoringTask = Task { @MainActor [weak self] in
+                                guard let self, !Task.isCancelled else { return }
+                                let features = DruseScoreFeatureExtractor.extract(
+                                    proteinAtoms: liveScoringProteinAtoms,
+                                    ligandAtoms: capturedAtoms,
+                                    pocketCenter: livePocketCenter,
+                                    proteinBonds: liveScoringProteinBonds,
+                                    ligandBonds: liveLigandBonds
+                                )
+                                guard !Task.isCancelled else { return }
+                                if let pred = await self.druseMLScoring.score(features: features) {
+                                    guard !Task.isCancelled else { return }
+                                    self.docking.dockingBestPKi = pred.pKd
+                                }
                             }
-                            self.docking.isLiveScoring = false
                         }
                     }
                     if !interactions.isEmpty {
@@ -370,6 +376,42 @@ extension AppViewModel {
                 )
             }
 
+            // GFN2-xTB post-docking refinement (geometry opt + D4 + solvation scoring)
+            let gfn2Config = docking.dockingConfig.gfn2Refinement
+            if gfn2Config.enabled {
+                workspace.statusMessage = "GFN2-xTB refinement..."
+                log.info("GFN2-xTB post-docking refinement: top \(gfn2Config.topPosesToRefine) poses, \(gfn2Config.solvation.rawValue), opt=\(gfn2Config.optLevel.rawValue)", category: .dock)
+                rankedResults = await refineWithGFN2(
+                    results: rankedResults,
+                    originalLigand: origLig,
+                    config: gfn2Config
+                )
+                let refined = rankedResults.prefix(gfn2Config.topPosesToRefine).filter { $0.gfn2Converged == true }.count
+                log.success("GFN2-xTB refinement complete: \(refined)/\(min(gfn2Config.topPosesToRefine, rankedResults.count)) converged", category: .dock)
+            }
+
+            // GFN2 single-point energy on best pose (always-on, ~2ms, informational)
+            if let bestResult = rankedResults.first {
+                let spHeavyAtoms = origLig.atoms.filter { $0.element != .H }
+                let spPositions = bestResult.transformedAtomPositions
+                if spHeavyAtoms.count >= 2, spPositions.count == spHeavyAtoms.count {
+                    var spAtoms = spHeavyAtoms
+                    for j in 0..<spAtoms.count { spAtoms[j].position = spPositions[j] }
+                    let formalCharge = spHeavyAtoms.reduce(0) { $0 + $1.formalCharge }
+                    if let sp = try? await GFN2Refiner.computeEnergy(
+                        atoms: spAtoms, totalCharge: formalCharge, solvation: .water
+                    ) {
+                        rankedResults[0].gfn2Energy = sp.totalEnergy_kcal
+                        rankedResults[0].gfn2DispersionEnergy = sp.dispersionEnergy * 627.509
+                        rankedResults[0].gfn2SolvationEnergy = sp.solvationEnergy * 627.509
+                        rankedResults[0].gfn2Converged = sp.converged
+                        log.info(String(format: "GFN2-xTB best pose: %.1f kcal/mol (D4:%.2f, solv:%.2f)",
+                                        sp.totalEnergy_kcal, sp.dispersionEnergy * 627.509, sp.solvationEnergy * 627.509),
+                                 category: .dock)
+                    }
+                }
+            }
+
             docking.dockingResults = rankedResults
             docking.isDocking = false
             docking.dockingDuration = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
@@ -427,10 +469,23 @@ extension AppViewModel {
     func stopDocking() {
         docking.dockingEngine?.stopDocking()
         docking.isDocking = false
-        docking.isLiveScoring = false
+        docking.liveScoringTask?.cancel()
+        docking.liveScoringTask = nil
         renderer?.clearGhostPose()
         pushToRenderer()
         log.info("Docking stopped", category: .dock)
+    }
+
+    /// Remove all displayed poses and interaction lines from the 3D viewport.
+    /// The docking results data is preserved for re-viewing later.
+    func clearPosesFromView() {
+        molecules.ligand = nil
+        docking.currentInteractions = []
+        docking.selectedPoseIndices = []
+        renderer?.updateInteractionLines([])
+        renderer?.clearGhostPose()
+        pushToRenderer()
+        workspace.statusMessage = "Poses cleared from view"
     }
 
     func showDockingPose(at index: Int) {
@@ -570,26 +625,27 @@ extension AppViewModel {
 
     func buildTransformedLigand(result: DockingResult, originalLigand: Molecule) -> (atoms: [Atom], bonds: [Bond])? {
         guard !result.transformedAtomPositions.isEmpty else { return nil }
-        let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
 
+        // Build index mapping from original array position → new heavy-atom index.
+        // Bond.atomIndex1/2 are array positions, NOT atom IDs — we must map by position.
+        var originalIdxToNew: [Int: Int] = [:]
         var newAtoms: [Atom] = []
-        for (i, atom) in heavyAtoms.enumerated() {
-            guard i < result.transformedAtomPositions.count else { break }
+        for (origIdx, atom) in originalLigand.atoms.enumerated() {
+            guard atom.element != .H else { continue }
+            let newIdx = newAtoms.count
+            guard newIdx < result.transformedAtomPositions.count else { break }
+            originalIdxToNew[origIdx] = newIdx
             newAtoms.append(Atom(
-                id: i, element: atom.element, position: result.transformedAtomPositions[i],
+                id: newIdx, element: atom.element, position: result.transformedAtomPositions[newIdx],
                 name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
                 chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
                 isHetAtom: atom.isHetAtom
             ))
         }
 
-        var oldToNew: [Int: Int] = [:]
-        for (newIdx, atom) in heavyAtoms.enumerated() {
-            oldToNew[atom.id] = newIdx
-        }
         var newBonds: [Bond] = []
         for bond in originalLigand.bonds {
-            if let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] {
+            if let a = originalIdxToNew[bond.atomIndex1], let b = originalIdxToNew[bond.atomIndex2] {
                 newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
             }
         }
@@ -669,6 +725,101 @@ extension AppViewModel {
     // MARK: - Strain Penalty
 
     /// Compute MMFF94 strain energy for top docking poses and apply penalty to scores.
+    // MARK: - GFN2-xTB Post-Docking Refinement
+
+    /// Refine top docked poses using GFN2-xTB geometry optimization.
+    ///
+    /// For each top pose:
+    /// 1. Build a temporary Atom array with the docked ligand coordinates
+    /// 2. Run GFN2-xTB optimization (with D4 dispersion + implicit solvation)
+    /// 3. Store energy decomposition and optionally update coordinates
+    /// 4. Blend GFN2 energy into ranking score
+    func refineWithGFN2(
+        results: [DockingResult],
+        originalLigand: Molecule,
+        config: GFN2RefinementConfig
+    ) async -> [DockingResult] {
+        let topN = min(results.count, config.topPosesToRefine)
+        guard topN > 0 else { return results }
+
+        let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
+        guard heavyAtoms.count >= 2 else { return results }
+
+        let formalCharge = originalLigand.atoms.reduce(0) { $0 + $1.formalCharge }
+
+        var updated = results
+
+        // Process top poses in parallel (each on its own detached task)
+        let refinements: [(Int, GFN2RefinementResult?)] = await withTaskGroup(
+            of: (Int, GFN2RefinementResult?).self
+        ) { group in
+            for i in 0..<topN {
+                let positions = results[i].transformedAtomPositions
+                guard positions.count == heavyAtoms.count else { continue }
+
+                group.addTask {
+                    // Build temporary atom array with docked coordinates
+                    var dockedAtoms = heavyAtoms
+                    for j in 0..<dockedAtoms.count {
+                        dockedAtoms[j].position = positions[j]
+                    }
+
+                    do {
+                        let result = try await GFN2Refiner.optimizeGeometry(
+                            atoms: dockedAtoms,
+                            totalCharge: formalCharge,
+                            solvation: config.solvation,
+                            optLevel: config.optLevel,
+                            maxSteps: config.maxSteps
+                        )
+                        return (i, result)
+                    } catch {
+                        return (i, nil)
+                    }
+                }
+            }
+
+            var collected = [(Int, GFN2RefinementResult?)]()
+            for await result in group {
+                collected.append(result)
+            }
+            return collected
+        }
+
+        // Apply results
+        // Compute reference energy for blending (first successful result as baseline)
+        var gfn2Energies = [Float]()
+        for (i, gfn2Result) in refinements {
+            guard let gfn2Result else { continue }
+
+            updated[i].gfn2Energy = gfn2Result.totalEnergy_kcal
+            updated[i].gfn2DispersionEnergy = gfn2Result.dispersionEnergy * 627.509
+            updated[i].gfn2SolvationEnergy = gfn2Result.solvationEnergy * 627.509
+            updated[i].gfn2Converged = gfn2Result.converged
+            updated[i].gfn2OptSteps = gfn2Result.steps
+            gfn2Energies.append(gfn2Result.totalEnergy_kcal)
+
+            // Update coordinates if requested
+            if config.updateCoordinates, let optPos = gfn2Result.optimizedPositions {
+                updated[i].transformedAtomPositions = optPos
+            }
+        }
+
+        // Blend GFN2 energy into ranking: use relative GFN2 energy (ΔE from best)
+        if let minGFN2 = gfn2Energies.min(), config.blendWeight > 0 {
+            for i in 0..<updated.count {
+                if let gfn2E = updated[i].gfn2Energy {
+                    let relativeGFN2 = gfn2E - minGFN2  // relative to best GFN2 pose
+                    updated[i].energy += config.blendWeight * relativeGFN2
+                }
+            }
+            // Re-sort after blending
+            updated.sort { $0.energy < $1.energy }
+        }
+
+        return updated
+    }
+
     func computeStrainPenalties(
         results: [DockingResult], smiles: String, config: DockingConfig
     ) async -> [DockingResult] {

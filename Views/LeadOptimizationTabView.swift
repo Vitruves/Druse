@@ -50,11 +50,42 @@ struct LeadOptimizationTabView: View {
 
     @ViewBuilder
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label("No Reference Ligand", systemImage: "arrow.triangle.branch")
-        } description: {
-            Text("Select a docking pose or screening hit in the Results tab and click \"Optimize\" to start lead optimization.")
+        VStack(spacing: 12) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 32))
+                .foregroundStyle(.tertiary)
+            Text("No Reference Ligand")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text("To start lead optimization:")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Run docking in the Docking tab", systemImage: "1.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Label("Go to Results tab", systemImage: "2.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Label("Click", systemImage: "3.circle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Label("Optimize", systemImage: "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    Text("on a pose")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 30)
     }
 
     // MARK: - Reference Summary
@@ -250,14 +281,27 @@ struct LeadOptimizationTabView: View {
     private var analogList: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                let active = viewModel.leadOpt.analogs.filter { $0.status != .filtered && $0.status != .failed }.count
+                let passed = viewModel.leadOpt.analogs.filter { $0.status != .filtered && $0.status != .failed }.count
+                let filtered = viewModel.leadOpt.analogs.filter { $0.status == .filtered }.count
+                let failed = viewModel.leadOpt.analogs.filter { $0.status == .failed }.count
                 let total = viewModel.leadOpt.analogs.count
-                Label("\(active) Analogs", systemImage: "list.bullet")
+                Label("\(passed) Passed", systemImage: "list.bullet")
                     .font(.system(size: 11, weight: .semibold))
-                if total != active {
-                    Text("(\(total - active) filtered)")
+                    .foregroundStyle(passed > 0 ? .primary : .secondary)
+                if total > 0 {
+                    Text("\(total) generated")
                         .font(.system(size: 9))
                         .foregroundStyle(.tertiary)
+                }
+                if filtered > 0 {
+                    Text("\(filtered) filtered")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                }
+                if failed > 0 {
+                    Text("\(failed) failed")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.red)
                 }
                 Spacer()
                 Button("Clear") {

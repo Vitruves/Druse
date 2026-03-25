@@ -86,8 +86,23 @@ final class Renderer: NSObject {
 
     // Z-slab clipping
     var enableClipping: Bool = false
-    var clipNearZ: Float = 0    // view-space distance from camera to near clip
-    var clipFarZ: Float = 100   // view-space distance from camera to far clip
+    var clipNearZ: Float = 0    // view-space distance from camera to near clip (legacy/fallback)
+    var clipFarZ: Float = 100   // view-space distance from camera to far clip (legacy/fallback)
+
+    // Object-space slab clipping (zoom-invariant)
+    var slabCenter: SIMD3<Float>? = nil
+    var slabHalfThickness: Float = 10.0
+    var slabOffset: Float = 0.0
+
+    // Ligand Focus color overrides (set from AppViewModel based on WorkspaceState.colorScheme)
+    /// When set, protein atoms use this uniform color instead of element colors
+    var uniformProteinColor: SIMD3<Float>? = nil
+    /// When set, ligand carbon atoms use this color (e.g., gold/yellow for Ligand Focus)
+    var ligandCarbonColor: SIMD3<Float>? = nil
+    /// Number of protein atoms in the current data (used to distinguish protein vs ligand)
+    var proteinAtomCount: Int = 0
+    /// Per-chain color map for chain-colored mode (protein atoms only; ligand keeps CPK)
+    var chainColorMap: [String: SIMD3<Float>] = [:]
 
     // Molecule data (set from AppViewModel)
     private var currentAtoms: [Atom] = []
@@ -336,10 +351,24 @@ final class Renderer: NSObject {
             if atom.id == selectedAtomIndex { flags |= 1 }
             if selectedResidueAtomIndices.contains(atom.id) { flags |= 2 }
 
+            // Apply color overrides
+            let isProteinAtom = atom.id < proteinAtomCount
+            var color = atom.element.color
+            if !chainColorMap.isEmpty, isProteinAtom {
+                // Per-chain coloring mode
+                if let chainColor = chainColorMap[atom.chainID] {
+                    color = SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                }
+            } else if isProteinAtom, let protColor = uniformProteinColor {
+                color = SIMD4<Float>(protColor.x, protColor.y, protColor.z, 1.0)
+            } else if !isProteinAtom, atom.element == .C, let ligCarbon = ligandCarbonColor {
+                color = SIMD4<Float>(ligCarbon.x, ligCarbon.y, ligCarbon.z, 1.0)
+            }
+
             atomInstances.append(AtomInstance(
                 position: atom.position,
                 radius: atom.element.vdwRadius * atomScale,
-                color: atom.element.color,
+                color: color,
                 atomIndex: Int32(atom.id),
                 flags: flags,
                 _pad0: 0,
@@ -368,7 +397,8 @@ final class Renderer: NSObject {
         let bondScale = renderMode.bondRadiusScale
         guard bondScale > 0 else {
             bondInstanceCount = 0
-            bondInstanceBuffer = nil
+            // Keep bondInstanceBuffer and bondInstanceCapacity intact so bonds
+            // reappear immediately when switching back to a bond-showing mode.
             return
         }
 
@@ -383,13 +413,28 @@ final class Renderer: NSObject {
             let a2 = currentAtoms[bond.atomIndex2]
             let r = bond.order.displayRadius * bondScale
 
+            // Apply color overrides to bond half-colors
+            func atomColor(_ atom: Atom) -> SIMD4<Float> {
+                let isProt = atom.id < proteinAtomCount
+                if !chainColorMap.isEmpty, isProt {
+                    if let chainColor = chainColorMap[atom.chainID] {
+                        return SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                    }
+                } else if isProt, let protColor = uniformProteinColor {
+                    return SIMD4<Float>(protColor.x, protColor.y, protColor.z, 1.0)
+                } else if !isProt, atom.element == .C, let ligCarbon = ligandCarbonColor {
+                    return SIMD4<Float>(ligCarbon.x, ligCarbon.y, ligCarbon.z, 1.0)
+                }
+                return atom.element.color
+            }
+
             bondInstances.append(BondInstance(
                 positionA: a1.position,
                 radiusA: r,
                 positionB: a2.position,
                 radiusB: r,
-                colorA: a1.element.color,
-                colorB: a2.element.color
+                colorA: atomColor(a1),
+                colorB: atomColor(a2)
             ))
         }
 
@@ -714,6 +759,26 @@ final class Renderer: NSObject {
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 8, instanceCount: bondInstanceCount)
         }
 
+        // 3b. Live docking ligand — rendered as standard opaque ball-and-stick
+        //     BEFORE ribbon/surface so it participates in depth buffer normally
+        //     and translucent surfaces blend on top of it correctly.
+        if ghostAtomCount > 0, let ghostAtomBuf = ghostAtomBuffer {
+            encoder.setRenderPipelineState(atomPipeline)
+            encoder.setDepthStencilState(depthStateReadWrite)
+            encoder.setVertexBuffer(ghostAtomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
+            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+            encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: ghostAtomCount)
+        }
+        if ghostBondCount > 0, let ghostBondBuf = ghostBondBuffer {
+            encoder.setRenderPipelineState(bondPipeline)
+            encoder.setDepthStencilState(depthStateReadWrite)
+            encoder.setVertexBuffer(ghostBondBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
+            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+            encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 8, instanceCount: ghostBondCount)
+        }
+
         // 4. Ribbon (triangle mesh)
         if ribbonIndexCount > 0, let vertBuf = ribbonVertexBuffer, let idxBuf = ribbonIndexBuffer {
             encoder.setRenderPipelineState(ribbonPipeline)
@@ -781,24 +846,6 @@ final class Renderer: NSObject {
             encoder.setCullMode(.back) // Restore
         }
 
-        // 8. Live docking ligand (opaque ball-and-stick, same pipeline as main atoms/bonds)
-        if ghostAtomCount > 0, let ghostAtomBuf = ghostAtomBuffer {
-            encoder.setRenderPipelineState(atomPipeline)
-            encoder.setDepthStencilState(depthStateReadWrite)
-            encoder.setVertexBuffer(ghostAtomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
-            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-            encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: ghostAtomCount)
-        }
-        if ghostBondCount > 0, let ghostBondBuf = ghostBondBuffer {
-            encoder.setRenderPipelineState(bondPipeline)
-            encoder.setDepthStencilState(depthStateReadWrite)
-            encoder.setVertexBuffer(ghostBondBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
-            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-            encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 8, instanceCount: ghostBondCount)
-        }
-
         encoder.endEncoding()
 
         if let drawable = view.currentDrawable {
@@ -824,9 +871,22 @@ final class Renderer: NSObject {
         uniforms.atomRadiusScale = renderMode.atomRadiusScale
         uniforms.bondRadiusScale = renderMode.bondRadiusScale
         uniforms.lightingMode = lightingMode
-        uniforms.enableClipping = enableClipping ? 1 : 0
-        uniforms.clipNearZ = clipNearZ
-        uniforms.clipFarZ = clipFarZ
+        if enableClipping {
+            if let center = slabCenter {
+                // Project pocket center into view space to get its Z depth
+                let viewPos = camera.viewMatrix * SIMD4<Float>(center.x, center.y, center.z, 1.0)
+                let centerZ = -viewPos.z  // camera looks down -Z, so negate
+                let offsetCenterZ = centerZ + slabOffset
+                uniforms.clipNearZ = max(offsetCenterZ - slabHalfThickness, 0.1)
+                uniforms.clipFarZ = offsetCenterZ + slabHalfThickness
+            } else {
+                uniforms.clipNearZ = clipNearZ
+                uniforms.clipFarZ = clipFarZ
+            }
+            uniforms.enableClipping = 1
+        } else {
+            uniforms.enableClipping = 0
+        }
         uniforms.themeMode = themeMode
         uniforms.backgroundOpacity = backgroundOpacity
         uniforms.surfaceOpacity = surfaceOpacity
@@ -998,15 +1058,19 @@ final class Renderer: NSObject {
     }
 
     /// Focus camera on a pocket and set Z-clipping slab to frame it.
+    /// Stores pocket center in object space so slab stays correct when zooming.
     func focusOnPocket(center: SIMD3<Float>, halfExtent: SIMD3<Float>) {
         let pocketRadius = max(halfExtent.x, max(halfExtent.y, halfExtent.z))
         camera.fitToSphere(center: center, radius: max(pocketRadius + 4.0, 6.0))
 
-        // Set Z-slab around the pocket depth
-        let slabHalf = pocketRadius + 6.0
+        // Store object-space pocket center for zoom-invariant slab clipping
+        slabCenter = center
+        slabHalfThickness = pocketRadius + 6.0
+        slabOffset = 0.0
+
+        // Also update legacy clip values for backward compat / fallback
         let camDist = camera.distance
-        enableClipping = true
-        clipNearZ = max(camDist - slabHalf, 0.5)
-        clipFarZ = camDist + slabHalf
+        clipNearZ = max(camDist - slabHalfThickness, 0.5)
+        clipFarZ = camDist + slabHalfThickness
     }
 }

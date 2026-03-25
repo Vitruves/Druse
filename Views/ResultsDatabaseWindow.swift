@@ -72,7 +72,7 @@ struct ResultsDatabaseWindow: View {
                     // Right: detail panel (interaction diagram + info)
                     if let idx = selectedPoseIndex, idx < displayedResults.count {
                         detailPanel(result: displayedResults[idx], index: idx)
-                            .frame(minWidth: 350, idealWidth: 420, maxWidth: 550)
+                            .frame(minWidth: 420, idealWidth: 540, maxWidth: 700)
                     }
                 }
             }
@@ -144,6 +144,7 @@ struct ResultsDatabaseWindow: View {
                         .font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
+                .help(sortAscending ? "Sort descending" : "Sort ascending")
             }
 
             Divider().frame(height: 18)
@@ -156,6 +157,7 @@ struct ResultsDatabaseWindow: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("Analyze correlation between docking scores and experimental affinity")
             }
 
             // Export
@@ -166,6 +168,7 @@ struct ResultsDatabaseWindow: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("Export poses as SDF file")
 
                 Button(action: { viewModel.exportDockingResultsCSV() }) {
                     Label("CSV", systemImage: "tablecells")
@@ -173,6 +176,7 @@ struct ResultsDatabaseWindow: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("Export results as CSV")
             }
         }
         .padding(.horizontal, 12)
@@ -332,6 +336,7 @@ struct ResultsDatabaseWindow: View {
             }
             .buttonStyle(.plain)
             .frame(width: 24)
+            .help("Select for multi-pose overlay")
 
             Text("#\(index + 1)")
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -397,6 +402,7 @@ struct ResultsDatabaseWindow: View {
                 }
                 .controlSize(.mini)
                 .buttonStyle(.bordered)
+                .help("Show this pose in the 3D viewport")
 
                 Button {
                     selectedPoseIndex = index
@@ -460,6 +466,11 @@ struct ResultsDatabaseWindow: View {
 
                     Divider()
 
+                    // Mini interaction map
+                    miniInteractionDiagram
+
+                    Divider()
+
                     // Action buttons
                     VStack(spacing: 6) {
                         Button(action: {
@@ -472,6 +483,7 @@ struct ResultsDatabaseWindow: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .help("Open 2D interaction diagram for this pose")
 
                         Button(action: {
                             viewModel.showDockingPose(at: index)
@@ -481,6 +493,7 @@ struct ResultsDatabaseWindow: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .help("Display this pose in the 3D viewer")
                     }
                 }
                 .padding(10)
@@ -580,6 +593,113 @@ struct ResultsDatabaseWindow: View {
                     }
                 }
             }
+        }
+    }
+
+    // MARK: - Mini Interaction Diagram
+
+    @ViewBuilder
+    private var miniInteractionDiagram: some View {
+        let interactions = viewModel.docking.currentInteractions
+        if let protein = viewModel.molecules.protein, !interactions.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Interaction Map")
+                    .font(.system(size: 11, weight: .semibold))
+
+                Canvas { context, size in
+                    drawMiniDiagram(context: context, size: size,
+                                    interactions: interactions,
+                                    proteinAtoms: protein.atoms)
+                }
+                .frame(height: 220)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+
+    private func drawMiniDiagram(context: GraphicsContext, size: CGSize,
+                                  interactions: [MolecularInteraction],
+                                  proteinAtoms: [Atom]) {
+        let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        let radius = min(size.width, size.height) * 0.38
+
+        // Group interactions by residue
+        var residueInteractions: [String: [MolecularInteraction]] = [:]
+        for inter in interactions {
+            guard inter.proteinAtomIndex < proteinAtoms.count else { continue }
+            let pa = proteinAtoms[inter.proteinAtomIndex]
+            let key = "\(pa.residueName)\(pa.residueSeq)"
+            residueInteractions[key, default: []].append(inter)
+        }
+
+        let residues = Array(residueInteractions.keys).sorted()
+        guard !residues.isEmpty else { return }
+
+        // Draw ligand circle at center
+        let ligandRect = CGRect(x: center.x - 14, y: center.y - 14, width: 28, height: 28)
+        context.fill(Circle().path(in: ligandRect), with: .color(.green.opacity(0.25)))
+        context.stroke(Circle().path(in: ligandRect), with: .color(.green.opacity(0.8)), lineWidth: 1.5)
+        context.draw(Text("Lig").font(.system(size: 8, weight: .bold)).foregroundColor(.green), at: center)
+
+        // Draw residues radially
+        for (i, resName) in residues.enumerated() {
+            let angle = CGFloat(i) / CGFloat(residues.count) * 2.0 * .pi - .pi / 2.0
+            let resCenter = CGPoint(
+                x: center.x + cos(angle) * radius,
+                y: center.y + sin(angle) * radius
+            )
+
+            guard let inters = residueInteractions[resName] else { continue }
+
+            // Draw interaction lines from ligand center to residue
+            for inter in inters {
+                let lineColor = interactionColor(inter.type)
+                var path = Path()
+                path.move(to: center)
+                path.addLine(to: resCenter)
+                let dashPattern: [CGFloat] = inter.type == .hbond ? [3, 2] : []
+                context.stroke(path, with: .color(lineColor.opacity(0.6)),
+                              style: StrokeStyle(lineWidth: 1.5, dash: dashPattern))
+            }
+
+            // Draw residue bubble
+            let bubbleRadius: CGFloat = 18
+            let bubbleRect = CGRect(x: resCenter.x - bubbleRadius, y: resCenter.y - bubbleRadius,
+                                     width: bubbleRadius * 2, height: bubbleRadius * 2)
+            let bubbleColor = miniResidueColor(resName)
+            context.fill(Circle().path(in: bubbleRect), with: .color(bubbleColor.opacity(0.15)))
+            context.stroke(Circle().path(in: bubbleRect), with: .color(bubbleColor.opacity(0.7)), lineWidth: 1)
+
+            // Residue label
+            context.draw(
+                Text(resName).font(.system(size: 7, weight: .medium)).foregroundColor(bubbleColor),
+                at: resCenter
+            )
+
+            // Small colored dots for each unique interaction type in this residue
+            let uniqueTypes = Array(Set(inters.map(\.type))).sorted(by: { $0.rawValue < $1.rawValue })
+            if uniqueTypes.count > 0 {
+                let dotSpacing: CGFloat = 7
+                let totalWidth = CGFloat(uniqueTypes.count - 1) * dotSpacing
+                let startX = resCenter.x - totalWidth / 2
+                let dotY = resCenter.y + bubbleRadius + 5
+                for (di, iType) in uniqueTypes.enumerated() {
+                    let dotCenter = CGPoint(x: startX + CGFloat(di) * dotSpacing, y: dotY)
+                    let dotRect = CGRect(x: dotCenter.x - 2.5, y: dotCenter.y - 2.5, width: 5, height: 5)
+                    context.fill(Circle().path(in: dotRect), with: .color(interactionColor(iType)))
+                }
+            }
+        }
+    }
+
+    private func miniResidueColor(_ name: String) -> Color {
+        let resName = String(name.prefix(3))
+        switch resName {
+        case "ASP", "GLU":                              return .red     // acidic
+        case "LYS", "ARG", "HIS":                      return .blue    // basic
+        case "SER", "THR", "ASN", "GLN", "TYR", "CYS": return .purple  // polar
+        default:                                        return .green   // hydrophobic / other
         }
     }
 

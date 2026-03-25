@@ -125,42 +125,71 @@ extension AppViewModel {
             var generated: [LeadOptAnalog] = []
             var seenSMILES = Set<String>([smiles])
             let total = Float(scoredReplacements.count)
+            var invalidCount = 0
 
             for (i, entry) in scoredReplacements.enumerated() {
                 if generated.count >= count || Task.isCancelled { break }
 
                 let rep = entry.rep
-                guard smiles.contains(rep.pattern) else { continue }
+                // Case-insensitive pattern matching for SMILES (aromatic atoms are lowercase)
+                guard smiles.localizedCaseInsensitiveContains(rep.pattern) else { continue }
 
-                // Single substitution
-                if let range = smiles.range(of: rep.pattern) {
+                // Single substitution: find first case-sensitive match, then try case-insensitive
+                let ranges: [Range<String.Index>] = {
+                    var found: [Range<String.Index>] = []
+                    if let r = smiles.range(of: rep.pattern) { found.append(r) }
+                    // Also try lowercase pattern for aromatic SMILES (e.g., "C" → "c")
+                    let lowerPattern = rep.pattern.lowercased()
+                    if lowerPattern != rep.pattern, let r = smiles.range(of: lowerPattern) {
+                        found.append(r)
+                    }
+                    return found
+                }()
+
+                for range in ranges {
+                    guard generated.count < count else { break }
                     let newSmi = smiles.replacingCharacters(in: range, with: rep.replacement)
                     if newSmi != smiles && !seenSMILES.contains(newSmi) {
-                        seenSMILES.insert(newSmi)
-                        var analog = LeadOptAnalog(
-                            id: UUID(), name: "\(name)_\(rep.label)",
-                            smiles: newSmi
-                        )
-                        self.computeDeltaProperties(for: &analog, reference: refDesc)
-                        generated.append(analog)
+                        // Validate via RDKit — skip if SMILES is chemically invalid
+                        if let desc = RDKitBridge.computeDescriptors(smiles: newSmi) {
+                            seenSMILES.insert(newSmi)
+                            var analog = LeadOptAnalog(
+                                id: UUID(), name: "\(name)_\(rep.label)",
+                                smiles: newSmi
+                            )
+                            analog.descriptors = desc
+                            self.computeDeltaProperties(for: &analog, reference: refDesc)
+                            generated.append(analog)
+                        } else {
+                            invalidCount += 1
+                        }
                     }
                 }
 
-                // Global substitution
+                // Global substitution (replace all occurrences)
                 if generated.count < count {
                     let allReplaced = smiles.replacingOccurrences(of: rep.pattern, with: rep.replacement)
                     if allReplaced != smiles && !seenSMILES.contains(allReplaced) {
-                        seenSMILES.insert(allReplaced)
-                        var analog = LeadOptAnalog(
-                            id: UUID(), name: "\(name)_\(rep.label)_all",
-                            smiles: allReplaced
-                        )
-                        self.computeDeltaProperties(for: &analog, reference: refDesc)
-                        generated.append(analog)
+                        if let desc = RDKitBridge.computeDescriptors(smiles: allReplaced) {
+                            seenSMILES.insert(allReplaced)
+                            var analog = LeadOptAnalog(
+                                id: UUID(), name: "\(name)_\(rep.label)_all",
+                                smiles: allReplaced
+                            )
+                            analog.descriptors = desc
+                            self.computeDeltaProperties(for: &analog, reference: refDesc)
+                            generated.append(analog)
+                        } else {
+                            invalidCount += 1
+                        }
                     }
                 }
 
-                self.leadOpt.generationProgress = Float(i + 1) / total * 0.5  // 50% for generation
+                self.leadOpt.generationProgress = Float(i + 1) / total * 0.5
+            }
+
+            if invalidCount > 0 {
+                self.log.info("Skipped \(invalidCount) invalid SMILES during analog generation", category: .molecule)
             }
 
             // ADMET filtering (remaining 50% of progress)
@@ -196,25 +225,32 @@ extension AppViewModel {
 
             let activeCount = passed.filter { $0.status == .generated }.count
             let filteredCount = passed.filter { $0.status == .filtered }.count
-            if activeCount > 0 {
-                self.log.success("Generated \(activeCount) analogs (\(filteredCount) filtered out)", category: .molecule)
+            let totalGenerated = generated.count
+
+            if totalGenerated == 0 {
+                self.log.warn("Could not generate any analogs from \(name) — the SMILES structure may not contain matching functional groups for substitution", category: .molecule)
+                self.workspace.statusMessage = "No analogs could be generated"
+            } else if activeCount > 0 {
+                self.log.success("Generated \(activeCount) analogs (\(filteredCount) filtered, \(totalGenerated) total candidates)", category: .molecule)
                 self.workspace.statusMessage = "\(activeCount) analogs ready"
             } else {
-                self.log.warn("No analogs passed filters", category: .molecule)
-                self.workspace.statusMessage = "No analogs passed filters"
+                self.log.warn("\(totalGenerated) analogs generated but all \(filteredCount) filtered out — try loosening ADMET filters", category: .molecule)
+                self.workspace.statusMessage = "All \(totalGenerated) analogs filtered — loosen filters"
             }
         }
     }
 
     private func computeDeltaProperties(for analog: inout LeadOptAnalog, reference: LigandDescriptors?) {
-        guard let desc = RDKitBridge.computeDescriptors(smiles: analog.smiles) else { return }
-        analog.descriptors = desc
-        if let ref = reference {
-            analog.deltaMW = desc.molecularWeight - ref.molecularWeight
-            analog.deltaLogP = desc.logP - ref.logP
-            analog.deltaTPSA = desc.tpsa - ref.tpsa
-            analog.deltaRotBonds = desc.rotatableBonds - ref.rotatableBonds
+        // Descriptors may already be set during generation (with RDKit validation).
+        // Only compute if missing.
+        if analog.descriptors == nil {
+            analog.descriptors = RDKitBridge.computeDescriptors(smiles: analog.smiles)
         }
+        guard let desc = analog.descriptors, let ref = reference else { return }
+        analog.deltaMW = desc.molecularWeight - ref.molecularWeight
+        analog.deltaLogP = desc.logP - ref.logP
+        analog.deltaTPSA = desc.tpsa - ref.tpsa
+        analog.deltaRotBonds = desc.rotatableBonds - ref.rotatableBonds
     }
 
     // MARK: - Mini-Docking

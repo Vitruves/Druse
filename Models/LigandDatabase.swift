@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 import simd
 
 /// A tautomer or protomer variant of a ligand.
+/// Kept temporarily for backward compatibility during migration from nested variants
+/// to the flat parentID-based hierarchy.
 struct MolecularVariant: Identifiable, Sendable {
     let id: UUID
     var smiles: String
@@ -30,6 +32,14 @@ struct MolecularVariant: Identifiable, Sendable {
     }
 }
 
+/// A stored conformer of a ligand (persistent, survives re-selection).
+struct LigandConformer: Identifiable, Sendable {
+    let id: Int              // conformer index (0-based)
+    var atoms: [Atom]
+    var bonds: [Bond]
+    var energy: Double       // MMFF94 energy in kcal/mol
+}
+
 /// An entry in the ligand database.
 struct LigandEntry: Identifiable, Sendable {
     let id: UUID
@@ -47,8 +57,26 @@ struct LigandEntry: Identifiable, Sendable {
     var pKi: Float?      // -log10(Ki in M)
     var ic50: Float?     // IC50 in nM
 
-    // Tautomer and protomer variants
-    var variants: [MolecularVariant] = []
+    // --- Hierarchy fields (flat variant model) ---
+
+    /// nil for top-level entries; set to the parent's UUID for variant children.
+    var parentID: UUID?
+
+    /// nil for top-level entries; .tautomer or .protomer for variant children.
+    var variantKind: VariantKind?
+
+    /// Energy relative to parent (kcal/mol, from the variant enumeration step).
+    var relativeEnergy: Double?
+
+    // Persistent conformer storage (survives re-selection of the entry)
+    var conformers: [LigandConformer] = []
+
+    /// Source chain ID from the protein (for co-crystallized ligands).
+    /// Used to robustly match when removing chains or re-importing.
+    var sourceChainID: String?
+
+    /// Variant lineage: if this entry was created from a variant, track the parent info
+    var variantLineage: String?   // e.g., "Taut_2 of MK1" or "Prot_1 of Indinavir"
 
     /// Computed pKi from whatever affinity data is available (pKi > Ki > IC50).
     var effectivePKi: Float? {
@@ -61,7 +89,10 @@ struct LigandEntry: Identifiable, Sendable {
     init(name: String, smiles: String, atoms: [Atom] = [], bonds: [Bond] = [],
          descriptors: LigandDescriptors? = nil, isPrepared: Bool = false,
          conformerCount: Int = 0, ki: Float? = nil, pKi: Float? = nil, ic50: Float? = nil,
-         variants: [MolecularVariant] = []) {
+         sourceChainID: String? = nil,
+         variantLineage: String? = nil,
+         parentID: UUID? = nil, variantKind: VariantKind? = nil,
+         relativeEnergy: Double? = nil) {
         self.id = UUID()
         self.name = name
         self.smiles = smiles
@@ -74,7 +105,11 @@ struct LigandEntry: Identifiable, Sendable {
         self.ki = ki
         self.pKi = pKi
         self.ic50 = ic50
-        self.variants = variants
+        self.sourceChainID = sourceChainID
+        self.variantLineage = variantLineage
+        self.parentID = parentID
+        self.variantKind = variantKind
+        self.relativeEnergy = relativeEnergy
     }
 }
 
@@ -97,6 +132,72 @@ final class LigandDatabase {
 
     init() {
         // Don't auto-load — user explicitly loads via File > Load Database
+    }
+
+    // MARK: - Hierarchy Helpers
+
+    /// All top-level entries (those without a parent).
+    var topLevelEntries: [LigandEntry] {
+        entries.filter { $0.parentID == nil }
+    }
+
+    /// Returns all child entries whose parentID matches the given UUID.
+    func children(of parentID: UUID) -> [LigandEntry] {
+        entries.filter { $0.parentID == parentID }
+    }
+
+    /// Returns the parent entry for a given child, or nil if it is top-level.
+    func parent(of entry: LigandEntry) -> LigandEntry? {
+        guard let pid = entry.parentID else { return nil }
+        return entries.first { $0.id == pid }
+    }
+
+    /// Remove an entry and all its children (cascading delete).
+    func removeWithChildren(id: UUID) {
+        // Collect the target plus all descendants (one level deep in practice,
+        // but handles arbitrary depth for future-proofing).
+        var toRemove: Set<UUID> = [id]
+        var frontier: Set<UUID> = [id]
+        while !frontier.isEmpty {
+            let childIDs = Set(
+                entries.compactMap { entry -> UUID? in
+                    guard let pid = entry.parentID, frontier.contains(pid) else { return nil }
+                    return entry.id
+                }
+            )
+            if childIDs.isEmpty { break }
+            toRemove.formUnion(childIDs)
+            frontier = childIDs
+        }
+        entries.removeAll { toRemove.contains($0.id) }
+    }
+
+    /// Create a new child variant entry linked to a parent and append it to the database.
+    @discardableResult
+    func addVariant(parentID: UUID, smiles: String, atoms: [Atom], bonds: [Bond],
+                    relativeEnergy: Double, kind: VariantKind, label: String,
+                    isPrepared: Bool, conformerCount: Int) -> LigandEntry {
+        let parentName = entries.first(where: { $0.id == parentID })?.name ?? "Unknown"
+        let entry = LigandEntry(
+            name: "\(parentName)_\(label)",
+            smiles: smiles,
+            atoms: atoms,
+            bonds: bonds,
+            isPrepared: isPrepared,
+            conformerCount: conformerCount,
+            variantLineage: "\(label) of \(parentName)",
+            parentID: parentID,
+            variantKind: kind,
+            relativeEnergy: relativeEnergy
+        )
+        entries.append(entry)
+        return entry
+    }
+
+    /// Perform multiple mutations on the entries array as a single batch.
+    /// This triggers only one `didSet` (and thus one debounced save) instead of N.
+    func batchMutate(_ block: (inout [LigandEntry]) -> Void) {
+        block(&entries)
     }
 
     // MARK: - Add
@@ -437,6 +538,10 @@ final class LigandDatabase {
 
     // MARK: - Codable Helpers
 
+    /// Current on-disk format version.
+    private static let currentFormatVersion = 2
+
+    /// Legacy serializable variant (v1 nested model).
     private struct SerializableVariant: Codable {
         let smiles: String
         let relativeEnergy: Double
@@ -476,8 +581,20 @@ final class LigandDatabase {
         let atomElements: [Int]?
         let atomNames: [String]?
         let bondData: [Int]?  // [a1,a2,order, a1,a2,order, ...]
-        // Tautomer/protomer variants
+        // Legacy tautomer/protomer variants (v1 format)
         let variants: [SerializableVariant]?
+        // --- v2 fields ---
+        let parentID: String?              // UUID as string; nil for top-level
+        let variantKind: Int?              // VariantKind.rawValue; nil for top-level
+        let relativeEnergy: Double?        // energy relative to parent
+        let conformerPositions: [[Float]]? // per-conformer flat [x,y,z,...] arrays
+        let conformerEnergies: [Double]?   // per-conformer energies
+    }
+
+    /// Top-level wrapper for versioned on-disk format.
+    private struct DatabaseWrapper: Codable {
+        let version: Int
+        let entries: [SerializableEntry]
     }
 
     private static func encodeAtoms(_ atoms: [Atom]) -> (data: [Float]?, elements: [Int]?, names: [String]?) {
@@ -520,21 +637,53 @@ final class LigandDatabase {
         return bonds
     }
 
+    /// Encode conformers for an entry. Returns parallel arrays of flat positions and energies.
+    private static func encodeConformers(_ conformers: [LigandConformer]) -> (positions: [[Float]]?, energies: [Double]?) {
+        guard !conformers.isEmpty else { return (nil, nil) }
+        let positions = conformers.map { conf in
+            conf.atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] }
+        }
+        let energies = conformers.map(\.energy)
+        return (positions, energies)
+    }
+
+    /// Decode conformers from serialized flat position arrays and energies.
+    /// Uses the entry's bonds as the template (conformers share the same bonding).
+    private static func decodeConformers(positions: [[Float]]?, energies: [Double]?,
+                                         templateElements: [Int]?, templateNames: [String]?,
+                                         templateBonds: [Int]?) -> [LigandConformer] {
+        guard let posArrays = positions, !posArrays.isEmpty else { return [] }
+        let energyList = energies ?? Array(repeating: 0.0, count: posArrays.count)
+        let bonds = decodeBonds(data: templateBonds)
+
+        return posArrays.enumerated().compactMap { confIdx, flatPos -> LigandConformer? in
+            // Reconstruct atoms from the flat position array + template element/name info
+            guard let elems = templateElements, let names = templateNames else { return nil }
+            var atoms: [Atom] = []
+            for i in stride(from: 0, to: flatPos.count - 2, by: 3) {
+                let aIdx = i / 3
+                guard aIdx < elems.count, aIdx < names.count else { break }
+                atoms.append(Atom(
+                    id: aIdx, element: Element(rawValue: elems[aIdx]) ?? .C,
+                    position: SIMD3(flatPos[i], flatPos[i+1], flatPos[i+2]),
+                    name: names[aIdx], residueName: "LIG", residueSeq: 1, chainID: "L",
+                    charge: 0, formalCharge: 0, isHetAtom: true
+                ))
+            }
+            let energy = confIdx < energyList.count ? energyList[confIdx] : 0.0
+            return LigandConformer(id: confIdx, atoms: atoms, bonds: bonds, energy: energy)
+        }
+    }
+
+    // MARK: - Encode (v2 format)
+
     private func encodeToDisk() throws -> Data {
         let serializable = entries.map { entry -> SerializableEntry in
             let (atomData, atomElements, atomNames) = Self.encodeAtoms(entry.atoms)
             let bondData = Self.encodeBonds(entry.bonds)
 
-            let serializedVariants: [SerializableVariant]? = entry.variants.isEmpty ? nil : entry.variants.map { v in
-                let (vad, vae, van) = Self.encodeAtoms(v.atoms)
-                return SerializableVariant(
-                    smiles: v.smiles, relativeEnergy: v.relativeEnergy,
-                    kind: v.kind.rawValue, label: v.label,
-                    isPrepared: v.isPrepared, conformerCount: v.conformerCount,
-                    atomData: vad, atomElements: vae, atomNames: van,
-                    bondData: Self.encodeBonds(v.bonds)
-                )
-            }
+            // Conformer persistence
+            let (confPositions, confEnergies) = Self.encodeConformers(entry.conformers)
 
             return SerializableEntry(
                 name: entry.name, smiles: entry.smiles, isPrepared: entry.isPrepared,
@@ -547,17 +696,42 @@ final class LigandDatabase {
                 veber: entry.descriptors?.veber,
                 ki: entry.ki, pKi: entry.pKi, ic50: entry.ic50,
                 atomData: atomData, atomElements: atomElements, atomNames: atomNames, bondData: bondData,
-                variants: serializedVariants
+                variants: nil,
+                parentID: entry.parentID?.uuidString,
+                variantKind: entry.variantKind?.rawValue,
+                relativeEnergy: entry.relativeEnergy,
+                conformerPositions: confPositions,
+                conformerEnergies: confEnergies
             )
         }
-        return try JSONEncoder().encode(serializable)
+        let wrapper = DatabaseWrapper(version: Self.currentFormatVersion, entries: serializable)
+        return try JSONEncoder().encode(wrapper)
     }
 
+    // MARK: - Decode (v1 + v2 format)
+
     private func decodeFromDisk(_ data: Data) throws {
+        // Try the new versioned wrapper first
+        if let wrapper = try? JSONDecoder().decode(DatabaseWrapper.self, from: data) {
+            entries = Self.decodeEntries(wrapper.entries, migrateVariants: false)
+            return
+        }
+
+        // Fall back to legacy v1 format: plain [SerializableEntry] array
         let decoded = try JSONDecoder().decode([SerializableEntry].self, from: data)
-        let loaded: [LigandEntry] = decoded.map { s in
-            let atoms = Self.decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames)
-            let bonds = Self.decodeBonds(data: s.bondData)
+        entries = Self.decodeEntries(decoded, migrateVariants: true)
+    }
+
+    /// Shared entry decoding logic.
+    /// When `migrateVariants` is true (v1 data), nested `MolecularVariant` objects
+    /// are promoted to first-class child `LigandEntry` items linked by parentID.
+    private static func decodeEntries(_ serializableEntries: [SerializableEntry],
+                                       migrateVariants: Bool) -> [LigandEntry] {
+        var result: [LigandEntry] = []
+
+        for s in serializableEntries {
+            let atoms = decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames)
+            let bonds = decodeBonds(data: s.bondData)
             let desc: LigandDescriptors? = s.mw != nil ? LigandDescriptors(
                 molecularWeight: s.mw!, exactMW: s.mw!, logP: s.logP ?? 0, tpsa: s.tpsa ?? 0,
                 hbd: s.hbd ?? 0, hba: s.hba ?? 0, rotatableBonds: s.rotBonds ?? 0,
@@ -565,11 +739,13 @@ final class LigandDatabase {
                 heavyAtomCount: s.heavyAtomCount ?? 0, fractionCSP3: s.fractionCSP3 ?? 0,
                 lipinski: s.lipinski ?? false, veber: s.veber ?? false
             ) : nil
-            let variants: [MolecularVariant] = (s.variants ?? []).map { sv in
+
+            // Decode legacy nested variants (kept on the struct for compat)
+            let legacyVariants: [MolecularVariant] = (s.variants ?? []).map { sv in
                 MolecularVariant(
                     smiles: sv.smiles,
-                    atoms: Self.decodeAtoms(data: sv.atomData, elements: sv.atomElements, names: sv.atomNames),
-                    bonds: Self.decodeBonds(data: sv.bondData),
+                    atoms: decodeAtoms(data: sv.atomData, elements: sv.atomElements, names: sv.atomNames),
+                    bonds: decodeBonds(data: sv.bondData),
                     relativeEnergy: sv.relativeEnergy,
                     kind: VariantKind(rawValue: sv.kind) ?? .tautomer,
                     label: sv.label,
@@ -577,12 +753,52 @@ final class LigandDatabase {
                     conformerCount: sv.conformerCount
                 )
             }
-            return LigandEntry(name: s.name, smiles: s.smiles, atoms: atoms, bonds: bonds,
-                              descriptors: desc, isPrepared: s.isPrepared,
-                              conformerCount: s.conformerCount ?? 0,
-                              ki: s.ki, pKi: s.pKi, ic50: s.ic50,
-                              variants: variants)
+
+            // Decode v2 hierarchy fields
+            let parentID: UUID? = s.parentID.flatMap { UUID(uuidString: $0) }
+            let variantKind: VariantKind? = s.variantKind.flatMap { VariantKind(rawValue: $0) }
+
+            // Decode persisted conformers
+            let conformers = decodeConformers(
+                positions: s.conformerPositions,
+                energies: s.conformerEnergies,
+                templateElements: s.atomElements,
+                templateNames: s.atomNames,
+                templateBonds: s.bondData
+            )
+
+            var entry = LigandEntry(
+                name: s.name, smiles: s.smiles, atoms: atoms, bonds: bonds,
+                descriptors: desc, isPrepared: s.isPrepared,
+                conformerCount: s.conformerCount ?? 0,
+                ki: s.ki, pKi: s.pKi, ic50: s.ic50,
+                parentID: parentID,
+                variantKind: variantKind,
+                relativeEnergy: s.relativeEnergy
+            )
+            entry.conformers = conformers
+            result.append(entry)
+
+            // If migrating from v1, promote nested variants to child entries
+            if migrateVariants && !legacyVariants.isEmpty {
+                for variant in legacyVariants {
+                    let child = LigandEntry(
+                        name: "\(s.name)_\(variant.label)",
+                        smiles: variant.smiles,
+                        atoms: variant.atoms,
+                        bonds: variant.bonds,
+                        isPrepared: variant.isPrepared,
+                        conformerCount: variant.conformerCount,
+                        variantLineage: "\(variant.label) of \(s.name)",
+                        parentID: entry.id,
+                        variantKind: variant.kind,
+                        relativeEnergy: variant.relativeEnergy
+                    )
+                    result.append(child)
+                }
+            }
         }
-        entries = loaded
+
+        return result
     }
 }

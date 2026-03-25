@@ -23,14 +23,20 @@ struct ContentView: View {
                 ZStack {
                     metalViewport
 
-                    // Top overlay: badges left, mode label right
+                    // Top overlay: badges left, interaction legend + docking HUD right
                     VStack {
                         HStack(alignment: .top) {
                             moleculeBadges
                             Spacer()
-                            // Interaction legend (top-right, only when interactions present)
-                            if !viewModel.docking.currentInteractions.isEmpty {
-                                InteractionLegendView(interactions: viewModel.docking.currentInteractions)
+                            VStack(alignment: .trailing, spacing: 6) {
+                                // Interaction legend
+                                if !viewModel.docking.currentInteractions.isEmpty {
+                                    InteractionLegendView(interactions: viewModel.docking.currentInteractions)
+                                }
+                                // Live docking HUD (visible during active docking)
+                                if viewModel.docking.isDocking {
+                                    dockingHUD
+                                }
                             }
                         }
                         .padding(10)
@@ -219,7 +225,72 @@ struct ContentView: View {
 
     // MARK: - Render Controls (bottom overlay)
 
+    // MARK: - Docking HUD (live progress overlay on Metal viewport)
+
     @ViewBuilder
+    private var dockingHUD: some View {
+        let gen = viewModel.docking.dockingGeneration
+        let totalGen = viewModel.docking.dockingTotalGenerations
+        let bestE = viewModel.docking.dockingBestEnergy
+        let bestPKi = viewModel.docking.dockingBestPKi
+        let isBatch = viewModel.docking.isBatchDocking
+        let bp = viewModel.docking.batchProgress
+
+        VStack(alignment: .trailing, spacing: 4) {
+            // Batch progress (if applicable)
+            if isBatch && bp.total > 1 {
+                Text("Ligand \(bp.current + 1)/\(bp.total)")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.cyan)
+            }
+
+            // Generation progress bar
+            HStack(spacing: 6) {
+                Text("Gen \(gen + 1)/\(totalGen)")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.9))
+
+                ProgressView(value: Double(gen + 1), total: Double(max(totalGen, 1)))
+                    .progressViewStyle(.linear)
+                    .frame(width: 80)
+                    .tint(.cyan)
+            }
+
+            // Best score (kcal/mol or pKi)
+            HStack(spacing: 4) {
+                if let pKi = bestPKi {
+                    Text("pKi")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                    Text(String(format: "%.1f", pKi))
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundStyle(pKi > 6 ? .green : pKi > 4 ? .yellow : .orange)
+                } else if bestE < .infinity {
+                    Text(String(format: "%.1f", bestE))
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundStyle(bestE < -6 ? .green : bestE < -3 ? .yellow : .orange)
+                    Text("kcal/mol")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+            }
+
+            // Poses tested count
+            let posesPerGen = viewModel.docking.dockingConfig.populationSize
+            let totalPoses = (gen + 1) * posesPerGen
+            Text("\(totalPoses) poses")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.5))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.ultraThinMaterial)
+                .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+        )
+    }
+
     private var renderControls: some View {
         HStack(spacing: 4) {
             // Render mode buttons
@@ -227,8 +298,8 @@ struct ContentView: View {
                 let isActive = viewModel.workspace.renderMode == mode
                 Button(action: { viewModel.setRenderMode(mode) }) {
                     Image(systemName: mode.icon)
-                        .font(.system(size: 14))
-                        .frame(width: 34, height: 34)
+                        .font(.system(size: 12))
+                        .frame(width: 28, height: 28)
                         .background(isActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
                         .clipShape(RoundedRectangle(cornerRadius: 7))
                         .overlay(
@@ -260,8 +331,8 @@ struct ContentView: View {
                     }
                 } label: {
                     Image(systemName: viewModel.workspace.sideChainDisplay.icon)
-                        .font(.system(size: 14))
-                        .frame(width: 34, height: 34)
+                        .font(.system(size: 12))
+                        .frame(width: 28, height: 28)
                         .background(scActive ? Color.purple.opacity(0.5) : Color.white.opacity(0.05))
                         .clipShape(RoundedRectangle(cornerRadius: 7))
                         .overlay(
@@ -284,8 +355,8 @@ struct ContentView: View {
             let hAvailable = viewModel.proteinHasHydrogens
             Button(action: { viewModel.toggleHydrogens() }) {
                 Text("H")
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                    .frame(width: 34, height: 34)
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .frame(width: 28, height: 28)
                     .background(hActive && hAvailable ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                     .overlay(
@@ -298,12 +369,44 @@ struct ContentView: View {
             .disabled(!hAvailable)
             .help(hAvailable ? (hActive ? "Hide hydrogens" : "Show hydrogens") : "No hydrogens — add them in Preparation")
 
+            // Color scheme picker (ligand focus coloring)
+            let isLigandFocus = viewModel.workspace.colorScheme == .ligandFocus
+            Menu {
+                ForEach(WorkspaceState.MoleculeColorScheme.allCases, id: \.self) { scheme in
+                    Button(action: {
+                        viewModel.workspace.colorScheme = scheme
+                        viewModel.pushToRenderer()
+                    }) {
+                        HStack {
+                            Text(scheme.rawValue)
+                            if viewModel.workspace.colorScheme == scheme {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "paintpalette")
+                    .font(.system(size: 14))
+                    .frame(width: 28, height: 28)
+                    .background(isLigandFocus ? Color.yellow.opacity(0.3) : Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(isLigandFocus ? Color.yellow.opacity(0.5) : Color.clear, lineWidth: 1)
+                    )
+            }
+            .menuStyle(.borderlessButton)
+            .frame(width: 34)
+            .foregroundStyle(isLigandFocus ? .yellow : .secondary)
+            .help("Color scheme: \(viewModel.workspace.colorScheme.rawValue)")
+
             // Molecular surface toggle
             let surfActive = viewModel.workspace.showSurface
             Button(action: { viewModel.toggleSurface() }) {
                 Image(systemName: "drop.halffull")
                     .font(.system(size: 14))
-                    .frame(width: 34, height: 34)
+                    .frame(width: 28, height: 28)
                     .background(surfActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                     .overlay(
@@ -332,8 +435,8 @@ struct ContentView: View {
                     }
                 } label: {
                     Image(systemName: surfaceColorIcon)
-                        .font(.system(size: 14))
-                        .frame(width: 34, height: 34)
+                        .font(.system(size: 12))
+                        .frame(width: 28, height: 28)
                         .background(scmActive ? Color.yellow.opacity(0.5) : Color.white.opacity(0.05))
                         .clipShape(RoundedRectangle(cornerRadius: 7))
                         .overlay(
@@ -354,6 +457,25 @@ struct ContentView: View {
                 .frame(width: 60)
                 .controlSize(.small)
                 .help("Surface opacity: \(Int(viewModel.workspace.surfaceOpacity * 100))%")
+
+                // Probe radius control (affects channel/pocket size visibility)
+                Menu {
+                    Button("Water (1.4 Å)") { viewModel.workspace.surfaceProbeRadius = 1.4; viewModel.regenerateSurface() }
+                    Button("Small molecule (1.8 Å)") { viewModel.workspace.surfaceProbeRadius = 1.8; viewModel.regenerateSurface() }
+                    Button("Ligand access (2.2 Å)") { viewModel.workspace.surfaceProbeRadius = 2.2; viewModel.regenerateSurface() }
+                    Button("Large pocket (3.0 Å)") { viewModel.workspace.surfaceProbeRadius = 3.0; viewModel.regenerateSurface() }
+                    Divider()
+                    Button("Fine grid (0.3 Å)") { viewModel.workspace.surfaceGridSpacing = 0.3; viewModel.regenerateSurface() }
+                    Button("Normal grid (0.5 Å)") { viewModel.workspace.surfaceGridSpacing = 0.5; viewModel.regenerateSurface() }
+                    Button("Coarse grid (0.7 Å)") { viewModel.workspace.surfaceGridSpacing = 0.7; viewModel.regenerateSurface() }
+                } label: {
+                    Image(systemName: "scope")
+                        .font(.system(size: 11))
+                        .foregroundStyle(viewModel.workspace.surfaceProbeRadius != 1.4 ? .cyan : .secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 22)
+                .help("Probe: \(String(format: "%.1f", viewModel.workspace.surfaceProbeRadius)) Å, Grid: \(String(format: "%.1f", viewModel.workspace.surfaceGridSpacing)) Å")
             }
 
             // Lighting toggle
@@ -361,7 +483,7 @@ struct ContentView: View {
             Button(action: { viewModel.toggleLighting() }) {
                 Image(systemName: lightActive ? "sun.max.fill" : "sun.min")
                     .font(.system(size: 14))
-                    .frame(width: 34, height: 34)
+                    .frame(width: 28, height: 28)
                     .background(lightActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                     .overlay(
@@ -385,7 +507,7 @@ struct ContentView: View {
             }) {
                 Image(systemName: "scissors")
                     .font(.system(size: 14))
-                    .frame(width: 34, height: 34)
+                    .frame(width: 28, height: 28)
                     .background(clipActive ? Color.orange.opacity(0.5) : Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                     .overlay(
@@ -398,24 +520,24 @@ struct ContentView: View {
             .help("Z-slab clipping")
 
             if viewModel.workspace.enableClipping {
-                // Near/Far sliders
+                // Thickness / Offset sliders (object-space slab)
                 VStack(spacing: 2) {
                     Slider(value: Binding(
-                        get: { viewModel.workspace.clipNearZ },
-                        set: { viewModel.workspace.clipNearZ = $0; syncClipping() }
-                    ), in: 0...200)
+                        get: { viewModel.workspace.slabThickness },
+                        set: { viewModel.workspace.slabThickness = $0; syncClipping() }
+                    ), in: 2...40)
                     .frame(width: 90)
                     .controlSize(.small)
 
                     Slider(value: Binding(
-                        get: { viewModel.workspace.clipFarZ },
-                        set: { viewModel.workspace.clipFarZ = $0; syncClipping() }
-                    ), in: 0...200)
+                        get: { viewModel.workspace.slabOffset },
+                        set: { viewModel.workspace.slabOffset = $0; syncClipping() }
+                    ), in: -20...20)
                     .frame(width: 90)
                     .controlSize(.small)
                 }
 
-                Text(String(format: "%.0f\u{2013}%.0f \u{00C5}", viewModel.workspace.clipNearZ, viewModel.workspace.clipFarZ))
+                Text(String(format: "%.0f \u{00C5}", viewModel.workspace.slabThickness))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -441,6 +563,8 @@ struct ContentView: View {
         viewModel.renderer?.enableClipping = viewModel.workspace.enableClipping
         viewModel.renderer?.clipNearZ = viewModel.workspace.clipNearZ
         viewModel.renderer?.clipFarZ = viewModel.workspace.clipFarZ
+        viewModel.renderer?.slabHalfThickness = viewModel.workspace.slabThickness / 2.0
+        viewModel.renderer?.slabOffset = viewModel.workspace.slabOffset
     }
 
     private func badge(_ name: String, icon: String, color: Color, count: Int) -> some View {

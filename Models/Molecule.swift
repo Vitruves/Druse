@@ -149,6 +149,12 @@ final class Molecule: Identifiable {
                 let res = residues[firstRes]
                 if res.isWater { return .water }
                 if res.isStandard { return .protein }
+                // Check if this chain is nucleic acid by sampling residue names
+                let sampleSize = min(resIndices.count, 5)
+                let naCount = resIndices.prefix(sampleSize).filter { idx in
+                    ChainType.nucleicAcidResidues.contains(residues[idx].name)
+                }.count
+                if naCount > sampleSize / 2 { return .nucleicAcid }
                 if res.name.count <= 3 && atoms[res.atomIndices.first ?? 0].isHetAtom { return .ligand }
                 return .unknown
             }()

@@ -18,6 +18,8 @@ struct DruseApp: App {
                 .preferredColorScheme(selectedColorScheme)
                 .onAppear {
                     initializeRenderer()
+                    // Speed up tooltip display (default macOS delay is ~1.5 seconds)
+                    UserDefaults.standard.set(300, forKey: "NSInitialToolTipDelay")
                 }
                 .frame(minWidth: 1100, minHeight: 700)
         }
@@ -173,6 +175,16 @@ struct DruseApp: App {
             return
         }
 
+        // Apply persisted theme immediately so renderer doesn't flash dark on relaunch
+        let theme = AppTheme(rawValue: appTheme) ?? .dark
+        switch theme {
+        case .light: renderer.themeMode = 1
+        case .dark:  renderer.themeMode = 0
+        case .auto:  renderer.themeMode = (selectedColorScheme == .light) ? 1 : 0
+        }
+        renderer.backgroundOpacity = viewModel.workspace.backgroundOpacity
+        renderer.surfaceOpacity = viewModel.workspace.surfaceOpacity
+
         viewModel.renderer = renderer
         viewModel.log.success("Metal renderer initialized (\(device.name))", category: .render)
         viewModel.log.info("GPU: \(device.name), Unified Memory: \(device.hasUnifiedMemory)", category: .system)
@@ -182,5 +194,12 @@ struct DruseApp: App {
 
         // Load ML models in the background (non-blocking)
         viewModel.loadMLModels()
+
+        // Initialize GPU-accelerated xTB if available
+        if let xtbGPU = XTBMetalAccelerator() {
+            XTBMetalAccelerator.shared = xtbGPU
+            xtbGPU.installGPUContext()
+            viewModel.log.info("GFN2-xTB Metal GPU acceleration enabled", category: .system)
+        }
     }
 }
