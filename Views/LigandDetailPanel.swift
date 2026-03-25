@@ -34,12 +34,8 @@ extension LigandDatabaseWindow {
                     switch bottomTab {
                     case .properties:
                         propertiesTab(entry)
-                    case .prepare:
-                        prepareTab(entry)
-                    case .variants:
-                        variantsTab(entry)
-                    case .conformers:
-                        conformersTab(entry)
+                    case .populateAndPrepare:
+                        populateAndPrepareTab(entry)
                     }
                 }
             }
@@ -597,6 +593,161 @@ extension LigandDatabaseWindow {
                 }
             }
         }
+    }
+
+    // MARK: - Populate & Prepare Tab (unified pipeline)
+
+    @ViewBuilder
+    func populateAndPrepareTab(_ entry: LigandEntry) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Header
+            Label("Populate & Prepare", systemImage: "wand.and.stars")
+                .font(.system(size: 12, weight: .semibold))
+
+            Text("Automated pipeline: add polar H → MMFF94 minimize → Gasteiger charges → enumerate tautomers & protomers at target pH → generate conformers → filter by Boltzmann population. Output replaces the raw molecule with docking-ready ligand(s).")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
+            // Configuration
+            Label("Configuration", systemImage: "gearshape")
+                .font(.system(size: 11, weight: .medium))
+
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                GridRow {
+                    Text("Target pH").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Slider(value: $variantPH, in: 1...14, step: 0.1).controlSize(.mini)
+                    Text(String(format: "%.1f", variantPH))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 30)
+                }
+                GridRow {
+                    Text("pKa threshold").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Slider(value: $variantPkaThreshold, in: 0.5...5.0, step: 0.5).controlSize(.mini)
+                    Text(String(format: "%.1f", variantPkaThreshold))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 30)
+                }
+                GridRow {
+                    Text("Conformers/form").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Stepper("\(prepNumConformers)", value: $prepNumConformers, in: 1...100, step: 5)
+                        .controlSize(.small)
+                    Spacer()
+                }
+                GridRow {
+                    Text("Max tautomers").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Stepper("\(variantMaxTautomers)", value: $variantMaxTautomers, in: 1...50)
+                        .controlSize(.small)
+                    Spacer()
+                }
+                GridRow {
+                    Text("Max protomers").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Stepper("\(variantMaxProtomers)", value: $variantMaxProtomers, in: 1...20)
+                        .controlSize(.small)
+                    Spacer()
+                }
+                GridRow {
+                    Text("Energy cutoff").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Slider(value: $variantEnergyCutoff, in: 5...50, step: 1).controlSize(.mini)
+                    Text(String(format: "%.0f kcal", variantEnergyCutoff))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 50)
+                }
+            }
+
+            Divider()
+
+            // Run button
+            Button(action: {
+                runPopulateAndPrepare(entries: [entry])
+            }) {
+                Label(isProcessing ? "Processing..." : "Run Populate & Prepare",
+                      systemImage: "play.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(entry.smiles.isEmpty || isProcessing || entry.parentID != nil)
+
+            if isProcessing {
+                VStack(spacing: 4) {
+                    ProgressView(processingMessage)
+                        .controlSize(.small)
+                    if batchProgress.total > 0 {
+                        ProgressView(value: Double(batchProgress.current), total: Double(batchProgress.total))
+                            .controlSize(.small)
+                    }
+                }
+            }
+
+            // Results summary
+            let children = db.children(of: entry.id)
+            if entry.isPrepared || !children.isEmpty {
+                Divider()
+                Label("Output", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.green)
+
+                if entry.isPrepared {
+                    HStack(spacing: 6) {
+                        Image(systemName: "molecule").foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Input molecule → prepared ligand")
+                                .font(.system(size: 10, weight: .medium))
+                            Text("\(entry.atoms.count) atoms, \(entry.conformerCount) conformers")
+                                .font(.system(size: 9)).foregroundStyle(.secondary)
+                            if let date = entry.preparationDate {
+                                Text(date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.system(size: 8)).foregroundStyle(.tertiary)
+                            }
+                        }
+                        Spacer()
+                        Button("Use for Docking") {
+                            useEntryForDocking(entry)
+                        }
+                        .controlSize(.small)
+                        .disabled(entry.atoms.isEmpty)
+                    }
+                    .padding(8)
+                    .background(Color.green.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+
+                if !children.isEmpty {
+                    let nForms = Set(children.map(\.smiles)).count
+                    Text("\(nForms) chemical forms, \(children.count) variant entries")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+
+                    ForEach(children) { child in
+                        variantRow(child)
+                    }
+                }
+            }
+
+            // Quick prepare (simple preparation without ensemble)
+            if !entry.isPrepared {
+                Divider()
+                DisclosureGroup("Quick Prepare (single conformer, no variants)") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle("Add hydrogens", isOn: $prepAddHydrogens)
+                            .toggleStyle(.switch).controlSize(.small)
+                        Toggle("Energy minimize (MMFF94)", isOn: $prepMinimize)
+                            .toggleStyle(.switch).controlSize(.small)
+                        Toggle("Compute Gasteiger charges", isOn: $prepComputeCharges)
+                            .toggleStyle(.switch).controlSize(.small)
+                        Button("Quick Prepare") {
+                            prepareSingleEntry(entry)
+                        }
+                        .controlSize(.small)
+                        .disabled(entry.smiles.isEmpty)
+                    }
+                    .padding(.top, 4)
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
     }
 
     // MARK: - 2D Structure Drawing

@@ -22,9 +22,9 @@ Druse uses two complementary ML scoring models, each serving a distinct role in 
 
 **Pipeline position:**
 ```
-Metal GA (Vina grid scoring) → 50 diverse poses → DruseScorePKi ranks them → user sees pKd + confidence
+Metal GA (DruseAF scoring on GPU) → 50 diverse poses → user sees pKi + confidence
 ```
-The Vina grid score is fast (O(1) per atom via trilinear interpolation) and serves as the search heuristic for the genetic algorithm. DruseScorePKi is the evaluator — slower but accurate.
+DruseAF runs autonomously as the GA fitness function via Metal compute kernels (DruseAFCompute.metal). The v2 MLP encoder architecture was designed specifically for 1:1 weight compatibility with Metal inference — no Vina grid dependency.
 
 ---
 

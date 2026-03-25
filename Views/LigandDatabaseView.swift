@@ -11,18 +11,30 @@ struct LigandDatabaseView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Header
+            // Header with molecule/ligand counts
             HStack {
-                Label("Ligands", systemImage: "tray.full")
+                Label("Ligand Database", systemImage: "tray.full")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 if db.count > 0 {
-                    Text("\(db.count)")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.15))
-                        .clipShape(Capsule())
+                    let prepared = db.entries.filter(\.isPrepared).count
+                    let total = db.topLevelEntries.count
+                    HStack(spacing: 3) {
+                        Text("\(total)")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 7))
+                            .foregroundStyle(.tertiary)
+                        Text("\(prepared)")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.green)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.1))
+                    .clipShape(Capsule())
+                    .help("\(total) molecules imported, \(prepared) ligands ready for docking")
                 }
             }
 
@@ -145,7 +157,7 @@ struct LigandDatabaseView: View {
                 let unprepared = db.entries.filter { !$0.isPrepared }
 
                 if prepared.isEmpty && !unprepared.isEmpty {
-                    Text("\(unprepared.count) ligands not prepared — open Database Manager to prepare")
+                    Text("\(unprepared.count) molecules not yet prepared — open Database Manager and run Populate & Prepare")
                         .font(.system(size: 9))
                         .foregroundStyle(.orange.opacity(0.8))
                 }

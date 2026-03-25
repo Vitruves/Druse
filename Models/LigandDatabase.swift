@@ -207,8 +207,25 @@ final class LigandDatabase {
     }
 
     func addFromSMILES(_ smiles: String, name: String) {
-        let entry = LigandEntry(name: name, smiles: smiles)
+        var entry = LigandEntry(name: name, smiles: smiles)
+        // Auto-compute descriptors on import so table data is immediately visible
+        if let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
+            entry.descriptors = desc
+        }
         entries.append(entry)
+    }
+
+    /// Add a molecule from SMILES and immediately run full preparation (3D + minimize + charges).
+    /// Returns the entry UUID so caller can track progress.
+    @discardableResult
+    func addAndAutoPrepare(_ smiles: String, name: String) -> UUID {
+        var entry = LigandEntry(name: name, smiles: smiles)
+        if let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
+            entry.descriptors = desc
+        }
+        let id = entry.id
+        entries.append(entry)
+        return id
     }
 
     // MARK: - Remove

@@ -351,6 +351,47 @@ enum ScoringMethod: String, CaseIterable, Sendable {
     }
 }
 
+// MARK: - Search Method
+
+/// Which search engine to use for pose sampling during docking.
+enum SearchMethod: String, CaseIterable, Sendable {
+    case genetic          = "GA"
+    case fragmentBased    = "Fragment"
+    case diffusionGuided  = "Diffusion"
+    case parallelTempering = "Replica Exchange"
+    case auto             = "Auto"
+
+    var shortLabel: String {
+        switch self {
+        case .genetic:          "GA"
+        case .fragmentBased:    "Fragment"
+        case .diffusionGuided:  "Diffusion"
+        case .parallelTempering: "REMC"
+        case .auto:             "Auto"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .genetic:          "arrow.triangle.branch"
+        case .fragmentBased:    "puzzlepiece.extension"
+        case .diffusionGuided:  "waveform.path"
+        case .parallelTempering: "thermometer.variable"
+        case .auto:             "gearshape.2"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .genetic:          "Genetic algorithm + Metropolis ILS (default)"
+        case .fragmentBased:    "Incremental fragment construction with beam search"
+        case .diffusionGuided:  "DruseAF attention-guided reverse diffusion"
+        case .parallelTempering: "Replica exchange Monte Carlo (multiple temperatures)"
+        case .auto:             "Automatically select based on ligand flexibility"
+        }
+    }
+}
+
 // MARK: - Affinity Display Unit
 
 /// How to display binding affinity from the Druse ML scorer.

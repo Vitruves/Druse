@@ -219,6 +219,8 @@ struct StatusStripView: View {
                 Button(action: { saveProject() }) {
                     Image(systemName: "square.and.arrow.down")
                         .font(.system(size: 10))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -227,6 +229,8 @@ struct StatusStripView: View {
                 Button(action: { openProject() }) {
                     Image(systemName: "folder")
                         .font(.system(size: 10))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -242,7 +246,7 @@ struct StatusStripView: View {
                         }
                     }
                     .pickerStyle(.menu)
-                    .frame(width: 100)
+                    .frame(width: 60)
 
                     if !selectedEntryIDs.isEmpty {
                         Button(action: copySelected) {
@@ -252,6 +256,8 @@ struct StatusStripView: View {
                                 Text("\(selectedEntryIDs.count)")
                                     .font(.system(size: 9, design: .monospaced))
                             }
+                            .frame(height: 22)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
@@ -261,6 +267,8 @@ struct StatusStripView: View {
                     Button(action: copyAll) {
                         Image(systemName: "doc.on.clipboard")
                             .font(.system(size: 10))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -273,16 +281,18 @@ struct StatusStripView: View {
                     }) {
                         Image(systemName: "trash")
                             .font(.system(size: 10))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
 
                     if log.currentLogFileURL != nil {
-                        Divider().frame(height: 10)
-
                         Button(action: { log.revealLogInFinder() }) {
                             Image(systemName: "doc.text.magnifyingglass")
                                 .font(.system(size: 10))
+                                .frame(width: 22, height: 22)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
@@ -307,7 +317,27 @@ struct StatusStripView: View {
                     }
                 }
 
-                // System metrics removed (caused performance interference)
+                Divider().frame(height: 14)
+
+                // Console toggle
+                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showConsole.toggle() } }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "terminal")
+                            .font(.system(size: 10))
+                        if !showConsole {
+                            Text("Console")
+                                .font(.system(size: 10))
+                        }
+                    }
+                    .foregroundStyle(showConsole ? .primary : .tertiary)
+                    .padding(.horizontal, 6)
+                    .frame(height: 22)
+                    .background(showConsole ? Color.accentColor.opacity(0.12) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(showConsole ? "Hide console" : "Show console")
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)

@@ -1101,23 +1101,40 @@ kernel void scorePosesExplicit(
 // MARK: - Drusina Extended Scoring
 // ============================================================================
 
+/// Verdonk 2003 block/ramp function: linear interpolation between full score and zero.
+/// Returns 1.0 when |x| <= inner, ramps to 0.0 at |x| >= outer, 0 beyond.
+/// GPU-friendly (no transcendentals), smooth enough for GA search.
+inline float drusinaRamp(float x, float inner, float outer) {
+    float ax = abs(x);
+    if (ax <= inner) return 1.0f;
+    if (ax >= outer) return 0.0f;
+    return (outer - ax) / (outer - inner);
+}
+
 /// Compute Drusina correction terms:
 ///   - π-π stacking, π-cation, halogen bond, metal coordination (original)
-///   - salt bridge, amide-π stacking, chalcogen bond (extended)
+///   - salt bridge (group-based, Donald 2011), amide-π stacking, chalcogen bond (extended)
 /// Returns total correction energy (kcal/mol, negative = favorable).
+///
+/// Design principles (Verdonk 2003, Bissantz 2010, Donald 2011):
+///   - Linear ramp functions instead of steep Gaussians for smoother GA landscape
+///   - Group-based salt bridge scoring (1 contribution per charged-group pair)
+///   - Burial-weighted salt bridges (exposed contribute little, Bissantz 2010)
+///   - Corrected optimal distances from CSD/PDB statistics
 inline float computeDrusinaCorrections(
-    thread float3              *positions,
-    constant DockLigandAtom    *ligandAtoms,
-    uint                        nAtoms,
-    constant ProteinRingGPU    *proteinRings,
-    constant LigandRingGPU     *ligandRings,
-    constant float4            *proteinCations,
-    constant DrusinaParams     &params,
-    constant GridProteinAtom   *proteinAtoms,
-    uint                        numProteinAtoms,
-    constant HalogenBondInfo   *halogenInfo,
-    constant ProteinAmideGPU   *proteinAmides,
-    constant ChalcogenBondInfo *chalcogenInfo)
+    thread float3                *positions,
+    constant DockLigandAtom      *ligandAtoms,
+    uint                          nAtoms,
+    constant ProteinRingGPU      *proteinRings,
+    constant LigandRingGPU       *ligandRings,
+    constant float4              *proteinCations,
+    constant DrusinaParams       &params,
+    constant GridProteinAtom     *proteinAtoms,
+    uint                          numProteinAtoms,
+    constant HalogenBondInfo     *halogenInfo,
+    constant ProteinAmideGPU     *proteinAmides,
+    constant ChalcogenBondInfo   *chalcogenInfo,
+    constant SaltBridgeGroupGPU  *saltBridgeGroups)
 {
     float drusinaE = 0.0f;
 
@@ -1159,39 +1176,50 @@ inline float computeDrusinaCorrections(
         numValidLigRings++;
     }
 
-    // ---- π-π stacking & π-cation (ligand rings vs protein rings/cations) ----
+    // ---- π-π stacking (ligand rings vs protein rings) ----
+    // Bissantz 2010: parallel displaced 3.4-3.6 Å, T-shaped 4.5-5.5 Å
+    // Using ramp functions for smooth landscape (Verdonk 2003)
     for (uint lr = 0; lr < numValidLigRings; lr++) {
         float3 centroid = ligRingCentroid[lr];
         float3 norm = ligRingNormal[lr];
 
-        // π-π: check ligand ring vs each protein ring
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
             float d = distance(centroid, proteinRings[pr].centroid);
-            if (d < 3.3f || d > 5.5f) continue;
+            if (d < 3.2f || d > 5.8f) continue;
             float dotN = abs(dot(norm, proteinRings[pr].normal));
 
-            // Face-to-face stacking (parallel, close)
-            if (dotN > 0.85f && d < 4.2f) {
-                float dd = d - 3.7f;
-                drusinaE += params.wPiPi * exp(-dd * dd * 2.0f);
+            // Face-to-face stacking (parallel, |dotN| > 0.8)
+            // Optimal 3.5 Å (Bissantz 2010 Table 2), ramp from 3.3-4.5 Å
+            if (dotN > 0.8f) {
+                float dd = d - 3.5f;
+                drusinaE += params.wPiPi * dotN * drusinaRamp(dd, 0.3f, 1.0f);
             }
-            // Edge-to-face / T-shaped (perpendicular, moderate distance)
-            else if (dotN < 0.5f && d >= 4.0f) {
+            // Edge-to-face / T-shaped (perpendicular, |dotN| < 0.4)
+            // Optimal 4.8 Å, ramp from 4.2-5.5 Å (Bissantz 2010)
+            else if (dotN < 0.4f) {
                 float dd = d - 4.8f;
-                drusinaE += params.wPiPi * 0.7f * exp(-dd * dd * 2.0f);
+                float perpFactor = 1.0f - dotN;  // stronger when more perpendicular
+                drusinaE += params.wPiPi * 0.6f * perpFactor * drusinaRamp(dd, 0.4f, 1.0f);
             }
         }
+    }
 
-        // π-cation: ligand ring vs protein cations
+    // ---- π-cation: ligand ring vs protein cations ----
+    // Bissantz 2010: cation 3.4-4.0 Å above ring, perpendicular approach preferred
+    for (uint lr = 0; lr < numValidLigRings; lr++) {
+        float3 centroid = ligRingCentroid[lr];
+        float3 norm = ligRingNormal[lr];
+
         for (uint pc = 0; pc < params.numProteinCations; pc++) {
             float3 cPos = proteinCations[pc].xyz;
             float d = distance(centroid, cPos);
-            if (d > 6.0f) continue;
+            if (d > 5.5f) continue;
             float3 toAtom = normalize(cPos - centroid);
             float cosA = abs(dot(toAtom, norm));
+            // Require above-plane approach (cosA > 0.5 = within 60° of normal)
             if (cosA > 0.5f) {
-                float dd = d - 4.0f;
-                drusinaE += params.wPiCation * cosA * exp(-dd * dd);
+                float dd = d - 3.8f;
+                drusinaE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
             }
         }
     }
@@ -1201,68 +1229,74 @@ inline float computeDrusinaCorrections(
         if (ligandAtoms[a].formalCharge <= 0) continue;
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
             float d = distance(positions[a], proteinRings[pr].centroid);
-            if (d > 6.0f) continue;
+            if (d > 5.5f) continue;
             float3 toAtom = normalize(positions[a] - proteinRings[pr].centroid);
             float cosA = abs(dot(toAtom, proteinRings[pr].normal));
             if (cosA > 0.5f) {
-                float dd = d - 4.0f;
-                drusinaE += params.wPiCation * cosA * exp(-dd * dd);
+                float dd = d - 3.8f;
+                drusinaE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
             }
         }
     }
 
-    // ---- Salt bridge: oppositely charged ligand ↔ protein atoms ----
-    // Donald 2011: N-O pair cutoff 4 Å, optimal ρ ~3.5 Å
+    // ---- Salt bridge: group-based scoring (Donald 2011, Bissantz 2010) ----
+    // One contribution per (ligand charged atom, protein charged group) pair.
+    // Optimal N-O distance 2.8 Å (Bissantz 2010 Table 2, CSD median).
+    // Ramp: full score at 2.5-3.1 Å, fading to zero at 4.0 Å.
+    // Burial-weighted: exposed salt bridges contribute little (Bissantz 2010).
     for (uint a = 0; a < nAtoms; a++) {
         int ligCharge = ligandAtoms[a].formalCharge;
         if (ligCharge == 0) continue;
 
-        for (uint p = 0; p < numProteinAtoms; p++) {
-            uint pflags = proteinAtoms[p].flags;
-            bool protPos = (pflags & GRPROT_FLAG_POS_CHARGED) != 0;
-            bool protNeg = (pflags & GRPROT_FLAG_NEG_CHARGED) != 0;
-
+        for (uint g = 0; g < params.numSaltBridgeGroups; g++) {
             // Require opposite charges
-            bool isSB = (ligCharge > 0 && protNeg) || (ligCharge < 0 && protPos);
+            bool isSB = (ligCharge > 0 && saltBridgeGroups[g].chargeSign < 0) ||
+                        (ligCharge < 0 && saltBridgeGroups[g].chargeSign > 0);
             if (!isSB) continue;
 
-            float d = distance(positions[a], proteinAtoms[p].position);
-            if (d > 4.5f) continue;
+            float d = distance(positions[a], saltBridgeGroups[g].centroid);
+            if (d > 4.0f) continue;
 
-            // Gaussian centered at 3.5 Å (optimal salt bridge distance, Donald 2011 Fig 3)
-            float dd = d - 3.5f;
-            drusinaE += params.wSaltBridge * exp(-dd * dd * 2.0f);
+            // Ramp centered at 2.8 Å (Bissantz 2010: CSD median N-O = 2.79 Å)
+            float dd = d - 2.8f;
+            float distScore = drusinaRamp(dd, 0.3f, 1.2f);
+
+            // Burial dampening (Bissantz 2010: exposed salt bridges ≈ no free energy)
+            float burial = saltBridgeGroups[g].burialFactor;
+
+            drusinaE += params.wSaltBridge * distScore * burial;
         }
     }
 
     // ---- Amide-π stacking: protein backbone amide ↔ ligand aromatic ring ----
-    // Harder 2013: optimal d=3.4 Å interplanar, r=3.5-4.0 Å centroid, parallel (|dotN|>0.85)
-    // Energy range: -1.3 to -4.1 kcal/mol (SCS-MP2), we use correction weight
+    // Bissantz 2010: amide-aryl distance 3.2-3.7 Å between planes
+    // Harder 2013: optimal d=3.4 Å interplanar, parallel (|dotN|>0.8)
     for (uint lr = 0; lr < numValidLigRings; lr++) {
         float3 centroid = ligRingCentroid[lr];
         float3 norm = ligRingNormal[lr];
 
         for (uint am = 0; am < params.numProteinAmides; am++) {
             float d = distance(centroid, proteinAmides[am].centroid);
-            if (d < 3.0f || d > 5.0f) continue;
+            if (d < 3.0f || d > 5.2f) continue;
 
             float dotN = abs(dot(norm, proteinAmides[am].normal));
 
-            // Parallel stacking (Harder 2013 Fig 9: interplanar ≤30°, |dotN| > 0.85)
-            if (dotN > 0.85f && d < 4.5f) {
-                // Gaussian at 3.8 Å (centroid-centroid, Harder 2013 Fig 6: d_min=3.4 Å interplanar)
-                float dd = d - 3.8f;
-                drusinaE += params.wAmideStack * exp(-dd * dd * 2.0f);
+            // Parallel stacking (Harder 2013: interplanar ≤30°, |dotN| > 0.8)
+            if (dotN > 0.8f) {
+                float dd = d - 3.6f;
+                drusinaE += params.wAmideStack * dotN * drusinaRamp(dd, 0.3f, 0.9f);
             }
             // Tilted/offset stacking (weaker, broader distance range)
-            else if (dotN > 0.65f && d >= 3.5f) {
-                float dd = d - 4.2f;
-                drusinaE += params.wAmideStack * 0.5f * exp(-dd * dd * 1.5f);
+            else if (dotN > 0.6f) {
+                float dd = d - 4.0f;
+                drusinaE += params.wAmideStack * 0.4f * dotN * drusinaRamp(dd, 0.3f, 1.0f);
             }
         }
     }
 
     // ---- Halogen bonds: C-X...O/N with σ-hole angle check ----
+    // Bissantz 2010: Cl 3.0-3.4 Å, Br 3.0-3.5 Å, I 2.9-3.5 Å
+    // C-X...A angle preferred near 160-180° (sigma-hole alignment)
     for (uint h = 0; h < params.numHalogens; h++) {
         int hi = halogenInfo[h].halogenAtomIndex;
         int ci = halogenInfo[h].carbonAtomIndex;
@@ -1277,23 +1311,24 @@ inline float computeDrusinaCorrections(
             if (!isAcceptor) continue;
 
             float d = distance(halPos, proteinAtoms[p].position);
-            if (d < 2.5f || d > 3.5f) continue;
+            if (d < 2.5f || d > 3.8f) continue;
 
-            // σ-hole directionality: C-X-A angle should be > 140° (cosine < -0.766)
+            // σ-hole directionality: C-X...A angle should be > 140° (cosine < -0.766)
             float3 xToC = normalize(carPos - halPos);
             float3 xToA = normalize(proteinAtoms[p].position - halPos);
             float cosTheta = dot(xToC, xToA);
             if (cosTheta < -0.766f) {
-                float dd = d - 3.1f;
+                // Ramp centered at 3.2 Å (Bissantz 2010 median for Cl/Br)
+                float dd = d - 3.2f;
                 float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                drusinaE += params.wHalogenBond * angleFactor * exp(-dd * dd * 3.33f);
+                drusinaE += params.wHalogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.6f);
             }
         }
     }
 
     // ---- Chalcogen bonds: C-S...O/N with σ-hole angle check ----
     // Stricter than halogen: S σ-hole is weaker, angle > 150° (cos < -0.866)
-    // Distance 2.8-3.8 Å, optimal ~3.3 Å
+    // Distance 2.8-3.8 Å, optimal ~3.3 Å (Bissantz 2010)
     for (uint ch = 0; ch < params.numChalcogens; ch++) {
         int si = chalcogenInfo[ch].sulfurAtomIndex;
         int ci = chalcogenInfo[ch].carbonAtomIndex;
@@ -1317,12 +1352,14 @@ inline float computeDrusinaCorrections(
             if (cosTheta < -0.866f) {
                 float dd = d - 3.3f;
                 float angleFactor = (-cosTheta - 0.866f) / 0.134f;
-                drusinaE += params.wChalcogenBond * angleFactor * exp(-dd * dd * 2.5f);
+                drusinaE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.2f, 0.5f);
             }
         }
     }
 
     // ---- Enhanced metal coordination ----
+    // Verdonk 2003: optimal distance loosened from 2.2 to 2.6 Å for raw PDB structures.
+    // We use 2.4 Å optimal with cutoff at 3.2 Å for robustness.
     for (uint p = 0; p < numProteinAtoms; p++) {
         if (proteinAtoms[p].vinaType != VINA_MET_D) continue;
         for (uint a = 0; a < nAtoms; a++) {
@@ -1331,9 +1368,9 @@ inline float computeDrusinaCorrections(
                             lt == VINA_O_A || lt == VINA_O_DA || lt == VINA_S_P);
             if (!isCoord) continue;
             float d = distance(positions[a], proteinAtoms[p].position);
-            if (d > 3.0f) continue;
-            float dd = d - 2.1f;
-            drusinaE += params.wMetalCoord * exp(-dd * dd * 5.0f);
+            if (d > 3.2f) continue;
+            float dd = d - 2.4f;
+            drusinaE += params.wMetalCoord * drusinaRamp(dd, 0.2f, 0.8f);
         }
     }
 
@@ -1343,24 +1380,25 @@ inline float computeDrusinaCorrections(
 /// Score poses with Vina grid maps + Drusina extended interaction corrections.
 /// Used during GA when Drusina scoring is selected.
 kernel void scorePosesDrusina(
-    device DockPose            *poses         [[buffer(0)]],
-    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
-    device const half          *affinityMaps  [[buffer(2)]],
-    device const int32_t       *typeIndexLookup [[buffer(3)]],
-    constant GridParams        &gridParams    [[buffer(4)]],
-    constant GAParams          &gaParams      [[buffer(5)]],
-    constant TorsionEdge       *torsionEdges  [[buffer(6)]],
-    constant int32_t           *movingIndices [[buffer(7)]],
-    constant uint32_t          *intraPairs    [[buffer(8)]],
-    constant ProteinRingGPU    *proteinRings  [[buffer(9)]],
-    constant LigandRingGPU     *ligandRings   [[buffer(10)]],
-    constant float4            *proteinCations [[buffer(11)]],
-    constant DrusinaParams     &drusinaParams [[buffer(12)]],
-    constant GridProteinAtom   *proteinAtoms  [[buffer(13)]],
-    constant HalogenBondInfo   *halogenInfo   [[buffer(14)]],
-    constant ProteinAmideGPU   *proteinAmides [[buffer(15)]],
-    constant ChalcogenBondInfo *chalcogenInfo [[buffer(16)]],
-    uint                        tid           [[thread_position_in_grid]])
+    device DockPose              *poses           [[buffer(0)]],
+    constant DockLigandAtom      *ligandAtoms     [[buffer(1)]],
+    device const half            *affinityMaps    [[buffer(2)]],
+    device const int32_t         *typeIndexLookup [[buffer(3)]],
+    constant GridParams          &gridParams      [[buffer(4)]],
+    constant GAParams            &gaParams        [[buffer(5)]],
+    constant TorsionEdge         *torsionEdges    [[buffer(6)]],
+    constant int32_t             *movingIndices   [[buffer(7)]],
+    constant uint32_t            *intraPairs      [[buffer(8)]],
+    constant ProteinRingGPU      *proteinRings    [[buffer(9)]],
+    constant LigandRingGPU       *ligandRings     [[buffer(10)]],
+    constant float4              *proteinCations  [[buffer(11)]],
+    constant DrusinaParams       &drusinaParams   [[buffer(12)]],
+    constant GridProteinAtom     *proteinAtoms    [[buffer(13)]],
+    constant HalogenBondInfo     *halogenInfo     [[buffer(14)]],
+    constant ProteinAmideGPU     *proteinAmides   [[buffer(15)]],
+    constant ChalcogenBondInfo   *chalcogenInfo   [[buffer(16)]],
+    constant SaltBridgeGroupGPU  *saltBridgeGroups [[buffer(17)]],
+    uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
 
@@ -1397,7 +1435,7 @@ kernel void scorePosesDrusina(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
-        proteinAmides, chalcogenInfo);
+        proteinAmides, chalcogenInfo, saltBridgeGroups);
 
     pose.stericEnergy      = totalIntermolecular;
     pose.hydrophobicEnergy = 0.0f;
@@ -1410,21 +1448,22 @@ kernel void scorePosesDrusina(
 
 /// Apply Drusina corrections to already-scored poses (e.g., after explicit Vina rescoring).
 kernel void applyDrusinaCorrection(
-    device DockPose            *poses         [[buffer(0)]],
-    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
-    constant GAParams          &gaParams      [[buffer(2)]],
-    constant TorsionEdge       *torsionEdges  [[buffer(3)]],
-    constant int32_t           *movingIndices [[buffer(4)]],
-    constant ProteinRingGPU    *proteinRings  [[buffer(5)]],
-    constant LigandRingGPU     *ligandRings   [[buffer(6)]],
-    constant float4            *proteinCations [[buffer(7)]],
-    constant DrusinaParams     &drusinaParams [[buffer(8)]],
-    constant GridProteinAtom   *proteinAtoms  [[buffer(9)]],
-    constant GridParams        &gridParams    [[buffer(10)]],
-    constant HalogenBondInfo   *halogenInfo   [[buffer(11)]],
-    constant ProteinAmideGPU   *proteinAmides [[buffer(12)]],
-    constant ChalcogenBondInfo *chalcogenInfo [[buffer(13)]],
-    uint                        tid           [[thread_position_in_grid]])
+    device DockPose              *poses           [[buffer(0)]],
+    constant DockLigandAtom      *ligandAtoms     [[buffer(1)]],
+    constant GAParams            &gaParams        [[buffer(2)]],
+    constant TorsionEdge         *torsionEdges    [[buffer(3)]],
+    constant int32_t             *movingIndices   [[buffer(4)]],
+    constant ProteinRingGPU      *proteinRings    [[buffer(5)]],
+    constant LigandRingGPU       *ligandRings     [[buffer(6)]],
+    constant float4              *proteinCations  [[buffer(7)]],
+    constant DrusinaParams       &drusinaParams   [[buffer(8)]],
+    constant GridProteinAtom     *proteinAtoms    [[buffer(9)]],
+    constant GridParams          &gridParams      [[buffer(10)]],
+    constant HalogenBondInfo     *halogenInfo     [[buffer(11)]],
+    constant ProteinAmideGPU     *proteinAmides   [[buffer(12)]],
+    constant ChalcogenBondInfo   *chalcogenInfo   [[buffer(13)]],
+    constant SaltBridgeGroupGPU  *saltBridgeGroups [[buffer(14)]],
+    uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
 
@@ -1440,7 +1479,7 @@ kernel void applyDrusinaCorrection(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
-        proteinAmides, chalcogenInfo);
+        proteinAmides, chalcogenInfo, saltBridgeGroups);
 
     pose.drusinaCorrection = drusinaE;
     pose.energy += drusinaE;
@@ -2555,7 +2594,10 @@ kernel void localSearchAnalytical(
 /// SIMD-cooperative version of localSearchAnalytical.
 /// Dispatch with populationSize threadgroups of 32 threads each.
 /// Each threadgroup (= 1 SIMD group on Apple Silicon) handles one pose.
-/// Grid scoring atom loop is distributed across SIMD lanes.
+/// Rigid body transform and grid scoring distributed across SIMD lanes.
+/// Verification uses inline SIMD scoring (same FP reduction order as gradient loop)
+/// instead of sequential evaluatePoseConstrained — eliminates FP mismatch that
+/// caused false step rejections and premature convergence.
 kernel void localSearchAnalyticalSIMD(
     device DockPose            *poses         [[buffer(0)]],
     constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
@@ -2579,21 +2621,28 @@ kernel void localSearchAnalyticalSIMD(
     uint nPairs = gaParams.numIntraPairs;
     float3 gMin = gridParams.searchCenter - gridParams.searchHalfExtent;
     float3 gMax = gridParams.searchCenter + gridParams.searchHalfExtent;
+    float3 gridMin = gridParams.origin;
+    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
 
     float nRotF = float(nTor);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
 
     threadgroup float3 tg_pos[128];
     threadgroup float3 tg_forces[128];
+    threadgroup float3 tg_oldT;
+    threadgroup float4 tg_oldRot;
+    threadgroup float  tg_oldTor[32];
 
     float stepSize = 0.08f;
     int maxSteps = max(int(gaParams.localSearchSteps), 1);
 
     for (int step = 0; step < maxSteps; step++) {
-        // === Transform atoms (lane 0 — sequential torsion deps) ===
+        // === Transform atoms: rigid body parallel, torsions sequential ===
+        for (uint a = lane; a < nA; a += 32)
+            tg_pos[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         if (lane == 0) {
-            for (uint a = 0; a < nA; a++)
-                tg_pos[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
             for (uint t = 0; t < nTor; t++) {
                 float angle = pose.torsions[t];
                 if (abs(angle) < 1e-6f) continue;
@@ -2611,22 +2660,23 @@ kernel void localSearchAnalyticalSIMD(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // === Zero forces (parallel) ===
         for (uint a = lane; a < nA; a += 32) tg_forces[a] = float3(0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // === Grid scoring: distribute atoms across lanes ===
-        float laneE = 0.0f;
+        // === Grid scoring with gradient (parallel across lanes) ===
+        float laneGridE = 0.0f;
         for (uint a = lane; a < nA; a += 32) {
             float3 grad;
             float e = sampleTypedAffinityMapWithGrad(
                 affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, tg_pos[a], gridParams, grad);
-            laneE += e;
+            laneGridE += e;
             tg_forces[a] = -grad * normFactor;
         }
-        float totalIntermolecular = simd_sum(laneE);
+        float totalIntermolecular = simd_sum(laneGridE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // === Intramolecular (lane 0) ===
+        // === Intramolecular with gradient (lane 0 — force writes need sequential) ===
         float intraE = 0.0f;
         if (lane == 0 && nPairs > 0) {
             for (uint p = 0; p < nPairs; p++) {
@@ -2647,7 +2697,7 @@ kernel void localSearchAnalyticalSIMD(
 
         float totalEnergy = totalIntermolecular * normFactor + intraE - gaParams.referenceIntraEnergy;
 
-        // === Torsion gradients ===
+        // === Torsion gradients (parallel per torsion's moving atoms) ===
         float gradTor[32];
         for (uint t = 0; t < nTor; t++) {
             TorsionEdge edge = torsionEdges[t];
@@ -2665,7 +2715,7 @@ kernel void localSearchAnalyticalSIMD(
             gradTor[t] = -simd_sum(lt);
         }
 
-        // === Translation/rotation gradients ===
+        // === Translation/rotation gradients (parallel reduction) ===
         float3 lf(0), ltr(0);
         for (uint a = lane; a < nA; a += 32) {
             lf += tg_forces[a];
@@ -2678,7 +2728,6 @@ kernel void localSearchAnalyticalSIMD(
 
         // === Pharmacophore constraints (lane 0) ===
         if (pharmaParams.numConstraints > 0 && lane == 0) {
-            // Copy threadgroup positions to thread-local for constraint eval
             float3 cPos[128], cF[128];
             for (uint a = 0; a < nA; a++) { cPos[a] = tg_pos[a]; cF[a] = float3(0); }
             float cPen = evaluateConstraintPenaltyWithGrad(cPos, cF, ligandAtoms, nA, pharmaConstraints, pharmaParams);
@@ -2700,8 +2749,12 @@ kernel void localSearchAnalyticalSIMD(
 
         float scale = min(stepSize / gradMag, stepSize);
 
-        // === Apply step + verify (lane 0) ===
+        // === Apply step (lane 0 saves old pose, applies trial pose) ===
         if (lane == 0) {
+            tg_oldT = pose.translation;
+            tg_oldRot = pose.rotation;
+            for (uint t = 0; t < nTor; t++) tg_oldTor[t] = pose.torsions[t];
+
             float3 newT = pose.translation;
             for (int i = 0; i < 3; i++) newT[i] -= scale * gradT[i];
             newT = clamp(newT, gMin, gMax);
@@ -2718,24 +2771,86 @@ kernel void localSearchAnalyticalSIMD(
                     dq.w*pose.rotation.z + dq.x*pose.rotation.y - dq.y*pose.rotation.x + dq.z*pose.rotation.w,
                     dq.w*pose.rotation.w - dq.x*pose.rotation.x - dq.y*pose.rotation.y - dq.z*pose.rotation.z));
             }
-            float3 oldT = pose.translation; float4 oldRot = pose.rotation;
-            float oldTor[32]; for (uint t = 0; t < nTor; t++) oldTor[t] = pose.torsions[t];
-
             pose.translation = newT; pose.rotation = newRot;
             for (uint t = 0; t < nTor; t++) {
                 pose.torsions[t] -= scale * gradTor[t];
                 if (pose.torsions[t] > M_PI_F) pose.torsions[t] -= 2.0f * M_PI_F;
                 if (pose.torsions[t] < -M_PI_F) pose.torsions[t] += 2.0f * M_PI_F;
             }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float newE = evaluatePoseConstrained(pose, ligandAtoms, nA, nTor,
-                                       torsionEdges, movingIndices, affinityMaps, typeIndexLookup, gridParams,
-                                       gaParams.referenceIntraEnergy, intraPairs, nPairs, pharmaConstraints, pharmaParams);
+        // === SIMD-consistent verification ===
+        // Re-score trial pose using same lane distribution as gradient loop.
+        // This eliminates FP mismatch between gradient energy and verification energy
+        // that caused false step rejections with the old evaluatePoseConstrained path.
+        for (uint a = lane; a < nA; a += 32)
+            tg_pos[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            for (uint t = 0; t < nTor; t++) {
+                float angle = pose.torsions[t];
+                if (abs(angle) < 1e-6f) continue;
+                TorsionEdge edge = torsionEdges[t];
+                float3 pivot = tg_pos[edge.atom1];
+                float3 axis = normalize(tg_pos[edge.atom2] - pivot);
+                float cosA = cos(angle); float sinA = sin(angle);
+                for (int i = 0; i < edge.movingCount; i++) {
+                    int ai = movingIndices[edge.movingStart + i];
+                    if (ai < 0 || uint(ai) >= nA) continue;
+                    float3 v = tg_pos[ai] - pivot;
+                    tg_pos[ai] = pivot + v * cosA + cross(axis, v) * sinA + axis * dot(axis, v) * (1.0f - cosA);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Grid energy + boundary penalty (parallel — same lane distribution)
+        float laneNewGridE = 0.0f;
+        float lanePenalty = 0.0f;
+        for (uint a = lane; a < nA; a += 32) {
+            float oopP = outOfGridPenalty(tg_pos[a], gridMin, gridMax);
+            if (oopP > 0.0f) {
+                lanePenalty += oopP;
+            } else {
+                laneNewGridE += sampleTypedAffinityMap(
+                    affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, tg_pos[a], gridParams);
+            }
+        }
+        float newGridE = simd_sum(laneNewGridE);
+        float newPenalty = simd_sum(lanePenalty);
+
+        // Intramolecular energy (lane 0 — same order as gradient loop)
+        float newIntraE = 0.0f;
+        if (lane == 0 && nPairs > 0) {
+            for (uint p = 0; p < nPairs; p++) {
+                uint packed = intraPairs[p];
+                uint i = packed & 0xFFFFu; uint j = packed >> 16u;
+                if (i >= nA || j >= nA) continue;
+                float r = distance(tg_pos[i], tg_pos[j]);
+                newIntraE += vinaPairEnergy(ligandAtoms[i].vinaType, ligandAtoms[j].vinaType, r);
+            }
+        }
+        newIntraE = simd_broadcast_first(newIntraE);
+
+        float newE = newGridE * normFactor + wPenalty * newPenalty
+                   + newIntraE - gaParams.referenceIntraEnergy;
+
+        // Pharmacophore constraint penalty on trial pose
+        if (pharmaParams.numConstraints > 0 && lane == 0) {
+            float3 cPos[128];
+            for (uint a = 0; a < nA; a++) cPos[a] = tg_pos[a];
+            newE += evaluateConstraintPenalty(cPos, ligandAtoms, nA, pharmaConstraints, pharmaParams);
+        }
+        newE = simd_broadcast_first(newE);
+
+        // === Accept/reject ===
+        if (lane == 0) {
             if (newE < totalEnergy) {
                 pose.energy = newE; stepSize = min(stepSize * 1.2f, 0.5f);
             } else {
-                pose.translation = oldT; pose.rotation = oldRot;
-                for (uint t = 0; t < nTor; t++) pose.torsions[t] = oldTor[t];
+                pose.translation = tg_oldT; pose.rotation = tg_oldRot;
+                for (uint t = 0; t < nTor; t++) pose.torsions[t] = tg_oldTor[t];
                 pose.energy = totalEnergy; stepSize *= 0.5f;
             }
         }
@@ -2866,4 +2981,210 @@ kernel void metropolisAcceptBatched(
         }
     }
     if (accept) { cur = cand; if (cand.energy < bp.energy || !isfinite(bp.energy)) bp = cand; }
+}
+
+// ============================================================================
+// MARK: - Parallel Tempering / Replica Exchange Monte Carlo
+// ============================================================================
+
+/// Temperature-aware MC perturbation for replica exchange.
+/// Each pose belongs to a replica (replicaIdx = tid / populationPerReplica).
+/// Perturbation step sizes scale with sqrt(T/T_min) — higher T replicas explore wider.
+kernel void mcPerturbReplica(
+    device DockPose            *perturbed   [[buffer(0)]],
+    device const DockPose      *current     [[buffer(1)]],
+    constant GAParams          &gaParams    [[buffer(2)]],
+    constant GridParams        &gridParams  [[buffer(3)]],
+    constant ReplicaParams     &repParams   [[buffer(4)]],
+    uint                        tid         [[thread_position_in_grid]])
+{
+    if (tid >= repParams.totalPoses) return;
+
+    uint replicaIdx = tid / repParams.populationPerReplica;
+    float T = repParams.temperatures[min(replicaIdx, MAX_REPLICAS - 1u)];
+    float Tmin = repParams.temperatures[0];
+    float tempScale = sqrt(max(T / max(Tmin, 0.01f), 1.0f));
+
+    uint seed = tid * 314159u + repParams.swapGeneration * 271828u + replicaIdx * 999983u + 42u;
+    device const DockPose &src = current[tid];
+    device DockPose &dst = perturbed[tid];
+
+    float3 gMin = gridParams.searchCenter - gridParams.searchHalfExtent;
+    float3 gMax = gridParams.searchCenter + gridParams.searchHalfExtent;
+
+    dst = src;
+
+    uint mutableEntities = 2u + gaParams.numTorsions;
+    uint which = mutableEntities > 0u
+        ? uint(gpuRandom(seed, 0) * float(mutableEntities)) % mutableEntities
+        : 0u;
+
+    if (which == 0u) {
+        // Translation perturbation — scaled by temperature
+        float step = gaParams.translationStep * tempScale;
+        float3 delta = step * randomInsideUnitSphere(seed, 10);
+        dst.translation = clamp(src.translation + delta, gMin, gMax);
+    } else if (which == 1u) {
+        // Rotation perturbation — scaled by temperature
+        float radius = max(gaParams.ligandRadius, 1.0f);
+        float rotSpread = max(gaParams.rotationStep, gaParams.translationStep / radius) * tempScale;
+        float3 rotVec = rotSpread * randomInsideUnitSphere(seed, 20);
+        float angle = length(rotVec);
+        if (angle > 1e-6f) {
+            float3 axis = rotVec / angle;
+            float halfA = angle * 0.5f;
+            float4 dq = float4(axis * sin(halfA), cos(halfA));
+            float4 sq = src.rotation;
+            dst.rotation = normalize(float4(
+                dq.w*sq.x + dq.x*sq.w + dq.y*sq.z - dq.z*sq.y,
+                dq.w*sq.y - dq.x*sq.z + dq.y*sq.w + dq.z*sq.x,
+                dq.w*sq.z + dq.x*sq.y - dq.y*sq.x + dq.z*sq.w,
+                dq.w*sq.w - dq.x*sq.x - dq.y*sq.y - dq.z*sq.z
+            ));
+        }
+    } else {
+        // Torsion perturbation — full random resample at high T, small perturbation at low T
+        uint torsionIndex = which - 2u;
+        if (torsionIndex < gaParams.numTorsions) {
+            if (tempScale > 1.5f) {
+                // High temperature: random resample for broad exploration
+                dst.torsions[torsionIndex] = gpuRandom(seed, 30 + torsionIndex) * 2.0f * M_PI_F - M_PI_F;
+            } else {
+                // Low temperature: Gaussian-like perturbation
+                float perturbation = (gpuRandom(seed, 30 + torsionIndex) - 0.5f) * gaParams.torsionStep * tempScale;
+                float newVal = src.torsions[torsionIndex] + perturbation;
+                // Wrap to [-pi, pi]
+                newVal = newVal - 2.0f * M_PI_F * floor((newVal + M_PI_F) / (2.0f * M_PI_F));
+                dst.torsions[torsionIndex] = newVal;
+            }
+        }
+    }
+
+    dst.numTorsions = src.numTorsions;
+    dst.generation = src.generation + 1;
+    dst.energy = 1e10f;
+    dst.stericEnergy = 0.0f;
+    dst.hydrophobicEnergy = 0.0f;
+    dst.hbondEnergy = 0.0f;
+    dst.torsionPenalty = 0.0f;
+    dst.clashPenalty = 0.0f;
+}
+
+/// Temperature-aware Metropolis acceptance for replica exchange.
+/// Acceptance probability uses the replica's own temperature.
+kernel void metropolisAcceptReplica(
+    device DockPose            *current     [[buffer(0)]],
+    device const DockPose      *candidate   [[buffer(1)]],
+    device DockPose            *best        [[buffer(2)]],
+    constant GAParams          &gaParams    [[buffer(3)]],
+    constant ReplicaParams     &repParams   [[buffer(4)]],
+    uint                        tid         [[thread_position_in_grid]])
+{
+    if (tid >= repParams.totalPoses) return;
+
+    uint replicaIdx = tid / repParams.populationPerReplica;
+    float T = max(repParams.temperatures[min(replicaIdx, MAX_REPLICAS - 1u)], 1e-4f);
+
+    device DockPose &cur = current[tid];
+    device DockPose &bestPose = best[tid];
+    DockPose cand = candidate[tid];
+
+    bool candValid = isfinite(cand.energy) && cand.energy < 1e9f;
+    bool curValid = isfinite(cur.energy) && cur.energy < 1e9f;
+    bool accept = false;
+
+    if (candValid) {
+        if (!curValid || cand.energy < cur.energy) {
+            accept = true;
+        } else {
+            float acceptance = exp((cur.energy - cand.energy) / T);
+            uint seed = tid * 92837111u + repParams.swapGeneration * 689287499u + replicaIdx * 456789u + 17u;
+            accept = gpuRandom(seed, 0) < min(acceptance, 1.0f);
+        }
+    }
+
+    if (accept) {
+        cur = cand;
+    }
+
+    bool bestValid = isfinite(bestPose.energy) && bestPose.energy < 1e9f;
+    bool nowValid = isfinite(cur.energy) && cur.energy < 1e9f;
+    if (nowValid && (!bestValid || cur.energy < bestPose.energy)) {
+        bestPose = cur;
+    }
+}
+
+/// Replica exchange swap kernel.
+/// Dispatched with one thread per adjacent replica pair.
+/// Uses checkerboard pattern: even generations swap pairs (0,1),(2,3),...
+/// odd generations swap pairs (1,2),(3,4),... to avoid race conditions.
+kernel void replicaSwap(
+    device DockPose            *population  [[buffer(0)]],
+    device DockPose            *best        [[buffer(1)]],
+    constant ReplicaParams     &repParams   [[buffer(2)]],
+    uint                        tid         [[thread_position_in_grid]])
+{
+    uint numPairs = repParams.numReplicas - 1u;
+    if (tid >= numPairs) return;
+
+    // Checkerboard: even gen swaps even pairs, odd gen swaps odd pairs
+    uint parity = repParams.swapGeneration & 1u;
+    if ((tid & 1u) != parity) return;
+
+    uint replicaI = tid;
+    uint replicaJ = tid + 1u;
+
+    // Find the best (lowest energy) pose in each replica
+    uint startI = replicaI * repParams.populationPerReplica;
+    uint startJ = replicaJ * repParams.populationPerReplica;
+    uint ppReplica = repParams.populationPerReplica;
+
+    float bestEI = 1e10f;
+    uint bestIdxI = startI;
+    for (uint k = 0; k < ppReplica; k++) {
+        float e = population[startI + k].energy;
+        if (isfinite(e) && e < bestEI) {
+            bestEI = e;
+            bestIdxI = startI + k;
+        }
+    }
+
+    float bestEJ = 1e10f;
+    uint bestIdxJ = startJ;
+    for (uint k = 0; k < ppReplica; k++) {
+        float e = population[startJ + k].energy;
+        if (isfinite(e) && e < bestEJ) {
+            bestEJ = e;
+            bestIdxJ = startJ + k;
+        }
+    }
+
+    // Skip if either replica has no valid poses
+    if (!isfinite(bestEI) || !isfinite(bestEJ)) return;
+    if (bestEI >= 1e9f || bestEJ >= 1e9f) return;
+
+    float Ti = max(repParams.temperatures[replicaI], 1e-4f);
+    float Tj = max(repParams.temperatures[replicaJ], 1e-4f);
+    float betaI = 1.0f / Ti;
+    float betaJ = 1.0f / Tj;
+
+    // Metropolis swap criterion: P = min(1, exp((βi - βj)(Ei - Ej)))
+    float delta = (betaI - betaJ) * (bestEI - bestEJ);
+    float P = min(1.0f, exp(delta));
+
+    uint seed = tid * 482711u + repParams.swapGeneration * 937373u + 777u;
+    float r = gpuRandom(seed, 0);
+
+    if (r < P) {
+        // Swap entire replica populations by exchanging all poses
+        for (uint k = 0; k < ppReplica; k++) {
+            DockPose tmp = population[startI + k];
+            population[startI + k] = population[startJ + k];
+            population[startJ + k] = tmp;
+
+            DockPose tmpBest = best[startI + k];
+            best[startI + k] = best[startJ + k];
+            best[startJ + k] = tmpBest;
+        }
+    }
 }

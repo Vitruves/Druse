@@ -288,25 +288,25 @@ vertex BondVertexOut bondVertex(
     float3 upDir = cross(right, axisDir);
 
     float bondRadius = max(inst.radiusA, inst.radiusB);
-    float expand = bondRadius * 1.5;
+    // Ensure minimum expansion of 0.06 Å so thin bonds remain visible at all angles
+    float expand = max(bondRadius * 2.0, 0.06);
 
-    // 8 vertices forming a box around the cylinder
-    // vertexID 0-3: cap A, vertexID 4-7: cap B
-    float3 basePos;
-    if (vertexID < 4) {
-        basePos = viewA - axisDir * expand;
-    } else {
-        basePos = viewB + axisDir * expand;
-    }
+    // 8 vertices as interleaved strip covering the bounding box hull:
+    // Strip order: A-left-bottom, B-left-bottom, A-right-bottom, B-right-bottom,
+    //              A-right-top, B-right-top, A-left-top, B-left-top
+    // This creates 6 triangles forming a proper tube covering all side faces.
+    bool isB = (vertexID & 1) != 0;
+    int sideIdx = (int)(vertexID >> 1); // 0,1,2,3
 
-    int cornerIdx = vertexID % 4;
-    float2 offsets[4] = {
+    float2 sideOffsets[4] = {
         float2(-1.0, -1.0),
         float2( 1.0, -1.0),
-        float2(-1.0,  1.0),
-        float2( 1.0,  1.0)
+        float2( 1.0,  1.0),
+        float2(-1.0,  1.0)
     };
-    float2 off = offsets[cornerIdx];
+    float2 off = sideOffsets[sideIdx];
+
+    float3 basePos = isB ? (viewB + axisDir * expand) : (viewA - axisDir * expand);
     float3 vertexPos = basePos + right * off.x * expand + upDir * off.y * expand;
 
     BondVertexOut out;

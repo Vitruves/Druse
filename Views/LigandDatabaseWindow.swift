@@ -110,9 +110,7 @@ struct LigandDatabaseWindow: View {
     @State var bottomTab: BottomTab = .properties
     enum BottomTab: String, CaseIterable {
         case properties = "Properties"
-        case prepare = "Prepare"
-        case variants = "Variants"
-        case conformers = "Conformers"
+        case populateAndPrepare = "Populate & Prepare"
     }
 
     // 2D structure preview (RDKit-based, not 3D projection)
@@ -194,13 +192,14 @@ struct LigandDatabaseWindow: View {
 
     private var toolbar: some View {
         HStack(spacing: 8) {
-            // Add SMILES
+            // Add SMILES (adds raw molecule)
             Button(action: { showSMILESEntry.toggle() }) {
-                Label("Add SMILES", systemImage: "plus")
+                Label("Add Molecule", systemImage: "plus")
             }
             .controlSize(.small)
+            .help("Add a molecule from SMILES string")
 
-            // Import buttons
+            // Import buttons (import raw molecules)
             Menu {
                 Button("Import .smi file") { openImportWithMapping(.smi) }
                 Button("Import .csv file") { openImportWithMapping(.csv) }
@@ -209,16 +208,28 @@ struct LigandDatabaseWindow: View {
                 Label("Import", systemImage: "square.and.arrow.down")
             }
             .controlSize(.small)
+            .help("Import molecules from file")
 
             Divider().frame(height: 16)
 
-            // Bulk actions (enabled when selection exists)
-            Button(action: { prepareSelected() }) {
-                Label("Prepare", systemImage: "wand.and.stars")
+            // Populate & Prepare — the core action: protonate, minimize, charges,
+            // enumerate tautomers/protomers/conformers → produce docking-ready ligands
+            Button(action: {
+                bottomTab = .populateAndPrepare
+                if let entry = inspectedEntry {
+                    runPopulateAndPrepare(entries: [entry])
+                } else {
+                    let selected = db.entries.filter { selectedIDs.contains($0.id) }
+                    if !selected.isEmpty {
+                        runPopulateAndPrepare(entries: selected)
+                    }
+                }
+            }) {
+                Label("Populate & Prepare", systemImage: "wand.and.stars")
             }
             .controlSize(.small)
             .disabled(selectedIDs.isEmpty || isProcessing)
-            .help("Prepare selected ligands (3D + minimize + charges)")
+            .help("Full pipeline: add polar H, minimize (MMFF94), compute charges, enumerate conformers/tautomers/protomers. Produces docking-ready ligands.")
 
             Button(action: { deleteSelected() }) {
                 Label("Delete", systemImage: "trash")
@@ -226,16 +237,22 @@ struct LigandDatabaseWindow: View {
             .controlSize(.small)
             .foregroundStyle(.red)
             .disabled(selectedIDs.isEmpty)
-            .help("Delete selected ligands")
+            .help("Delete selected molecules and their variants")
 
+            Divider().frame(height: 16)
+
+            // Use for docking — only prepared ligands can be sent
             Button(action: { useSelectedForDocking() }) {
-                Label(selectedIDs.count > 1 ? "Queue \(selectedIDs.count) for Docking" : "Use for Docking",
+                let preparedCount = db.entries.filter { selectedIDs.contains($0.id) && $0.isPrepared }.count
+                Label(selectedIDs.count > 1
+                      ? "Dock \(preparedCount) Ligands"
+                      : "Use for Docking",
                       systemImage: "arrow.right.circle")
             }
             .controlSize(.small)
             .disabled(selectedIDs.isEmpty)
             .help(selectedIDs.count > 1
-                  ? "Queue \(selectedIDs.count) ligands for batch docking (launch from Docking tab)"
+                  ? "Queue prepared ligands for batch docking"
                   : "Set selected ligand as active for docking")
 
             Spacer()
@@ -251,11 +268,11 @@ struct LigandDatabaseWindow: View {
                 .controlSize(.mini)
                 .font(.system(size: 10))
 
-            // Save/Load
+            // Save/Load/Export
             Menu {
                 Button("Save Database") {
                     db.save()
-                    viewModel.log.success("Saved \(db.count) ligands", category: .molecule)
+                    viewModel.log.success("Saved \(db.count) entries", category: .molecule)
                 }
                 Button("Load Database") {
                     db.load()
@@ -705,23 +722,39 @@ struct LigandDatabaseWindow: View {
     @ViewBuilder
     private var statusBar: some View {
         let topLevel = db.topLevelEntries.count
-        let totalWithChildren = db.count
+        let prepared = db.entries.filter(\.isPrepared).count
+        let variants = db.count - topLevel
         HStack(spacing: 16) {
-            if totalWithChildren != topLevel {
-                Text("Ligands: \(topLevel) (+\(totalWithChildren - topLevel) variants)")
+            // Molecules imported → Ligands ready
+            HStack(spacing: 4) {
+                Text("\(topLevel) molecules imported")
                     .font(.system(size: 10))
-            } else {
-                Text("Total: \(topLevel)")
-                    .font(.system(size: 10))
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                Text("\(prepared) ligands ready")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.green)
             }
-            Text("Prepared: \(db.entries.filter(\.isPrepared).count)")
-                .font(.system(size: 10))
-                .foregroundStyle(.green)
+            if variants > 0 {
+                Text("(\(variants) variants)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
             Text("Selected: \(selectedIDs.count)")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.accentColor)
 
             Spacer()
+
+            if isBatchProcessing {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Processing \(batchProgress.current)/\(batchProgress.total)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             if let lig = viewModel.molecules.ligand {
                 HStack(spacing: 4) {
@@ -842,7 +875,7 @@ struct LigandDatabaseWindow: View {
         }
     }
 
-    private func deleteSelected() {
+    func deleteSelected() {
         let count = selectedIDs.count
         if let inspID = inspectedEntry?.id, selectedIDs.contains(inspID) {
             inspectedEntry = nil
@@ -855,7 +888,7 @@ struct LigandDatabaseWindow: View {
         viewModel.log.info("Deleted \(count) ligands (with children)", category: .molecule)
     }
 
-    private func useSelectedForDocking() {
+    func useSelectedForDocking() {
         let selectedEntries = db.entries.filter { selectedIDs.contains($0.id) }
         guard !selectedEntries.isEmpty else { return }
 
@@ -935,6 +968,122 @@ struct LigandDatabaseWindow: View {
         db.addFromSMILES(smiles, name: name)
         if let entry = db.entries.last, entry.smiles == smiles {
             prepareSingleEntry(entry)
+        }
+    }
+
+    // MARK: - Populate & Prepare (Unified Pipeline)
+
+    /// Full preparation pipeline for one or more entries:
+    /// 1. Add polar hydrogens
+    /// 2. MMFF94 minimization → 3D coordinates
+    /// 3. Gasteiger charge computation
+    /// 4. Enumerate tautomers and protomers at target pH
+    /// 5. Generate conformers for each chemical form
+    /// 6. Filter by Boltzmann population (configurable cutoff, default 10%)
+    /// Each produced molecule replaces/extends the original entry as a docking-ready "ligand".
+    func runPopulateAndPrepare(entries: [LigandEntry]) {
+        let toProcess = entries.filter { !$0.smiles.isEmpty || !$0.name.isEmpty }
+        guard !toProcess.isEmpty else { return }
+
+        isProcessing = true
+        isBatchProcessing = true
+        batchProgress = (0, toProcess.count)
+
+        let ph = variantPH
+        let maxTauto = variantMaxTautomers
+        let maxProto = variantMaxProtomers
+        let energyCutoff = variantEnergyCutoff
+        let confsPerForm = prepNumConformers
+        let pkaThreshold = variantPkaThreshold
+
+        Task {
+            var totalLigands = 0
+            for (i, entry) in toProcess.enumerated() {
+                batchProgress = (i + 1, toProcess.count)
+                processingMessage = "Populating \(i+1)/\(toProcess.count): \(entry.name)"
+
+                let smiles = !entry.smiles.isEmpty ? entry.smiles : entry.name
+                let name = entry.name
+
+                // Run the full ensemble preparation via RDKitBridge
+                let result = await Task.detached { @Sendable in
+                    RDKitBridge.prepareEnsemble(
+                        smiles: smiles, name: name,
+                        pH: ph,
+                        pkaThreshold: pkaThreshold,
+                        maxTautomers: maxTauto,
+                        maxProtomers: maxProto,
+                        energyCutoff: energyCutoff,
+                        conformersPerForm: confsPerForm
+                    )
+                }.value
+
+                guard !result.members.isEmpty else {
+                    viewModel.log.error("Failed to populate \(name): invalid SMILES or no viable forms", category: .molecule)
+                    continue
+                }
+
+                // Update the parent entry with the best (lowest energy) form
+                let best = result.members.min(by: { $0.mmffEnergy < $1.mmffEnergy })!
+                var updatedParent = entry
+                updatedParent.atoms = best.molecule.atoms
+                updatedParent.bonds = best.molecule.bonds
+                if !best.smiles.isEmpty { updatedParent.smiles = best.smiles }
+                updatedParent.isPrepared = true
+                updatedParent.conformerCount = result.members.filter { $0.formIndex == best.formIndex }.count
+                updatedParent.preparationDate = Date()
+                // Recompute descriptors from the prepared SMILES
+                if let desc = RDKitBridge.computeDescriptors(smiles: updatedParent.smiles) {
+                    updatedParent.descriptors = desc
+                }
+                db.update(updatedParent)
+
+                // Add all distinct forms as child variants (skip the best one already used for parent)
+                let distinctForms = Dictionary(grouping: result.members, by: { $0.formIndex })
+                db.batchMutate { entries in
+                    // Remove old children first
+                    entries.removeAll { $0.parentID == entry.id }
+
+                    for (formIdx, members) in distinctForms {
+                        guard let rep = members.first else { continue }
+                        // Skip the form already used as parent
+                        if rep.formIndex == best.formIndex && members.count == 1 { continue }
+
+                        let kind: VariantKind = rep.kind <= 1 ? .protomer : .tautomer
+                        let child = LigandEntry(
+                            name: "\(name)_\(rep.label)",
+                            smiles: rep.smiles,
+                            atoms: rep.molecule.atoms,
+                            bonds: rep.molecule.bonds,
+                            isPrepared: true,
+                            conformerCount: members.count,
+                            variantLineage: "\(rep.label) of \(name)",
+                            parentID: entry.id,
+                            variantKind: kind,
+                            relativeEnergy: Double(rep.mmffEnergy - best.mmffEnergy)
+                        )
+                        entries.append(child)
+                        totalLigands += members.count
+                    }
+                }
+                totalLigands += updatedParent.conformerCount
+                expandedEntryIDs.insert(entry.id)
+            }
+
+            isProcessing = false
+            isBatchProcessing = false
+            processingMessage = ""
+
+            // Refresh inspected entry
+            if let inspID = inspectedEntry?.id {
+                inspectedEntry = db.entries.first { $0.id == inspID }
+            }
+
+            let preparedCount = db.entries.filter(\.isPrepared).count
+            viewModel.log.success(
+                "Populate & Prepare complete: \(toProcess.count) molecules → \(preparedCount) ligands ready (\(totalLigands) total conformers)",
+                category: .molecule
+            )
         }
     }
 }

@@ -104,6 +104,9 @@ final class Renderer: NSObject {
     /// Per-chain color map for chain-colored mode (protein atoms only; ligand keeps CPK)
     var chainColorMap: [String: SIMD3<Float>] = [:]
 
+    /// Whether a ligand is currently visible (controls interaction lines and grid visibility)
+    var ligandVisible: Bool = true
+
     // Molecule data (set from AppViewModel)
     private var currentAtoms: [Atom] = []
     private var currentBonds: [Bond] = []
@@ -403,7 +406,7 @@ final class Renderer: NSObject {
         }
 
         var bondInstances: [BondInstance] = []
-        bondInstances.reserveCapacity(currentBonds.count)
+        bondInstances.reserveCapacity(currentBonds.count * 2) // headroom for double/triple bonds
 
         for bond in currentBonds {
             guard bond.atomIndex1 < currentAtoms.count,
@@ -411,7 +414,6 @@ final class Renderer: NSObject {
 
             let a1 = currentAtoms[bond.atomIndex1]
             let a2 = currentAtoms[bond.atomIndex2]
-            let r = bond.order.displayRadius * bondScale
 
             // Apply color overrides to bond half-colors
             func atomColor(_ atom: Atom) -> SIMD4<Float> {
@@ -428,14 +430,81 @@ final class Renderer: NSObject {
                 return atom.element.color
             }
 
-            bondInstances.append(BondInstance(
-                positionA: a1.position,
-                radiusA: r,
-                positionB: a2.position,
-                radiusB: r,
-                colorA: atomColor(a1),
-                colorB: atomColor(a2)
-            ))
+            let cA = atomColor(a1)
+            let cB = atomColor(a2)
+
+            switch bond.order {
+            case .single, .aromatic:
+                let r = bond.order.displayRadius * bondScale
+                bondInstances.append(BondInstance(
+                    positionA: a1.position, radiusA: r,
+                    positionB: a2.position, radiusB: r,
+                    colorA: cA, colorB: cB
+                ))
+
+            case .double:
+                // Two parallel cylinders offset perpendicular to the bond axis
+                let bondVec = a2.position - a1.position
+                let bondLen = simd_length(bondVec)
+                let r = bond.order.displayRadius * bondScale
+                guard bondLen > 0.01 else {
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position, radiusA: r,
+                        positionB: a2.position, radiusB: r,
+                        colorA: cA, colorB: cB
+                    ))
+                    continue
+                }
+                let bondDir = bondVec / bondLen
+                let ref: SIMD3<Float> = abs(bondDir.y) < 0.99
+                    ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                let perp = simd_normalize(simd_cross(bondDir, ref))
+                let separation: Float = r * 1.4  // gap between cylinder centers
+
+                for sign: Float in [-1.0, 1.0] {
+                    let off = perp * (sign * separation * 0.5)
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position + off, radiusA: r,
+                        positionB: a2.position + off, radiusB: r,
+                        colorA: cA, colorB: cB
+                    ))
+                }
+
+            case .triple:
+                // Three parallel cylinders: one centered, two offset
+                let bondVec = a2.position - a1.position
+                let bondLen = simd_length(bondVec)
+                let r = bond.order.displayRadius * bondScale
+                guard bondLen > 0.01 else {
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position, radiusA: r,
+                        positionB: a2.position, radiusB: r,
+                        colorA: cA, colorB: cB
+                    ))
+                    continue
+                }
+                let bondDir = bondVec / bondLen
+                let ref: SIMD3<Float> = abs(bondDir.y) < 0.99
+                    ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                let perp = simd_normalize(simd_cross(bondDir, ref))
+                let separation: Float = r * 1.5  // gap from center to outer cylinder
+
+                // Center cylinder
+                bondInstances.append(BondInstance(
+                    positionA: a1.position, radiusA: r,
+                    positionB: a2.position, radiusB: r,
+                    colorA: cA, colorB: cB
+                ))
+                // Two outer cylinders
+                for sign: Float in [-1.0, 1.0] {
+                    let off = perp * (sign * separation)
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position + off, radiusA: r,
+                        positionB: a2.position + off, radiusB: r,
+                        colorA: cA, colorB: cB
+                    ))
+                }
+            }
         }
 
         bondInstanceCount = bondInstances.count
@@ -605,18 +674,78 @@ final class Renderer: NSObject {
         ghostAtomBuffer?.label = "GhostAtomInstances"
 
         let bondScale = RenderMode.ballAndStick.bondRadiusScale
-        var bondInstances: [BondInstance] = bonds.compactMap { bond in
-            guard bond.atomIndex1 < atoms.count, bond.atomIndex2 < atoms.count else { return nil }
+        var bondInstances: [BondInstance] = []
+        bondInstances.reserveCapacity(bonds.count * 2)
+
+        for bond in bonds {
+            guard bond.atomIndex1 < atoms.count, bond.atomIndex2 < atoms.count else { continue }
             let a1 = atoms[bond.atomIndex1]
             let a2 = atoms[bond.atomIndex2]
             var c1 = a1.element.color; c1.w = ghostAlpha
             var c2 = a2.element.color; c2.w = ghostAlpha
             let r = bond.order.displayRadius * bondScale
-            return BondInstance(
-                positionA: a1.position, radiusA: r,
-                positionB: a2.position, radiusB: r,
-                colorA: c1, colorB: c2
-            )
+
+            switch bond.order {
+            case .single, .aromatic:
+                bondInstances.append(BondInstance(
+                    positionA: a1.position, radiusA: r,
+                    positionB: a2.position, radiusB: r,
+                    colorA: c1, colorB: c2
+                ))
+            case .double:
+                let bondVec = a2.position - a1.position
+                let bondLen = simd_length(bondVec)
+                guard bondLen > 0.01 else {
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position, radiusA: r,
+                        positionB: a2.position, radiusB: r,
+                        colorA: c1, colorB: c2
+                    ))
+                    continue
+                }
+                let bondDir = bondVec / bondLen
+                let ref: SIMD3<Float> = abs(bondDir.y) < 0.99
+                    ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                let perp = simd_normalize(simd_cross(bondDir, ref))
+                let sep: Float = r * 1.4
+                for sign: Float in [-1.0, 1.0] {
+                    let off = perp * (sign * sep * 0.5)
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position + off, radiusA: r,
+                        positionB: a2.position + off, radiusB: r,
+                        colorA: c1, colorB: c2
+                    ))
+                }
+            case .triple:
+                let bondVec = a2.position - a1.position
+                let bondLen = simd_length(bondVec)
+                guard bondLen > 0.01 else {
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position, radiusA: r,
+                        positionB: a2.position, radiusB: r,
+                        colorA: c1, colorB: c2
+                    ))
+                    continue
+                }
+                let bondDir = bondVec / bondLen
+                let ref: SIMD3<Float> = abs(bondDir.y) < 0.99
+                    ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                let perp = simd_normalize(simd_cross(bondDir, ref))
+                let sep: Float = r * 1.5
+                bondInstances.append(BondInstance(
+                    positionA: a1.position, radiusA: r,
+                    positionB: a2.position, radiusB: r,
+                    colorA: c1, colorB: c2
+                ))
+                for sign: Float in [-1.0, 1.0] {
+                    let off = perp * (sign * sep)
+                    bondInstances.append(BondInstance(
+                        positionA: a1.position + off, radiusA: r,
+                        positionB: a2.position + off, radiusB: r,
+                        colorA: c1, colorB: c2
+                    ))
+                }
+            }
         }
 
         ghostBondCount = bondInstances.count
@@ -798,7 +927,8 @@ final class Renderer: NSObject {
         }
 
         // 5. Interaction lines (dashed billboard quads, between ligand and protein atoms)
-        if interactionLineCount > 0, let lineBuf = interactionLineBuffer {
+        // Hide when ligand is hidden or ghost pose is active (during docking, ghost pose has its own update path)
+        if interactionLineCount > 0, let lineBuf = interactionLineBuffer, ligandVisible {
             encoder.setRenderPipelineState(interactionLinePipeline)
             encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(lineBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))

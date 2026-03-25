@@ -1,8 +1,12 @@
 // DruseAFCompute.metal — DruseAF neural network scoring on Metal GPU
 //
-// Implements DruseScorePKi v2 forward pass as two compute kernels:
-//   Kernel 1 (druseAFEncode): pose transform + MLP encoding → prot_h, lig_h per pose
-//   Kernel 2 (druseAFScore):  cross-attention × 2 → gated pooling → affinity/confidence heads
+// Three-kernel architecture:
+//   Kernel 0 (druseAFSetup):  ONE-TIME per dock — MLP encoding + K/V projections
+//   Kernel 1 (druseAFEncode): per-generation — ligand position transform only
+//   Kernel 2 (druseAFScore):  per-generation — cross-attention + pooling + heads
+//
+// Pre-computing protein/ligand encoding and K/V projections in the setup kernel
+// eliminates ~95% of redundant work from the per-generation kernels.
 //
 // Architecture: atom_dim=20, hidden=128, heads=4, head_dim=32, rbf=50, 2 cross-attn layers
 // Score output: docking_score = pKd × confidence (negated for GA minimization)
@@ -81,6 +85,22 @@ using namespace metal;
 #define DAF_ATOM_DIM  20
 
 // ============================================================================
+// Setup buffer layout (pre-computed once per dock, constant during GA)
+// ============================================================================
+
+#define DAF_SETUP_PROT_H  0                                                    // [P, 128]
+#define DAF_SETUP_LIG_H   (DAF_MAX_PROT * DAF_HIDDEN)                        // [L, 128]
+#define DAF_SETUP_K0      (DAF_SETUP_LIG_H + DAF_MAX_LIG * DAF_HIDDEN)       // [P, 128]
+#define DAF_SETUP_V0      (DAF_SETUP_K0 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 128]
+#define DAF_SETUP_K1      (DAF_SETUP_V0 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 128]
+#define DAF_SETUP_V1      (DAF_SETUP_K1 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 128]
+#define DAF_SETUP_FLOATS  (DAF_SETUP_V1 + DAF_MAX_PROT * DAF_HIDDEN)
+// Total: 5*256*128 + 64*128 = 171,776 floats = 671 KB
+
+// Per-pose intermediate: just transformed ligand positions
+#define DAF_POSE_LIG_POS_FLOATS (DAF_MAX_LIG * 3)  // 192 floats per pose
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -88,7 +108,6 @@ inline float silu(float x) {
     return x / (1.0f + exp(-x));
 }
 
-/// Get pointer to weight tensor by index.
 inline device const float* getWeight(
     device const float *weights,
     constant DruseAFWeightEntry *entries,
@@ -98,7 +117,6 @@ inline device const float* getWeight(
 }
 
 /// Linear layer: out[outDim] = W[outDim, inDim] @ in[inDim] + b[outDim]
-/// W is stored row-major: W[row * inDim + col]
 inline void linearLayer(
     thread float *out,
     thread const float *in_ptr,
@@ -115,8 +133,7 @@ inline void linearLayer(
     }
 }
 
-/// Linear layer overload for constant-space input (pre-computed features).
-inline void linearLayer(
+inline void linearLayerFromConst(
     thread float *out,
     constant const float *in_ptr,
     device const float *W,
@@ -132,8 +149,7 @@ inline void linearLayer(
     }
 }
 
-/// Linear layer overload for device-space input (intermediate buffers).
-inline void linearLayer(
+inline void linearLayerFromDevice(
     thread float *out,
     device const float *in_ptr,
     device const float *W,
@@ -180,7 +196,7 @@ inline float3 dafQuatRotate(float4 q, float3 v) {
     return 2.0f * dot(u, v) * u + (s * s - dot(u, u)) * v + 2.0f * s * cross(u, v);
 }
 
-/// Apply torsion rotation around axis atom1→atom2 to selected atoms.
+/// Apply torsion rotations to ligand positions.
 inline void dafApplyTorsions(
     thread float3 *pos, uint nAtoms,
     device const DockPose &pose,
@@ -210,19 +226,106 @@ inline void dafApplyTorsions(
     }
 }
 
-// ============================================================================
-// Kernel 1: Feature Extraction + MLP Encoding
-// ============================================================================
 
-// Per-pose intermediate buffer layout:
-//   prot_h:  [DAF_MAX_PROT * DAF_HIDDEN] floats
-//   lig_h:   [DAF_MAX_LIG * DAF_HIDDEN] floats
-//   lig_pos: [DAF_MAX_LIG * 3] floats
-// Total per pose: 256*128 + 64*128 + 64*3 = 41,152 floats = ~161 KB
-#define DAF_INTERMEDIATE_FLOATS_PER_POSE (DAF_MAX_PROT * DAF_HIDDEN + DAF_MAX_LIG * DAF_HIDDEN + DAF_MAX_LIG * 3)
-#define DAF_PROT_H_OFFSET 0
-#define DAF_LIG_H_OFFSET  (DAF_MAX_PROT * DAF_HIDDEN)
-#define DAF_LIG_POS_OFFSET (DAF_MAX_PROT * DAF_HIDDEN + DAF_MAX_LIG * DAF_HIDDEN)
+// ============================================================================
+// Kernel 0: ONE-TIME Setup (pre-compute encodings + K/V projections)
+// ============================================================================
+//
+// Dispatched once before the GA loop with (P + L) threads.
+// Thread 0..P-1: encode protein atom, compute K0, V0, K1, V1
+// Thread P..P+L-1: encode ligand atom
+
+kernel void druseAFSetup(
+    constant float                 *protFeatures   [[buffer(0)]],   // [P, 20]
+    constant float                 *ligFeatures    [[buffer(1)]],   // [L, 20]
+    device const float             *weights        [[buffer(2)]],
+    constant DruseAFWeightEntry    *weightEntries  [[buffer(3)]],
+    constant DruseAFParams         &afParams       [[buffer(4)]],
+    device float                   *setupBuffer    [[buffer(5)]],   // output
+    uint                            tid            [[thread_position_in_grid]])
+{
+    uint P = afParams.numProteinAtoms;
+    uint L = afParams.numLigandAtoms;
+    if (tid >= P + L) return;
+
+    bool isProtein = tid < P;
+    uint atomIdx = isProtein ? tid : (tid - P);
+
+    if (isProtein) {
+        // --- Protein atom: encode + K/V projections ---
+        constant float *feat = protFeatures + atomIdx * DAF_ATOM_DIM;
+
+        device const float *enc_w0 = getWeight(weights, weightEntries, W_PROT_ENC_0_W);
+        device const float *enc_b0 = getWeight(weights, weightEntries, W_PROT_ENC_0_B);
+        device const float *enc_w2 = getWeight(weights, weightEntries, W_PROT_ENC_2_W);
+        device const float *enc_b2 = getWeight(weights, weightEntries, W_PROT_ENC_2_B);
+
+        // MLP encode: Linear(20→128) → SiLU → Linear(128→128)
+        float h1[DAF_HIDDEN];
+        linearLayerFromConst(h1, feat, enc_w0, enc_b0, DAF_HIDDEN, DAF_ATOM_DIM);
+        for (uint i = 0; i < DAF_HIDDEN; i++) h1[i] = silu(h1[i]);
+        float h2[DAF_HIDDEN];
+        linearLayer(h2, h1, enc_w2, enc_b2, DAF_HIDDEN, DAF_HIDDEN);
+
+        // Store prot_h
+        device float *prot_h_out = setupBuffer + DAF_SETUP_PROT_H + atomIdx * DAF_HIDDEN;
+        for (uint i = 0; i < DAF_HIDDEN; i++) prot_h_out[i] = h2[i];
+
+        // K/V projections for layer 0
+        device const float *k0_w = getWeight(weights, weightEntries, W_CA0_K_W);
+        device const float *k0_b = getWeight(weights, weightEntries, W_CA0_K_B);
+        device const float *v0_w = getWeight(weights, weightEntries, W_CA0_V_W);
+        device const float *v0_b = getWeight(weights, weightEntries, W_CA0_V_B);
+
+        float k0[DAF_HIDDEN], v0[DAF_HIDDEN];
+        linearLayer(k0, h2, k0_w, k0_b, DAF_HIDDEN, DAF_HIDDEN);
+        linearLayer(v0, h2, v0_w, v0_b, DAF_HIDDEN, DAF_HIDDEN);
+
+        device float *k0_out = setupBuffer + DAF_SETUP_K0 + atomIdx * DAF_HIDDEN;
+        device float *v0_out = setupBuffer + DAF_SETUP_V0 + atomIdx * DAF_HIDDEN;
+        for (uint i = 0; i < DAF_HIDDEN; i++) { k0_out[i] = k0[i]; v0_out[i] = v0[i]; }
+
+        // K/V projections for layer 1
+        device const float *k1_w = getWeight(weights, weightEntries, W_CA1_K_W);
+        device const float *k1_b = getWeight(weights, weightEntries, W_CA1_K_B);
+        device const float *v1_w = getWeight(weights, weightEntries, W_CA1_V_W);
+        device const float *v1_b = getWeight(weights, weightEntries, W_CA1_V_B);
+
+        float k1[DAF_HIDDEN], v1[DAF_HIDDEN];
+        linearLayer(k1, h2, k1_w, k1_b, DAF_HIDDEN, DAF_HIDDEN);
+        linearLayer(v1, h2, v1_w, v1_b, DAF_HIDDEN, DAF_HIDDEN);
+
+        device float *k1_out = setupBuffer + DAF_SETUP_K1 + atomIdx * DAF_HIDDEN;
+        device float *v1_out = setupBuffer + DAF_SETUP_V1 + atomIdx * DAF_HIDDEN;
+        for (uint i = 0; i < DAF_HIDDEN; i++) { k1_out[i] = k1[i]; v1_out[i] = v1[i]; }
+
+    } else {
+        // --- Ligand atom: encode only ---
+        constant float *feat = ligFeatures + atomIdx * DAF_ATOM_DIM;
+
+        device const float *enc_w0 = getWeight(weights, weightEntries, W_LIG_ENC_0_W);
+        device const float *enc_b0 = getWeight(weights, weightEntries, W_LIG_ENC_0_B);
+        device const float *enc_w2 = getWeight(weights, weightEntries, W_LIG_ENC_2_W);
+        device const float *enc_b2 = getWeight(weights, weightEntries, W_LIG_ENC_2_B);
+
+        float h1[DAF_HIDDEN];
+        linearLayerFromConst(h1, feat, enc_w0, enc_b0, DAF_HIDDEN, DAF_ATOM_DIM);
+        for (uint i = 0; i < DAF_HIDDEN; i++) h1[i] = silu(h1[i]);
+        float h2[DAF_HIDDEN];
+        linearLayer(h2, h1, enc_w2, enc_b2, DAF_HIDDEN, DAF_HIDDEN);
+
+        device float *lig_h_out = setupBuffer + DAF_SETUP_LIG_H + atomIdx * DAF_HIDDEN;
+        for (uint i = 0; i < DAF_HIDDEN; i++) lig_h_out[i] = h2[i];
+    }
+}
+
+
+// ============================================================================
+// Kernel 1: Per-Pose Ligand Position Transform
+// ============================================================================
+//
+// Dispatched per generation with 1 thread per pose (same as Vina perturbation).
+// Transforms ligand positions and writes to per-pose intermediate buffer.
 
 kernel void druseAFEncode(
     device DockPose                *poses          [[buffer(0)]],
@@ -230,39 +333,17 @@ kernel void druseAFEncode(
     constant GAParams              &gaParams       [[buffer(2)]],
     constant TorsionEdge           *torsionEdges   [[buffer(3)]],
     constant int32_t               *movingIndices  [[buffer(4)]],
-    constant float                 *protFeatures   [[buffer(5)]],   // [P, 20] pre-computed
-    constant float                 *ligFeatures    [[buffer(6)]],   // [L, 20] pre-computed
-    constant float3                *protPositions  [[buffer(7)]],   // [P] protein pocket positions
-    device const float             *weights        [[buffer(8)]],
-    constant DruseAFWeightEntry    *weightEntries  [[buffer(9)]],
-    constant DruseAFParams         &afParams       [[buffer(10)]],
-    device float                   *intermediates  [[buffer(11)]],  // output per-pose
-    constant GridParams            &gridParams     [[buffer(12)]],
+    constant DruseAFParams         &afParams       [[buffer(5)]],
+    device float                   *intermediates  [[buffer(6)]],   // per-pose lig positions
+    constant GridParams            &gridParams     [[buffer(7)]],
     uint                            tid            [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
 
-    uint P = afParams.numProteinAtoms;
     uint L = min(gaParams.numLigandAtoms, uint(DAF_MAX_LIG));
     uint nTorsions = min(gaParams.numTorsions, 32u);
 
-    // Get per-pose output region
-    device float *myIntermediate = intermediates + tid * DAF_INTERMEDIATE_FLOATS_PER_POSE;
-    device float *prot_h = myIntermediate + DAF_PROT_H_OFFSET;
-    device float *lig_h  = myIntermediate + DAF_LIG_H_OFFSET;
-    device float *lig_pos_out = myIntermediate + DAF_LIG_POS_OFFSET;
-
-    // Weight pointers for MLP encoders
-    device const float *prot_w0 = getWeight(weights, weightEntries, W_PROT_ENC_0_W);
-    device const float *prot_b0 = getWeight(weights, weightEntries, W_PROT_ENC_0_B);
-    device const float *prot_w2 = getWeight(weights, weightEntries, W_PROT_ENC_2_W);
-    device const float *prot_b2 = getWeight(weights, weightEntries, W_PROT_ENC_2_B);
-    device const float *lig_w0  = getWeight(weights, weightEntries, W_LIG_ENC_0_W);
-    device const float *lig_b0  = getWeight(weights, weightEntries, W_LIG_ENC_0_B);
-    device const float *lig_w2  = getWeight(weights, weightEntries, W_LIG_ENC_2_W);
-    device const float *lig_b2  = getWeight(weights, weightEntries, W_LIG_ENC_2_B);
-
-    // 1. Transform ligand atoms (rigid body + torsions)
+    // Transform ligand atoms (rigid body + torsions)
     float3 ligPositions[DAF_MAX_LIG];
     device const DockPose &pose = poses[tid];
     for (uint a = 0; a < L; a++) {
@@ -270,14 +351,15 @@ kernel void druseAFEncode(
     }
     dafApplyTorsions(ligPositions, L, pose, torsionEdges, movingIndices, nTorsions);
 
-    // Write ligand positions to intermediate buffer (needed by Kernel 2 for distances)
+    // Write transformed positions to intermediate
+    device float *myPos = intermediates + tid * DAF_POSE_LIG_POS_FLOATS;
     for (uint a = 0; a < L; a++) {
-        lig_pos_out[a * 3 + 0] = ligPositions[a].x;
-        lig_pos_out[a * 3 + 1] = ligPositions[a].y;
-        lig_pos_out[a * 3 + 2] = ligPositions[a].z;
+        myPos[a * 3 + 0] = ligPositions[a].x;
+        myPos[a * 3 + 1] = ligPositions[a].y;
+        myPos[a * 3 + 2] = ligPositions[a].z;
     }
 
-    // Check out-of-grid penalty (keep poses in search volume)
+    // Out-of-grid penalty
     float3 gridMin = gridParams.origin;
     float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
     float oopTotal = 0.0f;
@@ -288,49 +370,23 @@ kernel void druseAFEncode(
         float3 d = belowMin + aboveMax;
         oopTotal += dot(d, d);
     }
-    // Store out-of-grid penalty in pose for use by Kernel 2
     poses[tid].clashPenalty = oopTotal * 10.0f;
-
-    // 2. Encode protein atoms: Linear(20→128) → SiLU → Linear(128→128)
-    for (uint p = 0; p < P; p++) {
-        constant float *feat = protFeatures + p * DAF_ATOM_DIM;
-        float h1[DAF_HIDDEN];
-        linearLayer(h1, feat, prot_w0, prot_b0, DAF_HIDDEN, DAF_ATOM_DIM);
-        for (uint i = 0; i < DAF_HIDDEN; i++) h1[i] = silu(h1[i]);
-        float h2[DAF_HIDDEN];
-        linearLayer(h2, h1, prot_w2, prot_b2, DAF_HIDDEN, DAF_HIDDEN);
-        for (uint i = 0; i < DAF_HIDDEN; i++) prot_h[p * DAF_HIDDEN + i] = h2[i];
-    }
-    // Zero-pad remaining protein slots
-    for (uint p = P; p < DAF_MAX_PROT; p++) {
-        for (uint i = 0; i < DAF_HIDDEN; i++) prot_h[p * DAF_HIDDEN + i] = 0.0f;
-    }
-
-    // 3. Encode ligand atoms: Linear(20→128) → SiLU → Linear(128→128)
-    for (uint l = 0; l < L; l++) {
-        constant float *feat = ligFeatures + l * DAF_ATOM_DIM;
-        float h1[DAF_HIDDEN];
-        linearLayer(h1, feat, lig_w0, lig_b0, DAF_HIDDEN, DAF_ATOM_DIM);
-        for (uint i = 0; i < DAF_HIDDEN; i++) h1[i] = silu(h1[i]);
-        float h2[DAF_HIDDEN];
-        linearLayer(h2, h1, lig_w2, lig_b2, DAF_HIDDEN, DAF_HIDDEN);
-        for (uint i = 0; i < DAF_HIDDEN; i++) lig_h[l * DAF_HIDDEN + i] = h2[i];
-    }
-    // Zero-pad remaining ligand slots
-    for (uint l = L; l < DAF_MAX_LIG; l++) {
-        for (uint i = 0; i < DAF_HIDDEN; i++) lig_h[l * DAF_HIDDEN + i] = 0.0f;
-    }
 }
 
 
 // ============================================================================
-// Kernel 2: Cross-Attention + Gated Pooling + Heads
+// Kernel 2: Cross-Attention + Pooling + Heads (using pre-computed K/V)
 // ============================================================================
 //
 // Each threadgroup (32 SIMD lanes) processes one pose.
-// Ligand atoms are distributed across lanes (64 atoms / 32 lanes = 2 per lane).
-// Cross-attention is computed per-ligand-atom without materializing the full
-// attention matrix — each lane handles its own ligand atoms sequentially.
+// Pre-computed K/V from setup buffer eliminates ~90% of attention computation.
+//
+// Optimizations over naive implementation:
+//   1. RBF pre-computation: compute rbf_bias[H] once per (l,p) pair, reused
+//      across heads (eliminates 75% of exp() calls)
+//   2. Online softmax: stream protein atoms without storing 256-float array
+//      (eliminates register spilling / 1KB per thread)
+//   3. Fused Q·K + RBF: single protein atom loop computes both
 
 kernel void druseAFScore(
     device DockPose                *poses          [[buffer(0)]],
@@ -338,7 +394,8 @@ kernel void druseAFScore(
     device const float             *weights        [[buffer(2)]],
     constant DruseAFWeightEntry    *weightEntries  [[buffer(3)]],
     constant DruseAFParams         &afParams       [[buffer(4)]],
-    device float                   *intermediates  [[buffer(5)]],
+    device float                   *intermediates  [[buffer(5)]],   // per-pose lig positions
+    device const float             *setupBuffer    [[buffer(6)]],   // pre-computed data
     uint                            gid            [[threadgroup_position_in_grid]],
     uint                            lid            [[thread_index_in_threadgroup]],
     uint                            simd_lane      [[thread_index_in_simdgroup]])
@@ -348,28 +405,39 @@ kernel void druseAFScore(
     uint L = afParams.numLigandAtoms;
     uint D = DAF_HIDDEN;
 
-    // Per-pose intermediate data
-    device float *myIntermediate = intermediates + poseIdx * DAF_INTERMEDIATE_FLOATS_PER_POSE;
-    device float *prot_h = myIntermediate + DAF_PROT_H_OFFSET;
-    device float *lig_h  = myIntermediate + DAF_LIG_H_OFFSET;
-    device float *lig_pos_buf = myIntermediate + DAF_LIG_POS_OFFSET;
-
-    // Read ligand positions for this pose
-    float3 ligPos[DAF_MAX_LIG];
-    for (uint a = 0; a < L; a++) {
-        ligPos[a] = float3(lig_pos_buf[a*3], lig_pos_buf[a*3+1], lig_pos_buf[a*3+2]);
+    // Read transformed ligand positions for this pose
+    device float *myPos = intermediates + poseIdx * DAF_POSE_LIG_POS_FLOATS;
+    float3 ligPos[2];
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l < L) {
+            ligPos[la] = float3(myPos[l*3], myPos[l*3+1], myPos[l*3+2]);
+        }
     }
 
-    // ---- Run 2 cross-attention layers ----
+    // Pre-computed data pointers
+    device const float *prot_h   = setupBuffer + DAF_SETUP_PROT_H;
+    device const float *lig_h    = setupBuffer + DAF_SETUP_LIG_H;
+    device const float *preK0    = setupBuffer + DAF_SETUP_K0;
+    device const float *preV0    = setupBuffer + DAF_SETUP_V0;
+    device const float *preK1    = setupBuffer + DAF_SETUP_K1;
+    device const float *preV1    = setupBuffer + DAF_SETUP_V1;
+
+    // Per-lane ligand hidden states (start from pre-computed lig_h, evolve through layers)
+    float lig_state[2][DAF_HIDDEN];
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l < L) {
+            for (uint i = 0; i < D; i++) lig_state[la][i] = lig_h[l * D + i];
+        }
+    }
+
+    // ---- Cross-attention layers ----
     for (uint layer = 0; layer < 2; layer++) {
         uint base = (layer == 0) ? W_CA0_Q_W : W_CA1_Q_W;
 
         device const float *q_w    = getWeight(weights, weightEntries, base + 0);
         device const float *q_b    = getWeight(weights, weightEntries, base + 1);
-        device const float *k_w    = getWeight(weights, weightEntries, base + 2);
-        device const float *k_b    = getWeight(weights, weightEntries, base + 3);
-        device const float *v_w    = getWeight(weights, weightEntries, base + 4);
-        device const float *v_b    = getWeight(weights, weightEntries, base + 5);
         device const float *rbf_w  = getWeight(weights, weightEntries, base + 6);
         device const float *rbf_b  = getWeight(weights, weightEntries, base + 7);
         device const float *out_w  = getWeight(weights, weightEntries, base + 8);
@@ -377,80 +445,85 @@ kernel void druseAFScore(
         device const float *norm_w = getWeight(weights, weightEntries, base + 10);
         device const float *norm_b = getWeight(weights, weightEntries, base + 11);
 
+        device const float *preK = (layer == 0) ? preK0 : preK1;
+        device const float *preV = (layer == 0) ? preV0 : preV1;
+
         float invScale = 1.0f / sqrt(float(DAF_HEAD_DIM));
 
-        // Each lane processes a subset of ligand atoms
-        // With 32 lanes and up to 64 ligand atoms: 2 atoms per lane
-        for (uint laneAtom = 0; laneAtom < 2; laneAtom++) {
-            uint l = lid * 2 + laneAtom;
+        for (uint la = 0; la < 2; la++) {
+            uint l = lid * 2 + la;
             if (l >= L) continue;
 
-            // Q projection for this ligand atom: [D] -> [D]
+            // Q projection from current lig_state
             float Q[DAF_HIDDEN];
-            device const float *lig_h_l = lig_h + l * D;
-            for (uint i = 0; i < D; i++) {
-                float sum = q_b[i];
-                for (uint j = 0; j < D; j++) sum += q_w[i * D + j] * lig_h_l[j];
-                Q[i] = sum;
+            linearLayer(Q, lig_state[la], q_w, q_b, D, D);
+
+            // === Online softmax attention (no 256-element score array) ===
+            // Track per-head: running max, sum_exp, weighted V accumulator
+            float hd_max[DAF_HEADS];
+            float hd_sum[DAF_HEADS];
+            float hd_V[DAF_HIDDEN]; // accumulated weighted V, indexed [h * HEAD_DIM + d]
+            for (uint h = 0; h < DAF_HEADS; h++) {
+                hd_max[h] = -1e9f;
+                hd_sum[h] = 0.0f;
+            }
+            for (uint i = 0; i < D; i++) hd_V[i] = 0.0f;
+
+            // Stream over protein atoms — single pass, O(1) register overhead
+            for (uint p = 0; p < P; p++) {
+                // Pre-compute RBF distance bias for ALL heads at once (amortized 50 exp())
+                float dist_lp = distance(ligPos[la], protPositions[p]);
+                float rbf_vals[DAF_RBF_BINS];
+                for (uint r = 0; r < DAF_RBF_BINS; r++) {
+                    float center = float(r) * afParams.rbfSpacing;
+                    float diff = dist_lp - center;
+                    rbf_vals[r] = exp(-afParams.rbfGamma * diff * diff);
+                }
+
+                // Per-head: Q·K + rbf_bias → online softmax update
+                for (uint h = 0; h < DAF_HEADS; h++) {
+                    // Q·K dot product
+                    float qk = 0.0f;
+                    uint hOffset = h * DAF_HEAD_DIM;
+                    device const float *Kp = preK + p * D + hOffset;
+                    for (uint d = 0; d < DAF_HEAD_DIM; d++) {
+                        qk += Q[hOffset + d] * Kp[d];
+                    }
+                    qk *= invScale;
+
+                    // RBF bias (dot product of shared rbf_vals with per-head weights)
+                    float rbf_bias = rbf_b[h];
+                    device const float *rw = rbf_w + h * DAF_RBF_BINS;
+                    for (uint r = 0; r < DAF_RBF_BINS; r++) {
+                        rbf_bias += rw[r] * rbf_vals[r];
+                    }
+
+                    float score = qk + rbf_bias;
+
+                    // Online softmax: update running max, rescale accumulated values
+                    float old_max = hd_max[h];
+                    float new_max = max(old_max, score);
+                    float exp_score = exp(score - new_max);
+                    float rescale = exp(old_max - new_max); // correction factor
+
+                    // Rescale running accumulator and add new contribution
+                    hd_sum[h] = hd_sum[h] * rescale + exp_score;
+
+                    device const float *Vp = preV + p * D + hOffset;
+                    for (uint d = 0; d < DAF_HEAD_DIM; d++) {
+                        hd_V[hOffset + d] = hd_V[hOffset + d] * rescale + exp_score * Vp[d];
+                    }
+                    hd_max[h] = new_max;
+                }
             }
 
-            // For each head, compute attention over all protein atoms
-            float attended[DAF_HIDDEN]; // output of attention for this ligand atom
-            for (uint i = 0; i < D; i++) attended[i] = 0.0f;
-
+            // Normalize V accumulators by softmax denominators
+            float attended[DAF_HIDDEN];
             for (uint h = 0; h < DAF_HEADS; h++) {
-                // Compute attention scores for this (ligand atom, head) over all protein atoms
-                float attn_scores[DAF_MAX_PROT];
-                float max_score = -1e9f;
-
-                float dist_lp = 0.0f; // will be set per protein atom
-
-                for (uint p = 0; p < P; p++) {
-                    // K projection for protein atom p, head h
-                    float kh_dot = 0.0f;
-                    for (uint d = 0; d < DAF_HEAD_DIM; d++) {
-                        uint ki = h * DAF_HEAD_DIM + d;
-                        float k_val = k_b[ki];
-                        for (uint j = 0; j < D; j++) k_val += k_w[ki * D + j] * prot_h[p * D + j];
-                        kh_dot += Q[h * DAF_HEAD_DIM + d] * k_val;
-                    }
-                    kh_dot *= invScale;
-
-                    // RBF distance bias (computed on-the-fly, no materialization)
-                    dist_lp = distance(ligPos[l], protPositions[p]);
-                    float rbf_bias = rbf_b[h];
-                    for (uint r = 0; r < DAF_RBF_BINS; r++) {
-                        float center = float(r) * afParams.rbfSpacing;
-                        float diff = dist_lp - center;
-                        float rbf_val = exp(-afParams.rbfGamma * diff * diff);
-                        rbf_bias += rbf_w[h * DAF_RBF_BINS + r] * rbf_val;
-                    }
-
-                    attn_scores[p] = kh_dot + rbf_bias;
-                    max_score = max(max_score, attn_scores[p]);
-                }
-
-                // Softmax over protein atoms
-                float sum_exp = 0.0f;
-                for (uint p = 0; p < P; p++) {
-                    attn_scores[p] = exp(attn_scores[p] - max_score);
-                    sum_exp += attn_scores[p];
-                }
-                float inv_sum = 1.0f / max(sum_exp, 1e-8f);
-                for (uint p = 0; p < P; p++) {
-                    attn_scores[p] *= inv_sum;
-                }
-
-                // Weighted sum of V projections
+                float inv_sum = 1.0f / max(hd_sum[h], 1e-8f);
+                uint hOffset = h * DAF_HEAD_DIM;
                 for (uint d = 0; d < DAF_HEAD_DIM; d++) {
-                    uint vi = h * DAF_HEAD_DIM + d;
-                    float val = 0.0f;
-                    for (uint p = 0; p < P; p++) {
-                        float v_val = v_b[vi];
-                        for (uint j = 0; j < D; j++) v_val += v_w[vi * D + j] * prot_h[p * D + j];
-                        val += attn_scores[p] * v_val;
-                    }
-                    attended[h * DAF_HEAD_DIM + d] = val;
+                    attended[hOffset + d] = hd_V[hOffset + d] * inv_sum;
                 }
             }
 
@@ -458,85 +531,68 @@ kernel void druseAFScore(
             float projected[DAF_HIDDEN];
             linearLayer(projected, attended, out_w, out_b, D, D);
 
-            // Residual connection
             float updated[DAF_HIDDEN];
-            for (uint i = 0; i < D; i++) updated[i] = lig_h_l[i] + projected[i];
-
-            // LayerNorm
+            for (uint i = 0; i < D; i++) updated[i] = lig_state[la][i] + projected[i];
             layerNorm(updated, norm_w, norm_b, D);
 
-            // Write back to lig_h for next layer
-            for (uint i = 0; i < D; i++) lig_h[l * D + i] = updated[i];
+            for (uint i = 0; i < D; i++) lig_state[la][i] = updated[i];
         }
-
-        // Sync all lanes before next cross-attention layer
-        threadgroup_barrier(mem_flags::mem_device);
     }
 
     // ---- Gated Attention Pooling ----
-    // Each lane computes gate logits for its ligand atoms, then we reduce
-
     device const float *gate_w0 = getWeight(weights, weightEntries, W_GATE_0_W);
     device const float *gate_b0 = getWeight(weights, weightEntries, W_GATE_0_B);
     device const float *gate_w2 = getWeight(weights, weightEntries, W_GATE_2_W);
     device const float *gate_b2 = getWeight(weights, weightEntries, W_GATE_2_B);
 
-    // Compute gate logits for each ligand atom
-    float gate_logits[2] = {-1e9f, -1e9f}; // for 2 atoms per lane
+    float gate_logits[2] = {-1e9f, -1e9f};
     float gate_max = -1e9f;
 
-    for (uint laneAtom = 0; laneAtom < 2; laneAtom++) {
-        uint l = lid * 2 + laneAtom;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
         if (l >= L) continue;
-        device const float *h = lig_h + l * D;
 
-        // Linear(128→64) → Tanh → Linear(64→1)
         float g1[64];
-        linearLayer(g1, h, gate_w0, gate_b0, 64, D);
+        linearLayer(g1, lig_state[la], gate_w0, gate_b0, 64, D);
         for (uint i = 0; i < 64; i++) g1[i] = tanh(g1[i]);
         float g2 = gate_b2[0];
         for (uint i = 0; i < 64; i++) g2 += gate_w2[i] * g1[i];
 
-        gate_logits[laneAtom] = g2;
+        gate_logits[la] = g2;
         gate_max = max(gate_max, g2);
     }
 
-    // Find global max for stable softmax (SIMD reduction)
     gate_max = simd_max(gate_max);
 
-    // Compute exp and partial sums
     float gate_exp[2] = {0.0f, 0.0f};
     float lane_sum = 0.0f;
-    for (uint laneAtom = 0; laneAtom < 2; laneAtom++) {
-        uint l = lid * 2 + laneAtom;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
         if (l >= L) continue;
-        gate_exp[laneAtom] = exp(gate_logits[laneAtom] - gate_max);
-        lane_sum += gate_exp[laneAtom];
+        gate_exp[la] = exp(gate_logits[la] - gate_max);
+        lane_sum += gate_exp[la];
     }
     float total_exp = simd_sum(lane_sum);
     float inv_total = 1.0f / max(total_exp, 1e-8f);
 
-    // Weighted sum: complex_repr = sum(gate_weight[l] * lig_h[l])
     float complex_repr[DAF_HIDDEN];
     for (uint i = 0; i < D; i++) complex_repr[i] = 0.0f;
 
-    for (uint laneAtom = 0; laneAtom < 2; laneAtom++) {
-        uint l = lid * 2 + laneAtom;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
         if (l >= L) continue;
-        float w = gate_exp[laneAtom] * inv_total;
-        device const float *h = lig_h + l * D;
-        for (uint i = 0; i < D; i++) complex_repr[i] += w * h[i];
+        float w = gate_exp[la] * inv_total;
+        for (uint i = 0; i < D; i++) complex_repr[i] += w * lig_state[la][i];
     }
 
-    // SIMD reduce complex_repr across all lanes
     for (uint i = 0; i < D; i++) {
         complex_repr[i] = simd_sum(complex_repr[i]);
     }
 
-    // Only lane 0 computes the final heads and writes the score
+    // Only lane 0 computes final heads
     if (simd_lane != 0) return;
 
-    // ---- Affinity Head: Linear(128→128) → SiLU → Linear(128→1) ----
+    // ---- Affinity Head ----
     device const float *aff_w0 = getWeight(weights, weightEntries, W_AFF_0_W);
     device const float *aff_b0 = getWeight(weights, weightEntries, W_AFF_0_B);
     device const float *aff_w3 = getWeight(weights, weightEntries, W_AFF_3_W);
@@ -548,7 +604,7 @@ kernel void druseAFScore(
     float pkd = aff_b3[0];
     for (uint i = 0; i < D; i++) pkd += aff_w3[i] * aff_h[i];
 
-    // ---- Confidence Head: Linear(128→64) → SiLU → Linear(64→1) → sigmoid ----
+    // ---- Confidence Head ----
     device const float *conf_w0 = getWeight(weights, weightEntries, W_CONF_0_W);
     device const float *conf_b0 = getWeight(weights, weightEntries, W_CONF_0_B);
     device const float *conf_w3 = getWeight(weights, weightEntries, W_CONF_3_W);
@@ -564,15 +620,282 @@ kernel void druseAFScore(
     // ---- Final score ----
     float docking_score = pkd * confidence;
 
-    // NaN guard
     if (isnan(docking_score) || isinf(docking_score)) {
         docking_score = 0.0f;
         pkd = 0.0f;
         confidence = 0.0f;
     }
 
-    // Write to pose (negate: GA minimizes, but higher docking_score is better)
-    float oopPenalty = poses[poseIdx].clashPenalty; // set by Kernel 1
+    float oopPenalty = poses[poseIdx].clashPenalty;
+    poses[poseIdx].energy = -docking_score + oopPenalty;
+    poses[poseIdx].stericEnergy = pkd;
+    poses[poseIdx].hydrophobicEnergy = confidence;
+    poses[poseIdx].hbondEnergy = docking_score;
+    poses[poseIdx].torsionPenalty = 0.0f;
+    poses[poseIdx].drusinaCorrection = 0.0f;
+    poses[poseIdx].constraintPenalty = 0.0f;
+}
+
+// ============================================================================
+// MARK: - DruseAF Score with Attention Gradient Output
+// ============================================================================
+//
+// Variant of druseAFScore that additionally writes per-ligand-atom attention
+// gradients (attention-weighted protein centroids) for diffusion-guided docking.
+// The attention gradient for each ligand atom is the attention-weighted average
+// of protein atom positions across all heads and layers, minus the ligand atom's
+// current position. This gives a "pull direction" toward high-affinity regions.
+
+kernel void druseAFScoreWithGradient(
+    device DockPose                *poses          [[buffer(0)]],
+    constant float3                *protPositions  [[buffer(1)]],
+    device const float             *weights        [[buffer(2)]],
+    constant DruseAFWeightEntry    *weightEntries  [[buffer(3)]],
+    constant DruseAFParams         &afParams       [[buffer(4)]],
+    device float                   *intermediates  [[buffer(5)]],
+    device const float             *setupBuffer    [[buffer(6)]],
+    device AttentionGradient       *attnGradients  [[buffer(7)]],  // [numPoses × L]
+    uint                            gid            [[threadgroup_position_in_grid]],
+    uint                            lid            [[thread_index_in_threadgroup]],
+    uint                            simd_lane      [[thread_index_in_simdgroup]])
+{
+    uint poseIdx = gid;
+    uint P = afParams.numProteinAtoms;
+    uint L = afParams.numLigandAtoms;
+    uint D = DAF_HIDDEN;
+
+    device float *myPos = intermediates + poseIdx * DAF_POSE_LIG_POS_FLOATS;
+    float3 ligPos[2];
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l < L) {
+            ligPos[la] = float3(myPos[l*3], myPos[l*3+1], myPos[l*3+2]);
+        }
+    }
+
+    device const float *prot_h   = setupBuffer + DAF_SETUP_PROT_H;
+    device const float *lig_h    = setupBuffer + DAF_SETUP_LIG_H;
+    device const float *preK0    = setupBuffer + DAF_SETUP_K0;
+    device const float *preV0    = setupBuffer + DAF_SETUP_V0;
+    device const float *preK1    = setupBuffer + DAF_SETUP_K1;
+    device const float *preV1    = setupBuffer + DAF_SETUP_V1;
+
+    float lig_state[2][DAF_HIDDEN];
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l < L) {
+            for (uint i = 0; i < D; i++) lig_state[la][i] = lig_h[l * D + i];
+        }
+    }
+
+    // Accumulate attention-weighted protein centroids per ligand atom
+    float3 attnWeightedPos[2] = {float3(0.0f), float3(0.0f)};
+    float attnWeightSum[2] = {0.0f, 0.0f};
+
+    // Cross-attention layers (same as druseAFScore + attention centroid accumulation)
+    for (uint layer = 0; layer < 2; layer++) {
+        uint base = (layer == 0) ? W_CA0_Q_W : W_CA1_Q_W;
+
+        device const float *q_w    = getWeight(weights, weightEntries, base + 0);
+        device const float *q_b    = getWeight(weights, weightEntries, base + 1);
+        device const float *rbf_w  = getWeight(weights, weightEntries, base + 6);
+        device const float *rbf_b  = getWeight(weights, weightEntries, base + 7);
+        device const float *out_w  = getWeight(weights, weightEntries, base + 8);
+        device const float *out_b  = getWeight(weights, weightEntries, base + 9);
+        device const float *norm_w = getWeight(weights, weightEntries, base + 10);
+        device const float *norm_b = getWeight(weights, weightEntries, base + 11);
+
+        device const float *preK = (layer == 0) ? preK0 : preK1;
+        device const float *preV = (layer == 0) ? preV0 : preV1;
+
+        float invScale = 1.0f / sqrt(float(DAF_HEAD_DIM));
+
+        for (uint la = 0; la < 2; la++) {
+            uint l = lid * 2 + la;
+            if (l >= L) continue;
+
+            float Q[DAF_HIDDEN];
+            linearLayer(Q, lig_state[la], q_w, q_b, D, D);
+
+            // Online softmax + centroid accumulation
+            float hd_max[DAF_HEADS];
+            float hd_sum[DAF_HEADS];
+            float hd_V[DAF_HIDDEN];
+            // Per-head centroid accumulators (for gradient output)
+            float3 hd_centroid[DAF_HEADS];
+            float hd_centroid_sum[DAF_HEADS];
+            for (uint h = 0; h < DAF_HEADS; h++) {
+                hd_max[h] = -1e9f;
+                hd_sum[h] = 0.0f;
+                hd_centroid[h] = float3(0.0f);
+                hd_centroid_sum[h] = 0.0f;
+            }
+            for (uint i = 0; i < D; i++) hd_V[i] = 0.0f;
+
+            for (uint p = 0; p < P; p++) {
+                // Pre-compute RBF once per protein atom
+                float dist_lp = distance(ligPos[la], protPositions[p]);
+                float rbf_vals[DAF_RBF_BINS];
+                for (uint r = 0; r < DAF_RBF_BINS; r++) {
+                    float center = float(r) * afParams.rbfSpacing;
+                    float diff = dist_lp - center;
+                    rbf_vals[r] = exp(-afParams.rbfGamma * diff * diff);
+                }
+
+                for (uint h = 0; h < DAF_HEADS; h++) {
+                    float qk = 0.0f;
+                    uint hOffset = h * DAF_HEAD_DIM;
+                    device const float *Kp = preK + p * D + hOffset;
+                    for (uint d = 0; d < DAF_HEAD_DIM; d++) {
+                        qk += Q[hOffset + d] * Kp[d];
+                    }
+                    qk *= invScale;
+
+                    float rbf_bias = rbf_b[h];
+                    device const float *rw = rbf_w + h * DAF_RBF_BINS;
+                    for (uint r = 0; r < DAF_RBF_BINS; r++) {
+                        rbf_bias += rw[r] * rbf_vals[r];
+                    }
+
+                    float score = qk + rbf_bias;
+                    float old_max = hd_max[h];
+                    float new_max = max(old_max, score);
+                    float exp_score = exp(score - new_max);
+                    float rescale = exp(old_max - new_max);
+
+                    hd_sum[h] = hd_sum[h] * rescale + exp_score;
+
+                    device const float *Vp = preV + p * D + hOffset;
+                    for (uint d = 0; d < DAF_HEAD_DIM; d++) {
+                        hd_V[hOffset + d] = hd_V[hOffset + d] * rescale + exp_score * Vp[d];
+                    }
+
+                    // Rescale centroid accumulator and add new contribution
+                    hd_centroid[h] = hd_centroid[h] * rescale + exp_score * protPositions[p];
+                    hd_centroid_sum[h] = hd_centroid_sum[h] * rescale + exp_score;
+
+                    hd_max[h] = new_max;
+                }
+            }
+
+            // Normalize V and accumulate attention centroids
+            float attended[DAF_HIDDEN];
+            for (uint h = 0; h < DAF_HEADS; h++) {
+                float inv_sum = 1.0f / max(hd_sum[h], 1e-8f);
+                uint hOffset = h * DAF_HEAD_DIM;
+                for (uint d = 0; d < DAF_HEAD_DIM; d++) {
+                    attended[hOffset + d] = hd_V[hOffset + d] * inv_sum;
+                }
+                // Accumulate attention centroid across heads/layers
+                if (hd_centroid_sum[h] > 1e-8f) {
+                    attnWeightedPos[la] += hd_centroid[h] / hd_centroid_sum[h];
+                    attnWeightSum[la] += 1.0f;
+                }
+            }
+
+            float projected[DAF_HIDDEN];
+            linearLayer(projected, attended, out_w, out_b, D, D);
+
+            float updated[DAF_HIDDEN];
+            for (uint i = 0; i < D; i++) updated[i] = lig_state[la][i] + projected[i];
+            layerNorm(updated, norm_w, norm_b, D);
+
+            for (uint i = 0; i < D; i++) lig_state[la][i] = updated[i];
+        }
+    }
+
+    // Write attention gradients: pull direction = attention_centroid - ligand_atom_position
+    uint gradBase = poseIdx * L;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l >= L) continue;
+
+        float3 centroid = float3(0.0f);
+        if (attnWeightSum[la] > 1e-8f) {
+            centroid = attnWeightedPos[la] / attnWeightSum[la];
+        }
+        float3 pull = centroid - ligPos[la];
+        float pullMag = length(pull);
+
+        device AttentionGradient &ag = attnGradients[gradBase + l];
+        ag.pullDirection = (pullMag > 1e-6f) ? (pull / pullMag) : float3(0.0f);
+        ag.pullMagnitude = pullMag;
+    }
+
+    // ---- Gated Attention Pooling (same as druseAFScore) ----
+    device const float *gate_w0 = getWeight(weights, weightEntries, W_GATE_0_W);
+    device const float *gate_b0 = getWeight(weights, weightEntries, W_GATE_0_B);
+    device const float *gate_w2 = getWeight(weights, weightEntries, W_GATE_2_W);
+    device const float *gate_b2 = getWeight(weights, weightEntries, W_GATE_2_B);
+
+    float gate_logits[2] = {-1e9f, -1e9f};
+    float gate_max = -1e9f;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l >= L) continue;
+        float g1[64];
+        linearLayer(g1, lig_state[la], gate_w0, gate_b0, 64, D);
+        for (uint i = 0; i < 64; i++) g1[i] = tanh(g1[i]);
+        float g2 = gate_b2[0];
+        for (uint i = 0; i < 64; i++) g2 += gate_w2[i] * g1[i];
+        gate_logits[la] = g2;
+        gate_max = max(gate_max, g2);
+    }
+    gate_max = simd_max(gate_max);
+
+    float gate_exp[2] = {0.0f, 0.0f};
+    float lane_sum = 0.0f;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l >= L) continue;
+        gate_exp[la] = exp(gate_logits[la] - gate_max);
+        lane_sum += gate_exp[la];
+    }
+    float total_exp = simd_sum(lane_sum);
+    float inv_total = 1.0f / max(total_exp, 1e-8f);
+
+    float complex_repr[DAF_HIDDEN];
+    for (uint i = 0; i < D; i++) complex_repr[i] = 0.0f;
+    for (uint la = 0; la < 2; la++) {
+        uint l = lid * 2 + la;
+        if (l >= L) continue;
+        float w = gate_exp[la] * inv_total;
+        for (uint i = 0; i < D; i++) complex_repr[i] += w * lig_state[la][i];
+    }
+    for (uint i = 0; i < D; i++) complex_repr[i] = simd_sum(complex_repr[i]);
+
+    if (simd_lane != 0) return;
+
+    // ---- Affinity + Confidence Heads ----
+    device const float *aff_w0 = getWeight(weights, weightEntries, W_AFF_0_W);
+    device const float *aff_b0 = getWeight(weights, weightEntries, W_AFF_0_B);
+    device const float *aff_w3 = getWeight(weights, weightEntries, W_AFF_3_W);
+    device const float *aff_b3 = getWeight(weights, weightEntries, W_AFF_3_B);
+
+    float aff_h[DAF_HIDDEN];
+    linearLayer(aff_h, complex_repr, aff_w0, aff_b0, D, D);
+    for (uint i = 0; i < D; i++) aff_h[i] = silu(aff_h[i]);
+    float pkd = aff_b3[0];
+    for (uint i = 0; i < D; i++) pkd += aff_w3[i] * aff_h[i];
+
+    device const float *conf_w0 = getWeight(weights, weightEntries, W_CONF_0_W);
+    device const float *conf_b0 = getWeight(weights, weightEntries, W_CONF_0_B);
+    device const float *conf_w3 = getWeight(weights, weightEntries, W_CONF_3_W);
+    device const float *conf_b3 = getWeight(weights, weightEntries, W_CONF_3_B);
+
+    float conf_h[64];
+    linearLayer(conf_h, complex_repr, conf_w0, conf_b0, 64, D);
+    for (uint i = 0; i < 64; i++) conf_h[i] = silu(conf_h[i]);
+    float conf_logit = conf_b3[0];
+    for (uint i = 0; i < 64; i++) conf_logit += conf_w3[i] * conf_h[i];
+    float confidence = 1.0f / (1.0f + exp(-conf_logit));
+
+    float docking_score = pkd * confidence;
+    if (isnan(docking_score) || isinf(docking_score)) {
+        docking_score = 0.0f; pkd = 0.0f; confidence = 0.0f;
+    }
+
+    float oopPenalty = poses[poseIdx].clashPenalty;
     poses[poseIdx].energy = -docking_score + oopPenalty;
     poses[poseIdx].stericEnergy = pkd;
     poses[poseIdx].hydrophobicEnergy = confidence;

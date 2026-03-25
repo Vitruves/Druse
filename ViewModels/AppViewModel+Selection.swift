@@ -562,7 +562,14 @@ extension AppViewModel {
 
     func fitToView() {
         guard let renderer else { return }
-        let allAtoms = (molecules.protein?.atoms ?? []) + (molecules.ligand?.atoms ?? [])
+
+        // During docking, only use protein positions (ligand is replaced by ghost pose)
+        let allAtoms: [Atom]
+        if docking.isDocking {
+            allAtoms = molecules.protein?.atoms ?? []
+        } else {
+            allAtoms = (molecules.protein?.atoms ?? []) + (molecules.ligand?.atoms ?? [])
+        }
 
         if !workspace.selectedAtomIndices.isEmpty {
             let selectedPositions = workspace.selectedAtomIndices.compactMap { idx -> SIMD3<Float>? in
@@ -579,7 +586,13 @@ extension AppViewModel {
     }
 
     func fitToLigand() {
-        guard let renderer, let lig = molecules.ligand, !lig.atoms.isEmpty else { return }
+        guard let renderer else { return }
+        // During docking, focus on the pocket center instead of the moving ligand
+        if docking.isDocking, let pocket = docking.selectedPocket {
+            renderer.fitToPositions([pocket.center])
+            return
+        }
+        guard let lig = molecules.ligand, !lig.atoms.isEmpty else { return }
         renderer.fitToPositions(lig.atoms.map(\.position))
     }
 

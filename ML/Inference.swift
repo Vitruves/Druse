@@ -26,7 +26,8 @@ struct DruseScoreFeatureExtractor {
     static let maxAtoms = 512
 
     /// Radial basis function centers for distance encoding (0-10 Å, 50 bins)
-    static let rbfCenters: [Float] = (0..<50).map { Float($0) * 0.2 }
+    /// Must match torch.linspace(0, 10, 50) — spacing is 10/49 ≈ 0.20408, NOT 10/50
+    static let rbfCenters: [Float] = (0..<50).map { Float($0) * (10.0 / 49.0) }
     static let rbfGamma: Float = 10.0 // 1/(2σ²) where σ=0.2236
 
     struct ComplexFeatures {
@@ -115,7 +116,7 @@ struct DruseScoreFeatureExtractor {
                     cpuDist[idx] = d
                     let rbfBase = idx * 50
                     for k in 0..<50 {
-                        let center = Float(k) * 0.2
+                        let center = Float(k) * (10.0 / 49.0)
                         let diff = d - center
                         cpuRBF[rbfBase + k] = exp(-rbfGamma * diff * diff)
                     }
@@ -135,11 +136,65 @@ struct DruseScoreFeatureExtractor {
         )
     }
 
+    // ── Residue-level lookup tables (must match train_druse_pKi_v2.py exactly) ──
+
+    /// Aromatic atoms per residue (training: AROMATIC_RESIDUE_ATOMS)
+    private static let aromaticResidueAtoms: [String: Set<String>] = [
+        "PHE": ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+        "TYR": ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+        "TRP": ["CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"],
+        "HIS": ["CG", "ND1", "CD2", "CE1", "NE2"],
+    ]
+
+    /// Partial charges per (residue, atom) (training: RESIDUE_ATOM_CHARGES)
+    private static let residueAtomCharges: [String: Float] = [
+        "ASP:OD1": -0.5, "ASP:OD2": -0.5,
+        "GLU:OE1": -0.5, "GLU:OE2": -0.5,
+        "LYS:NZ":   1.0,
+        "ARG:NH1":  0.33, "ARG:NH2": 0.33, "ARG:NE": 0.33,
+        "HIS:ND1":  0.25, "HIS:NE2": 0.25,
+    ]
+
+    /// H-bond donors per residue (training: HBD_RESIDUE_ATOMS)
+    private static let hbdResidueAtoms: [String: Set<String>] = [
+        "SER": ["OG"], "THR": ["OG1"], "TYR": ["OH"],
+        "ASN": ["ND2"], "GLN": ["NE2"],
+        "LYS": ["NZ"], "ARG": ["NE", "NH1", "NH2"],
+        "HIS": ["ND1", "NE2"], "TRP": ["NE1"],
+        "CYS": ["SG"],
+    ]
+
+    /// H-bond acceptors per residue (training: HBA_RESIDUE_ATOMS)
+    private static let hbaResidueAtoms: [String: Set<String>] = [
+        "ASP": ["OD1", "OD2"], "GLU": ["OE1", "OE2"],
+        "ASN": ["OD1"], "GLN": ["OE1"],
+        "SER": ["OG"], "THR": ["OG1"], "TYR": ["OH"],
+        "HIS": ["ND1", "NE2"],
+        "MET": ["SD"], "CYS": ["SG"],
+    ]
+
+    /// SP2 atoms per residue (training: SP2_RESIDUE_ATOMS)
+    private static let sp2ResidueAtoms: [String: Set<String>] = [
+        "ASP": ["CG", "OD1", "OD2"], "GLU": ["CD", "OE1", "OE2"],
+        "ASN": ["CG", "OD1", "ND2"], "GLN": ["CD", "OE1", "NE2"],
+        "ARG": ["CZ", "NH1", "NH2"],
+    ]
+
+    /// Formal charges per (residue, atom) (training: RESIDUE_FORMAL_CHARGES)
+    private static let residueFormalCharges: [String: Float] = [
+        "ASP:OD1": -1, "ASP:OD2": -1,
+        "GLU:OE1": -1, "GLU:OE2": -1,
+        "LYS:NZ":   1,
+        "ARG:NH1":  1, "ARG:NH2": 1, "ARG:NE": 1, "ARG:CZ": 1,
+        "HIS:ND1":  0, "HIS:NE2": 0,
+    ]
+
     /// Encode atom as 20-dimensional feature vector (v2).
+    /// Must exactly match pdb_atom_features() / mol2_atom_features() in train_druse_pKi_v2.py.
     static func atomFeatures(_ atom: Atom, isProtein: Bool, hybridization: Hybridization? = nil) -> [Float] {
         var features = [Float](repeating: 0, count: atomFeatureSize)
 
-        // [0-9] One-hot encode atomic number (H, C, N, O, F, P, S, Cl, Br, other)
+        // [0-9] One-hot encode element (H, C, N, O, F, P, S, Cl, Br, other)
         let atomNumBin: Int
         switch atom.element {
         case .H:                atomNumBin = 0
@@ -155,39 +210,90 @@ struct DruseScoreFeatureExtractor {
         }
         features[atomNumBin] = 1.0
 
-        // [10] Aromaticity — inferred from hybridization (sp2 on C/N = aromatic candidate)
-        let hyb = hybridization ?? .sp3
-        let isAromatic = hyb == .sp2 && (atom.element == .C || atom.element == .N)
-        features[10] = isAromatic ? 1.0 : 0.0
-
-        // [11] Partial charge
-        features[11] = atom.charge
-
-        // [12-13] H-bond donor/acceptor (simple element-based heuristic)
-        let isHBDonor = atom.element == Element.N || atom.element == Element.O
-        let isHBAcceptor = atom.element == Element.N || atom.element == Element.O || atom.element == Element.F
-        features[12] = isHBDonor ? 1.0 : 0.0
-        features[13] = isHBAcceptor ? 1.0 : 0.0
-
-        // [14-16] Hybridization one-hot: [14]=sp, [15]=sp2, [16]=sp3
-        switch hyb {
-        case .sp:  features[14] = 1.0
-        case .sp2: features[15] = 1.0
-        case .sp3: features[16] = 1.0
-        }
-
-        // [17] Is ligand flag
-        features[17] = isProtein ? 0.0 : 1.0
-
-        // [18] Formal charge (v2)
-        features[18] = Float(atom.formalCharge)
-
-        // [19] Ring membership (v2)
         if isProtein {
-            let ringAtoms = ringResidueAtoms[atom.residueName] ?? []
-            features[19] = ringAtoms.contains(atom.name) ? 1.0 : 0.0
+            // ── Protein features: residue-level lookups (match pdb_atom_features) ──
+            let res = atom.residueName
+            let name = atom.name
+
+            // [10] Aromatic — residue-specific atom set
+            let aroSet = aromaticResidueAtoms[res] ?? []
+            let isAromatic = aroSet.contains(name)
+            features[10] = isAromatic ? 1.0 : 0.0
+
+            // [11] Partial charge — residue-level fixed charges (NOT Gasteiger)
+            let key = "\(res):\(name)"
+            features[11] = residueAtomCharges[key] ?? 0.0
+
+            // [12] H-bond donor — backbone N (not PRO) + sidechain donors
+            let isBackboneHBD = (name == "N" && res != "PRO")
+            let isSidechainHBD = (hbdResidueAtoms[res] ?? []).contains(name)
+            features[12] = (isBackboneHBD || isSidechainHBD) ? 1.0 : 0.0
+
+            // [13] H-bond acceptor — backbone O + sidechain acceptors
+            let isBackboneHBA = (name == "O")
+            let isSidechainHBA = (hbaResidueAtoms[res] ?? []).contains(name)
+            features[13] = (isBackboneHBA || isSidechainHBA) ? 1.0 : 0.0
+
+            // [14-16] Hybridization
+            let isSP2 = isAromatic
+                || (sp2ResidueAtoms[res] ?? []).contains(name)
+                || (name == "C" && atom.element == .C)
+                || (name == "O" && atom.element == .O)
+            features[14] = 0.0         // sp (not assigned for protein in training)
+            features[15] = isSP2 ? 1.0 : 0.0
+            features[16] = isSP2 ? 0.0 : 1.0
+
+            // [17] Is ligand
+            features[17] = 0.0
+
+            // [18] Formal charge — residue-level (NOT atom.formalCharge)
+            features[18] = residueFormalCharges[key] ?? 0.0
+
+            // [19] Ring membership
+            let ringSet = ringResidueAtoms[res] ?? []
+            features[19] = ringSet.contains(name) ? 1.0 : 0.0
+
         } else {
-            // For ligands, use aromatic flag as proxy (matches training data)
+            // ── Ligand features: element/hybridization based (match mol2_atom_features) ──
+            let hyb = hybridization ?? .sp3
+            let isAromatic = hyb == .sp2 && (atom.element == .C || atom.element == .N)
+
+            // [10] Aromatic
+            features[10] = isAromatic ? 1.0 : 0.0
+
+            // [11] Partial charge (Gasteiger — same as MOL2 training data)
+            features[11] = atom.charge
+
+            // [12] H-bond donor — element + hybridization based
+            var isHBD = false
+            if atom.element == .N && (hyb == .sp3 || hyb == .sp2) { isHBD = true }
+            if atom.element == .O && hyb == .sp3 { isHBD = true }
+            if atom.element == .S && hyb == .sp3 { isHBD = true }
+            features[12] = isHBD ? 1.0 : 0.0
+
+            // [13] H-bond acceptor — N, O, S, F (training includes S!)
+            let isHBA = atom.element == .N || atom.element == .O
+                || atom.element == .S || atom.element == .F
+            features[13] = isHBA ? 1.0 : 0.0
+
+            // [14-16] Hybridization
+            switch hyb {
+            case .sp:  features[14] = 1.0
+            case .sp2: features[15] = 1.0
+            case .sp3: features[16] = 1.0
+            }
+
+            // [17] Is ligand
+            features[17] = 1.0
+
+            // [18] Formal charge
+            var formal: Float = 0
+            if abs(atom.charge) > 0.5 { formal = Float(Int(atom.charge.rounded())) }
+            // Quaternary nitrogen → +1
+            if atom.element == .N && hyb == .sp3 && atom.charge > 0.3 { formal = 1 }
+            features[18] = formal
+
+            // [19] Ring membership (aromatic proxy — matches training)
             features[19] = isAromatic ? 1.0 : 0.0
         }
 
@@ -1448,7 +1554,7 @@ private final class FeatureComputeAccelerator {
         let nPairs = nProt * nLig
         var protPos = protPositions
         var ligPos = ligPositions
-        var params = RBFParams(nProt: UInt32(nProt), nLig: UInt32(nLig), numBins: 50, gamma: 10.0, binSpacing: 0.2, _pad0: 0)
+        var params = RBFParams(nProt: UInt32(nProt), nLig: UInt32(nLig), numBins: 50, gamma: 10.0, binSpacing: 10.0 / 49.0, _pad0: 0)
 
         guard let protBuffer = device.makeBuffer(bytes: &protPos, length: nProt * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared),
               let ligBuffer = device.makeBuffer(bytes: &ligPos, length: nLig * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared),

@@ -42,6 +42,16 @@ class DockingTestCase: XCTestCase {
         return content
     }
 
+    // MARK: - Integration Test Guard
+
+    /// Call at the start of slow integration tests that download PDB files.
+    /// Tests are skipped unless DRUSE_INTEGRATION_TESTS=1 is set in the environment.
+    func requireIntegrationEnvironment() throws {
+        guard ProcessInfo.processInfo.environment["DRUSE_INTEGRATION_TESTS"] != nil else {
+            throw XCTSkip("Slow integration test — set DRUSE_INTEGRATION_TESTS=1 to run")
+        }
+    }
+
     // MARK: - RMSD
 
     /// RMSD between two equal-length position arrays.
@@ -84,6 +94,34 @@ class DockingTestCase: XCTestCase {
             guard let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] else { return nil }
             return Bond(id: bond.id, atomIndex1: a, atomIndex2: b, order: bond.order)
         }
+    }
+
+    // MARK: - Inline Test System (no PDB download)
+
+    /// Build a lightweight docking test system from SMILES without any network calls.
+    /// Uses alanineDipeptide as protein and generates the ligand from SMILES via RDKit.
+    /// Returns everything needed for runTestDocking().
+    @MainActor
+    func inlineTestSystem(
+        ligandSmiles: String,
+        ligandName: String = "TestLig"
+    ) throws -> (engine: DockingEngine, protein: Molecule, ligand: Molecule, pocket: BindingPocket) {
+        let engine = try sharedDockingEngine()
+        let protein = TestMolecules.alanineDipeptide()
+        engine.setProtein(protein.atoms, protein.bonds)
+
+        let (molData, err) = RDKitBridge.smilesToMolecule(
+            smiles: ligandSmiles, name: ligandName, numConformers: 1, minimize: true)
+        if let err = err { throw XCTSkip("RDKit error: \(err)") }
+        guard let md = molData else { throw XCTSkip("RDKit unavailable") }
+        let ligand = Molecule(name: md.name, atoms: md.atoms, bonds: md.bonds, title: ligandName)
+
+        let pocket = BindingPocket(
+            id: 0, center: SIMD3<Float>(0, 0, 0), size: SIMD3<Float>(repeating: 8),
+            volume: 200, buriedness: 0.5, polarity: 0.5, druggability: 1.0,
+            residueIndices: Array(0..<protein.residues.count), probePositions: []
+        )
+        return (engine, protein, ligand, pocket)
     }
 
     // MARK: - Ligand Atom Type Debug
@@ -220,6 +258,7 @@ class DockingTestCase: XCTestCase {
         id: String,
         ligandResidue: String? = nil
     ) async throws -> (protein: Molecule, ligand: Molecule, crystalHeavyPositions: [SIMD3<Float>]) {
+        try requireIntegrationEnvironment()
         print("  [\(id)] Fetching PDB from RCSB...")
         let pdbContent = try await cachedPDBContent(id: id)
         print("  [\(id)] PDB content: \(pdbContent.count) chars")

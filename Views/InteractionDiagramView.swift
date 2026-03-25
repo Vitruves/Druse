@@ -47,7 +47,7 @@ struct InteractionDiagramView: View {
             Divider()
             legend
         }
-        .frame(minWidth: 900, minHeight: 700)
+        .frame(minWidth: 1000, minHeight: 750)
         .task {
             if let smiles = ligandSmiles, !smiles.isEmpty {
                 let result = await Task.detached {
@@ -215,39 +215,42 @@ struct InteractionDiagramView: View {
         let presentTypes = Set(interactions.map(\.type))
         let types = MolecularInteraction.InteractionType.allCases.filter { presentTypes.contains($0) }
 
-        return HStack(spacing: 0) {
-            // Interaction type legend
-            HStack(spacing: 14) {
-                ForEach(types, id: \.rawValue) { type in
-                    let count = interactions.filter { $0.type == type }.count
-                    HStack(spacing: 4) {
-                        interactionSymbol(type)
-                            .frame(width: 24, height: 14)
-                        Text("\(type.label) (\(count))")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
+        return VStack(spacing: 6) {
+            // Top row: Interaction type legend (wraps if needed)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(types, id: \.rawValue) { type in
+                        let count = interactions.filter { $0.type == type }.count
+                        HStack(spacing: 4) {
+                            interactionSymbol(type)
+                                .frame(width: 24, height: 14)
+                            Text("\(type.label) (\(count))")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
+                        }
                     }
                 }
             }
 
-            Spacer()
+            // Bottom row: Residue types + total count
+            HStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    residueLegendDot("polar", Color(red: 0.2, green: 0.6, blue: 0.7))
+                    residueLegendDot("acidic", Color(red: 0.8, green: 0.2, blue: 0.2))
+                    residueLegendDot("basic", Color(red: 0.3, green: 0.3, blue: 0.9))
+                    residueLegendDot("greasy", Color(red: 0.4, green: 0.6, blue: 0.3))
+                }
 
-            // Residue type legend (MOE-style)
-            HStack(spacing: 10) {
-                residueLegendDot("polar", Color(red: 0.2, green: 0.6, blue: 0.7))
-                residueLegendDot("acidic", Color(red: 0.8, green: 0.2, blue: 0.2))
-                residueLegendDot("basic", Color(red: 0.3, green: 0.3, blue: 0.9))
-                residueLegendDot("greasy", Color(red: 0.4, green: 0.6, blue: 0.3))
+                Spacer()
+
+                Text("\(interactions.count) interactions")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
             }
-
-            Spacer()
-
-            Text("\(interactions.count) interactions")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
     }
 
     @ViewBuilder
@@ -398,14 +401,66 @@ struct InteractionDiagramView: View {
 
         // 5. Draw interaction lines and residue bubbles
         for (key, residueCenter, ixns) in residuePlacements {
-            for ixn in ixns {
+            // Separate hydrophobic from directional interactions
+            let hydrophobic = ixns.filter { $0.type == .hydrophobic }
+            let directional = ixns.filter { $0.type != .hydrophobic }
+
+            // Draw hydrophobic contacts as a single proximity arc between the ligand
+            // region and the residue bubble
+            if !hydrophobic.isEmpty {
+                // Compute average ligand contact position for this hydrophobic residue
+                var sumX: CGFloat = 0, sumY: CGFloat = 0, cnt: CGFloat = 0
+                for ixn in hydrophobic {
+                    let ligIdx = ixn.ligandAtomIndex
+                    guard ligIdx < positions.count else { continue }
+                    let p = project(positions[ligIdx])
+                    sumX += p.x; sumY += p.y; cnt += 1
+                }
+                if cnt > 0 {
+                    let avgLig = CGPoint(x: sumX / cnt, y: sumY / cnt)
+                    let dx = residueCenter.x - avgLig.x
+                    let dy = residueCenter.y - avgLig.y
+                    let len = sqrt(dx * dx + dy * dy)
+                    let nx = -dy / max(len, 1) * 18
+                    let ny = dx / max(len, 1) * 18
+
+                    // Draw proximity arc (curved line from ligand zone to residue)
+                    let fromPt = CGPoint(x: avgLig.x, y: avgLig.y)
+                    let toPt = shorten(from: fromPt, to: residueCenter, fromInset: 8, toInset: 45)
+                    let mid = CGPoint(x: (toPt.0.x + toPt.1.x) / 2 + nx,
+                                      y: (toPt.0.y + toPt.1.y) / 2 + ny)
+                    var arcPath = Path()
+                    arcPath.move(to: toPt.0)
+                    arcPath.addQuadCurve(to: toPt.1, control: mid)
+                    let arcColor = interactionColor(.hydrophobic)
+                    context.stroke(arcPath, with: .color(arcColor),
+                                   style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+
+                    // Small "hydrophobic zone" arc near the ligand contact point
+                    let arcR: CGFloat = 10
+                    let arcRect = CGRect(x: avgLig.x - arcR, y: avgLig.y - arcR,
+                                         width: arcR * 2, height: arcR * 2)
+                    let contactAngle = atan2(residueCenter.y - avgLig.y, residueCenter.x - avgLig.x)
+                    var zonePath = Path()
+                    zonePath.addArc(center: avgLig, radius: arcR,
+                                    startAngle: .radians(contactAngle - 0.6),
+                                    endAngle: .radians(contactAngle + 0.6),
+                                    clockwise: false)
+                    context.stroke(zonePath, with: .color(arcColor.opacity(0.5)),
+                                   style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                }
+            }
+
+            // Draw directional interactions as individual lines
+            for ixn in directional {
                 let ligIdx = ixn.ligandAtomIndex
                 guard ligIdx < positions.count else { continue }
                 let ligPos = project(positions[ligIdx])
-                let toResidue = shorten(from: ligPos, to: residueCenter, fromInset: 8, toInset: 42)
+                let toResidue = shorten(from: ligPos, to: residueCenter, fromInset: 8, toInset: 45)
                 drawInteractionLine(context: context, from: toResidue.0, to: toResidue.1,
                                     type: ixn.type, distance: ixn.distance)
             }
+
             drawResidueBubble(context: context, at: residueCenter, key: key, interactions: ixns)
         }
     }
@@ -609,9 +664,16 @@ struct InteractionDiagramView: View {
         let dominantType = dominantInteractionType(interactions)
         let (fillColor, borderColor) = residuePropertyColors(key.name)
 
+        // Find the interacting atom name(s) on the protein side
+        let atomNames = Set(interactions.compactMap { ixn -> String? in
+            guard ixn.proteinAtomIndex < proteinAtoms.count else { return nil }
+            return proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
+        })
+        let atomLabel = atomNames.prefix(2).joined(separator: ",")
+
         let labelStr = key.label
-        let bubbleW: CGFloat = max(72, CGFloat(labelStr.count) * 9 + 24)
-        let bubbleH: CGFloat = 40
+        let bubbleW: CGFloat = max(80, CGFloat(labelStr.count) * 9 + 28)
+        let bubbleH: CGFloat = atomLabel.isEmpty ? 40 : 50
 
         let rect = CGRect(x: center.x - bubbleW / 2, y: center.y - bubbleH / 2,
                           width: bubbleW, height: bubbleH)
@@ -625,16 +687,18 @@ struct InteractionDiagramView: View {
         context.stroke(Path(roundedRect: rect, cornerRadius: 8), with: .color(borderColor), lineWidth: 2)
 
         // Residue name
+        let yOffset: CGFloat = atomLabel.isEmpty ? -4 : -9
         let resLabel = Text(key.label)
             .font(.system(size: 13, weight: .bold))
             .foregroundColor(.primary)
-        context.draw(context.resolve(resLabel), at: CGPoint(x: center.x, y: center.y - 4), anchor: .center)
+        context.draw(context.resolve(resLabel), at: CGPoint(x: center.x, y: center.y + yOffset), anchor: .center)
 
-        // Interaction type
-        let typeLabel = Text(dominantType.label)
+        // Interaction type + interacting atom name
+        let typeStr = atomLabel.isEmpty ? dominantType.label : "\(dominantType.label) (\(atomLabel))"
+        let typeLabel = Text(typeStr)
             .font(.system(size: 8, weight: .medium))
             .foregroundColor(borderColor)
-        context.draw(context.resolve(typeLabel), at: CGPoint(x: center.x, y: center.y + 12), anchor: .center)
+        context.draw(context.resolve(typeLabel), at: CGPoint(x: center.x, y: center.y + yOffset + 16), anchor: .center)
     }
 
     /// MOE-style: color by amino acid chemical property.

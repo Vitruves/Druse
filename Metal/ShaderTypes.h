@@ -336,23 +336,34 @@ struct ProteinAmideGPU {
     float       _pad1;
 };
 
+// Protein charged group for group-based salt bridge scoring (Donald 2011, Bissantz 2010)
+// One entry per functional group: Arg guanidinium, Lys NH3+, His+ imidazolium, Asp/Glu carboxylate
+struct SaltBridgeGroupGPU {
+    simd_float3 centroid;       // geometric center of charged atoms
+    int32_t     chargeSign;     // +1 or -1
+    float       burialFactor;   // 0.0 (exposed) to 1.0 (buried), from neighbor count proxy
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
+};
+
 // Drusina scoring parameters
 struct DrusinaParams {
     uint32_t    numProteinRings;
     uint32_t    numLigandRings;
     uint32_t    numProteinCations;
     uint32_t    numHalogens;
-    float       wPiPi;           // π-π stacking weight (default: -0.40)
-    float       wPiCation;       // π-cation weight (default: -0.80)
-    float       wHalogenBond;    // halogen bond weight (default: -0.50)
-    float       wMetalCoord;     // metal coordination weight (default: -1.00)
+    float       wPiPi;           // π-π stacking weight
+    float       wPiCation;       // π-cation weight
+    float       wHalogenBond;    // halogen bond weight
+    float       wMetalCoord;     // metal coordination weight
     // Extended interactions (salt bridge, amide-π, chalcogen bond)
     uint32_t    numProteinAmides;
     uint32_t    numChalcogens;
-    float       wSaltBridge;     // salt bridge weight (default: -0.60)
-    float       wAmideStack;     // amide-π stacking weight (default: -0.40)
-    float       wChalcogenBond;  // chalcogen bond weight (default: -0.30)
-    float       _pad;
+    float       wSaltBridge;     // salt bridge weight (per charged-group pair, not per-atom)
+    float       wAmideStack;     // amide-π stacking weight
+    float       wChalcogenBond;  // chalcogen bond weight
+    uint32_t    numSaltBridgeGroups; // number of protein charged groups
 };
 
 // ============================================================================
@@ -368,7 +379,7 @@ struct DruseAFParams {
     uint32_t    headDim;           // 32 (hiddenDim / numHeads)
     uint32_t    rbfBins;           // 50
     float       rbfGamma;          // 10.0
-    float       rbfSpacing;        // 0.2 (10.0 / 50)
+    float       rbfSpacing;        // 10.0 / 49.0 (matches torch.linspace(0, 10, 50))
     uint32_t    numCrossAttnLayers; // 2
     uint32_t    numWeightTensors;  // 48
     uint32_t    _pad0;
@@ -379,6 +390,96 @@ struct DruseAFParams {
 struct DruseAFWeightEntry {
     uint32_t    offset;    // float offset into weight buffer
     uint32_t    count;     // number of float elements
+};
+
+// ============================================================================
+// Parallel Tempering / Replica Exchange types
+// ============================================================================
+
+#define MAX_REPLICAS 16u
+
+struct ReplicaParams {
+    uint32_t    numReplicas;            // K temperature replicas (max 16)
+    uint32_t    populationPerReplica;   // poses per replica
+    uint32_t    totalPoses;             // numReplicas * populationPerReplica
+    uint32_t    swapGeneration;         // current generation (for swap timing)
+    float       temperatures[MAX_REPLICAS]; // T_1 < T_2 < ... < T_K (kcal/mol)
+};
+
+// ============================================================================
+// Fragment-Based Docking types
+// ============================================================================
+
+#define MAX_FRAGMENT_ATOMS  64u
+#define MAX_FRAGMENTS       16u
+#define MAX_BEAM_WIDTH     256u
+
+// One atom within a rigid fragment
+struct FragmentAtom {
+    simd_float3 position;       // position relative to fragment centroid
+    float       vdwRadius;
+    float       charge;
+    int32_t     vinaType;       // VinaAtomType enum
+    int32_t     globalAtomIndex; // index in full ligand DockLigandAtom array
+    float       _pad0;
+};
+
+// Definition of one rigid fragment in the decomposition
+struct FragmentDef {
+    uint32_t    atomStart;          // offset into FragmentAtom array
+    uint32_t    atomCount;          // number of atoms in this fragment
+    uint32_t    connectingTorsionIdx; // torsion edge index connecting to parent (-1 for anchor)
+    int32_t     parentFragmentIdx;  // -1 for anchor fragment
+    simd_float3 centroid;           // fragment centroid in ligand frame
+    float       _pad0;
+};
+
+// A candidate placement for a fragment (beam search node)
+struct FragmentPlacement {
+    simd_float3 translation;        // world-space translation
+    float       energy;             // cumulative partial energy
+    simd_float4 rotation;           // quaternion for anchor; identity for grown fragments
+    float       connectingTorsion;  // torsion angle at connecting bond
+    int32_t     parentPlacementIdx; // index of parent in previous beam (-1 for anchor)
+    int32_t     fragmentIdx;        // which fragment this placement is for
+    int32_t     valid;              // 1 if this placement is active, 0 if pruned
+};
+
+// Parameters for fragment docking GPU kernels
+struct FragmentSearchParams {
+    uint32_t    numFragments;
+    uint32_t    beamWidth;          // max surviving placements per level
+    uint32_t    currentFragment;    // which fragment we're placing (0 = anchor)
+    uint32_t    numPlacements;      // current number of active placements
+    uint32_t    numAnchorSamples;   // initial anchor samples
+    uint32_t    torsionSamples;     // torsion angle subdivisions per growth step
+    float       pruneThreshold;     // kcal/mol above best for pruning
+    uint32_t    numLigandAtoms;     // total atoms in full ligand
+};
+
+// ============================================================================
+// Diffusion-Guided Docking types
+// ============================================================================
+
+struct DiffusionParams {
+    uint32_t    numPoses;           // number of parallel diffusion trajectories
+    uint32_t    currentStep;        // reverse diffusion step (T → 0)
+    uint32_t    totalSteps;         // total denoising steps
+    float       noiseScale;         // sigma_t for current step
+    float       guidanceScale;      // DruseAF attention gradient multiplier
+    uint32_t    numLigandAtoms;
+    uint32_t    numTorsions;
+    float       translationNoise;   // noise magnitude for translation
+    float       rotationNoise;      // noise magnitude for rotation
+    float       torsionNoise;       // noise magnitude for torsions
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+};
+
+// Per-ligand-atom attention gradient from DruseAF (output of druseAFScoreWithGradient)
+struct AttentionGradient {
+    simd_float3 pullDirection;      // attention-weighted protein centroid minus ligand atom pos
+    float       pullMagnitude;      // norm of raw attention-weighted pull
 };
 
 // ============================================================================
@@ -502,7 +603,7 @@ struct RBFParams {
     uint32_t nLig;
     uint32_t numBins;       // 50
     float    gamma;         // 10.0
-    float    binSpacing;    // 0.2
+    float    binSpacing;    // 10.0 / 49.0 (torch.linspace(0, 10, 50))
     uint32_t _pad0;
 };
 

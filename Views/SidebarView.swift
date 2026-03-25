@@ -34,174 +34,92 @@ enum SidebarTab: String, CaseIterable {
         case .leadOptimization: "Optimize leads"
         }
     }
+
+    /// Compact label for the toolbar pill
+    var shortLabel: String {
+        switch self {
+        case .search:           "Search"
+        case .preparation:      "Prep"
+        case .sequence:         "Seq"
+        case .ligands:          "Ligands"
+        case .dock:             "Dock"
+        case .results:          "Results"
+        case .leadOptimization: "Lead Opt"
+        }
+    }
 }
 
-struct SidebarView: View {
+// MARK: - Pipeline Bar (horizontal, lives in toolbar)
+
+struct PipelineBar: View {
     @Environment(AppViewModel.self) private var viewModel
-    @State private var selectedTab: SidebarTab = .search
-    @State private var hoveredTab: SidebarTab?
-    @State private var panelExpanded: Bool = true
+    @Binding var selectedTab: SidebarTab
+    @Binding var panelOpen: Bool
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Left: vertical step pipeline
-            VStack(spacing: 0) {
-                ForEach(SidebarTab.allCases, id: \.self) { tab in
-                    stepRow(tab)
-                }
-
-                Spacer()
-
-                // Expand button at bottom of stepper (only when collapsed)
-                if !panelExpanded {
-                    Button(action: {
-                        withAnimation(.easeInOut(duration: 0.2)) { panelExpanded = true }
-                    }) {
-                        Image(systemName: "sidebar.right")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Expand panel")
-                }
-            }
-            .frame(width: panelExpanded ? 150 : 52)
-            .padding(.top, 8)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
-
-            // Panel content — only when expanded
-            if panelExpanded {
-                Divider()
-
-                VStack(spacing: 0) {
-                    // Panel header with collapse button
-                    HStack {
-                        Text(selectedTab.rawValue)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button(action: {
-                            withAnimation(.easeInOut(duration: 0.2)) { panelExpanded = false }
-                        }) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 22, height: 22)
-                                .background(Color.primary.opacity(0.06))
-                                .clipShape(RoundedRectangle(cornerRadius: 5))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Collapse panel")
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-
-                    Divider()
-
-                    ScrollView {
-                        switch selectedTab {
-                        case .search:      SearchTabView()
-                        case .preparation: PreparationTabView()
-                        case .sequence:    SequenceView()
-                        case .ligands:     LigandDatabaseView()
-                        case .dock:        DockingTabView()
-                        case .results:          ResultsTabView()
-                        case .leadOptimization: LeadOptimizationTabView()
-                        }
-                    }
-                }
-                .frame(width: 300)
+        HStack(spacing: 1) {
+            ForEach(SidebarTab.allCases, id: \.self) { tab in
+                pipelineButton(tab)
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
     }
 
-    // MARK: - Step Row
-
     @ViewBuilder
-    private func stepRow(_ tab: SidebarTab) -> some View {
-        let isSelected = selectedTab == tab
-        let isHovered = hoveredTab == tab
+    private func pipelineButton(_ tab: SidebarTab) -> some View {
+        let isSelected = selectedTab == tab && panelOpen
         let status = stepStatus(tab)
 
         Button(action: {
             withAnimation(.easeInOut(duration: 0.15)) {
-                if selectedTab == tab && panelExpanded {
-                    // Clicking the already-selected step collapses the panel
-                    panelExpanded = false
+                if selectedTab == tab && panelOpen {
+                    panelOpen = false
                 } else {
                     selectedTab = tab
-                    panelExpanded = true
+                    panelOpen = true
                 }
             }
         }) {
-            HStack(spacing: 0) {
-                // Step indicator column
-                VStack(spacing: 0) {
-                    Rectangle()
-                        .fill(tab == .search ? Color.clear : connectorColor(for: previousTab(tab)))
-                        .frame(width: 2, height: 8)
+            HStack(spacing: 5) {
+                // Status-aware icon
+                ZStack {
+                    Circle()
+                        .fill(circleFill(status: status, isSelected: isSelected))
+                        .frame(width: 20, height: 20)
 
-                    ZStack {
+                    if isSelected {
                         Circle()
-                            .fill(stepCircleFill(status: status, isSelected: isSelected))
-                            .frame(width: 24, height: 24)
-
-                        if isSelected {
-                            Circle()
-                                .stroke(Color.accentColor, lineWidth: 2)
-                                .frame(width: 24, height: 24)
-                        } else if status == .available {
-                            Circle()
-                                .stroke(Color.orange.opacity(0.5), lineWidth: 1.5)
-                                .frame(width: 24, height: 24)
-                        }
-
-                        stepCircleContent(tab: tab, status: status, isSelected: isSelected)
+                            .stroke(Color.accentColor, lineWidth: 1.5)
+                            .frame(width: 20, height: 20)
                     }
 
-                    Rectangle()
-                        .fill(tab == .results ? Color.clear : connectorColor(for: tab))
-                        .frame(width: 2, height: 8)
+                    circleContent(tab: tab, status: status, isSelected: isSelected)
                 }
-                .frame(width: panelExpanded ? 40 : 52)
 
-                // Label (only when panel expanded)
-                if panelExpanded {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(tab.rawValue)
-                            .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
-                            .foregroundStyle(isSelected ? .primary : .secondary)
-                            .lineLimit(1)
-                        Text(tab.subtitle)
-                            .font(.system(size: 9))
-                            .foregroundStyle(isSelected ? .secondary : .tertiary)
-                            .lineLimit(1)
-                    }
-                    .padding(.trailing, 8)
-                    Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(tab.rawValue)
+                        .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+                        .lineLimit(1)
+                    Text(tab.subtitle)
+                        .font(.system(size: 9))
+                        .foregroundStyle(isSelected ? .secondary : .tertiary)
+                        .lineLimit(1)
                 }
             }
-            .frame(height: 40)
-            .contentShape(Rectangle())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isSelected ? Color.accentColor.opacity(0.12) : isHovered ? Color.primary.opacity(0.04) : .clear)
-                .padding(.horizontal, 4)
-        )
-        .onHover { hovering in hoveredTab = hovering ? tab : nil }
     }
 
     // MARK: - Step Status
 
-    /// Three states: completed (green), available (orange — can do but hasn't), upcoming (gray)
-    private enum StepStatus {
-        case completed, available, upcoming
-    }
+    private enum StepStatus { case completed, available, upcoming }
 
     private func stepStatus(_ tab: SidebarTab) -> StepStatus {
         switch tab {
@@ -225,42 +143,88 @@ struct SidebarView: View {
         }
     }
 
-    private func stepCircleFill(status: StepStatus, isSelected: Bool) -> Color {
-        if isSelected { return Color.accentColor.opacity(0.2) }
+    private func circleFill(status: StepStatus, isSelected: Bool) -> Color {
+        if isSelected { return Color.accentColor.opacity(0.25) }
         switch status {
-        case .completed: return Color.green.opacity(0.15)
-        case .available: return Color.orange.opacity(0.12)
-        case .upcoming:  return Color.primary.opacity(0.05)
+        case .completed: return Color.green.opacity(0.2)
+        case .available: return Color.orange.opacity(0.15)
+        case .upcoming:  return Color.primary.opacity(0.06)
         }
     }
 
     @ViewBuilder
-    private func stepCircleContent(tab: SidebarTab, status: StepStatus, isSelected: Bool) -> some View {
+    private func circleContent(tab: SidebarTab, status: StepStatus, isSelected: Bool) -> some View {
         if status == .completed && !isSelected {
             Image(systemName: "checkmark")
-                .font(.system(size: 10, weight: .bold))
+                .font(.system(size: 8, weight: .bold))
                 .foregroundStyle(.green)
         } else if status == .available && !isSelected {
             Image(systemName: tab.icon)
-                .font(.system(size: 10))
+                .font(.system(size: 8))
                 .foregroundStyle(.orange)
         } else {
             Image(systemName: tab.icon)
-                .font(.system(size: 10))
+                .font(.system(size: 8))
                 .foregroundStyle(isSelected ? .primary : .tertiary)
         }
     }
+}
 
-    private func connectorColor(for tab: SidebarTab) -> Color {
-        let s = stepStatus(tab)
-        if s == .completed { return Color.green.opacity(0.4) }
-        if s == .available { return Color.orange.opacity(0.3) }
-        return Color.primary.opacity(0.08)
+// MARK: - Pipeline Content Panel (overlay on render area)
+
+struct PipelineContentPanel: View {
+    @Environment(AppViewModel.self) private var viewModel
+    @Binding var selectedTab: SidebarTab
+    @Binding var panelOpen: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Image(systemName: selectedTab.icon)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text(selectedTab.rawValue)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { panelOpen = false } }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20, height: 20)
+                        .background(Color.primary.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                }
+                .buttonStyle(.plain)
+                .help("Close panel")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            ScrollView {
+                switch selectedTab {
+                case .search:           SearchTabView()
+                case .preparation:      PreparationTabView()
+                case .sequence:         SequenceView()
+                case .ligands:          LigandDatabaseView()
+                case .dock:             DockingTabView()
+                case .results:          ResultsTabView()
+                case .leadOptimization: LeadOptimizationTabView()
+                }
+            }
+        }
+        .frame(width: 300)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
     }
+}
 
-    private func previousTab(_ tab: SidebarTab) -> SidebarTab {
-        let all = SidebarTab.allCases
-        guard let idx = all.firstIndex(of: tab), idx > 0 else { return .search }
-        return all[idx - 1]
+// MARK: - Legacy wrapper (keep SidebarView compiling for any remaining references)
+
+struct SidebarView: View {
+    var body: some View {
+        EmptyView()
     }
 }

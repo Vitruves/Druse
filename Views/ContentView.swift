@@ -6,88 +6,29 @@ struct ContentView: View {
     @AppStorage("appTheme") private var appTheme: String = AppTheme.dark.rawValue
     @Environment(\.colorScheme) private var colorScheme
     @State private var showInspector = true
-    @State private var showConsole = true
+    @State private var showConsole = false
     @State private var consoleHeight: CGFloat = 54
     @State private var isDragTargeted = false
+    @State private var pipelineTab: SidebarTab = .search
+    @State private var pipelinePanelOpen: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
-            // Main content area
-            HStack(spacing: 0) {
-                // Left sidebar
-                SidebarView()
-
-                Divider()
-
-                // Center: Metal viewport with overlays
-                ZStack {
-                    metalViewport
-
-                    // Top overlay: badges left, interaction legend + docking HUD right
-                    VStack {
-                        HStack(alignment: .top) {
-                            moleculeBadges
-                            Spacer()
-                            VStack(alignment: .trailing, spacing: 6) {
-                                // Interaction legend
-                                if !viewModel.docking.currentInteractions.isEmpty {
-                                    InteractionLegendView(interactions: viewModel.docking.currentInteractions)
-                                }
-                                // Live docking HUD (visible during active docking)
-                                if viewModel.docking.isDocking {
-                                    dockingHUD
-                                }
-                            }
-                        }
-                        .padding(10)
-
-                        Spacer()
-
-                        // Bottom overlay: render controls
-                        renderControls
-                            .padding(10)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                if showInspector {
-                    Divider()
-                    InspectorPanel()
-                }
-            }
-
-            // Bottom status strip + expandable console
+            mainContentArea
             StatusStripView(showConsole: $showConsole, consoleHeight: $consoleHeight)
         }
         .toolbar {
+            // Pipeline steps — centered in the toolbar
+            ToolbarItem(placement: .principal) {
+                PipelineBar(selectedTab: $pipelineTab, panelOpen: $pipelinePanelOpen)
+            }
+
+            // Inspector toggle only (console moved to status strip)
             ToolbarItemGroup(placement: .primaryAction) {
-                Button(action: { viewModel.fitToView() }) {
-                    Label("Fit to View", systemImage: "viewfinder")
-                }
-                .help("Fit molecule to view (Space)")
-
-                Button(action: { viewModel.fitToLigand() }) {
-                    Label("Center to Ligand", systemImage: "scope")
-                }
-                .help("Center camera on ligand")
-                .disabled(viewModel.molecules.ligand == nil)
-
-                Button(action: { viewModel.renderer?.camera.reset(); viewModel.pushToRenderer() }) {
-                    Label("Reset", systemImage: "arrow.counterclockwise")
-                }
-                .help("Reset camera")
-
-                Divider()
-
                 Toggle(isOn: $showInspector) {
                     Label("Inspector", systemImage: "sidebar.right")
                 }
                 .help("Toggle inspector panel")
-
-                Toggle(isOn: $showConsole) {
-                    Label("Console", systemImage: "terminal")
-                }
-                .help("Toggle console")
             }
         }
         .onChange(of: ActivityLog.shared.entries.count) { _, _ in
@@ -147,6 +88,58 @@ struct ContentView: View {
                     }
                     .allowsHitTesting(false)
             }
+        }
+    }
+
+    // MARK: - Main Content Area (extracted to help type checker)
+
+    private var mainContentArea: some View {
+        HStack(spacing: 0) {
+            // Pipeline panel — takes its own space so Metal viewport shrinks naturally
+            if pipelinePanelOpen {
+                PipelineContentPanel(
+                    selectedTab: $pipelineTab,
+                    panelOpen: $pipelinePanelOpen
+                )
+                .transition(.move(edge: .leading).combined(with: .opacity))
+
+                Divider()
+            }
+
+            // Metal viewport with overlays — auto-centers in remaining space
+            ZStack {
+                metalViewport
+                viewportTopBottom
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if showInspector {
+                Divider()
+                InspectorPanel(showInspector: $showInspector)
+            }
+        }
+    }
+
+    private var viewportTopBottom: some View {
+        VStack {
+            HStack(alignment: .top) {
+                moleculeBadges
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    if !viewModel.docking.currentInteractions.isEmpty {
+                        InteractionLegendView(interactions: viewModel.docking.currentInteractions)
+                    }
+                    if viewModel.docking.isDocking {
+                        dockingHUD
+                    }
+                }
+            }
+            .padding(10)
+
+            Spacer()
+
+            renderControls
+                .padding(10)
         }
     }
 
@@ -542,7 +535,16 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Spacer()
+            // Camera controls (moved from toolbar)
+            Divider()
+                .frame(height: 24)
+                .padding(.horizontal, 2)
+
+            cameraButtons
+
+            Divider()
+                .frame(height: 24)
+                .padding(.horizontal, 2)
 
             // Current mode label
             Text(viewModel.workspace.renderMode.rawValue)
@@ -557,6 +559,44 @@ struct ContentView: View {
         .padding(.vertical, 8)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var cameraButtons: some View {
+        HStack(spacing: 4) {
+            Button(action: { viewModel.fitToView() }) {
+                Image(systemName: "viewfinder")
+                    .font(.system(size: 12))
+                    .frame(width: 28, height: 28)
+                    .background(Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Fit to view (Space)")
+
+            Button(action: { viewModel.fitToLigand() }) {
+                Image(systemName: "scope")
+                    .font(.system(size: 12))
+                    .frame(width: 28, height: 28)
+                    .background(Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .disabled(viewModel.molecules.ligand == nil)
+            .help("Center on ligand")
+
+            Button(action: { viewModel.renderer?.camera.reset(); viewModel.pushToRenderer() }) {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 12))
+                    .frame(width: 28, height: 28)
+                    .background(Color.white.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Reset camera")
+        }
     }
 
     private func syncClipping() {

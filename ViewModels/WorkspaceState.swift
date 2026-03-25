@@ -87,6 +87,22 @@ struct WorkspaceState {
     var gridLineWidth: Float = 2.5       // screen-space pixels
     var gridColor: SIMD4<Float> = SIMD4<Float>(0.2, 1.0, 0.4, 0.8)
 
+    /// Per-chain display color mode (MOE-style). Default = `.chainDefault` (palette color).
+    enum ChainColorMode: Equatable {
+        case cpk           // element colors (C=gray, N=blue, O=red, S=yellow)
+        case chainDefault  // chain palette color (distinct per chain)
+        case custom        // user-chosen uniform color (stored in chainColorOverrides)
+    }
+    var chainColorModes: [String: ChainColorMode] = [:]
+
+    // Per-chain custom color overrides (chain ID → SIMD3 RGB)
+    // Only used when chainColorModes[id] == .custom
+    var chainColorOverrides: [String: SIMD3<Float>] = [:]
+
+    /// Ligand render mode override: allows ligand to render differently from the global protein mode.
+    /// nil = follow global renderMode, otherwise uses this specific mode for the ligand.
+    var ligandRenderMode: RenderMode? = nil
+
     // Selection
     var selectedAtomIndex: Int? = nil
     var selectedAtomIndices: Set<Int> = []

@@ -362,115 +362,208 @@ def resolve_scoring_methods(args, run_timestamp: str) -> list:
     return result
 
 
+def _format_rmsd(rmsd: float) -> str:
+    """Color-code RMSD for terminal display."""
+    if rmsd < 2.0:
+        return f"\033[32m{rmsd:6.2f}\033[0m"  # green
+    elif rmsd < 5.0:
+        return f"\033[33m{rmsd:6.2f}\033[0m"  # yellow
+    else:
+        return f"\033[31m{rmsd:6.2f}\033[0m"  # red
+
+
+def _format_time(ms: float) -> str:
+    """Format docking time compactly."""
+    if ms < 10_000:
+        return f"{ms/1000:.1f}s"
+    else:
+        return f"{ms/1000:.0f}s"
+
+
+import re
+# Vina/Drusina format — tolerates optional fields (e.g. GFN2=xxx) between RMSD and ms:
+#   [1/10] 1a30  E=-11.04  RMSD=3.49A  5912ms
+#   [1/10] 1a30  E=-11.04  RMSD=3.49A  GFN2=-123  5912ms
+#   [1/10] 1a30  E=-11.04  RMSD=N/AA  5912ms
+_RESULT_RE = re.compile(
+    r"\[(\d+)/(\d+)\]\s+(\S+)\s+E=([\-\d.]+)\s+RMSD=([\d.]+|N/A)A.*?(\d+)ms"
+)
+# DruseAF format — tolerates optional fields after RMSD:
+#   [1/10] 1a30  pKi=3.24  conf=7%  RMSD=9.36A  26156ms
+_RESULT_AF_RE = re.compile(
+    r"\[(\d+)/(\d+)\]\s+(\S+)\s+pKi=([\-\d.]+)\s+conf=(\d+)%\s+RMSD=([\d.]+|N/A)A.*?(\d+)ms"
+)
+# FAILED format:  [1/10] 1a30  FAILED: error message
+_FAILED_RE = re.compile(
+    r"\[(\d+)/(\d+)\]\s+(\S+)\s+FAILED:\s*(.*)"
+)
+_SUMMARY_RE = re.compile(r"(Docking Power|Scoring Power|Pearson|RMSD\s*<|Performance|Summary)")
+
+
 def run_xcodebuild(test_method: str, env: dict, verbose: bool,
                     druse_logs: str | None = None) -> tuple:
     """Run a single benchmark test via xcodebuild. Returns (success, duration_s, output).
 
-    druse_logs: None = no streaming; "-" = stream to terminal; path = stream to file.
+    Always streams per-complex results in real time. Filters xcodebuild noise.
+    druse_logs: None = benchmark lines only; "-" = all output to terminal;
+                path = all output to file (benchmark lines still shown on terminal).
     """
     test_id = f"DruseTests/BenchmarkRunner/{test_method}"
     cmd = [
         "xcodebuild", "test",
         "-project", str(PROJECT),
-        "-scheme", "DruseTests",
+        "-scheme", "Druse",
         f"-only-testing:{test_id}",
     ]
 
     t0 = time.time()
 
-    if druse_logs is not None:
-        # Stream output in real time via Popen
-        log_file = None
-        if druse_logs != "-":
-            log_file = open(druse_logs, "a")
+    log_file = None
+    if druse_logs is not None and druse_logs != "-":
+        log_file = open(druse_logs, "a")
 
-        collected = []
-        proc = subprocess.Popen(
-            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=str(ROOT),
-        )
-        try:
-            for line in proc.stdout:
-                collected.append(line)
-                if log_file is not None:
-                    log_file.write(line)
-                    log_file.flush()
-                else:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-            proc.wait()
-        finally:
+    collected = []
+    # Running stats
+    n_done = 0
+    n_total = 0
+    n_lt2 = 0
+    n_lt5 = 0
+    sum_time = 0.0
+    in_summary = False
+
+    proc = subprocess.Popen(
+        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, cwd=str(ROOT),
+    )
+    try:
+        for line in proc.stdout:
+            collected.append(line)
+
+            # Write full output to log file if requested
             if log_file is not None:
-                log_file.close()
+                log_file.write(line)
+                log_file.flush()
 
-        elapsed = time.time() - t0
-        output = "".join(collected)
-        success = proc.returncode == 0
-    else:
-        result = subprocess.run(
-            cmd, env=env, capture_output=True, text=True,
-            cwd=str(ROOT), timeout=3600 * 6,  # 6 hour timeout
-        )
-        elapsed = time.time() - t0
-        output = result.stdout + result.stderr
-        success = result.returncode == 0
+            # If --druse-logs -, stream everything raw
+            if druse_logs == "-":
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                continue
 
-        if verbose:
-            print(output)
-        else:
-            # Print just the benchmark lines (skip xcodebuild noise)
-            for line in output.split("\n"):
-                stripped = line.strip()
-                if any(k in stripped for k in [
-                    "[", "===", "Scoring Power", "Docking Power",
-                    "RMSD", "Pearson", "Performance", "Results:",
-                    "passed", "failed", "FAILED", "SUCCEEDED",
-                    "Summary", "GFN2", "benchmark",
-                ]):
-                    print(stripped)
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Per-complex result line (Vina/Drusina format)
+            m = _RESULT_RE.search(stripped)
+            m_af = _RESULT_AF_RE.search(stripped) if not m else None
+            m_fail = _FAILED_RE.search(stripped) if not m and not m_af else None
+            if m or m_af:
+                if m:
+                    idx, total, pdb, energy, rmsd_s, time_ms = m.groups()
+                    score_str = f"E={float(energy):7.2f}"
+                else:
+                    idx, total, pdb, pKd, conf, rmsd_s, time_ms = m_af.groups()
+                    score_str = f"pKi={float(pKd):5.2f}  conf={conf}%"
+                n_done = int(idx)
+                n_total = int(total)
+                rmsd = float(rmsd_s) if rmsd_s != "N/A" else None
+                t_ms = float(time_ms)
+                sum_time += t_ms
+                if rmsd is not None and rmsd < 2.0:
+                    n_lt2 += 1
+                if rmsd is not None and rmsd < 5.0:
+                    n_lt5 += 1
+
+                rate_lt2 = 100 * n_lt2 / max(n_done, 1)
+                avg_t = sum_time / max(n_done, 1)
+
+                # Compact live line: progress, PDB, score, RMSD, time, running stats
+                if rmsd is not None:
+                    rmsd_colored = _format_rmsd(rmsd)
+                else:
+                    rmsd_colored = "\033[2mN/A\033[0m"
+                print(
+                    f"  {n_done:3d}/{n_total}  {pdb}  "
+                    f"{score_str}  RMSD={rmsd_colored}A  {_format_time(t_ms):>5s}  "
+                    f"\033[2m<2A: {n_lt2}/{n_done} ({rate_lt2:.0f}%)  "
+                    f"avg {_format_time(avg_t)}\033[0m"
+                )
+                continue
+
+            if m_fail:
+                idx, total, pdb, err = m_fail.groups()
+                n_done = int(idx)
+                n_total = int(total)
+                print(
+                    f"  {n_done:3d}/{n_total}  {pdb}  "
+                    f"\033[31mFAILED\033[0m: {err}"
+                )
+                continue
+
+            # Summary section — print as-is
+            if _SUMMARY_RE.search(stripped):
+                in_summary = True
+            if in_summary:
+                if stripped.startswith("Test Case") or stripped.startswith("Test Suite"):
+                    in_summary = False
+                    continue
+                if stripped.startswith("Results:"):
+                    print(f"  {stripped}")
+                    in_summary = False
+                    continue
+                print(f"  {stripped}")
+                continue
+
+            # Verbose mode: show everything
+            if verbose:
+                print(stripped)
+
+        proc.wait()
+    finally:
+        if log_file is not None:
+            log_file.close()
+
+    elapsed = time.time() - t0
+    output = "".join(collected)
+    success = proc.returncode == 0
 
     return success, elapsed, output
 
 
 def print_config_summary(args, methods):
     """Print human-readable configuration summary."""
-    print("=" * 70)
-    print(f"  DRUSE BENCHMARK RUNNER  ({VERSION})")
-    print("=" * 70)
-    print()
-    print(f"  Dataset:     CASF-2016{f' (first {args.quick})' if args.quick else ' (full, 225 complexes)'}")
-    print(f"  Scoring:     {', '.join(SCORING_LABELS.get(m, m) for m, _, _ in methods)}")
-    print(f"  Preset:      {args.preset or 'custom'}")
-    print()
-    print(f"  GA:          pop={args.population}, gen={args.generations}, runs={args.runs}")
-    print(f"  Grid:        {args.grid_spacing} A")
-    print(f"  Local search: every {args.local_search_freq} gen, {args.local_search_steps} steps")
-    print(f"  Gradients:   {'numerical (FD)' if args.no_analytical_gradients else 'analytical'}")
-    print(f"  Ligand flex:  {'off' if args.no_ligand_flex else 'on'}")
-    print(f"  Flex receptor: {'on (auto-select)' if args.flex_residues else 'off'}")
-    print(f"  Charges:     {args.charge_method}")
-    print()
-
+    scoring_str = ", ".join(SCORING_LABELS.get(m, m) for m, _, _ in methods)
+    dataset_str = f"CASF-2016 (first {args.quick})" if args.quick else "CASF-2016 (225 complexes)"
     strain_on = args.strain_penalty and not args.no_strain_penalty
-    print(f"  Strain penalty: {'on' if strain_on else 'off'}"
-          f"{f' (threshold={args.strain_threshold}, weight={args.strain_weight})' if strain_on else ''}")
+    grad_str = "numerical (FD)" if args.no_analytical_gradients else "analytical"
 
-    if args.gfn2_opt:
-        print(f"  GFN2 opt:    on (level={args.gfn2_opt_level}, solv={args.gfn2_solvation}, "
-              f"top={args.gfn2_top_poses}, blend={args.gfn2_blend_weight})")
-    else:
-        print(f"  GFN2 opt:    off")
-
-    if args.gfn2_rescoring:
-        print(f"  GFN2 rescoring: on (D4 + solvation on best pose, ~2ms/complex)")
     print()
-    if args.druse_logs is not None:
-        dest = "terminal" if args.druse_logs == "-" else args.druse_logs
-        print(f"  Druse logs:  streaming to {dest}")
-    print(f"  Output:      {args.output_dir}/")
-    if args.output_prefix:
-        print(f"  Prefix:      {args.output_prefix}")
-    print("=" * 70)
+    print(f"\033[1mDruse Benchmark\033[0m  v{VERSION}")
+    print()
+    print(f"  {dataset_str}  |  {scoring_str}  |  {args.preset or 'custom'} preset")
+    print(f"  pop={args.population} gen={args.generations} runs={args.runs}  "
+          f"grid={args.grid_spacing}A  LS every {args.local_search_freq} gen x{args.local_search_steps}  "
+          f"{grad_str}")
+
+    flags = []
+    if not args.no_ligand_flex:
+        flags.append("ligand-flex")
+    if args.flex_residues:
+        flags.append("flex-receptor")
+    if strain_on:
+        flags.append(f"strain(>{args.strain_threshold})")
+    if args.gfn2_opt:
+        flags.append(f"gfn2-opt({args.gfn2_opt_level})")
+    if args.gfn2_rescoring:
+        flags.append("gfn2-rescore")
+    if args.exploration_ratio > 0:
+        flags.append(f"explore({args.exploration_ratio:.0%})")
+    if args.rerank_top > 0:
+        flags.append(f"rerank(top{args.rerank_top}x{args.rerank_variants})")
+    if flags:
+        print(f"  {' '.join(flags)}")
+
     print()
 
 
@@ -488,18 +581,20 @@ def main():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # Ensure project is built
-    print("Building Druse...")
+    sys.stdout.write("Building... ")
+    sys.stdout.flush()
     build = subprocess.run(
         ["xcodebuild", "-project", str(PROJECT), "-scheme", "Druse",
          "-configuration", "Release", "build"],
         capture_output=True, text=True, cwd=str(ROOT),
     )
     if build.returncode != 0:
-        print("BUILD FAILED — run `xcodebuild build` manually to see errors")
+        print("\033[31mFAILED\033[0m")
+        print("Run `xcodebuild build` manually to see errors")
         if args.verbose:
             print(build.stdout + build.stderr)
         sys.exit(1)
-    print("Build OK\n")
+    print("\033[32mOK\033[0m\n")
 
     # Run each scoring method
     results_files = []
@@ -507,9 +602,8 @@ def main():
 
     for i, (method_key, test_name, output_file) in enumerate(methods):
         label = SCORING_LABELS.get(method_key, method_key)
-        print(f"\n{'=' * 60}")
-        print(f"  [{i+1}/{len(methods)}] {label}")
-        print(f"{'=' * 60}\n")
+        if len(methods) > 1:
+            print(f"\033[1m[{i+1}/{len(methods)}] {label}\033[0m\n")
 
         # Update config file with output file and per-method overrides
         update_config_output_file(output_file)
@@ -520,22 +614,22 @@ def main():
                                                     args.verbose,
                                                     druse_logs=args.druse_logs)
 
-        status = "PASSED" if success else "FAILED"
-        print(f"\n  {label}: {status} ({elapsed:.1f}s)")
+        status = "\033[32mPASSED\033[0m" if success else "\033[31mFAILED\033[0m"
+        elapsed_str = f"{elapsed/60:.1f} min" if elapsed > 120 else f"{elapsed:.0f}s"
+        print(f"\n  {label}: {status} in {elapsed_str}")
 
         results_path = Path(args.output_dir) / output_file
         if results_path.exists():
             results_files.append(str(results_path))
-            print(f"  Results: {results_path}")
 
     # Clean up config file
     CONFIG_FILE.unlink(missing_ok=True)
 
     total_elapsed = time.time() - total_t0
-    print(f"\n{'=' * 60}")
-    print(f"  Total: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
-    print(f"  Results: {', '.join(results_files)}")
-    print(f"{'=' * 60}")
+    total_str = f"{total_elapsed/60:.1f} min" if total_elapsed > 120 else f"{total_elapsed:.0f}s"
+    print(f"\n  Total: {total_str}")
+    for r in results_files:
+        print(f"  -> {r}")
 
     # Optionally run analysis
     if args.analyze and results_files:

@@ -362,7 +362,9 @@ final class AppViewModel {
                 allPositions.append(contentsOf: prot.atoms.filter { !workspace.hiddenChainIDs.contains($0.chainID) }.map(\.position))
             }
         }
-        if workspace.showLigand, let lig = molecules.ligand {
+        // During docking, exclude ligand from camera fitting positions
+        // (the ghost pose handles visualization; original ligand coords are stale)
+        if workspace.showLigand, !docking.isDocking, let lig = molecules.ligand {
             allPositions.append(contentsOf: lig.atoms.map(\.position))
         }
         renderer.updateAllMoleculePositions(allPositions)
@@ -463,11 +465,15 @@ final class AppViewModel {
                 }
             }
 
-            // Side chain display
+            // Side chain display — include CA atom to visually connect to ribbon backbone
             if workspace.sideChainDisplay != .none, workspace.showProtein {
                 let sideChainResidueIndices = sideChainResidueSet(protein: prot)
                 if !sideChainResidueIndices.isEmpty {
-                    // Map by array position (bond.atomIndex is an array position)
+                    // Backbone atoms to exclude (but keep CA as the anchor connecting
+                    // side chains to the ribbon backbone)
+                    let backboneExcludeNames: Set<String> = ["N", "C", "O", "OXT", "H", "HA"]
+
+                    // First pass: collect all side chain atom indices including CA
                     var scPosToNew: [Int: Int] = [:]
                     for residueIdx in sideChainResidueIndices {
                         guard residueIdx < prot.residues.count else { continue }
@@ -478,7 +484,8 @@ final class AppViewModel {
                             if workspace.hiddenChainIDs.contains(atom.chainID) { continue }
                             if !workspace.showHydrogens && atom.element == .H { continue }
                             let trimmedName = atom.name.trimmingCharacters(in: .whitespaces)
-                            if SideChainDisplay.backboneAtomNames.contains(trimmedName) { continue }
+                            // Keep CA (alpha carbon) — it's the attachment point to the ribbon
+                            if backboneExcludeNames.contains(trimmedName) { continue }
                             scPosToNew[atomIdx] = allAtoms.count
                             allAtoms.append(Atom(
                                 id: allAtoms.count, element: atom.element, position: atom.position,
@@ -488,6 +495,7 @@ final class AppViewModel {
                             ))
                         }
                     }
+                    // Second pass: remap bonds where at least both endpoints are in the side chain set
                     for bond in prot.bonds {
                         if let a = scPosToNew[bond.atomIndex1], let b = scPosToNew[bond.atomIndex2] {
                             allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
@@ -499,6 +507,7 @@ final class AppViewModel {
             renderer.selectedAtomIndex = workspace.selectedAtomIndex ?? -1
             renderer.selectedResidueAtomIndices = []
             renderer.renderMode = .ballAndStick
+            renderer.ligandVisible = workspace.showLigand && !docking.isDocking && molecules.ligand != nil
             renderer.updateMoleculeData(atoms: allAtoms, bonds: allBonds)
             return
         }
@@ -567,21 +576,38 @@ final class AppViewModel {
         renderer.slabHalfThickness = workspace.slabThickness / 2.0
         renderer.slabOffset = workspace.slabOffset
 
-        // Ligand focus color overrides
+        // Protein uniform color override (e.g., ligand focus mode)
         renderer.uniformProteinColor = workspace.colorScheme.proteinColor
-        renderer.ligandCarbonColor = workspace.colorScheme.ligandCarbon
 
-        // Build chain color map for per-chain coloring
-        if workspace.colorScheme == .chainColored, let prot = molecules.protein {
-            let chainIDs = prot.chains.map(\.id)
+        // Build chain color map respecting per-chain color modes (CPK / Chain / Custom)
+        if let prot = molecules.protein {
             var colorMap: [String: SIMD3<Float>] = [:]
             let palette = WorkspaceState.MoleculeColorScheme.chainPalette
-            for (i, cid) in chainIDs.enumerated() {
-                colorMap[cid] = palette[i % palette.count]
+            for (i, chain) in prot.chains.enumerated() {
+                let mode = workspace.chainColorModes[chain.id] ?? .chainDefault
+                switch mode {
+                case .cpk:
+                    break // omit from map → renderer falls through to element colors
+                case .chainDefault:
+                    colorMap[chain.id] = palette[i % palette.count]
+                case .custom:
+                    if let custom = workspace.chainColorOverrides[chain.id] {
+                        colorMap[chain.id] = custom
+                    } else {
+                        colorMap[chain.id] = palette[i % palette.count]
+                    }
+                }
             }
             renderer.chainColorMap = colorMap
         } else {
             renderer.chainColorMap = [:]
+        }
+
+        // Ligand carbon color: user override from inspector, otherwise from color scheme
+        if let userLigColor = workspace.ligandCarbonColor {
+            renderer.ligandCarbonColor = userLigColor
+        } else {
+            renderer.ligandCarbonColor = workspace.colorScheme.ligandCarbon
         }
 
         // Track how many protein atoms are in the buffer so Renderer can distinguish them
@@ -591,6 +617,9 @@ final class AppViewModel {
             return true
         }.count ?? 0) : 0
         renderer.proteinAtomCount = protCount
+
+        // Track ligand visibility so renderer can hide interaction lines/grid when ligand is hidden
+        renderer.ligandVisible = workspace.showLigand && !docking.isDocking && molecules.ligand != nil
 
         renderer.updateMoleculeData(atoms: allAtoms, bonds: allBonds)
 

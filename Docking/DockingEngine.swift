@@ -53,6 +53,18 @@ struct DockingConfig: Sendable {
     // GFN2-xTB post-docking refinement
     var gfn2Refinement: GFN2RefinementConfig = GFN2RefinementConfig()
 
+    // Search method
+    var searchMethod: SearchMethod = .genetic
+
+    // Fragment-Based Docking config
+    var fragment: FragmentDockingConfig = FragmentDockingConfig()
+
+    // Diffusion-Guided Docking config
+    var diffusion: DiffusionDockingConfig = DiffusionDockingConfig()
+
+    // Parallel Tempering config
+    var replicaExchange: ParallelTemperingConfig = ParallelTemperingConfig()
+
     // Auto mode: adapt parameters to protein/ligand/pocket complexity
     var autoMode: Bool = false
 
@@ -113,8 +125,77 @@ struct DockingConfig: Sendable {
             config.localSearchSteps = 20
         }
 
+        // --- Search method: auto-select based on flexibility ---
+        if ligandRotatableBonds > 10 {
+            config.searchMethod = .fragmentBased
+        } else if ligandRotatableBonds > 6 {
+            config.searchMethod = .parallelTempering
+        } else {
+            config.searchMethod = .genetic
+        }
+
         return config
     }
+}
+
+// MARK: - Fragment-Based Docking Config
+
+struct FragmentDockingConfig: Sendable {
+    /// Number of surviving partial poses carried forward at each fragment growth step.
+    var beamWidth: Int = 32
+    /// Number of initial anchor placements to sample in the binding site.
+    var anchorSamplingCount: Int = 256
+    /// Local search steps for refining anchor placements before growth.
+    var anchorLocalSearchSteps: Int = 20
+    /// Energy threshold (kcal/mol) above best partial pose for pruning during growth.
+    var growthPruneThreshold: Float = 10.0
+    /// Number of torsion angle samples per connecting bond during fragment growth.
+    var torsionSamples: Int = 36
+    /// SMARTS pattern for enforced scaffold (nil = auto-detect largest fragment).
+    var scaffoldSMARTS: String? = nil
+    /// Scaffold enforcement mode.
+    var scaffoldMode: ScaffoldMode = .auto
+
+    enum ScaffoldMode: String, CaseIterable, Sendable {
+        case auto   = "Auto"
+        case manual = "Manual"
+    }
+}
+
+// MARK: - Diffusion-Guided Docking Config
+
+struct DiffusionDockingConfig: Sendable {
+    /// Number of reverse diffusion denoising steps.
+    var numDenoisingSteps: Int = 50
+    /// Number of poses generated in parallel via the diffusion process.
+    var numParallelPoses: Int = 128
+    /// Noise variance schedule type.
+    var noiseSchedule: NoiseSchedule = .cosine
+    /// Scale factor for DruseAF attention gradient guidance.
+    var guidanceScale: Float = 1.0
+    /// Vina gradient local search steps after diffusion completes.
+    var refinementSteps: Int = 30
+
+    enum NoiseSchedule: String, CaseIterable, Sendable {
+        case linear   = "Linear"
+        case cosine   = "Cosine"
+        case quadratic = "Quadratic"
+    }
+}
+
+// MARK: - Parallel Tempering Config
+
+struct ParallelTemperingConfig: Sendable {
+    /// Number of temperature replicas.
+    var numReplicas: Int = 8
+    /// Lowest temperature replica (kcal/mol).
+    var minTemperature: Float = 0.6
+    /// Highest temperature replica (kcal/mol).
+    var maxTemperature: Float = 4.0
+    /// Attempt replica swaps every N generations.
+    var swapInterval: Int = 5
+    /// MC steps per replica before result extraction.
+    var stepsPerReplica: Int = 200
 }
 
 // MARK: - VRAM Estimation
@@ -298,6 +379,12 @@ final class DockingEngine {
     private var drusinaScorePipeline: MTLComputePipelineState?
     private var drusinaCorrectionPipeline: MTLComputePipelineState?
 
+    // Parallel Tempering / Replica Exchange pipelines
+    private var mcPerturbReplicaPipeline: MTLComputePipelineState?
+    private var metropolisAcceptReplicaPipeline: MTLComputePipelineState?
+    private var replicaSwapPipeline: MTLComputePipelineState?
+    private var replicaParamsBuffer: MTLBuffer?
+
     /// Active local search pipeline based on config.useAnalyticalGradients.
     /// Uses SIMD-cooperative version when analytical gradients are enabled.
     private var activeLocalSearchPipeline: MTLComputePipelineState {
@@ -336,12 +423,14 @@ final class DockingEngine {
     private var halogenInfoBuffer: MTLBuffer?
     private var proteinAmideBuffer: MTLBuffer?
     private var chalcogenInfoBuffer: MTLBuffer?
+    private var saltBridgeGroupBuffer: MTLBuffer?
 
     // Pharmacophore constraint buffers
     private var pharmaConstraintBuffer: MTLBuffer?
     private var pharmaParamsBuffer: MTLBuffer?
 
     // DruseAF ML scoring (native Metal neural network)
+    private var druseAFSetupPipeline: MTLComputePipelineState?
     private var druseAFEncodePipeline: MTLComputePipelineState?
     private var druseAFScorePipeline: MTLComputePipelineState?
     private var druseAFWeights: DruseAFWeightLoader.LoadedWeights?
@@ -349,7 +438,8 @@ final class DockingEngine {
     private var druseAFProtFeatBuffer: MTLBuffer?
     private var druseAFLigFeatBuffer: MTLBuffer?
     private var druseAFProtPosBuffer: MTLBuffer?
-    private var druseAFIntermediateBuffer: MTLBuffer?
+    private var druseAFSetupBuffer: MTLBuffer?        // pre-computed encodings + K/V
+    private var druseAFIntermediateBuffer: MTLBuffer?  // per-pose ligand positions only
     private var druseAFIntermediateCapacity: Int = 0
 
     private(set) var isRunning = false
@@ -422,9 +512,19 @@ final class DockingEngine {
             if let rmsdFunction = library.makeFunction(name: "computePairwiseRMSD") {
                 pairwiseRMSDPipeline = try device.makeComputePipelineState(function: rmsdFunction)
             }
+            // Parallel Tempering / Replica Exchange
+            if let perturbFunc = library.makeFunction(name: "mcPerturbReplica"),
+               let acceptFunc = library.makeFunction(name: "metropolisAcceptReplica"),
+               let swapFunc = library.makeFunction(name: "replicaSwap") {
+                mcPerturbReplicaPipeline = try device.makeComputePipelineState(function: perturbFunc)
+                metropolisAcceptReplicaPipeline = try device.makeComputePipelineState(function: acceptFunc)
+                replicaSwapPipeline = try device.makeComputePipelineState(function: swapFunc)
+            }
             // DruseAF Metal neural network scoring
-            if let encodeFunc = library.makeFunction(name: "druseAFEncode"),
+            if let setupFunc = library.makeFunction(name: "druseAFSetup"),
+               let encodeFunc = library.makeFunction(name: "druseAFEncode"),
                let scoreFunc = library.makeFunction(name: "druseAFScore") {
+                druseAFSetupPipeline = try device.makeComputePipelineState(function: setupFunc)
                 druseAFEncodePipeline = try device.makeComputePipelineState(function: encodeFunc)
                 druseAFScorePipeline = try device.makeComputePipelineState(function: scoreFunc)
                 druseAFWeights = DruseAFWeightLoader.loadFromBundle(device: device)
@@ -1263,6 +1363,11 @@ final class DockingEngine {
                     let lo = min(i, k), hi = max(i, k)
                     excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
                 }
+                // 1-3 pairs via i: path j-i-k (needed when i is the central atom)
+                for k in adj[i] where k != j {
+                    let lo = min(j, k), hi = max(j, k)
+                    excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
+                }
             }
         }
         var pairList = [UInt32]()
@@ -1465,39 +1570,146 @@ final class DockingEngine {
             length: amides.count * MemoryLayout<ProteinAmideGPU>.stride,
             options: .storageModeShared)
 
+        // --- Salt bridge groups (Donald 2011: one entry per charged functional group) ---
+        // Group by residue → compute centroid of charged atoms → burial proxy from neighbor count
+        var sbGroups: [SaltBridgeGroupGPU] = []
+        var residueAtomsSB: [String: [Atom]] = [:]
+        for atom in proteinAtoms {
+            let key = "\(atom.chainID)_\(atom.residueSeq)"
+            residueAtomsSB[key, default: []].append(atom)
+        }
+        // All protein heavy atom positions for burial computation
+        let allPositions = proteinAtoms.map { $0.position }
+
+        for (_, atoms) in residueAtomsSB {
+            let resName = atoms.first?.residueName.trimmingCharacters(in: .whitespaces) ?? ""
+
+            // Arg guanidinium: centroid of NE, NH1, NH2, CZ
+            if resName == "ARG" {
+                let guanAtoms = atoms.filter {
+                    let n = $0.name.trimmingCharacters(in: .whitespaces)
+                    return n == "NE" || n == "NH1" || n == "NH2" || n == "CZ"
+                }
+                if guanAtoms.count >= 2 {
+                    let centroid = guanAtoms.reduce(SIMD3<Float>.zero) { $0 + $1.position } / Float(guanAtoms.count)
+                    let burial = Self.computeBurialFactor(centroid: centroid, allPositions: allPositions)
+                    sbGroups.append(SaltBridgeGroupGPU(
+                        centroid: centroid, chargeSign: 1,
+                        burialFactor: burial, _pad0: 0, _pad1: 0, _pad2: 0))
+                }
+            }
+            // Lys NH3+: just NZ
+            else if resName == "LYS" {
+                if let nz = atoms.first(where: { $0.name.trimmingCharacters(in: .whitespaces) == "NZ" }) {
+                    let burial = Self.computeBurialFactor(centroid: nz.position, allPositions: allPositions)
+                    sbGroups.append(SaltBridgeGroupGPU(
+                        centroid: nz.position, chargeSign: 1,
+                        burialFactor: burial, _pad0: 0, _pad1: 0, _pad2: 0))
+                }
+            }
+            // His+ (protonated): centroid of ND1, NE2
+            else if resName == "HIS" {
+                let hisN = atoms.filter {
+                    let n = $0.name.trimmingCharacters(in: .whitespaces)
+                    return (n == "NE2" || n == "ND1") && $0.formalCharge > 0
+                }
+                if !hisN.isEmpty {
+                    let centroid = hisN.reduce(SIMD3<Float>.zero) { $0 + $1.position } / Float(hisN.count)
+                    let burial = Self.computeBurialFactor(centroid: centroid, allPositions: allPositions)
+                    sbGroups.append(SaltBridgeGroupGPU(
+                        centroid: centroid, chargeSign: 1,
+                        burialFactor: burial, _pad0: 0, _pad1: 0, _pad2: 0))
+                }
+            }
+            // Asp carboxylate: centroid of OD1, OD2
+            else if resName == "ASP" {
+                let carb = atoms.filter {
+                    let n = $0.name.trimmingCharacters(in: .whitespaces)
+                    return n == "OD1" || n == "OD2"
+                }
+                if carb.count == 2 {
+                    let centroid = (carb[0].position + carb[1].position) / 2.0
+                    let burial = Self.computeBurialFactor(centroid: centroid, allPositions: allPositions)
+                    sbGroups.append(SaltBridgeGroupGPU(
+                        centroid: centroid, chargeSign: -1,
+                        burialFactor: burial, _pad0: 0, _pad1: 0, _pad2: 0))
+                }
+            }
+            // Glu carboxylate: centroid of OE1, OE2
+            else if resName == "GLU" {
+                let carb = atoms.filter {
+                    let n = $0.name.trimmingCharacters(in: .whitespaces)
+                    return n == "OE1" || n == "OE2"
+                }
+                if carb.count == 2 {
+                    let centroid = (carb[0].position + carb[1].position) / 2.0
+                    let burial = Self.computeBurialFactor(centroid: centroid, allPositions: allPositions)
+                    sbGroups.append(SaltBridgeGroupGPU(
+                        centroid: centroid, chargeSign: -1,
+                        burialFactor: burial, _pad0: 0, _pad1: 0, _pad2: 0))
+                }
+            }
+        }
+        if sbGroups.isEmpty {
+            sbGroups.append(SaltBridgeGroupGPU(centroid: .zero, chargeSign: 0,
+                                                burialFactor: 0, _pad0: 0, _pad1: 0, _pad2: 0))
+        }
+        saltBridgeGroupBuffer = device.makeBuffer(
+            bytes: &sbGroups,
+            length: sbGroups.count * MemoryLayout<SaltBridgeGroupGPU>.stride,
+            options: .storageModeShared)
+
         // --- Drusina parameters ---
+        // Weights scaled down ~2x from originals: these are corrections on top of Vina,
+        // not independent terms. Vina already captures H-bonds, hydrophobic, and some
+        // electrostatic effects through its grid maps. (Verdonk 2003 calibration principle)
         var params = DrusinaParams(
             numProteinRings: UInt32(protRings.count),
             numLigandRings: UInt32(ligRings.count),
             numProteinCations: UInt32(max(cations.count - (cations.first == .zero ? 1 : 0), 0)),
             numHalogens: UInt32(halogens.first?.halogenAtomIndex == -1 ? 0 : halogens.count),
-            wPiPi: -0.40,
-            wPiCation: -0.80,
-            wHalogenBond: -0.50,
-            wMetalCoord: -1.00,
+            wPiPi: -0.20,
+            wPiCation: -0.40,
+            wHalogenBond: -0.30,
+            wMetalCoord: -0.60,
             numProteinAmides: UInt32(amides.first?.centroid == .zero && amides.count == 1 ? 0 : amides.count),
             numChalcogens: UInt32(chalcogens.first?.sulfurAtomIndex == -1 ? 0 : chalcogens.count),
-            wSaltBridge: -0.60,
-            wAmideStack: -0.40,
-            wChalcogenBond: -0.30,
-            _pad: 0)
+            wSaltBridge: -0.45,
+            wAmideStack: -0.20,
+            wChalcogenBond: -0.15,
+            numSaltBridgeGroups: UInt32(sbGroups.first?.chargeSign == 0 ? 0 : sbGroups.count))
         drusinaParamsBuffer = device.makeBuffer(
             bytes: &params,
             length: MemoryLayout<DrusinaParams>.stride,
             options: .storageModeShared)
     }
 
+    /// Compute burial factor for a charged group centroid (Bissantz 2010).
+    /// Counts protein heavy atoms within 8 Å and normalizes: more neighbors = more buried.
+    /// Returns 0.15 (surface-exposed) to 1.0 (deeply buried).
+    private static func computeBurialFactor(centroid: SIMD3<Float>, allPositions: [SIMD3<Float>]) -> Float {
+        var count: Float = 0
+        for pos in allPositions {
+            let d = simd_distance(centroid, pos)
+            if d > 0.5 && d < 8.0 { count += 1 }
+        }
+        // Empirical scale: ~15 neighbors = partially buried, ~30+ = deeply buried
+        return max(0.15, min(1.0, count / 25.0))
+    }
+
     // MARK: - DruseAF ML Scoring Buffers
 
     /// Prepare GPU buffers for DruseAF neural network scoring.
-    /// Computes 20-dim atom features for protein pocket and ligand, stores protein positions.
+    /// Computes atom features, dispatches one-time setup kernel to pre-compute
+    /// protein/ligand encodings and K/V projections.
     private func prepareDruseAFBuffers(
         ligandAtoms: [Atom],
         gpuLigAtoms: [DockLigandAtom],
         pocket: BindingPocket,
         popSize: Int
     ) {
-        guard druseAFWeights != nil else { return }
+        guard let afWeights = druseAFWeights,
+              let setupPipe = druseAFSetupPipeline else { return }
 
         // Protein pocket atoms (heavy atoms within pocket radius)
         let pocketAtoms = proteinAtoms.filter { atom in
@@ -1550,28 +1762,48 @@ final class DockingEngine {
             headDim: 32,
             rbfBins: 50,
             rbfGamma: 10.0,
-            rbfSpacing: 0.2,
+            rbfSpacing: 10.0 / 49.0,  // torch.linspace(0, 10, 50) spacing
             numCrossAttnLayers: 2,
-            numWeightTensors: UInt32(druseAFWeights?.numTensors ?? 44),
+            numWeightTensors: UInt32(afWeights.numTensors),
             _pad0: 0, _pad1: 0
         )
         druseAFParamsBuffer = device.makeBuffer(
             bytes: &params, length: MemoryLayout<DruseAFParams>.stride,
             options: .storageModeShared)
 
-        // Intermediate buffer: per-pose storage for encoded features + ligand positions
-        // (256*128 + 64*128 + 64*3) floats per pose × 4 bytes
-        let floatsPerPose = 256 * 128 + 64 * 128 + 64 * 3  // 41,152
-        let requiredBytes = popSize * floatsPerPose * 4
+        // Setup buffer: pre-computed encodings + K/V (computed once, constant during GA)
+        // Layout: prot_h[256*128] + lig_h[64*128] + K0[256*128] + V0[256*128] + K1[256*128] + V1[256*128]
+        let setupFloats = 5 * 256 * 128 + 64 * 128  // 171,776 floats
+        druseAFSetupBuffer = device.makeBuffer(
+            length: setupFloats * 4, options: .storageModeShared)
+
+        // Per-pose intermediate: just transformed ligand positions (192 floats per pose)
+        let posFloatsPerPose = 64 * 3  // 192
+        let requiredBytes = popSize * posFloatsPerPose * 4
         if requiredBytes > druseAFIntermediateCapacity {
             druseAFIntermediateBuffer = device.makeBuffer(
                 length: requiredBytes, options: .storageModeShared)
             druseAFIntermediateCapacity = requiredBytes
         }
 
+        // Dispatch ONE-TIME setup kernel to pre-compute encodings + K/V projections
+        guard let afParamsBuf = druseAFParamsBuffer,
+              let afProtFeat = druseAFProtFeatBuffer,
+              let afLigFeat = druseAFLigFeatBuffer,
+              let afSetupBuf = druseAFSetupBuffer else { return }
+
+        let totalAtoms = P + L
+        let setupTgSize = MTLSize(width: min(totalAtoms, 256), height: 1, depth: 1)
+        let setupTgCount = MTLSize(width: (totalAtoms + 255) / 256, height: 1, depth: 1)
+        dispatchCompute(pipeline: setupPipe, buffers: [
+            (afProtFeat, 0), (afLigFeat, 1),
+            (afWeights.weightBuffer, 2), (afWeights.entryBuffer, 3),
+            (afParamsBuf, 4), (afSetupBuf, 5)
+        ], threadGroups: setupTgCount, threadGroupSize: setupTgSize)
+
         ActivityLog.shared.info(
-            "[DruseAF] Metal scoring ready: \(P) protein atoms, \(L) ligand atoms, " +
-            "\(requiredBytes / 1024 / 1024) MB intermediates",
+            "[DruseAF] Setup complete: \(P) protein atoms, \(L) ligand atoms, " +
+            "setup=\(setupFloats * 4 / 1024) KB, intermediates=\(requiredBytes / 1024) KB/pose",
             category: .dock
         )
     }
@@ -1781,7 +2013,6 @@ final class DockingEngine {
 
         // Build flat pair list for intramolecular energy (replaces bitmask).
         // Enumerate all non-excluded (i,j) pairs. Excluded = 1-2 bonded and 1-3 angle pairs.
-        let maxAtoms = 128
         var excluded = Set<UInt32>()  // packed (min<<16|max) pairs to exclude
 
         var adj: [[Int]] = Array(repeating: [], count: gpuLigAtoms.count)
@@ -1797,6 +2028,11 @@ final class DockingEngine {
                 excluded.insert(UInt32(i) | (UInt32(j) << 16))
                 for k in adj[j] where k > i && k != i {
                     let lo = min(i, k), hi = max(i, k)
+                    excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
+                }
+                // 1-3 pairs via i: path j-i-k (needed when i is the central atom)
+                for k in adj[i] where k != j {
+                    let lo = min(j, k), hi = max(j, k)
                     excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
                 }
             }
@@ -1843,8 +2079,8 @@ final class DockingEngine {
 
         // Prepare DruseAF Metal ML scoring buffers
         let useDruseAF = scoringMethod == .druseAffinity
-            && druseAFEncodePipeline != nil && druseAFScorePipeline != nil
-            && druseAFWeights != nil
+            && druseAFSetupPipeline != nil && druseAFEncodePipeline != nil
+            && druseAFScorePipeline != nil && druseAFWeights != nil
         if useDruseAF {
             prepareDruseAFBuffers(
                 ligandAtoms: heavyAtoms,
@@ -1936,6 +2172,22 @@ final class DockingEngine {
             )
         }
 
+        // Resolve auto search method
+        let resolvedSearchMethod: SearchMethod
+        if config.searchMethod == .auto {
+            if numTorsions > 10 {
+                resolvedSearchMethod = .fragmentBased
+            } else if numTorsions > 6 {
+                resolvedSearchMethod = .parallelTempering
+            } else {
+                resolvedSearchMethod = .genetic
+            }
+            ActivityLog.shared.info("[Engine] Auto search method resolved to: \(resolvedSearchMethod.rawValue) (torsions=\(numTorsions))", category: .dock)
+        } else {
+            resolvedSearchMethod = config.searchMethod
+        }
+        ActivityLog.shared.info("[Engine] Search method: \(resolvedSearchMethod.rawValue)", category: .dock)
+
         let totalRuns = max(config.numRuns, 1)
         var aggregatedResults: [DockingResult] = []
         let localSearchFrequency = max(config.localSearchFrequency, 1)
@@ -1978,6 +2230,221 @@ final class DockingEngine {
             isRunning = false
             return []
         }
+
+        // =====================================================================
+        // MARK: Parallel Tempering / Replica Exchange Monte Carlo
+        // =====================================================================
+        if resolvedSearchMethod == .parallelTempering,
+           let perturbPipe = mcPerturbReplicaPipeline,
+           let acceptPipe = metropolisAcceptReplicaPipeline,
+           let swapPipe = replicaSwapPipeline,
+           let afBuf = affinityBuf,
+           let tiBuf = typeIdxBuf {
+
+            let K = min(config.replicaExchange.numReplicas, Int(MAX_REPLICAS))
+            let popPerReplica = max(popSize / K, 4)
+            let totalPoses = K * popPerReplica
+            let totalPoseSize = totalPoses * MemoryLayout<DockPose>.stride
+
+            // Allocate larger population buffers for all replicas
+            let replicaPopBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared)!
+            let replicaOffBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared)!
+            let replicaBestBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared)!
+
+            // Clear best buffer
+            do {
+                let ptr = replicaBestBuf.contents().bindMemory(to: DockPose.self, capacity: totalPoses)
+                for i in 0..<totalPoses { ptr[i].energy = .infinity }
+            }
+
+            // Build geometric temperature ladder: T_k = T_min * (T_max/T_min)^(k/(K-1))
+            var repParams = ReplicaParams()
+            repParams.numReplicas = UInt32(K)
+            repParams.populationPerReplica = UInt32(popPerReplica)
+            repParams.totalPoses = UInt32(totalPoses)
+            repParams.swapGeneration = 0
+            let tMin = config.replicaExchange.minTemperature
+            let tMax = config.replicaExchange.maxTemperature
+            withUnsafeMutablePointer(to: &repParams.temperatures) { ptr in
+                ptr.withMemoryRebound(to: Float.self, capacity: Int(MAX_REPLICAS)) { temps in
+                    for k in 0..<K {
+                        let frac = K > 1 ? Float(k) / Float(K - 1) : 0
+                        temps[k] = tMin * pow(tMax / max(tMin, 0.01), frac)
+                    }
+                    for k in K..<Int(MAX_REPLICAS) {
+                        temps[k] = tMax
+                    }
+                }
+            }
+            replicaParamsBuffer = device.makeBuffer(bytes: &repParams, length: MemoryLayout<ReplicaParams>.stride, options: .storageModeShared)
+
+            // Override gaParams population size for replica-aware dispatch
+            var repGAParams = gaParams
+            repGAParams.populationSize = UInt32(totalPoses)
+            var repGAParamsRing = (0..<3).compactMap { _ in
+                device.makeBuffer(length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
+            }
+
+            let repTgSize = MTLSize(width: min(totalPoses, 256), height: 1, depth: 1)
+            let repTgCount = MTLSize(width: (totalPoses + 255) / 256, height: 1, depth: 1)
+
+            // Initialize all replica populations
+            repGAParams.populationSize = UInt32(totalPoses)
+            let initGABuf = device.makeBuffer(bytes: &repGAParams, length: MemoryLayout<GAParams>.stride, options: .storageModeShared)!
+            dispatchCompute(pipeline: initPopPipeline, buffers: [
+                (replicaPopBuf, 0), (gpBuf, 1), (initGABuf, 2)
+            ], threadGroups: repTgCount, threadGroupSize: repTgSize)
+
+            // Initial scoring (standard Vina scoring for all replicas)
+            let vinaScoreBuffersRep: [(MTLBuffer, Int)] = [
+                (replicaPopBuf, 0), (ligBuf, 1),
+                (afBuf, 2), (tiBuf, 3),
+                (gpBuf, 4), (initGABuf, 5),
+                (teBuf, 6), (miBuf, 7),
+                (emBuf, 8)
+            ]
+            dispatchCompute(pipeline: scorePipeline, buffers: vinaScoreBuffersRep, threadGroups: repTgCount, threadGroupSize: repTgSize)
+            copyPoseBuffer(from: replicaPopBuf, to: replicaBestBuf, poseCount: totalPoses)
+
+            ActivityLog.shared.info(
+                "[Engine] REMC: \(K) replicas × \(popPerReplica) poses = \(totalPoses) total, T=[\(String(format: "%.2f", tMin))–\(String(format: "%.2f", tMax))]",
+                category: .dock
+            )
+
+            let swapInterval = max(config.replicaExchange.swapInterval, 1)
+            let stepsPerReplica = config.replicaExchange.stepsPerReplica
+            var lastCmdBuf: (any MTLCommandBuffer)?
+            let explorationCutoff = Int(Float(stepsPerReplica) * config.explorationPhaseRatio)
+
+            for step in 0..<stepsPerReplica {
+                guard isRunning else { break }
+                currentGeneration = step
+                repGAParams.generation = UInt32(step)
+
+                // Two-phase search
+                if step < explorationCutoff {
+                    repGAParams.translationStep = config.explorationTranslationStep
+                    repGAParams.rotationStep = config.explorationRotationStep
+                    repGAParams.mutationRate = config.explorationMutationRate
+                } else if step == explorationCutoff {
+                    repGAParams.translationStep = config.translationStep
+                    repGAParams.rotationStep = config.rotationStep
+                    repGAParams.mutationRate = config.mutationRate
+                }
+
+                repParams.swapGeneration = UInt32(step)
+                replicaParamsBuffer?.contents().copyMemory(from: &repParams, byteCount: MemoryLayout<ReplicaParams>.stride)
+
+                let ringBuf = repGAParamsRing[step % 3]
+                ringBuf.contents().copyMemory(from: &repGAParams, byteCount: MemoryLayout<GAParams>.stride)
+
+                guard let repParamsBuf = replicaParamsBuffer else { break }
+
+                // Perturb → Score → Accept (temperature-aware)
+                let perturbBuffers: [(MTLBuffer, Int)] = [
+                    (replicaOffBuf, 0), (replicaPopBuf, 1),
+                    (ringBuf, 2), (gpBuf, 3), (repParamsBuf, 4)
+                ]
+                let scoreBuffers: [(MTLBuffer, Int)] = [
+                    (replicaOffBuf, 0), (ligBuf, 1),
+                    (afBuf, 2), (tiBuf, 3),
+                    (gpBuf, 4), (ringBuf, 5),
+                    (teBuf, 6), (miBuf, 7),
+                    (emBuf, 8)
+                ]
+                let acceptBuffers: [(MTLBuffer, Int)] = [
+                    (replicaPopBuf, 0), (replicaOffBuf, 1),
+                    (replicaBestBuf, 2), (ringBuf, 3), (repParamsBuf, 4)
+                ]
+
+                // Local search only for lowest-temperature replica every N steps
+                let doLS = step % localSearchFrequency == 0 && !useDruseAF
+
+                var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
+                    (pipeline: perturbPipe, buffers: perturbBuffers),
+                    (pipeline: scorePipeline, buffers: scoreBuffers)
+                ]
+
+                if doLS && !localSearchIsSIMD {
+                    dispatches.insert((pipeline: activeLocalSearchPipeline, buffers: scoreBuffers), at: 1)
+                }
+
+                dispatches.append((pipeline: acceptPipe, buffers: acceptBuffers))
+
+                if doLS && localSearchIsSIMD {
+                    // Batch perturb → score → accept, then SIMD local search separately
+                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: repTgCount, threadGroupSize: repTgSize)
+                    // SIMD local search only for lowest-temperature replica
+                    let loTempPoses = popPerReplica
+                    let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
+                    let simdTgCount = MTLSize(width: loTempPoses, height: 1, depth: 1)
+                    let loScoreBuffers: [(MTLBuffer, Int)] = [
+                        (replicaOffBuf, 0), (ligBuf, 1),
+                        (afBuf, 2), (tiBuf, 3),
+                        (gpBuf, 4), (ringBuf, 5),
+                        (teBuf, 6), (miBuf, 7),
+                        (emBuf, 8)
+                    ]
+                    lastCmdBuf = dispatchComputeAsync(pipeline: activeLocalSearchPipeline, buffers: loScoreBuffers,
+                                                       threadGroups: simdTgCount, threadGroupSize: simdTgSize)
+                } else {
+                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: repTgCount, threadGroupSize: repTgSize)
+                }
+
+                // Replica swap every swapInterval steps
+                if step % swapInterval == 0 && step > 0 {
+                    if let buf = lastCmdBuf {
+                        await buf.completed()
+                        lastCmdBuf = nil
+                    }
+                    let swapTgCount = MTLSize(width: max(K - 1, 1), height: 1, depth: 1)
+                    let swapTgSize = MTLSize(width: max(K - 1, 1), height: 1, depth: 1)
+                    lastCmdBuf = dispatchComputeAsync(pipeline: swapPipe, buffers: [
+                        (replicaPopBuf, 0), (replicaBestBuf, 1), (repParamsBuf, 2)
+                    ], threadGroups: swapTgCount, threadGroupSize: swapTgSize)
+                }
+
+                // Live update
+                if step % liveUpdateFrequency == 0 || step == stepsPerReplica - 1 {
+                    if let buf = lastCmdBuf {
+                        await buf.completed()
+                        lastCmdBuf = nil
+                    }
+                    // Extract best from lowest-temperature replica (first popPerReplica poses)
+                    if let best = extractBestPose(from: replicaBestBuf, ligandAtoms: heavyAtoms, centroid: centroid, maxPoses: popPerReplica) {
+                        bestEnergy = min(bestEnergy, best.energy)
+                        let interactions = InteractionDetector.detect(
+                            ligandAtoms: heavyAtoms,
+                            ligandPositions: best.transformedAtomPositions,
+                            proteinAtoms: proteinAtoms,
+                            ligandBonds: heavyBonds
+                        )
+                        onPoseUpdate?(best, interactions)
+                    }
+                    onGenerationComplete?(step, bestEnergy)
+                }
+                await Task.yield()
+            }
+
+            if let buf = lastCmdBuf {
+                await buf.completed()
+            }
+
+            // Extract results from ALL replicas (best poses from every temperature level)
+            aggregatedResults = extractAllResults(
+                from: replicaBestBuf,
+                ligandAtoms: heavyAtoms,
+                centroid: centroid,
+                idOffset: 0,
+                maxPoses: totalPoses
+            )
+
+            ActivityLog.shared.info("[Engine] REMC completed: \(aggregatedResults.count) poses extracted from \(K) replicas", category: .dock)
+
+        } else {
+        // =====================================================================
+        // MARK: Standard GA / ILS Search
+        // =====================================================================
 
         runLoop: for runIndex in 0..<totalRuns {
             guard isRunning else { break }
@@ -2078,20 +2545,13 @@ final class DockingEngine {
                     dispatches.append((pipeline: activeLocalSearchPipeline, buffers: vinaScoreBuffers))
                 }
                 if useDruseAF, let encodePipe = druseAFEncodePipeline,
-                   let afWeights = druseAFWeights,
                    let afParamsBuf = druseAFParamsBuffer,
-                   let afProtFeat = druseAFProtFeatBuffer,
-                   let afLigFeat = druseAFLigFeatBuffer,
-                   let afProtPos = druseAFProtPosBuffer,
                    let afIntermed = druseAFIntermediateBuffer {
-                    // DruseAF: encode features then neural network scoring
-                    // Encode kernel uses same threadgroup as Vina (1 thread per pose)
+                    // DruseAF: position transform only (encoding pre-computed in setup)
                     let encodeBuffers: [(MTLBuffer, Int)] = [
                         (offBuf, 0), (ligBuf, 1), (ringBuf, 2),
                         (teBuf, 3), (miBuf, 4),
-                        (afProtFeat, 5), (afLigFeat, 6), (afProtPos, 7),
-                        (afWeights.weightBuffer, 8), (afWeights.entryBuffer, 9),
-                        (afParamsBuf, 10), (afIntermed, 11), (gpBuf, 12)
+                        (afParamsBuf, 5), (afIntermed, 6), (gpBuf, 7)
                     ]
                     dispatches.append((pipeline: encodePipe, buffers: encodeBuffers))
                     // Score kernel dispatched separately (32 threads/threadgroup, 1 threadgroup/pose)
@@ -2102,7 +2562,8 @@ final class DockingEngine {
                         (proteinRingBuffer!, 9), (ligandRingBuffer!, 10),
                         (proteinCationBuffer!, 11), (drusinaParamsBuffer!, 12),
                         (proteinAtomBuffer!, 13), (halogenInfoBuffer!, 14),
-                        (proteinAmideBuffer!, 15), (chalcogenInfoBuffer!, 16)
+                        (proteinAmideBuffer!, 15), (chalcogenInfoBuffer!, 16),
+                        (saltBridgeGroupBuffer!, 17)
                     ])
                     dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
                 } else {
@@ -2146,14 +2607,15 @@ final class DockingEngine {
                           let afWeights = druseAFWeights,
                           let afParamsBuf = druseAFParamsBuffer,
                           let afProtPos = druseAFProtPosBuffer,
+                          let afSetup = druseAFSetupBuffer,
                           let afIntermed = druseAFIntermediateBuffer {
                     // DruseAF path: perturb+encode (standard tg), then score (SIMD tg), then accept
                     lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
-                    // Score kernel: 1 threadgroup of 32 lanes per pose
+                    // Score kernel: 1 threadgroup of 32 lanes per pose (uses pre-computed K/V)
                     let afScoreBuffers: [(MTLBuffer, Int)] = [
                         (offBuf, 0), (afProtPos, 1),
                         (afWeights.weightBuffer, 2), (afWeights.entryBuffer, 3),
-                        (afParamsBuf, 4), (afIntermed, 5)
+                        (afParamsBuf, 4), (afIntermed, 5), (afSetup, 6)
                     ]
                     let afTgSize = MTLSize(width: 32, height: 1, depth: 1)
                     let afTgCount = MTLSize(width: popSize, height: 1, depth: 1)
@@ -2207,6 +2669,8 @@ final class DockingEngine {
                 idOffset: aggregatedResults.count
             ))
         }
+
+        } // end else (standard GA/ILS path)
 
         let clustered = await clusterPoses(aggregatedResults)
         var reranked = rerankClusterRepresentativesExplicit(
@@ -2480,6 +2944,7 @@ final class DockingEngine {
               let pcBuf = proteinCationBuffer, let dpBuf = drusinaParamsBuffer,
               let paBuf = proteinAtomBuffer, let hiBuf = halogenInfoBuffer,
               let amBuf = proteinAmideBuffer, let chBuf = chalcogenInfoBuffer,
+              let sbBuf = saltBridgeGroupBuffer,
               let ligBuf = ligandAtomBuffer,
               let affBuf = vinaAffinityGridBuffer,
               let typBuf = vinaTypeIndexBuffer,
@@ -2497,7 +2962,7 @@ final class DockingEngine {
             (teBuf, 6), (miBuf, 7),
             (ipBuf, 8),
             (prBuf, 9), (lrBuf, 10), (pcBuf, 11), (dpBuf, 12), (paBuf, 13), (hiBuf, 14),
-            (amBuf, 15), (chBuf, 16)
+            (amBuf, 15), (chBuf, 16), (sbBuf, 17)
         ], threadGroups: tg, threadGroupSize: tgs)
     }
 
@@ -2507,9 +2972,8 @@ final class DockingEngine {
               let scorePipe = druseAFScorePipeline,
               let afWeights = druseAFWeights,
               let afParams = druseAFParamsBuffer,
-              let afProtFeat = druseAFProtFeatBuffer,
-              let afLigFeat = druseAFLigFeatBuffer,
               let afProtPos = druseAFProtPosBuffer,
+              let afSetup = druseAFSetupBuffer,
               let afIntermed = druseAFIntermediateBuffer,
               let ligBuf = ligandAtomBuffer,
               let gpBuf = gridParamsBuffer,
@@ -2518,22 +2982,20 @@ final class DockingEngine {
             ActivityLog.shared.error("[DruseAF] scoreDruseAF: missing buffers", category: .dock)
             return
         }
-        // Kernel 1: encode (standard threadgroup, 1 thread per pose)
+        // Kernel 1: encode — ligand position transform only (no MLP, uses pre-computed setup)
         dispatchCompute(pipeline: encodePipe, buffers: [
             (buffer, 0), (ligBuf, 1), (gaParamsBuffer, 2),
             (teBuf, 3), (miBuf, 4),
-            (afProtFeat, 5), (afLigFeat, 6), (afProtPos, 7),
-            (afWeights.weightBuffer, 8), (afWeights.entryBuffer, 9),
-            (afParams, 10), (afIntermed, 11), (gpBuf, 12)
+            (afParams, 5), (afIntermed, 6), (gpBuf, 7)
         ], threadGroups: tg, threadGroupSize: tgs)
-        // Kernel 2: score (32 SIMD lanes per threadgroup, 1 threadgroup per pose)
+        // Kernel 2: score (32 SIMD lanes per pose, uses pre-computed K/V from setup)
         let popSize = Int(tg.width * tgs.width)
         let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
         let simdTgCount = MTLSize(width: popSize, height: 1, depth: 1)
         dispatchCompute(pipeline: scorePipe, buffers: [
             (buffer, 0), (afProtPos, 1),
             (afWeights.weightBuffer, 2), (afWeights.entryBuffer, 3),
-            (afParams, 4), (afIntermed, 5)
+            (afParams, 4), (afIntermed, 5), (afSetup, 6)
         ], threadGroups: simdTgCount, threadGroupSize: simdTgSize)
     }
 
@@ -2690,9 +3152,9 @@ final class DockingEngine {
         return positions
     }
 
-    private func extractBestPose(from buffer: MTLBuffer? = nil, ligandAtoms: [Atom], centroid: SIMD3<Float>) -> DockingResult? {
+    private func extractBestPose(from buffer: MTLBuffer? = nil, ligandAtoms: [Atom], centroid: SIMD3<Float>, maxPoses: Int? = nil) -> DockingResult? {
         guard let buffer = buffer ?? populationBuffer else { return nil }
-        let poseCount = buffer.length / MemoryLayout<DockPose>.stride
+        let poseCount = min(maxPoses ?? Int.max, buffer.length / MemoryLayout<DockPose>.stride)
         guard poseCount > 0 else { return nil }
         let poses = buffer.contents().bindMemory(to: DockPose.self, capacity: poseCount)
 
@@ -2734,10 +3196,11 @@ final class DockingEngine {
         ligandAtoms: [Atom],
         centroid: SIMD3<Float>,
         idOffset: Int = 0,
-        sortByEnergy: Bool = true
+        sortByEnergy: Bool = true,
+        maxPoses: Int? = nil
     ) -> [DockingResult] {
         guard let buffer = buffer ?? populationBuffer else { return [] }
-        let poseCount = buffer.length / MemoryLayout<DockPose>.stride
+        let poseCount = min(maxPoses ?? Int.max, buffer.length / MemoryLayout<DockPose>.stride)
         guard poseCount > 0 else { return [] }
         let poses = buffer.contents().bindMemory(to: DockPose.self, capacity: poseCount)
 

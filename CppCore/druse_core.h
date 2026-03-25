@@ -509,6 +509,50 @@ DruseFingerprint* druse_morgan_fingerprint(const char *smiles, int32_t radius, i
 void druse_free_fingerprint(DruseFingerprint *fp);
 
 // ============================================================================
+// MARK: - Fragment Decomposition (for Fragment-Based Docking)
+// ============================================================================
+
+/// Result of decomposing a ligand into rigid fragments at rotatable bonds.
+typedef struct {
+    int32_t *fragmentMembership;    // length = numHeavyAtoms: fragment index per heavy atom
+    int32_t numHeavyAtoms;
+    int32_t numFragments;
+    int32_t *fragmentSizes;         // length = numFragments: atom count per fragment
+    int32_t anchorFragmentIdx;      // index of largest rigid fragment (default anchor)
+    /// Fragment connectivity: flat [parentFrag, childFrag, torsionBondAtom1, torsionBondAtom2] × numConnections
+    int32_t *connections;
+    int32_t numConnections;
+    /// Fragment centroids (flat xyz × numFragments)
+    float *centroids;
+    bool success;
+    char errorMessage[512];
+} DruseFragmentResult;
+
+/// Decompose a molecule into rigid fragments at rotatable bonds.
+/// Rings are kept intact. Terminal groups (single heavy atom leaves) form their own fragment.
+/// If scaffoldSmarts is non-NULL, the anchor is the fragment containing the most scaffold atoms.
+DruseFragmentResult* druse_decompose_fragments(
+    const char *smiles,
+    const char *scaffoldSmarts
+);
+
+void druse_free_fragment_result(DruseFragmentResult *result);
+
+/// Scaffold matching: check if a molecule contains a substructure and compute Tanimoto similarity.
+typedef struct {
+    bool hasMatch;
+    int32_t *matchedAtomIndices;    // heavy atom indices matching the scaffold
+    int32_t matchCount;
+    float tanimotoSimilarity;       // Morgan (radius=2, 2048 bits) Tanimoto coefficient
+} DruseScaffoldMatch;
+
+DruseScaffoldMatch* druse_match_scaffold(const char *smiles, const char *scaffoldSmarts);
+void druse_free_scaffold_match(DruseScaffoldMatch *result);
+
+/// Compute Tanimoto similarity between two molecules (Morgan radius=2, 2048 bits).
+float druse_tanimoto_similarity(const char *smiles1, const char *smiles2);
+
+// ============================================================================
 // MARK: - 2D Coordinate Generation
 // ============================================================================
 

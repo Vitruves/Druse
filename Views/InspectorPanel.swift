@@ -1,7 +1,227 @@
 import SwiftUI
 
+// MARK: - Inline Color Swatch Picker
+
+private let swatchPresetColors: [Color] = [
+    Color(red: 0.2, green: 0.5, blue: 1.0),   // blue
+    Color(red: 0.0, green: 0.75, blue: 0.95),  // cyan
+    Color(red: 0.0, green: 0.85, blue: 0.7),   // teal
+    Color(red: 0.3, green: 0.7, blue: 0.5),    // sea green
+    Color(red: 0.3, green: 0.85, blue: 0.3),   // green
+    Color(red: 0.6, green: 0.85, blue: 0.2),   // lime
+    Color(red: 0.95, green: 0.85, blue: 0.2),  // yellow
+    Color(red: 1.0, green: 0.65, blue: 0.0),   // orange
+    Color(red: 1.0, green: 0.4, blue: 0.3),    // red-orange
+    Color(red: 0.95, green: 0.25, blue: 0.3),  // red
+    Color(red: 0.9, green: 0.3, blue: 0.6),    // pink
+    Color(red: 0.75, green: 0.35, blue: 0.85), // purple
+    Color(red: 0.85, green: 0.85, blue: 0.85), // light gray
+    Color(red: 0.6, green: 0.6, blue: 0.65),   // gray
+    Color(red: 0.55, green: 0.45, blue: 0.35), // brown
+    Color(red: 0.4, green: 0.4, blue: 0.5),    // slate
+]
+
+private func swatchColorMatches(_ a: Color, _ b: Color) -> Bool {
+    let c1 = NSColor(a).usingColorSpace(.deviceRGB)
+    let c2 = NSColor(b).usingColorSpace(.deviceRGB)
+    guard let c1, let c2 else { return false }
+    return abs(c1.redComponent - c2.redComponent) < 0.05
+        && abs(c1.greenComponent - c2.greenComponent) < 0.05
+        && abs(c1.blueComponent - c2.blueComponent) < 0.05
+}
+
+/// Chain color picker: CPK / Chain / Custom modes
+private struct ChainColorPicker: View {
+    var chainID: String
+    var paletteColor: SIMD3<Float>
+    @Binding var mode: WorkspaceState.ChainColorMode
+    @Binding var customColor: SIMD3<Float>?
+    var onChange: () -> Void
+
+    @State private var showPopover = false
+
+    var body: some View {
+        Button(action: { showPopover.toggle() }) {
+            swatchIcon
+                .frame(width: 18, height: 18)
+        }
+        .buttonStyle(.plain)
+        .help("Chain color mode")
+        .popover(isPresented: $showPopover, arrowEdge: .leading) {
+            VStack(alignment: .leading, spacing: 6) {
+                // Mode buttons
+                modeButton("CPK", icon: "atom", isActive: mode == .cpk) {
+                    mode = .cpk
+                    onChange()
+                    showPopover = false
+                }
+                modeButton("Chain", icon: "link", isActive: mode == .chainDefault, swatchColor: paletteColor) {
+                    mode = .chainDefault
+                    onChange()
+                    showPopover = false
+                }
+
+                Divider()
+
+                // Custom color grid
+                Text("Custom")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.tertiary)
+
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22), spacing: 4), count: 4), spacing: 4) {
+                    ForEach(Array(swatchPresetColors.enumerated()), id: \.offset) { _, preset in
+                        let isSelected = mode == .custom && customColor != nil && swatchColorMatches(
+                            Color(red: Double(customColor!.x), green: Double(customColor!.y), blue: Double(customColor!.z)),
+                            preset
+                        )
+                        Button(action: {
+                            if let comps = NSColor(preset).usingColorSpace(.deviceRGB) {
+                                customColor = SIMD3<Float>(Float(comps.redComponent), Float(comps.greenComponent), Float(comps.blueComponent))
+                            }
+                            mode = .custom
+                            onChange()
+                            showPopover = false
+                        }) {
+                            Circle()
+                                .fill(preset)
+                                .frame(width: 20, height: 20)
+                                .overlay(
+                                    Circle()
+                                        .strokeBorder(Color.white.opacity(isSelected ? 0.9 : 0), lineWidth: 2)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(width: 120)
+        }
+    }
+
+    @ViewBuilder
+    private var swatchIcon: some View {
+        switch mode {
+        case .cpk:
+            // Multi-color CPK indicator
+            ZStack {
+                Circle().fill(Color(red: 0.5, green: 0.5, blue: 0.5)).frame(width: 16, height: 16) // C gray
+                Circle().fill(Color(red: 0.0, green: 0.4, blue: 1.0)).frame(width: 8, height: 8).offset(x: -3, y: -3) // N blue
+                Circle().fill(Color(red: 1.0, green: 0.2, blue: 0.2)).frame(width: 6, height: 6).offset(x: 3, y: 3) // O red
+            }
+            .clipShape(Circle())
+            .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
+        case .chainDefault:
+            Circle()
+                .fill(Color(red: Double(paletteColor.x), green: Double(paletteColor.y), blue: Double(paletteColor.z)))
+                .frame(width: 16, height: 16)
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
+        case .custom:
+            let c = customColor ?? paletteColor
+            Circle()
+                .fill(Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z)))
+                .frame(width: 16, height: 16)
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
+        }
+    }
+
+    private func modeButton(_ title: String, icon: String, isActive: Bool, swatchColor: SIMD3<Float>? = nil, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                if let sc = swatchColor {
+                    Circle()
+                        .fill(Color(red: Double(sc.x), green: Double(sc.y), blue: Double(sc.z)))
+                        .frame(width: 10, height: 10)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 10))
+                        .frame(width: 10)
+                }
+                Text(title)
+                    .font(.system(size: 10, weight: isActive ? .semibold : .regular))
+                Spacer()
+                if isActive {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 3)
+            .background(isActive ? Color.accentColor.opacity(0.1) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Simple color swatch picker (for ligand carbon color)
+private struct InlineColorPicker: View {
+    @Binding var color: Color
+    var label: String = ""
+    var size: CGFloat = 16
+    var onReset: (() -> Void)? = nil
+
+    @State private var showPopover = false
+
+    var body: some View {
+        Button(action: { showPopover.toggle() }) {
+            Circle()
+                .fill(color)
+                .frame(width: size, height: size)
+                .overlay(
+                    Circle()
+                        .strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(label)
+        .popover(isPresented: $showPopover, arrowEdge: .leading) {
+            VStack(spacing: 6) {
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22), spacing: 4), count: 4), spacing: 4) {
+                    ForEach(Array(swatchPresetColors.enumerated()), id: \.offset) { _, preset in
+                        Button(action: {
+                            color = preset
+                            showPopover = false
+                        }) {
+                            Circle()
+                                .fill(preset)
+                                .frame(width: 20, height: 20)
+                                .overlay(
+                                    Circle()
+                                        .strokeBorder(Color.white.opacity(swatchColorMatches(color, preset) ? 0.9 : 0), lineWidth: 2)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                if let onReset {
+                    Divider()
+                    Button(action: {
+                        onReset()
+                        showPopover = false
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 9))
+                            Text("Default")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(8)
+        }
+    }
+}
+
 struct InspectorPanel: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Binding var showInspector: Bool
     @State private var selectionMode: SelectionMode = .atom
 
     private enum SelectionMode: String, CaseIterable {
@@ -10,27 +230,50 @@ struct InspectorPanel: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                // Selection mode toggle + inspector
-                selectionSection
-
-                Divider()
-
-                // Chain Visibility
-                chainVisibilitySection
-
-                Divider()
-
-                // Residue Subsets (MOE-style)
-                residueSubsetsSection
-
-                Divider()
-
-                // Molecule Statistics
-                statisticsSection
+        VStack(spacing: 0) {
+            // Header with close button
+            HStack {
+                Image(systemName: "sidebar.right")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                Text("Inspector")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showInspector = false } }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 18, height: 18)
+                        .background(Color.primary.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .help("Hide inspector")
             }
-            .padding(12)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    selectionSection
+
+                    Divider()
+
+                    chainVisibilitySection
+
+                    Divider()
+
+                    residueSubsetsSection
+
+                    Divider()
+
+                    statisticsSection
+                }
+                .padding(12)
+            }
         }
         .frame(width: 260)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
@@ -325,20 +568,33 @@ struct InspectorPanel: View {
     @ViewBuilder
     private var chainVisibilitySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionHeader("Chains", icon: "link")
+            sectionHeader("Chains & Display", icon: "link")
 
             if viewModel.allChains.isEmpty && viewModel.molecules.ligand == nil {
                 Text("No chains loaded")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(viewModel.allChains) { chain in
+                ForEach(Array(viewModel.allChains.enumerated()), id: \.element.id) { chainIndex, chain in
                     let atomCount = chainAtomCount(chain)
+                    let palette = WorkspaceState.MoleculeColorScheme.chainPalette
+                    let paletteColor = palette[chainIndex % palette.count]
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            Circle()
-                                .fill(chain.displayColor)
-                                .frame(width: 8, height: 8)
+                            // Per-chain color mode picker (CPK / Chain / Custom)
+                            ChainColorPicker(
+                                chainID: chain.id,
+                                paletteColor: paletteColor,
+                                mode: Binding(
+                                    get: { viewModel.workspace.chainColorModes[chain.id] ?? .chainDefault },
+                                    set: { viewModel.workspace.chainColorModes[chain.id] = $0 }
+                                ),
+                                customColor: Binding(
+                                    get: { viewModel.workspace.chainColorOverrides[chain.id] },
+                                    set: { viewModel.workspace.chainColorOverrides[chain.id] = $0 }
+                                ),
+                                onChange: { viewModel.pushToRenderer() }
+                            )
 
                             VStack(alignment: .leading, spacing: 1) {
                                 Text("Chain \(chain.id)")
@@ -386,7 +642,7 @@ struct InspectorPanel: View {
                                     .padding(3)
                                     .background(Color.primary.opacity(0.05))
                                     .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
+                                }
                             .buttonStyle(.plain)
                             .foregroundStyle(.secondary)
                             .help("Show only this chain")
@@ -409,54 +665,105 @@ struct InspectorPanel: View {
                 }
 
                 if let lig = viewModel.molecules.ligand {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(Color.orange)
-                            .frame(width: 8, height: 8)
-                        Text("Ligand")
-                            .font(.system(size: 12, weight: .medium))
-                        Spacer()
-                        Text(lig.name)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                    Divider().padding(.vertical, 2)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            // Ligand carbon color picker (with CPK reset)
+                            InlineColorPicker(
+                                color: Binding(
+                                    get: {
+                                        if let lc = viewModel.workspace.ligandCarbonColor {
+                                            return Color(red: Double(lc.x), green: Double(lc.y), blue: Double(lc.z))
+                                        }
+                                        return Color.orange
+                                    },
+                                    set: { newColor in
+                                        if let comps = NSColor(newColor).usingColorSpace(.deviceRGB) {
+                                            viewModel.workspace.ligandCarbonColor = SIMD3<Float>(
+                                                Float(comps.redComponent),
+                                                Float(comps.greenComponent),
+                                                Float(comps.blueComponent)
+                                            )
+                                            viewModel.pushToRenderer()
+                                        }
+                                    }
+                                ),
+                                label: "Set ligand carbon color",
+                                onReset: {
+                                    viewModel.workspace.ligandCarbonColor = nil
+                                    viewModel.pushToRenderer()
+                                }
+                            )
 
-                        // Only show "define pocket from ligand" for co-crystallized ligands
-                        // (ligands from the PDB structure, not generated from SMILES)
-                        if lig.atoms.first?.isHetAtom == true && lig.smiles == nil {
-                            Button(action: { viewModel.definePocketFromLigand() }) {
-                                Image(systemName: "scope")
-                                    .font(.system(size: 11))
+                            Text("Ligand")
+                                .font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Text(lig.name)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+
+                        // Ligand render mode picker
+                        HStack(spacing: 4) {
+                            Text("Render")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { viewModel.workspace.ligandRenderMode ?? viewModel.workspace.renderMode },
+                                set: { newMode in
+                                    viewModel.workspace.ligandRenderMode = newMode
+                                    viewModel.pushToRenderer()
+                                }
+                            )) {
+                                Text("Stick").tag(RenderMode.wireframe)
+                                Text("B&S").tag(RenderMode.ballAndStick)
+                                Text("CPK").tag(RenderMode.spaceFilling)
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 150)
+                        }
+
+                        HStack(spacing: 4) {
+                            // Only show "define pocket from ligand" for co-crystallized ligands
+                            if lig.atoms.first?.isHetAtom == true && lig.smiles == nil {
+                                Button(action: { viewModel.definePocketFromLigand() }) {
+                                    Image(systemName: "scope")
+                                        .font(.system(size: 11))
+                                        .padding(3)
+                                        .background(Color.green.opacity(0.1))
+                                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.green)
+                                .help("Define docking pocket from co-crystallized ligand position")
+                            }
+
+                            Spacer()
+
+                            // Delete ligand from renderer
+                            Button(action: { viewModel.removeLigandFromView() }) {
+                                Image(systemName: "trash")
+                                    .font(.system(size: 10))
                                     .padding(3)
-                                    .background(Color.green.opacity(0.1))
+                                    .background(Color.red.opacity(0.05))
                                     .clipShape(RoundedRectangle(cornerRadius: 4))
                             }
                             .buttonStyle(.plain)
-                            .foregroundStyle(.green)
-                            .help("Define docking pocket from co-crystallized ligand position")
-                        }
+                            .foregroundStyle(.red.opacity(0.6))
+                            .help("Remove ligand from view and database")
 
-                        // Delete ligand from renderer
-                        Button(action: { viewModel.removeLigandFromView() }) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 10))
-                                .padding(3)
-                                .background(Color.red.opacity(0.05))
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                            Toggle("", isOn: Binding(
+                                get: { viewModel.workspace.showLigand },
+                                set: { newValue in
+                                    viewModel.workspace.showLigand = newValue
+                                    viewModel.pushToRenderer()
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.red.opacity(0.6))
-                        .help("Remove ligand from view and database")
-
-                        Toggle("", isOn: Binding(
-                            get: { viewModel.workspace.showLigand },
-                            set: { newValue in
-                                viewModel.workspace.showLigand = newValue
-                                viewModel.pushToRenderer()
-                            }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
                     }
                 }
             }

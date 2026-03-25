@@ -11,10 +11,12 @@ extension LigandDatabaseWindow {
     @ViewBuilder
     var batchActionPanel: some View {
         let selectedEntries = db.entries.filter { selectedIDs.contains($0.id) }
+        let unpreparedCount = selectedEntries.filter { !$0.isPrepared }.count
+        let preparedCount = selectedEntries.filter(\.isPrepared).count
 
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("\(selectedEntries.count) entries selected", systemImage: "checkmark.square.fill")
+                Label("\(selectedEntries.count) molecules selected", systemImage: "checkmark.square.fill")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 Button("Deselect All") { selectedIDs.removeAll() }
@@ -23,11 +25,28 @@ extension LigandDatabaseWindow {
                     .foregroundStyle(.secondary)
             }
 
+            HStack(spacing: 12) {
+                HStack(spacing: 3) {
+                    Circle().fill(.orange).frame(width: 6, height: 6)
+                    Text("\(unpreparedCount) raw molecules")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 3) {
+                    Circle().fill(.green).frame(width: 6, height: 6)
+                    Text("\(preparedCount) prepared ligands")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.green)
+                }
+            }
+
             if isBatchProcessing {
                 VStack(spacing: 4) {
                     ProgressView(value: Double(batchProgress.current), total: Double(max(batchProgress.total, 1)))
                         .controlSize(.small)
-                    Text("Processing \(batchProgress.current)/\(batchProgress.total)...")
+                    Text(processingMessage.isEmpty
+                         ? "Processing \(batchProgress.current)/\(batchProgress.total)..."
+                         : processingMessage)
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)
                 }
@@ -35,84 +54,90 @@ extension LigandDatabaseWindow {
 
             Divider()
 
-            // Batch parameters (shared with single-entry panel)
-            VStack(alignment: .leading, spacing: 6) {
-                Label("Batch Preparation", systemImage: "wand.and.stars")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
+            // Unified Populate & Prepare for batch
+            Label("Populate & Prepare", systemImage: "wand.and.stars")
+                .font(.system(size: 11, weight: .semibold))
 
-                Toggle("Add Hydrogens", isOn: $prepAddHydrogens)
-                    .toggleStyle(.switch).controlSize(.small)
-                Toggle("MMFF94 Minimization", isOn: $prepMinimize)
-                    .toggleStyle(.switch).controlSize(.small)
+            Text("Full pipeline for all \(selectedEntries.count) molecules: add polar H → MMFF94 minimize → Gasteiger charges → enumerate tautomers & protomers → generate conformers → filter by Boltzmann population.")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-                HStack {
-                    Text("Conformers:")
-                        .font(.system(size: 10))
+            // Configuration (same parameters as single entry)
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
+                GridRow {
+                    Text("Target pH").font(.system(size: 10)).frame(width: 90, alignment: .leading)
+                    Slider(value: $variantPH, in: 1...14, step: 0.1).controlSize(.mini)
+                    Text(String(format: "%.1f", variantPH))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 25)
+                }
+                GridRow {
+                    Text("Conformers/form").font(.system(size: 10)).frame(width: 90, alignment: .leading)
                     Picker("", selection: $prepNumConformers) {
                         ForEach([1, 10, 50, 100], id: \.self) { Text("\($0)").tag($0) }
                     }
                     .pickerStyle(.segmented).controlSize(.small)
+                    Spacer()
                 }
-            }
-
-            HStack(spacing: 8) {
-                Button(action: { prepareBatchEntries(selectedEntries) }) {
-                    Label("Prepare All", systemImage: "wand.and.stars")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent).controlSize(.small)
-                .disabled(isBatchProcessing)
-
-                Button(action: { generateConformersBatch(selectedEntries) }) {
-                    Label("Conformers", systemImage: "cube.transparent")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .disabled(isBatchProcessing)
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Label("Batch Variants", systemImage: "arrow.triangle.branch")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-
-                HStack {
-                    Text("Max tautomers:")
-                        .font(.system(size: 10))
+                GridRow {
+                    Text("Max tautomers").font(.system(size: 10)).frame(width: 90, alignment: .leading)
                     Picker("", selection: $variantMaxTautomers) {
                         ForEach([5, 10, 25], id: \.self) { Text("\($0)").tag($0) }
                     }
                     .pickerStyle(.segmented).controlSize(.small)
+                    Spacer()
                 }
-
-                HStack {
-                    Text("Max protomers:")
-                        .font(.system(size: 10))
+                GridRow {
+                    Text("Max protomers").font(.system(size: 10)).frame(width: 90, alignment: .leading)
                     Picker("", selection: $variantMaxProtomers) {
                         ForEach([4, 8, 16], id: \.self) { Text("\($0)").tag($0) }
                     }
                     .pickerStyle(.segmented).controlSize(.small)
+                    Spacer()
+                }
+                GridRow {
+                    Text("Energy cutoff").font(.system(size: 10)).frame(width: 90, alignment: .leading)
+                    Slider(value: $variantEnergyCutoff, in: 5...50, step: 1).controlSize(.mini)
+                    Text(String(format: "%.0f kcal", variantEnergyCutoff))
+                        .font(.system(size: 10, design: .monospaced)).frame(width: 45)
                 }
             }
 
-            HStack(spacing: 8) {
-                Button(action: { generateTautomersBatch(selectedEntries) }) {
-                    Label("Tautomers", systemImage: "arrow.2.squarepath")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .disabled(isBatchProcessing)
-
-                Button(action: { generateProtomersBatch(selectedEntries) }) {
-                    Label("Protomers", systemImage: "bolt")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .disabled(isBatchProcessing)
+            Button(action: {
+                runPopulateAndPrepare(entries: selectedEntries)
+            }) {
+                Label(isBatchProcessing
+                      ? "Processing \(batchProgress.current)/\(batchProgress.total)..."
+                      : "Populate & Prepare All (\(selectedEntries.count))",
+                      systemImage: "play.fill")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(isBatchProcessing)
+
+            Divider()
+
+            // Docking action
+            Button(action: { useSelectedForDocking() }) {
+                Label(preparedCount > 1
+                      ? "Queue \(preparedCount) Ligands for Batch Docking"
+                      : preparedCount == 1 ? "Use Ligand for Docking" : "No Prepared Ligands",
+                      systemImage: "arrow.right.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(preparedCount == 0)
+            .help("Only prepared ligands (with 3D coordinates) can be sent to docking")
+
+            Button(action: { deleteSelected() }) {
+                Label("Delete Selected (\(selectedEntries.count))", systemImage: "trash")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .foregroundStyle(.red)
         }
         .padding()
     }

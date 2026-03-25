@@ -492,6 +492,7 @@ struct DockingTabView: View {
                             .font(.system(size: 9))
                             .controlSize(.mini)
                             .buttonStyle(.bordered)
+                            .help("Z-slab \(preset.lowercased()) clipping around the pocket")
                         }
                     }
                 }
@@ -704,6 +705,7 @@ struct DockingTabView: View {
                     .font(.system(size: 9))
                     .buttonStyle(.plain)
                     .foregroundStyle(.red)
+                    .help("Remove all flexible residues (use rigid receptor)")
                 }
             }
 
@@ -828,6 +830,7 @@ struct DockingTabView: View {
                 .font(.system(size: 9))
                 .buttonStyle(.plain)
                 .foregroundStyle(.red)
+                .help("Remove all pharmacophore constraints")
             }
 
             ForEach(Array(viewModel.docking.pharmacophoreConstraints.enumerated()), id: \.element.id) { idx, constraint in
@@ -872,6 +875,143 @@ struct DockingTabView: View {
         }
     }
 
+    // MARK: - Search Method Options
+
+    @ViewBuilder
+    private var searchMethodOptionsSection: some View {
+        @Bindable var vm = viewModel
+        let method = viewModel.docking.dockingConfig.searchMethod
+
+        if method == .fragmentBased {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Beam Width")
+                        .font(.system(size: 9))
+                    Spacer()
+                    Text("\(viewModel.docking.dockingConfig.fragment.beamWidth)")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                Slider(
+                    value: Binding(
+                        get: { Float(viewModel.docking.dockingConfig.fragment.beamWidth) },
+                        set: { viewModel.docking.dockingConfig.fragment.beamWidth = Int($0) }
+                    ),
+                    in: 4...256, step: 4
+                )
+                .controlSize(.mini)
+
+                HStack(spacing: 4) {
+                    Button {
+                        viewModel.docking.showScaffoldInput = true
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "pencil.and.outline")
+                                .font(.system(size: 9))
+                            Text(viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil ? "Edit Scaffold" : "Enforce Scaffold")
+                                .font(.system(size: 10))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 3)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil ? .orange : .secondary)
+
+                    if viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil {
+                        Button {
+                            viewModel.docking.dockingConfig.fragment.scaffoldSMARTS = nil
+                            viewModel.docking.dockingConfig.fragment.scaffoldMode = .auto
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9))
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
+                    }
+                }
+
+                if let scaffold = viewModel.docking.dockingConfig.fragment.scaffoldSMARTS {
+                    Text("Scaffold: \(scaffold)")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .padding(.top, 2)
+        }
+
+        if method == .parallelTempering {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Replicas")
+                        .font(.system(size: 9))
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { viewModel.docking.dockingConfig.replicaExchange.numReplicas },
+                        set: { viewModel.docking.dockingConfig.replicaExchange.numReplicas = $0 }
+                    )) {
+                        Text("4").tag(4)
+                        Text("8").tag(8)
+                        Text("12").tag(12)
+                        Text("16").tag(16)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 140)
+                }
+
+                HStack {
+                    Text("T range")
+                        .font(.system(size: 9))
+                    Spacer()
+                    Text("\(String(format: "%.1f", viewModel.docking.dockingConfig.replicaExchange.minTemperature))–\(String(format: "%.1f", viewModel.docking.dockingConfig.replicaExchange.maxTemperature)) kcal/mol")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+            }
+            .padding(.top, 2)
+        }
+
+        if method == .diffusionGuided {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Denoising Steps")
+                        .font(.system(size: 9))
+                    Spacer()
+                    Text("\(viewModel.docking.dockingConfig.diffusion.numDenoisingSteps)")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                Slider(
+                    value: Binding(
+                        get: { Float(viewModel.docking.dockingConfig.diffusion.numDenoisingSteps) },
+                        set: { viewModel.docking.dockingConfig.diffusion.numDenoisingSteps = Int($0) }
+                    ),
+                    in: 10...100, step: 5
+                )
+                .controlSize(.mini)
+
+                HStack {
+                    Text("Schedule")
+                        .font(.system(size: 9))
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { viewModel.docking.dockingConfig.diffusion.noiseSchedule },
+                        set: { viewModel.docking.dockingConfig.diffusion.noiseSchedule = $0 }
+                    )) {
+                        ForEach(DiffusionDockingConfig.NoiseSchedule.allCases, id: \.self) { sched in
+                            Text(sched.rawValue).tag(sched)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 160)
+                }
+
+                Text("Requires DruseAF weights")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 2)
+        }
+    }
+
     // MARK: - Docking Control
 
     @ViewBuilder
@@ -884,8 +1024,43 @@ struct DockingTabView: View {
                 && viewModel.molecules.protein != nil
                 && !viewModel.docking.isDocking
 
-            // Scoring function selector
+            // Search method selector
             @Bindable var vm = viewModel
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Search Method")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 4) {
+                    ForEach(SearchMethod.allCases, id: \.self) { method in
+                        Button {
+                            vm.docking.dockingConfig.searchMethod = method
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: method.icon)
+                                    .font(.system(size: 10))
+                                Text(method.shortLabel)
+                                    .font(.system(size: 10, weight: .medium))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(vm.docking.dockingConfig.searchMethod == method ? .accentColor : .secondary)
+                        .opacity(vm.docking.dockingConfig.searchMethod == method ? 1 : 0.6)
+                        .help(method.description)
+                    }
+                }
+
+                Text(viewModel.docking.dockingConfig.searchMethod.description)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+
+                // Search method specific options
+                searchMethodOptionsSection
+            }
+
+            // Scoring function selector
             VStack(alignment: .leading, spacing: 4) {
                 Text("Scoring Function")
                     .font(.system(size: 10, weight: .semibold))
@@ -1057,6 +1232,7 @@ struct DockingTabView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
             .disabled(!canDock)
+            .help("Launch GPU-accelerated molecular docking with the configured scoring method and GA parameters")
 
             // VRAM usage warning
             if let engine = viewModel.docking.dockingEngine, let pocket = viewModel.docking.selectedPocket {
@@ -1157,6 +1333,7 @@ struct DockingTabView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .tint(.red)
+            .help("Cancel the active docking run and keep the best pose found so far")
         }
     }
 
@@ -1220,6 +1397,7 @@ struct DockingTabView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("Display the top-ranked docking pose in the 3D viewport")
             }
 
             // GA/search statistics
@@ -1243,6 +1421,7 @@ struct DockingTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .help("Browse all docking poses with scores, interactions, and export options")
         }
     }
 

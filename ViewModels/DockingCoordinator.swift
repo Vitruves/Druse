@@ -66,7 +66,11 @@ struct DockingCoordinator {
 
     var usePostDockingRefinement: Bool = false
 
-    // Scoring method and display preferences
+    // Scaffold enforcement UI
+    var showScaffoldInput: Bool = false
+
+    // Search method and scoring method preferences
+    var searchMethod: SearchMethod = .genetic
     var scoringMethod: ScoringMethod = .vina
     var chargeMethod: ChargeMethod = .gasteiger
     var affinityDisplayUnit: AffinityDisplayUnit = .pKi

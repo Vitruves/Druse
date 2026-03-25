@@ -85,63 +85,47 @@ EXPORT_WEIGHT_ORDER = [
     # "interaction_head.2.bias",    # [5]
 ]
 
-# Mapping from training model keys to export model keys
-TRAINING_TO_EXPORT = {
-    "prot_encoder.input_proj.weight": "prot_encoder.0.weight",
-    "prot_encoder.input_proj.bias": "prot_encoder.0.bias",
-    "lig_encoder.input_proj.weight": "lig_encoder.0.weight",
-    "lig_encoder.input_proj.bias": "lig_encoder.0.bias",
-}
-
-
 def load_weights(checkpoint_path: Path) -> dict:
-    """Load checkpoint, build the export model, and extract its full state dict.
+    """Load checkpoint and extract state dict directly.
 
-    This ensures Metal weights exactly match the CoreML export (including
-    randomly initialized layers that have no training-model analog).
+    With MLP encoders in train_druse_pKi_v2.py, the training model weight keys
+    match EXPORT_WEIGHT_ORDER exactly — no remapping needed.
     """
-    # Import the export model class from the sibling script
-    import importlib.util
-    export_script = Path(__file__).parent / "export_coreml_pKi.py"
-    spec = importlib.util.spec_from_file_location("export_pki", export_script)
-    export_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(export_mod)
-
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        training_state = checkpoint["model_state_dict"]
-        atom_dim = checkpoint.get("atom_dim", 20)
-        hidden_dim = checkpoint.get("hidden_dim", 128)
-        num_cross_attn = checkpoint.get("num_cross_attn_layers", 2)
+        state = checkpoint["model_state_dict"]
+        encoder_type = checkpoint.get("encoder", "unknown")
+        if encoder_type != "mlp":
+            print(f"  WARNING: checkpoint encoder='{encoder_type}', expected 'mlp'")
+            print(f"  Retrain with MLP encoders: python train_druse_pKi_v2.py ...")
     else:
-        training_state = checkpoint
-        atom_dim, hidden_dim, num_cross_attn = 20, 128, 2
+        state = checkpoint
 
-    # Build export model and load mapped weights (same as CoreML export)
-    model = export_mod.DruseScorePKiForExport(
-        atom_dim=atom_dim, hidden_dim=hidden_dim,
-        num_cross_attn_layers=num_cross_attn)
-    mapped = export_mod.map_training_weights(training_state, model)
-    model.load_state_dict(mapped, strict=False)
-
-    # Extract the complete state dict with all weights resolved
     result = {}
-    for key, val in model.state_dict().items():
+    for key, val in state.items():
         result[key] = val.float().numpy()
-
     return result
 
 
 def export_binary(weights: dict, output_path: Path):
     """Pack weights into flat binary format for Metal."""
-    tensors = []
+
+    # Verify all expected weights are present and have correct shapes
+    missing = []
     for key in EXPORT_WEIGHT_ORDER:
         if key not in weights:
-            print(f"  WARNING: missing weight '{key}' — using zeros")
-            # Infer shape from key name patterns
-            tensors.append(np.zeros(1, dtype=np.float32))
-        else:
-            tensors.append(weights[key].flatten().astype(np.float32))
+            missing.append(key)
+    if missing:
+        print(f"\n  ERROR: {len(missing)} weights missing from checkpoint:")
+        for k in missing:
+            print(f"    - {k}")
+        print(f"\n  This likely means the checkpoint was trained with EGNN encoders.")
+        print(f"  Retrain with: python train_druse_pKi_v2.py --input <cache> --output <dir> --epochs 80")
+        return
+
+    tensors = []
+    for key in EXPORT_WEIGHT_ORDER:
+        tensors.append(weights[key].flatten().astype(np.float32))
 
     num_tensors = len(tensors)
 

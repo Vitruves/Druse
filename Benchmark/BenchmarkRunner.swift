@@ -218,7 +218,7 @@ final class BenchmarkRunner: XCTestCase {
                 // 5. Set protein on engine (required for grid map computation)
                 eng.setProtein(protein.atoms, protein.bonds)
 
-                // 6. Dock (Vina GA search finds diverse poses)
+                // 6. Dock (DruseAF runs its own ML scoring on Metal during the GA)
                 print("    docking (pop=\(config.populationSize) gen=\(config.generationsPerRun))...")
                 fflush(stdout)
                 let gaResults = await eng.runDocking(
@@ -226,8 +226,7 @@ final class BenchmarkRunner: XCTestCase {
                     config: config, scoringMethod: scoringMethod
                 )
 
-                // 7. DruseAF scoring: evaluate GA poses with ML model in pKd units
-                //    (Vina search heuristic → DruseAF evaluator, same pipeline as the app)
+                // 7. DruseAF: rescore GA poses with CoreML DruseScorePKi for pKi output
                 let results: [DockingResult]
                 if scoringMethod == .druseAffinity {
                     let scorer = druseAFScorer()
@@ -288,8 +287,8 @@ final class BenchmarkRunner: XCTestCase {
 
                     let rmsd = entry.bestRmsd.map { String(format: "%.2f", $0) } ?? "N/A"
                     let gfn2Str = entry.gfn2Energy.map { String(format: "  GFN2=%.0f", $0) } ?? ""
-                    if scoringMethod == .druseAffinity, let pKd = best.mlPKd, let conf = best.mlPoseConfidence {
-                        print("  [\(idx+1)/\(total)] \(complex.pdbId)  pKd=\(String(format: "%.2f", pKd))  conf=\(String(format: "%.0f%%", conf * 100))  RMSD=\(rmsd)A  \(String(format: "%.0f", elapsed))ms")
+                    if scoringMethod == .druseAffinity, let pKi = best.mlPKd, let conf = best.mlPoseConfidence {
+                        print("  [\(idx+1)/\(total)] \(complex.pdbId)  pKi=\(String(format: "%.2f", pKi))  conf=\(String(format: "%.0f%%", conf * 100))  RMSD=\(rmsd)A  \(String(format: "%.0f", elapsed))ms")
                     } else {
                         print("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
                     }
@@ -350,15 +349,15 @@ final class BenchmarkRunner: XCTestCase {
         }
 
         let scored = ok.filter { $0.experimentalPKd != nil }
-        if scored.count > 10 {
+        if scored.count >= 3 {
             print("\n  Scoring Power:")
 
             // ML pKd correlation (DruseAF)
             let mlScored = scored.filter { $0.mlRescorePKd != nil }
-            if mlScored.count > 10 {
+            if mlScored.count >= 3 {
                 let rML = pearsonR(mlScored.map { $0.experimentalPKd! },
                                     mlScored.map { $0.mlRescorePKd! })
-                print("    Pearson r (DruseAF pKd vs exp): \(String(format: "%.4f", rML))  (n=\(mlScored.count))")
+                print("    Pearson r (DruseAF pKi vs exp): \(String(format: "%.4f", rML))  (n=\(mlScored.count))")
             }
 
             // Vina/Drusina energy correlation
