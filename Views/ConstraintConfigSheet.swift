@@ -50,14 +50,14 @@ struct ConstraintConfigSheet: View {
     private var header: some View {
         HStack {
             Image(systemName: "scope")
-                .font(.system(size: 16, weight: .semibold))
+                .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.accentColor)
             Text("Add Docking Constraint")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.body.weight(.semibold))
             Spacer()
             Button(action: { dismiss() }) {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 16))
+                    .font(.title3)
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
@@ -75,33 +75,33 @@ struct ConstraintConfigSheet: View {
             HStack(spacing: 8) {
                 if let atomName = context.atomName, let resName = context.residueName {
                     Text("\(atomName) @ \(resName)")
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .font(.callout.monospaced().weight(.medium))
                 } else if let resName = context.residueName {
                     Text(resName)
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .font(.callout.monospaced().weight(.medium))
                 } else {
                     Text("Selection")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.callout.weight(.medium))
                 }
 
                 if let chain = context.chainID, !chain.isEmpty {
                     Text("Chain \(chain)")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 2)
                         .background(.quaternary)
-                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
                 }
 
                 Spacer()
 
                 Text(context.sourceType == .receptor ? "Receptor" : "Ligand")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(context.sourceType == .receptor ? Color.blue.opacity(0.15) : Color.green.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
             }
         }
     }
@@ -110,7 +110,7 @@ struct ConstraintConfigSheet: View {
 
     @ViewBuilder
     private var scopeSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Target Scope", icon: "scope")
             Picker("", selection: $targetScope) {
                 ForEach(TargetScope.allCases, id: \.self) { scope in
@@ -122,7 +122,7 @@ struct ConstraintConfigSheet: View {
             Text(targetScope == .atom
                  ? "Constraint applies to the exact selected atom position."
                  : "Constraint is satisfied if ANY relevant atom in the residue interacts.")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -131,7 +131,7 @@ struct ConstraintConfigSheet: View {
 
     @ViewBuilder
     private var interactionTypeSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Interaction Type", icon: "arrow.triangle.branch")
             Picker("", selection: $interactionType) {
                 ForEach(ConstraintInteractionType.allCases, id: \.self) { type in
@@ -141,7 +141,7 @@ struct ConstraintConfigSheet: View {
             .pickerStyle(.menu)
 
             Text(interactionTypeDescription)
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -150,7 +150,7 @@ struct ConstraintConfigSheet: View {
 
     @ViewBuilder
     private var strengthSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Constraint Strength", icon: "gauge.with.dots.needle.33percent")
             Picker("", selection: $strengthMode) {
                 ForEach(StrengthMode.allCases, id: \.self) { mode in
@@ -162,15 +162,15 @@ struct ConstraintConfigSheet: View {
             if strengthMode == .soft {
                 HStack {
                     Text("Penalty")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                     Slider(value: $softStrength, in: 1...50, step: 1)
                     Text("\(String(format: "%.0f", softStrength)) kcal/mol/\u{00C5}\u{00B2}")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .frame(width: 90, alignment: .trailing)
                 }
             } else {
                 Text("Mandatory — poses violating this constraint will be strongly penalized (effective rejection).")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.orange)
             }
         }
@@ -180,16 +180,16 @@ struct ConstraintConfigSheet: View {
 
     @ViewBuilder
     private var distanceSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Distance Threshold", icon: "ruler")
             HStack {
                 Slider(value: $distanceThreshold, in: 2.0...5.0, step: 0.1)
                 Text("\(String(format: "%.1f", distanceThreshold)) \u{00C5}")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.subheadline.monospaced())
                     .frame(width: 45, alignment: .trailing)
             }
             Text("Maximum distance for the constraint to be considered satisfied.")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -217,8 +217,8 @@ struct ConstraintConfigSheet: View {
     @ViewBuilder
     private func sectionLabel(_ title: String, icon: String) -> some View {
         Label(title, systemImage: icon)
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(.secondary)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.primary)
     }
 
     private var interactionTypeDescription: String {

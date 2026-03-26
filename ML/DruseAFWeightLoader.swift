@@ -16,15 +16,19 @@ struct DruseAFWeightLoader {
         let entryBuffer: MTLBuffer        // DruseAFWeightEntry array
         let numTensors: Int
         let totalFloats: Int
+        let version: Int                  // 1 = v3 cross-attention, 2 = v4 PGN
     }
 
-    /// Load DruseAF weights from the app bundle.
-    static func loadFromBundle(device: MTLDevice, filename: String = "DruseAF") -> LoadedWeights? {
-        guard let url = Bundle.main.url(forResource: filename, withExtension: "weights") else {
-            print("[DruseAF] Weight file '\(filename).weights' not found in bundle")
-            return nil
+    /// Load DruseAF weights from the app bundle (prefers v4, falls back to v3).
+    static func loadFromBundle(device: MTLDevice) -> LoadedWeights? {
+        // Prefer v4 weights, fall back to v3
+        for filename in ["DruseAFv4", "DruseAF"] {
+            if let url = Bundle.main.url(forResource: filename, withExtension: "weights") {
+                return load(from: url, device: device)
+            }
         }
-        return load(from: url, device: device)
+        print("[DruseAF] No weight file found in bundle (tried DruseAFv4.weights, DruseAF.weights)")
+        return nil
     }
 
     /// Load DruseAF weights from a file URL.
@@ -50,10 +54,11 @@ struct DruseAFWeightLoader {
         let numTensors = Int(data.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt32.self) })
         let totalFloats = Int(data.withUnsafeBytes { $0.load(fromByteOffset: 12, as: UInt32.self) })
 
-        guard version == 1 else {
+        guard version == 1 || version == 2 else {
             print("[DruseAF] Unsupported weight file version: \(version)")
             return nil
         }
+        let isV4 = (version == 2)
 
         // Parse offset table: numTensors × (offset: UInt32, count: UInt32)
         let headerSize = 16
@@ -91,13 +96,15 @@ struct DruseAFWeightLoader {
             return nil
         }
 
-        print("[DruseAF] Weights loaded: \(numTensors) tensors, \(totalFloats) params (\(weightBytes / 1024) KB)")
+        let versionLabel = isV4 ? "v4 PGN" : "v3 cross-attention"
+        print("[DruseAF] Weights loaded (\(versionLabel)): \(numTensors) tensors, \(totalFloats) params (\(weightBytes / 1024) KB)")
 
         return LoadedWeights(
             weightBuffer: weightBuffer,
             entryBuffer: entryBuffer,
             numTensors: numTensors,
-            totalFloats: totalFloats
+            totalFloats: totalFloats,
+            version: Int(version)
         )
     }
 }

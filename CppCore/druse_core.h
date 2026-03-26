@@ -634,6 +634,33 @@ void druse_free_2d_result(Druse2DResult *result);
 /// Caller must free with druse_free_string().
 char* druse_mol_to_svg(const char *smiles, int32_t width, int32_t height);
 
+// ============================================================================
+// MARK: - Entity Sequence Extraction (SEQRES)
+// ============================================================================
+
+/// Per-chain full sequence from SEQRES / entity_poly_seq records.
+typedef struct {
+    char chainID[4];               // author chain ID
+    char (*residueNames)[8];       // array of 3-letter residue codes
+    int32_t residueCount;          // length of residueNames array
+} DruseChainSequence;
+
+/// Result of entity sequence extraction.
+typedef struct {
+    DruseChainSequence *chains;
+    int32_t chainCount;
+    bool success;
+    char errorMessage[512];
+} DruseEntitySequenceResult;
+
+/// Extract per-chain SEQRES / entity_poly_seq sequences from structure content.
+/// Uses gemmi's Entity::full_sequence populated by setup_entities().
+/// Returns heap-allocated result — caller must free with druse_free_entity_sequence_result().
+DruseEntitySequenceResult* druse_get_entity_sequences(const char *content);
+
+/// Free result from druse_get_entity_sequences.
+void druse_free_entity_sequence_result(DruseEntitySequenceResult *result);
+
 #ifdef __cplusplus
 }
 #endif

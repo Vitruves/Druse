@@ -57,11 +57,17 @@ struct PipelineBar: View {
     @Binding var panelOpen: Bool
 
     var body: some View {
-        HStack(spacing: 1) {
+        HStack(spacing: 2) {
             ForEach(SidebarTab.allCases, id: \.self) { tab in
                 pipelineButton(tab)
+                if tab != SidebarTab.allCases.last {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.quaternary)
+                }
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder
@@ -79,35 +85,35 @@ struct PipelineBar: View {
                 }
             }
         }) {
-            HStack(spacing: 5) {
+            HStack(spacing: 8) {
                 // Status-aware icon
                 ZStack {
                     Circle()
                         .fill(circleFill(status: status, isSelected: isSelected))
-                        .frame(width: 20, height: 20)
+                        .frame(width: 24, height: 24)
 
                     if isSelected {
                         Circle()
                             .stroke(Color.accentColor, lineWidth: 1.5)
-                            .frame(width: 20, height: 20)
+                            .frame(width: 24, height: 24)
                     }
 
                     circleContent(tab: tab, status: status, isSelected: isSelected)
                 }
 
-                VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(tab.rawValue)
-                        .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                        .font(isSelected ? .callout.weight(.bold) : .callout.weight(.semibold))
                         .foregroundStyle(isSelected ? .primary : .secondary)
                         .lineLimit(1)
                     Text(tab.subtitle)
-                        .font(.system(size: 9))
-                        .foregroundStyle(isSelected ? .secondary : .tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(isSelected ? .secondary : .secondary)
                         .lineLimit(1)
                 }
             }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
                     .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
@@ -115,6 +121,9 @@ struct PipelineBar: View {
             .contentShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityIdentifier(AccessibilityID.pipelineTab(tab.rawValue))
     }
 
     // MARK: - Step Status
@@ -156,16 +165,16 @@ struct PipelineBar: View {
     private func circleContent(tab: SidebarTab, status: StepStatus, isSelected: Bool) -> some View {
         if status == .completed && !isSelected {
             Image(systemName: "checkmark")
-                .font(.system(size: 8, weight: .bold))
+                .font(.footnote.weight(.bold))
                 .foregroundStyle(.green)
         } else if status == .available && !isSelected {
             Image(systemName: tab.icon)
-                .font(.system(size: 8))
+                .font(.footnote)
                 .foregroundStyle(.orange)
         } else {
             Image(systemName: tab.icon)
-                .font(.system(size: 8))
-                .foregroundStyle(isSelected ? .primary : .tertiary)
+                .font(.footnote)
+                .foregroundStyle(isSelected ? .primary : .secondary)
         }
     }
 }
@@ -182,19 +191,19 @@ struct PipelineContentPanel: View {
             // Header
             HStack {
                 Image(systemName: selectedTab.icon)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
                 Text(selectedTab.rawValue)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
                 Spacer()
                 Button(action: { withAnimation(.easeInOut(duration: 0.15)) { panelOpen = false } }) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
                         .frame(width: 20, height: 20)
                         .background(Color.primary.opacity(0.06))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
                 }
                 .buttonStyle(.plain)
                 .help("Close panel")
@@ -217,7 +226,7 @@ struct PipelineContentPanel: View {
             }
         }
         .frame(width: 300)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

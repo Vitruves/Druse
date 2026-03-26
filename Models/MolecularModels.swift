@@ -324,6 +324,7 @@ enum ScoringMethod: String, CaseIterable, Sendable {
     case vina = "Vina"
     case drusina = "Drusina"
     case druseAffinity = "Druse Affinity"
+    case pignet2 = "PIGNet2"
 
     /// Short label for compact UI (picker buttons).
     var shortLabel: String {
@@ -331,6 +332,7 @@ enum ScoringMethod: String, CaseIterable, Sendable {
         case .vina:          "Vina"
         case .drusina:       "Drusina"
         case .druseAffinity: "Druse AF"
+        case .pignet2:       "PIGNet2"
         }
     }
 
@@ -339,6 +341,7 @@ enum ScoringMethod: String, CaseIterable, Sendable {
         case .vina:          "function"
         case .drusina:       "sparkles"
         case .druseAffinity: "brain"
+        case .pignet2:       "atom"
         }
     }
 
@@ -347,6 +350,7 @@ enum ScoringMethod: String, CaseIterable, Sendable {
         case .vina:          "Empirical energy scoring (kcal/mol)"
         case .drusina:       "Extended Vina + π-π, π-cation, halogen bond, metal coord (kcal/mol)"
         case .druseAffinity: "Neural network affinity prediction (pKi)"
+        case .pignet2:       "Physics-informed GNN — vdW + H-bond + metal + hydrophobic (kcal/mol)"
         }
     }
 }

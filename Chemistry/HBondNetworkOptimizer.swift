@@ -76,6 +76,90 @@ enum HBondNetworkOptimizer {
         var decisions: [FlipDecision] = []
     }
 
+    // MARK: - Acceptor Spatial Hash (Tier 2)
+
+    /// Spatial hash grid indexing all N/O/S acceptor atoms for fast neighborhood queries.
+    /// Cell size matches the search radius (~4.0 A) so a 27-cell neighborhood covers it.
+    private struct AcceptorSpatialHash {
+        let cellSize: Float
+        let origin: SIMD3<Float>
+        let dims: SIMD3<Int32>
+        /// cell index -> [(atomIndex, position)]
+        let cells: [[(Int, SIMD3<Float>)]]
+
+        init(atoms: [Atom], cellSize: Float = 4.0) {
+            self.cellSize = cellSize
+            guard !atoms.isEmpty else {
+                self.origin = .zero
+                self.dims = .zero
+                self.cells = []
+                return
+            }
+
+            var minPos = atoms[0].position
+            var maxPos = atoms[0].position
+            for atom in atoms {
+                minPos = simd_min(minPos, atom.position)
+                maxPos = simd_max(maxPos, atom.position)
+            }
+            // Pad by one cell to avoid boundary issues
+            minPos -= SIMD3<Float>(repeating: cellSize)
+            let range = maxPos - minPos + SIMD3<Float>(repeating: cellSize)
+            let d = SIMD3<Int32>(
+                max(1, Int32(ceilf(range.x / cellSize))),
+                max(1, Int32(ceilf(range.y / cellSize))),
+                max(1, Int32(ceilf(range.z / cellSize)))
+            )
+
+            self.origin = minPos
+            self.dims = d
+            let totalCells = Int(d.x) * Int(d.y) * Int(d.z)
+            var grid = [[(Int, SIMD3<Float>)]](repeating: [], count: totalCells)
+
+            for (index, atom) in atoms.enumerated() {
+                // Only index N/O/S acceptor atoms (skip H and C)
+                guard atom.element == .N || atom.element == .O || atom.element == .S else { continue }
+                let rel = atom.position - minPos
+                let cx = min(Int(d.x) - 1, max(0, Int(rel.x / cellSize)))
+                let cy = min(Int(d.y) - 1, max(0, Int(rel.y / cellSize)))
+                let cz = min(Int(d.z) - 1, max(0, Int(rel.z / cellSize)))
+                let ci = cx + Int(d.x) * (cy + Int(d.y) * cz)
+                grid[ci].append((index, atom.position))
+            }
+            self.cells = grid
+        }
+
+        /// Returns positions of N/O/S acceptor atoms within `radius` of `center`,
+        /// excluding atoms in `excludeIndices`.
+        func query(center: SIMD3<Float>, radius: Float, excludeIndices: Set<Int>) -> [SIMD3<Float>] {
+            let radiusSq = radius * radius
+            let rel = center - origin
+            let cellRadius = Int(ceilf(radius / cellSize))
+            let cx0 = max(0, Int(rel.x / cellSize) - cellRadius)
+            let cy0 = max(0, Int(rel.y / cellSize) - cellRadius)
+            let cz0 = max(0, Int(rel.z / cellSize) - cellRadius)
+            let cx1 = min(Int(dims.x) - 1, Int(rel.x / cellSize) + cellRadius)
+            let cy1 = min(Int(dims.y) - 1, Int(rel.y / cellSize) + cellRadius)
+            let cz1 = min(Int(dims.z) - 1, Int(rel.z / cellSize) + cellRadius)
+
+            var result: [SIMD3<Float>] = []
+            for cz in cz0...cz1 {
+                for cy in cy0...cy1 {
+                    for cx in cx0...cx1 {
+                        let ci = cx + Int(dims.x) * (cy + Int(dims.y) * cz)
+                        for (atomIdx, pos) in cells[ci] {
+                            guard !excludeIndices.contains(atomIdx) else { continue }
+                            if simd_length_squared(pos - center) < radiusSq {
+                                result.append(pos)
+                            }
+                        }
+                    }
+                }
+            }
+            return result
+        }
+    }
+
     // MARK: - Entry point
 
     static func enumerateNetwork(
@@ -87,6 +171,9 @@ enum HBondNetworkOptimizer {
         let residueGroups = groupAtomsByResidue(atoms: atoms)
         let predictionMap = buildPredictionMap(predictions: predictions)
 
+        // Build spatial hash for acceptor lookups (Tier 2 optimization)
+        let acceptorHash = AcceptorSpatialHash(atoms: atoms, cellSize: 4.0)
+
         var groups: [MoveableGroup] = []
 
         for (residueID, atomIndices) in residueGroups {
@@ -95,7 +182,8 @@ enum HBondNetworkOptimizer {
                 atomIndices: atomIndices,
                 atoms: atoms,
                 adjacency: adjacencyList,
-                predictionMap: predictionMap
+                predictionMap: predictionMap,
+                acceptorHash: acceptorHash
             )
             groups.append(contentsOf: detected)
         }
@@ -170,7 +258,8 @@ enum HBondNetworkOptimizer {
         atomIndices: [Int],
         atoms: [Atom],
         adjacency: [[Int]],
-        predictionMap: [ResidueID: Protonation.ResiduePrediction]
+        predictionMap: [ResidueID: Protonation.ResiduePrediction],
+        acceptorHash: AcceptorSpatialHash? = nil
     ) -> [MoveableGroup] {
         let nameToIndex = buildNameMap(atomIndices: atomIndices, atoms: atoms)
 
@@ -180,28 +269,32 @@ enum HBondNetworkOptimizer {
                 residueID: residueID, atoms: atoms, adjacency: adjacency,
                 nameToIndex: nameToIndex,
                 parentName: "OG", hydrogenName: "HG",
-                axis1Name: "CB", axis2Name: "OG"
+                axis1Name: "CB", axis2Name: "OG",
+                acceptorHash: acceptorHash
             )
         case "THR":
             return makeRotatableOH(
                 residueID: residueID, atoms: atoms, adjacency: adjacency,
                 nameToIndex: nameToIndex,
                 parentName: "OG1", hydrogenName: "HG1",
-                axis1Name: "CB", axis2Name: "OG1"
+                axis1Name: "CB", axis2Name: "OG1",
+                acceptorHash: acceptorHash
             )
         case "TYR":
             return makeRotatableOH(
                 residueID: residueID, atoms: atoms, adjacency: adjacency,
                 nameToIndex: nameToIndex,
                 parentName: "OH", hydrogenName: "HH",
-                axis1Name: "CZ", axis2Name: "OH"
+                axis1Name: "CZ", axis2Name: "OH",
+                acceptorHash: acceptorHash
             )
         case "CYS":
             if let prediction = predictionMap[residueID],
                prediction.state == .protonated {
                 return makeRotatableSH(
                     residueID: residueID, atoms: atoms, adjacency: adjacency,
-                    nameToIndex: nameToIndex
+                    nameToIndex: nameToIndex,
+                    acceptorHash: acceptorHash
                 )
             }
             return []
@@ -263,7 +356,8 @@ enum HBondNetworkOptimizer {
         parentName: String,
         hydrogenName: String,
         axis1Name: String,
-        axis2Name: String
+        axis2Name: String,
+        acceptorHash: AcceptorSpatialHash? = nil
     ) -> [MoveableGroup] {
         guard let hIndex = nameToIndex[hydrogenName],
               let parentIndex = nameToIndex[parentName],
@@ -276,17 +370,22 @@ enum HBondNetworkOptimizer {
         let axisEnd = atoms[axis2Index].position
         let hPosition = atoms[hIndex].position
 
+        let excludeSet = Set(nameToIndex.values)
         let states = enumerateDonorRotations(
             hydrogenPosition: hPosition,
             axisOrigin: axisOrigin,
             axisEnd: axisEnd,
             hydrogenName: hydrogenName,
             coarseStep: 10,
-            nearbyAcceptors: findNearbyAcceptors(
+            nearbyAcceptors: acceptorHash?.query(
+                center: atoms[parentIndex].position,
+                radius: 3.5,
+                excludeIndices: excludeSet
+            ) ?? findNearbyAcceptors(
                 center: atoms[parentIndex].position,
                 radius: 3.5,
                 atoms: atoms,
-                excludeIndices: Set(nameToIndex.values)
+                excludeIndices: excludeSet
             )
         )
 
@@ -306,7 +405,8 @@ enum HBondNetworkOptimizer {
         residueID: ResidueID,
         atoms: [Atom],
         adjacency: [[Int]],
-        nameToIndex: [String: Int]
+        nameToIndex: [String: Int],
+        acceptorHash: AcceptorSpatialHash? = nil
     ) -> [MoveableGroup] {
         guard let hIndex = nameToIndex["HG"],
               let sgIndex = nameToIndex["SG"],
@@ -314,17 +414,22 @@ enum HBondNetworkOptimizer {
             return []
         }
 
+        let excludeSet = Set(nameToIndex.values)
         let states = enumerateDonorRotations(
             hydrogenPosition: atoms[hIndex].position,
             axisOrigin: atoms[cbIndex].position,
             axisEnd: atoms[sgIndex].position,
             hydrogenName: "HG",
             coarseStep: 10,
-            nearbyAcceptors: findNearbyAcceptors(
+            nearbyAcceptors: acceptorHash?.query(
+                center: atoms[sgIndex].position,
+                radius: 3.5,
+                excludeIndices: excludeSet
+            ) ?? findNearbyAcceptors(
                 center: atoms[sgIndex].position,
                 radius: 3.5,
                 atoms: atoms,
-                excludeIndices: Set(nameToIndex.values)
+                excludeIndices: excludeSet
             )
         )
 
@@ -1074,32 +1179,46 @@ enum HBondNetworkOptimizer {
         predictions: [Protonation.ResiduePrediction],
         device: MTLDevice? = nil
     ) -> (atoms: [Atom], bonds: [Bond], report: NetworkReport) {
+        let logSync = { (msg: String) in
+            _ = Task { @MainActor in ActivityLog.shared.debug(msg, category: .prep) }
+        }
+
         // Phase 4.1: Enumerate
+        let enumStart = CFAbsoluteTimeGetCurrent()
         let enumResult = enumerateNetwork(
             atoms: atoms, bonds: bonds, predictions: predictions
         )
         let graph = enumResult.graph
         var report = enumResult.report
+        let enumTime = CFAbsoluteTimeGetCurrent() - enumStart
+        logSync("[Phase4.1] Enumeration: \(graph.groups.count) groups, \(graph.cliques.count) cliques in \(String(format: "%.1f", enumTime * 1000))ms")
 
         guard !graph.groups.isEmpty else {
             return (atoms, bonds, report)
         }
 
         // Phase 4.2: Score and optimize
+        let scoreStart = CFAbsoluteTimeGetCurrent()
         let resolvedDevice = device ?? MTLCreateSystemDefaultDevice()
         let optimalStates: [Int]
 
+        let totalStates = graph.groups.reduce(0) { $0 + $1.states.count }
         if let gpu = resolvedDevice {
+            logSync("[Phase4.2] Batched GPU scoring: \(graph.groups.count) groups, \(totalStates) total states")
             optimalStates = optimizeWithGPU(
                 graph: graph, atoms: atoms, bonds: bonds, device: gpu, report: &report
             )
         } else {
+            logSync("[Phase4.2] CPU scoring fallback: \(graph.groups.count) groups, \(totalStates) total states")
             optimalStates = optimizeOnCPU(
                 graph: graph, atoms: atoms, bonds: bonds, report: &report
             )
         }
+        let scoreTime = CFAbsoluteTimeGetCurrent() - scoreStart
+        logSync("[Phase4.2] Scoring+optimization done in \(String(format: "%.1f", scoreTime * 1000))ms")
 
         // Phase 4.3: Apply optimal states
+        let applyStart = CFAbsoluteTimeGetCurrent()
         let result = applyOptimalStates(
             optimalStates: optimalStates,
             graph: graph,
@@ -1107,12 +1226,17 @@ enum HBondNetworkOptimizer {
             bonds: bonds,
             report: &report
         )
+        let applyTime = CFAbsoluteTimeGetCurrent() - applyStart
+        logSync("[Phase4.3] Applied optimal states in \(String(format: "%.1f", applyTime * 1000))ms — \(report.flipsAccepted) flips, \(report.rotationsOptimized) rotations")
 
         return (result.atoms, result.bonds, report)
     }
 
-    // MARK: - GPU Scoring
+    // MARK: - GPU Scoring (Batched)
 
+    /// Batched GPU scoring: pre-computes ALL candidates from ALL groups/states into a
+    /// single flat array, dispatches ONE Metal kernel, then partitions scores back.
+    /// This eliminates ~2500 individual command buffer dispatches (the main bottleneck).
     private static func optimizeWithGPU(
         graph: ConflictGraph,
         atoms: [Atom],
@@ -1131,25 +1255,170 @@ enum HBondNetworkOptimizer {
         let moveableIndices = Set(graph.groups.flatMap(\.moveableAtomIndices))
         let envAtomData = buildEnvironmentAtoms(atoms: atoms, excludeIndices: moveableIndices)
 
-        // Score each group's states
-        var groupStateScores: [[Float]] = []
+        guard !envAtomData.isEmpty else {
+            return optimizeOnCPU(graph: graph, atoms: atoms, bonds: bonds, report: &report)
+        }
 
+        let numEnv = envAtomData.count
+        let maskStride = (numEnv + 31) / 32
+
+        // --- Phase A: Pre-compute ALL candidates from ALL group-state combos into flat arrays ---
+        var allCandidates: [HBondCandidateAtom] = []
+        var allExcludeMask: [UInt32] = []
+        // Track (groupIndex, stateIndex, startOffset, count) for each group-state combo
+        struct BatchSlice {
+            let groupIndex: Int
+            let stateIndex: Int
+            let offset: Int
+            let count: Int
+        }
+        var slices: [BatchSlice] = []
+
+        // Pre-build same-residue env indices per group (reused across states)
+        var groupSameResIndices: [[Int]] = []
+        groupSameResIndices.reserveCapacity(graph.groups.count)
         for group in graph.groups {
-            var stateScores: [Float] = []
-            for state in group.states {
-                let score = scoreGroupStateGPU(
-                    group: group,
-                    state: state,
-                    envAtoms: envAtomData,
-                    atoms: atoms,
-                    bonds: bonds,
-                    device: device,
-                    commandQueue: commandQueue,
-                    pipeline: pipeline
-                )
-                stateScores.append(score - state.penalty)
+            groupSameResIndices.append(
+                findSameResidueEnvIndices(group: group, atoms: atoms, envAtoms: envAtomData)
+            )
+        }
+
+        for (gi, group) in graph.groups.enumerated() {
+            let sameResIndices = groupSameResIndices[gi]
+
+            for (si, state) in group.states.enumerated() {
+                let startOffset = allCandidates.count
+                var candidatesForState: [HBondCandidateAtom] = []
+
+                for (atomName, position) in state.atomPositions {
+                    let atomIndex = group.moveableAtomIndices.first { idx in
+                        atoms[idx].name.trimmingCharacters(in: .whitespaces).uppercased() == atomName
+                    }
+
+                    let element: Element
+                    let formalCharge: Int32
+                    if let idx = atomIndex {
+                        element = atoms[idx].element
+                        formalCharge = Int32(atoms[idx].formalCharge)
+                    } else {
+                        element = atomName.hasPrefix("H") ? .H : (atomName.hasPrefix("N") ? .N : .O)
+                        formalCharge = 0
+                    }
+
+                    var flags: UInt32 = 0
+                    if element == .H {
+                        flags |= UInt32(HBNET_FLAG_HYDROGEN)
+                        flags |= UInt32(HBNET_FLAG_DONOR)
+                    } else if element == .N {
+                        flags |= UInt32(HBNET_FLAG_DONOR)
+                        flags |= UInt32(HBNET_FLAG_ACCEPTOR)
+                    } else if element == .O {
+                        flags |= UInt32(HBNET_FLAG_ACCEPTOR)
+                    } else if element == .S {
+                        flags |= UInt32(HBNET_FLAG_ACCEPTOR)
+                    }
+                    if formalCharge != 0 {
+                        flags |= UInt32(HBNET_FLAG_CHARGED)
+                    }
+
+                    candidatesForState.append(HBondCandidateAtom(
+                        position: position,
+                        vdwRadius: element.vdwRadius,
+                        flags: flags,
+                        formalCharge: formalCharge,
+                        _pad0: 0, _pad1: 0
+                    ))
+                }
+
+                // Build exclusion mask for these candidates
+                for _ in 0..<candidatesForState.count {
+                    var maskWords = [UInt32](repeating: 0, count: maskStride)
+                    for ei in sameResIndices {
+                        maskWords[ei / 32] |= (1 << (ei & 31))
+                    }
+                    allExcludeMask.append(contentsOf: maskWords)
+                }
+
+                slices.append(BatchSlice(
+                    groupIndex: gi,
+                    stateIndex: si,
+                    offset: startOffset,
+                    count: candidatesForState.count
+                ))
+                allCandidates.append(contentsOf: candidatesForState)
             }
-            groupStateScores.append(stateScores)
+        }
+
+        let totalCandidates = allCandidates.count
+        guard totalCandidates > 0 else {
+            return optimizeOnCPU(graph: graph, atoms: atoms, bonds: bonds, report: &report)
+        }
+
+        // --- Phase B: Single GPU dispatch for ALL candidates ---
+        var params = HBondScoringParams(
+            numCandidates: UInt32(totalCandidates),
+            numEnvAtoms: UInt32(numEnv),
+            bumpWeight: 10.0,
+            hbondWeight: 4.0,
+            minRegHBGap: 0.6,
+            minChargedHBGap: 0.8,
+            badBumpGapCut: 0.4,
+            gapScale: 0.25
+        )
+
+        guard let candidateBuf = device.makeBuffer(
+                bytes: &allCandidates,
+                length: totalCandidates * MemoryLayout<HBondCandidateAtom>.stride,
+                options: .storageModeShared),
+              let envBuf = device.makeBuffer(
+                bytes: envAtomData,
+                length: numEnv * MemoryLayout<HBondEnvAtom>.stride,
+                options: .storageModeShared),
+              let scoreBuf = device.makeBuffer(
+                length: totalCandidates * MemoryLayout<HBondAtomScore>.stride,
+                options: .storageModeShared),
+              let paramBuf = device.makeBuffer(
+                bytes: &params,
+                length: MemoryLayout<HBondScoringParams>.stride,
+                options: .storageModeShared),
+              let maskBuf = device.makeBuffer(
+                bytes: &allExcludeMask,
+                length: allExcludeMask.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared),
+              let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder() else {
+            // CPU fallback: score all group-states on CPU
+            return optimizeOnCPU(graph: graph, atoms: atoms, bonds: bonds, report: &report)
+        }
+
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(candidateBuf, offset: 0, index: 0)
+        enc.setBuffer(envBuf, offset: 0, index: 1)
+        enc.setBuffer(scoreBuf, offset: 0, index: 2)
+        enc.setBuffer(paramBuf, offset: 0, index: 3)
+        enc.setBuffer(maskBuf, offset: 0, index: 4)
+
+        let threadgroupSize = min(totalCandidates, pipeline.maxTotalThreadsPerThreadgroup)
+        let threadgroupCount = (totalCandidates + threadgroupSize - 1) / threadgroupSize
+        enc.dispatchThreadgroups(
+            MTLSize(width: threadgroupCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        // --- Phase C: Partition output scores back by (group, state) offsets ---
+        let scorePtr = scoreBuf.contents().bindMemory(to: HBondAtomScore.self, capacity: totalCandidates)
+
+        var groupStateScores = [[Float]](repeating: [], count: graph.groups.count)
+        for slice in slices {
+            var totalScore: Float = 0
+            for i in 0..<slice.count {
+                totalScore += scorePtr[slice.offset + i].totalScore
+            }
+            let penalty = graph.groups[slice.groupIndex].states[slice.stateIndex].penalty
+            groupStateScores[slice.groupIndex].append(totalScore - penalty)
         }
 
         // Score pairwise interactions for clique members
@@ -1164,134 +1433,6 @@ enum HBondNetworkOptimizer {
             pairwiseScores: pairwiseScores,
             report: &report
         )
-    }
-
-    private static func scoreGroupStateGPU(
-        group: MoveableGroup,
-        state: GroupState,
-        envAtoms: [HBondEnvAtom],
-        atoms: [Atom],
-        bonds: [Bond],
-        device: MTLDevice,
-        commandQueue: MTLCommandQueue,
-        pipeline: MTLComputePipelineState
-    ) -> Float {
-        // Build candidate atoms from state positions
-        var candidates: [HBondCandidateAtom] = []
-        for (atomName, position) in state.atomPositions {
-            // Find the original atom to get its properties
-            let atomIndex = group.moveableAtomIndices.first { idx in
-                atoms[idx].name.trimmingCharacters(in: .whitespaces).uppercased() == atomName
-            }
-
-            let element: Element
-            let formalCharge: Int32
-            if let idx = atomIndex {
-                element = atoms[idx].element
-                formalCharge = Int32(atoms[idx].formalCharge)
-            } else {
-                // Infer from name
-                element = atomName.hasPrefix("H") ? .H : (atomName.hasPrefix("N") ? .N : .O)
-                formalCharge = 0
-            }
-
-            var flags: UInt32 = 0
-            if element == .H {
-                flags |= UInt32(HBNET_FLAG_HYDROGEN)
-                flags |= UInt32(HBNET_FLAG_DONOR)
-            } else if element == .N {
-                flags |= UInt32(HBNET_FLAG_DONOR)
-                flags |= UInt32(HBNET_FLAG_ACCEPTOR)
-            } else if element == .O {
-                flags |= UInt32(HBNET_FLAG_ACCEPTOR)
-            } else if element == .S {
-                flags |= UInt32(HBNET_FLAG_ACCEPTOR)
-            }
-            if formalCharge != 0 {
-                flags |= UInt32(HBNET_FLAG_CHARGED)
-            }
-
-            candidates.append(HBondCandidateAtom(
-                position: position,
-                vdwRadius: element.vdwRadius,
-                flags: flags,
-                formalCharge: formalCharge,
-                _pad0: 0, _pad1: 0
-            ))
-        }
-
-        guard !candidates.isEmpty, !envAtoms.isEmpty else { return 0.0 }
-
-        let numCandidates = candidates.count
-        let numEnv = envAtoms.count
-
-        // Build exclusion mask (exclude same-residue env atoms)
-        let sameResidueEnvIndices = findSameResidueEnvIndices(
-            group: group, atoms: atoms, envAtoms: envAtoms
-        )
-        let maskStride = (numEnv + 31) / 32
-        var excludeMask = [UInt32](repeating: 0, count: numCandidates * maskStride)
-        for ci in 0..<numCandidates {
-            for ei in sameResidueEnvIndices {
-                excludeMask[ci * maskStride + ei / 32] |= (1 << (ei & 31))
-            }
-        }
-
-        var params = HBondScoringParams(
-            numCandidates: UInt32(numCandidates),
-            numEnvAtoms: UInt32(numEnv),
-            bumpWeight: 10.0,
-            hbondWeight: 4.0,
-            minRegHBGap: 0.6,
-            minChargedHBGap: 0.8,
-            badBumpGapCut: 0.4,
-            gapScale: 0.25
-        )
-
-        guard let candidateBuf = device.makeBuffer(
-                bytes: &candidates,
-                length: numCandidates * MemoryLayout<HBondCandidateAtom>.stride,
-                options: .storageModeShared),
-              let envBuf = device.makeBuffer(
-                bytes: envAtoms,
-                length: numEnv * MemoryLayout<HBondEnvAtom>.stride,
-                options: .storageModeShared),
-              let scoreBuf = device.makeBuffer(
-                length: numCandidates * MemoryLayout<HBondAtomScore>.stride,
-                options: .storageModeShared),
-              let paramBuf = device.makeBuffer(
-                bytes: &params,
-                length: MemoryLayout<HBondScoringParams>.stride,
-                options: .storageModeShared),
-              let maskBuf = device.makeBuffer(
-                bytes: &excludeMask,
-                length: excludeMask.count * MemoryLayout<UInt32>.stride,
-                options: .storageModeShared),
-              let cmdBuf = commandQueue.makeCommandBuffer(),
-              let enc = cmdBuf.makeComputeCommandEncoder() else {
-            return scoreCPUFallback(candidates: candidates, envAtoms: envAtoms, params: params, excludeMask: excludeMask)
-        }
-
-        enc.setComputePipelineState(pipeline)
-        enc.setBuffer(candidateBuf, offset: 0, index: 0)
-        enc.setBuffer(envBuf, offset: 0, index: 1)
-        enc.setBuffer(scoreBuf, offset: 0, index: 2)
-        enc.setBuffer(paramBuf, offset: 0, index: 3)
-        enc.setBuffer(maskBuf, offset: 0, index: 4)
-
-        let tgSize = MTLSize(width: min(numCandidates, 256), height: 1, depth: 1)
-        let tgCount = MTLSize(width: (numCandidates + 255) / 256, height: 1, depth: 1)
-        enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-        enc.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
-
-        let ptr = scoreBuf.contents().bindMemory(to: HBondAtomScore.self, capacity: numCandidates)
-        var totalScore: Float = 0
-        for i in 0..<numCandidates {
-            totalScore += ptr[i].totalScore
-        }
-        return totalScore
     }
 
     // MARK: - CPU Scoring Fallback

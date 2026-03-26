@@ -78,6 +78,93 @@ extension AppViewModel {
         renderer?.camera.focusOnPoint(allAtoms[atomIndex].position)
     }
 
+    // MARK: - Extended Selection
+
+    /// Double-click: select the entire chain that the atom belongs to.
+    func selectChainOfAtom(_ atomIndex: Int) {
+        let allAtoms = (molecules.protein?.atoms ?? []) + (molecules.ligand?.atoms ?? [])
+        guard atomIndex < allAtoms.count else { return }
+        let chainID = allAtoms[atomIndex].chainID
+        selectChain(chainID)
+    }
+
+    /// Invert the current selection: deselect what's selected, select what wasn't.
+    func invertSelection() {
+        guard let prot = molecules.protein else { return }
+        let allResidues = Set(0..<prot.residues.count)
+        let newResidues = allResidues.subtracting(workspace.selectedResidueIndices)
+        workspace.selectedResidueIndices = newResidues
+
+        var newAtoms = Set<Int>()
+        for resIdx in newResidues {
+            guard resIdx < prot.residues.count else { continue }
+            newAtoms.formUnion(prot.residues[resIdx].atomIndices)
+        }
+        workspace.selectedAtomIndices = newAtoms
+        workspace.selectedAtomIndex = newAtoms.first
+        pushToRenderer()
+        log.info("Inverted selection: \(newResidues.count) residues", category: .molecule)
+        workspace.statusMessage = "\(newResidues.count) residues selected"
+    }
+
+    /// Extend selection by one residue in each direction along the chain sequence.
+    func extendSelectionByOneResidue() {
+        guard let prot = molecules.protein, !workspace.selectedResidueIndices.isEmpty else { return }
+
+        var newResidues = workspace.selectedResidueIndices
+        for chain in prot.chains {
+            let chainResidues = chain.residueIndices.sorted()
+            for resIdx in workspace.selectedResidueIndices {
+                guard let pos = chainResidues.firstIndex(of: resIdx) else { continue }
+                if pos > 0 { newResidues.insert(chainResidues[pos - 1]) }
+                if pos < chainResidues.count - 1 { newResidues.insert(chainResidues[pos + 1]) }
+            }
+        }
+
+        let added = newResidues.count - workspace.selectedResidueIndices.count
+        workspace.selectedResidueIndices = newResidues
+        for resIdx in newResidues {
+            guard resIdx < prot.residues.count else { continue }
+            workspace.selectedAtomIndices.formUnion(prot.residues[resIdx].atomIndices)
+        }
+        pushToRenderer()
+        log.info("Extended selection by \(added) adjacent residues", category: .molecule)
+        workspace.statusMessage = "\(workspace.selectedResidueIndices.count) residues selected"
+    }
+
+    /// Shrink selection by one residue from each end along the chain sequence.
+    func shrinkSelectionByOneResidue() {
+        guard let prot = molecules.protein, !workspace.selectedResidueIndices.isEmpty else { return }
+
+        // Find boundary residues (those with an unselected neighbor) and remove them
+        var boundary = Set<Int>()
+        for chain in prot.chains {
+            let chainResidues = chain.residueIndices.sorted()
+            for resIdx in workspace.selectedResidueIndices {
+                guard let pos = chainResidues.firstIndex(of: resIdx) else { continue }
+                let prevSelected = pos > 0 && workspace.selectedResidueIndices.contains(chainResidues[pos - 1])
+                let nextSelected = pos < chainResidues.count - 1 && workspace.selectedResidueIndices.contains(chainResidues[pos + 1])
+                if !prevSelected || !nextSelected {
+                    boundary.insert(resIdx)
+                }
+            }
+        }
+
+        let newResidues = workspace.selectedResidueIndices.subtracting(boundary)
+        workspace.selectedResidueIndices = newResidues
+
+        // Rebuild atom selection
+        var newAtoms = Set<Int>()
+        for resIdx in newResidues {
+            guard resIdx < prot.residues.count else { continue }
+            newAtoms.formUnion(prot.residues[resIdx].atomIndices)
+        }
+        workspace.selectedAtomIndices = newAtoms
+        workspace.selectedAtomIndex = newAtoms.first
+        pushToRenderer()
+        workspace.statusMessage = "\(newResidues.count) residues selected"
+    }
+
     // MARK: - Visibility
 
     func toggleChainVisibility(_ chainID: String) {
@@ -632,10 +719,43 @@ extension AppViewModel {
             menu.addItem(chainItem)
         }
 
-        let extendItem = NSMenuItem(title: "Select Residues Within 5 \u{00C5}", action: #selector(ContextMenuTarget.selectNearbyResiduesAction), keyEquivalent: "")
-        extendItem.target = contextMenuTarget
-        extendItem.isEnabled = !workspace.selectedAtomIndices.isEmpty
+        // Extend selection submenu
+        let hasSelection = !workspace.selectedAtomIndices.isEmpty
+        let extendMenu = NSMenu(title: "Extend")
+        let extendItem = NSMenuItem(title: "Extend Selection", action: nil, keyEquivalent: "")
+        extendItem.submenu = extendMenu
+        extendItem.isEnabled = hasSelection
+
+        for distance: Float in [5, 6, 8, 10] {
+            let label = String(format: "Nearby Residues Within %.0f \u{00C5}", distance)
+            let item = NSMenuItem(title: label, action: #selector(ContextMenuTarget.selectNearbyAction(_:)), keyEquivalent: "")
+            item.representedObject = distance
+            item.target = contextMenuTarget
+            extendMenu.addItem(item)
+        }
+        extendMenu.addItem(NSMenuItem.separator())
+
+        let extendOneItem = NSMenuItem(title: "Extend by \u{00B1}1 Residue", action: #selector(ContextMenuTarget.extendByOneResidueAction), keyEquivalent: "")
+        extendOneItem.target = contextMenuTarget
+        extendMenu.addItem(extendOneItem)
+
+        let shrinkOneItem = NSMenuItem(title: "Shrink by 1 Residue", action: #selector(ContextMenuTarget.shrinkByOneResidueAction), keyEquivalent: "")
+        shrinkOneItem.target = contextMenuTarget
+        extendMenu.addItem(shrinkOneItem)
+
         menu.addItem(extendItem)
+
+        let invertItem = NSMenuItem(title: "Invert Selection", action: #selector(ContextMenuTarget.invertSelectionAction), keyEquivalent: "")
+        invertItem.target = contextMenuTarget
+        invertItem.isEnabled = hasSelection
+        menu.addItem(invertItem)
+
+        let subsetItem = NSMenuItem(title: "Create Subset from Selection", action: #selector(ContextMenuTarget.createSubsetAction), keyEquivalent: "")
+        subsetItem.target = contextMenuTarget
+        subsetItem.isEnabled = !workspace.selectedResidueIndices.isEmpty
+        menu.addItem(subsetItem)
+
+        menu.addItem(NSMenuItem.separator())
 
         let pocketItem = NSMenuItem(title: "Define Pocket from Selection", action: #selector(ContextMenuTarget.definePocketAction), keyEquivalent: "")
         pocketItem.target = contextMenuTarget
@@ -651,7 +771,7 @@ extension AppViewModel {
 
         let hideItem = NSMenuItem(title: "Hide Selection", action: #selector(ContextMenuTarget.hideSelectionAction), keyEquivalent: "")
         hideItem.target = contextMenuTarget
-        hideItem.isEnabled = !workspace.selectedAtomIndices.isEmpty
+        hideItem.isEnabled = hasSelection
         menu.addItem(hideItem)
 
         let showAllItem = NSMenuItem(title: "Show All", action: #selector(ContextMenuTarget.showAllAction), keyEquivalent: "")
@@ -661,14 +781,14 @@ extension AppViewModel {
 
         let removeItem = NSMenuItem(title: "Remove Selection", action: #selector(ContextMenuTarget.removeSelectionAction), keyEquivalent: "")
         removeItem.target = contextMenuTarget
-        removeItem.isEnabled = !workspace.selectedAtomIndices.isEmpty
+        removeItem.isEnabled = hasSelection
         menu.addItem(removeItem)
 
         menu.addItem(NSMenuItem.separator())
 
         let centerItem = NSMenuItem(title: "Center on Selection", action: #selector(ContextMenuTarget.centerOnSelectionAction), keyEquivalent: "")
         centerItem.target = contextMenuTarget
-        centerItem.isEnabled = !workspace.selectedAtomIndices.isEmpty
+        centerItem.isEnabled = hasSelection
         menu.addItem(centerItem)
 
         let resetItem = NSMenuItem(title: "Reset View", action: #selector(ContextMenuTarget.resetViewAction), keyEquivalent: "")

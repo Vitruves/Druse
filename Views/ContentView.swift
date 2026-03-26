@@ -5,7 +5,7 @@ struct ContentView: View {
     @Environment(AppViewModel.self) private var viewModel
     @AppStorage("appTheme") private var appTheme: String = AppTheme.dark.rawValue
     @Environment(\.colorScheme) private var colorScheme
-    @State private var showInspector = true
+    @State private var showInspector = false
     @State private var showConsole = false
     @State private var consoleHeight: CGFloat = 54
     @State private var isDragTargeted = false
@@ -37,6 +37,36 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.2)) { showConsole = true }
             }
         }
+        .onChange(of: viewModel.molecules.protein?.atomCount) { old, new in
+            // Auto-show inspector when first molecule is loaded
+            if old == nil && new != nil && !showInspector {
+                withAnimation(.easeInOut(duration: 0.2)) { showInspector = true }
+            }
+        }
+        .onChange(of: viewModel.demoStep) { _, step in
+            // Auto-advance pipeline tabs during guided demo
+            withAnimation(.easeInOut(duration: 0.2)) {
+                switch step {
+                case .fetching, .parsing:
+                    pipelineTab = .search
+                    pipelinePanelOpen = false
+                case .overview, .ribbon:
+                    pipelineTab = .search
+                    pipelinePanelOpen = false
+                case .pocketScan, .pocketFound, .gridSetup:
+                    pipelineTab = .dock
+                    pipelinePanelOpen = false
+                case .dockingStart, .dockingRun, .dockingConverge:
+                    pipelineTab = .dock
+                    pipelinePanelOpen = false
+                case .scoring, .bestPose, .interactions:
+                    pipelineTab = .results
+                    pipelinePanelOpen = false
+                case .complete, .idle:
+                    break
+                }
+            }
+        }
         .onChange(of: colorScheme) { _, newScheme in
             viewModel.renderer?.themeMode = (newScheme == .light) ? 1 : 0
         }
@@ -51,6 +81,8 @@ struct ContentView: View {
             viewModel.renderer?.themeMode = isLight ? 1 : 0
             viewModel.renderer?.backgroundOpacity = viewModel.workspace.backgroundOpacity
             viewModel.renderer?.surfaceOpacity = viewModel.workspace.surfaceOpacity
+
+            // No auto-open — welcome screen handles first interaction
         }
         .sheet(isPresented: Binding(
             get: { viewModel.workspace.showingConstraintSheet },
@@ -79,10 +111,10 @@ struct ContentView: View {
                     .overlay {
                         VStack(spacing: 8) {
                             Image(systemName: "arrow.down.doc")
-                                .font(.system(size: 32))
+                                .font(.title)
                                 .foregroundStyle(.secondary)
                             Text("Drop to import")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.body.weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -109,7 +141,19 @@ struct ContentView: View {
             // Metal viewport with overlays — auto-centers in remaining space
             ZStack {
                 metalViewport
-                viewportTopBottom
+
+                if viewModel.molecules.protein == nil && !viewModel.isDemoRunning {
+                    WelcomeScreen(
+                        pipelineTab: $pipelineTab,
+                        pipelinePanelOpen: $pipelinePanelOpen
+                    )
+                    .transition(.opacity)
+                } else {
+                    viewportTopBottom
+                }
+
+                // Demo narration overlay (always on top when demo is active)
+                DemoOverlay()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -125,21 +169,21 @@ struct ContentView: View {
             HStack(alignment: .top) {
                 moleculeBadges
                 Spacer()
-                VStack(alignment: .trailing, spacing: 6) {
+                VStack(alignment: .trailing, spacing: 8) {
                     if !viewModel.docking.currentInteractions.isEmpty {
                         InteractionLegendView(interactions: viewModel.docking.currentInteractions)
                     }
-                    if viewModel.docking.isDocking {
+                    if viewModel.docking.isDocking && !viewModel.isDemoRunning {
                         dockingHUD
                     }
                 }
             }
-            .padding(10)
+            .padding(12)
 
             Spacer()
 
             renderControls
-                .padding(10)
+                .padding(12)
         }
     }
 
@@ -154,7 +198,7 @@ struct ContentView: View {
                     viewModel.selectAtom(atomIndex, toggle: isOptionClick)
                 },
                 onAtomDoubleClicked: { atomIndex in
-                    viewModel.focusOnAtom(atomIndex)
+                    viewModel.selectChainOfAtom(atomIndex)
                 },
                 onRenderModeChanged: { mode in
                     viewModel.setRenderMode(mode)
@@ -186,13 +230,13 @@ struct ContentView: View {
                 Color(nsColor: .windowBackgroundColor)
                 VStack(spacing: 12) {
                     Image(systemName: "cube.transparent")
-                        .font(.system(size: 40))
+                        .font(.title)
                         .foregroundStyle(.tertiary)
                     Text("Initializing Metal...")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.headline)
                         .foregroundStyle(.secondary)
                     Text("Load a protein from the Search tab or drag a PDB file here to begin")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 260)
@@ -205,7 +249,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var moleculeBadges: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             if let prot = viewModel.molecules.protein {
                 badge(prot.name, icon: "cube", color: .cyan, count: prot.atomCount)
             }
@@ -233,15 +277,15 @@ struct ContentView: View {
             // Batch progress (if applicable)
             if isBatch && bp.total > 1 {
                 Text("Ligand \(bp.current + 1)/\(bp.total)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.footnote.weight(.semibold).monospaced())
                     .foregroundStyle(.cyan)
             }
 
             // Generation progress bar
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Text("Gen \(gen + 1)/\(totalGen)")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.footnote.weight(.medium).monospaced())
+                    .foregroundStyle(.primary.opacity(0.9))
 
                 ProgressView(value: Double(gen + 1), total: Double(max(totalGen, 1)))
                     .progressViewStyle(.linear)
@@ -253,18 +297,18 @@ struct ContentView: View {
             HStack(spacing: 4) {
                 if let pKi = bestPKi {
                     Text("pKi")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.secondary)
                     Text(String(format: "%.1f", pKi))
-                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .font(.body.weight(.bold).monospaced())
                         .foregroundStyle(pKi > 6 ? .green : pKi > 4 ? .yellow : .orange)
                 } else if bestE < .infinity {
                     Text(String(format: "%.1f", bestE))
-                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .font(.body.weight(.bold).monospaced())
                         .foregroundStyle(bestE < -6 ? .green : bestE < -3 ? .yellow : .orange)
                     Text("kcal/mol")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -272,15 +316,15 @@ struct ContentView: View {
             let posesPerGen = viewModel.docking.dockingConfig.populationSize
             let totalPoses = (gen + 1) * posesPerGen
             Text("\(totalPoses) poses")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.5))
+                .font(.footnote.monospaced())
+                .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(.ultraThinMaterial)
-                .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+                .shadow(color: Color(nsColor: .shadowColor).opacity(0.3), radius: 4, y: 2)
         )
     }
 
@@ -291,18 +335,19 @@ struct ContentView: View {
                 let isActive = viewModel.workspace.renderMode == mode
                 Button(action: { viewModel.setRenderMode(mode) }) {
                     Image(systemName: mode.icon)
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .frame(width: 28, height: 28)
-                        .background(isActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .background(isActive ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 7)
-                                .stroke(isActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(isActive ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: isActive ? 1 : 0.5)
                         )
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(isActive ? .primary : .secondary)
                 .help(mode.rawValue)
+                .plainButtonAccessibility(AccessibilityID.renderMode(mode.rawValue))
             }
 
             // Side chain display in ribbon mode
@@ -324,13 +369,13 @@ struct ContentView: View {
                     }
                 } label: {
                     Image(systemName: viewModel.workspace.sideChainDisplay.icon)
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .frame(width: 28, height: 28)
-                        .background(scActive ? Color.purple.opacity(0.5) : Color.white.opacity(0.05))
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .background(scActive ? Color.purple.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 7)
-                                .stroke(scActive ? Color.purple.opacity(0.6) : Color.clear, lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(scActive ? Color.purple.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: scActive ? 1 : 0.5)
                         )
                 }
                 .menuStyle(.borderlessButton)
@@ -348,19 +393,20 @@ struct ContentView: View {
             let hAvailable = viewModel.proteinHasHydrogens
             Button(action: { viewModel.toggleHydrogens() }) {
                 Text("H")
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .font(.callout.weight(.bold).monospaced())
                     .frame(width: 28, height: 28)
-                    .background(hActive && hAvailable ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(hActive && hAvailable ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(hActive && hAvailable ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(hActive && hAvailable ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: hActive && hAvailable ? 1 : 0.5)
                     )
             }
             .buttonStyle(.plain)
             .foregroundStyle(hAvailable ? (hActive ? .primary : .secondary) : .tertiary)
             .disabled(!hAvailable)
             .help(hAvailable ? (hActive ? "Hide hydrogens" : "Show hydrogens") : "No hydrogens — add them in Preparation")
+            .plainButtonAccessibility(AccessibilityID.renderHydrogens)
 
             // Color scheme picker (ligand focus coloring)
             let isLigandFocus = viewModel.workspace.colorScheme == .ligandFocus
@@ -380,13 +426,13 @@ struct ContentView: View {
                 }
             } label: {
                 Image(systemName: "paintpalette")
-                    .font(.system(size: 14))
+                    .font(.body)
                     .frame(width: 28, height: 28)
-                    .background(isLigandFocus ? Color.yellow.opacity(0.3) : Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(isLigandFocus ? Color.yellow.opacity(0.3) : Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(isLigandFocus ? Color.yellow.opacity(0.5) : Color.clear, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(isLigandFocus ? Color.yellow.opacity(0.5) : Color(nsColor: .separatorColor), lineWidth: isLigandFocus ? 1 : 0.5)
                     )
             }
             .menuStyle(.borderlessButton)
@@ -398,19 +444,20 @@ struct ContentView: View {
             let surfActive = viewModel.workspace.showSurface
             Button(action: { viewModel.toggleSurface() }) {
                 Image(systemName: "drop.halffull")
-                    .font(.system(size: 14))
+                    .font(.body)
                     .frame(width: 28, height: 28)
-                    .background(surfActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(surfActive ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(surfActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(surfActive ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: surfActive ? 1 : 0.5)
                     )
             }
             .buttonStyle(.plain)
             .foregroundStyle(surfActive ? .primary : .secondary)
             .disabled(viewModel.molecules.protein == nil || viewModel.workspace.isGeneratingSurface)
             .help(surfActive ? "Hide molecular surface" : "Show molecular surface")
+            .plainButtonAccessibility(AccessibilityID.renderSurface)
 
             // Surface color mode picker and opacity (only when surface is visible)
             if viewModel.workspace.showSurface {
@@ -428,13 +475,13 @@ struct ContentView: View {
                     }
                 } label: {
                     Image(systemName: surfaceColorIcon)
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .frame(width: 28, height: 28)
-                        .background(scmActive ? Color.yellow.opacity(0.5) : Color.white.opacity(0.05))
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .background(scmActive ? Color.yellow.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 7)
-                                .stroke(scmActive ? Color.yellow.opacity(0.6) : Color.clear, lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(scmActive ? Color.yellow.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: scmActive ? 1 : 0.5)
                         )
                 }
                 .menuStyle(.borderlessButton)
@@ -463,7 +510,7 @@ struct ContentView: View {
                     Button("Coarse grid (0.7 Å)") { viewModel.workspace.surfaceGridSpacing = 0.7; viewModel.regenerateSurface() }
                 } label: {
                     Image(systemName: "scope")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(viewModel.workspace.surfaceProbeRadius != 1.4 ? .cyan : .secondary)
                 }
                 .menuStyle(.borderlessButton)
@@ -475,18 +522,19 @@ struct ContentView: View {
             let lightActive = viewModel.workspace.useDirectionalLighting
             Button(action: { viewModel.toggleLighting() }) {
                 Image(systemName: lightActive ? "sun.max.fill" : "sun.min")
-                    .font(.system(size: 14))
+                    .font(.body)
                     .frame(width: 28, height: 28)
-                    .background(lightActive ? Color.accentColor.opacity(0.5) : Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(lightActive ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(lightActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(lightActive ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: lightActive ? 1 : 0.5)
                     )
             }
             .buttonStyle(.plain)
             .foregroundStyle(lightActive ? .primary : .secondary)
             .help(lightActive ? "Uniform lighting" : "Directional lighting")
+            .plainButtonAccessibility(AccessibilityID.renderLighting)
 
             Divider()
                 .frame(height: 24)
@@ -499,18 +547,19 @@ struct ContentView: View {
                 syncClipping()
             }) {
                 Image(systemName: "scissors")
-                    .font(.system(size: 14))
+                    .font(.body)
                     .frame(width: 28, height: 28)
-                    .background(clipActive ? Color.orange.opacity(0.5) : Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(clipActive ? Color.orange.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(clipActive ? Color.orange.opacity(0.6) : Color.clear, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(clipActive ? Color.orange.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: clipActive ? 1 : 0.5)
                     )
             }
             .buttonStyle(.plain)
             .foregroundStyle(clipActive ? .orange : .secondary)
             .help("Z-slab clipping")
+            .plainButtonAccessibility(AccessibilityID.renderClipping)
 
             if viewModel.workspace.enableClipping {
                 // Thickness / Offset sliders (object-space slab)
@@ -531,7 +580,7 @@ struct ContentView: View {
                 }
 
                 Text(String(format: "%.0f \u{00C5}", viewModel.workspace.slabThickness))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
 
@@ -548,54 +597,61 @@ struct ContentView: View {
 
             // Current mode label
             Text(viewModel.workspace.renderMode.rawValue)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .font(.subheadline.weight(.medium).monospaced())
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Color.white.opacity(0.05))
+                .background(Color(nsColor: .separatorColor).opacity(0.3))
                 .clipShape(Capsule())
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
+        .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
     }
 
     private var cameraButtons: some View {
         HStack(spacing: 4) {
             Button(action: { viewModel.fitToView() }) {
                 Image(systemName: "viewfinder")
-                    .font(.system(size: 12))
+                    .font(.callout)
                     .frame(width: 28, height: 28)
-                    .background(Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Fit to view (Space)")
+            .plainButtonAccessibility(AccessibilityID.renderFitToView)
 
             Button(action: { viewModel.fitToLigand() }) {
                 Image(systemName: "scope")
-                    .font(.system(size: 12))
+                    .font(.callout)
                     .frame(width: 28, height: 28)
-                    .background(Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .disabled(viewModel.molecules.ligand == nil)
             .help("Center on ligand")
+            .plainButtonAccessibility(AccessibilityID.renderFitToLigand)
 
             Button(action: { viewModel.renderer?.camera.reset(); viewModel.pushToRenderer() }) {
                 Image(systemName: "arrow.counterclockwise")
-                    .font(.system(size: 12))
+                    .font(.callout)
                     .frame(width: 28, height: 28)
-                    .background(Color.white.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Reset camera")
+            .plainButtonAccessibility(AccessibilityID.renderResetCamera)
         }
     }
 
@@ -608,17 +664,17 @@ struct ContentView: View {
     }
 
     private func badge(_ name: String, icon: String, color: Color, count: Int) -> some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 4) {
             Image(systemName: icon)
-                .font(.system(size: 11))
+                .font(.subheadline)
             Text(name)
-                .font(.system(size: 12, weight: .medium))
+                .font(.callout.weight(.medium))
             Text("\(count) atoms")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(color.opacity(0.7))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
         .background(color.opacity(0.15))
         .foregroundStyle(color)
         .clipShape(Capsule())

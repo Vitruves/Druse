@@ -51,13 +51,13 @@ extension LigandDatabaseWindow {
     private func structurePreviewPanel(_ entry: LigandEntry) -> some View {
         VStack(spacing: 0) {
             // Header: name + prepared badge + 2D/3D toggle
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Text(entry.name)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.headline)
                 if entry.isPrepared {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                 }
                 Spacer()
 
@@ -72,12 +72,12 @@ extension LigandDatabaseWindow {
                 .help("Toggle 2D depiction / 3D ball-and-stick")
 
                 Text(entry.smiles.prefix(30) + (entry.smiles.count > 30 ? "..." : ""))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
 
             Divider()
 
@@ -88,13 +88,13 @@ extension LigandDatabaseWindow {
                     MetalView(renderer: renderer)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if entry.atoms.isEmpty {
-                    VStack(spacing: 6) {
+                    VStack(spacing: 8) {
                         Image(systemName: "cube")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.tertiary)
+                            .font(.title)
+                            .foregroundStyle(.secondary)
                         Text("Prepare ligand for 3D view")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -114,7 +114,7 @@ extension LigandDatabaseWindow {
                         .resizable()
                         .scaledToFit()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color.white)
+                        .background(Color(nsColor: .textBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if let coords = ligand2DCoords {
                     // Fallback to Canvas drawing if SVG generation failed
@@ -122,15 +122,15 @@ extension LigandDatabaseWindow {
                         draw2DStructure(context: context, size: size, coords: coords)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(nsColor: .controlBackgroundColor))
+                    .background(Color(nsColor: .textBackgroundColor))
                 } else {
-                    VStack(spacing: 6) {
+                    VStack(spacing: 8) {
                         Image(systemName: "hexagon")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.tertiary)
+                            .font(.title)
+                            .foregroundStyle(.secondary)
                         Text("No 2D structure")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -139,7 +139,7 @@ extension LigandDatabaseWindow {
             // Form navigator (when multiple chemical forms exist)
             if let entry = inspectedEntry, entry.forms.count > 1 {
                 Divider()
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     Button(action: {
                         let newIdx = max(0, selectedFormIndex - 1)
                         selectedFormIndex = newIdx
@@ -163,14 +163,14 @@ extension LigandDatabaseWindow {
                     case .tautomerProtomer: .purple
                     }
                     Text(form.kind.symbol)
-                        .font(.system(size: 7, weight: .bold))
+                        .font(.caption2.weight(.bold))
                         .foregroundStyle(.white)
                         .frame(width: 16, height: 14)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(kindColor))
+                        .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
                     Text("Form \(selectedFormIndex + 1)/\(entry.forms.count)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .font(.footnote.monospaced().weight(.medium))
                     Text(form.label)
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
 
                     Button(action: {
@@ -192,7 +192,7 @@ extension LigandDatabaseWindow {
 
                     if form.boltzmannWeight > 0 {
                         Text(form.populationString)
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
                                              form.boltzmannWeight > 0.1 ? .yellow : .secondary)
                     }
@@ -205,8 +205,8 @@ extension LigandDatabaseWindow {
             // Hint: 2D can't show conformer differences
             if !conformers.isEmpty && !show3DPreview {
                 Text("Switch to 3D to see conformer spatial differences")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.quaternary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 2)
             }
@@ -224,7 +224,7 @@ extension LigandDatabaseWindow {
                     .disabled(selectedConformerIndex == 0)
 
                     Text("Conformer \(selectedConformerIndex + 1) / \(conformers.count)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .font(.footnote.monospaced().weight(.medium))
 
                     Button(action: {
                         selectedConformerIndex = min(conformers.count - 1, selectedConformerIndex + 1)
@@ -238,12 +238,12 @@ extension LigandDatabaseWindow {
 
                     if selectedConformerIndex < conformers.count {
                         Text(String(format: "%.1f kcal/mol", conformers[selectedConformerIndex].energy))
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                     }
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.vertical, 8)
                 .onChange(of: selectedConformerIndex) { _, newIdx in
                     guard newIdx >= 0, newIdx < conformers.count else { return }
                     let conf = conformers[newIdx]
@@ -275,40 +275,40 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     func propertiesTab(_ entry: LigandEntry) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             if let desc = entry.descriptors {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                     GridRow {
-                        Text("MW").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text(String(format: "%.1f Da", desc.molecularWeight)).font(.system(size: 11, design: .monospaced))
+                        Text("MW").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text(String(format: "%.1f Da", desc.molecularWeight)).font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("cLogP").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text(String(format: "%.2f", desc.logP)).font(.system(size: 11, design: .monospaced))
+                        Text("cLogP").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", desc.logP)).font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("TPSA").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text(String(format: "%.1f \u{00C5}\u{00B2}", desc.tpsa)).font(.system(size: 11, design: .monospaced))
+                        Text("TPSA").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text(String(format: "%.1f \u{00C5}\u{00B2}", desc.tpsa)).font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("HBD / HBA").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text("\(desc.hbd) / \(desc.hba)").font(.system(size: 11, design: .monospaced))
+                        Text("HBD / HBA").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text("\(desc.hbd) / \(desc.hba)").font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("RotBonds").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text("\(desc.rotatableBonds)").font(.system(size: 11, design: .monospaced))
+                        Text("RotBonds").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text("\(desc.rotatableBonds)").font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("Rings").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text("\(desc.rings) (\(desc.aromaticRings) arom)").font(.system(size: 11, design: .monospaced))
+                        Text("Rings").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text("\(desc.rings) (\(desc.aromaticRings) arom)").font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("Fsp3").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text(String(format: "%.2f", desc.fractionCSP3)).font(.system(size: 11, design: .monospaced))
+                        Text("Fsp3").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", desc.fractionCSP3)).font(.subheadline.monospaced())
                     }
                     GridRow {
-                        Text("Heavy atoms").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        Text("\(desc.heavyAtomCount)").font(.system(size: 11, design: .monospaced))
+                        Text("Heavy atoms").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        Text("\(desc.heavyAtomCount)").font(.subheadline.monospaced())
                     }
                 }
 
@@ -320,8 +320,8 @@ extension LigandDatabaseWindow {
                 }
             } else {
                 Text("Prepare this ligand to compute properties")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
 
             // Binding affinity (if available)
@@ -330,20 +330,20 @@ extension LigandDatabaseWindow {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                     if let ki = entry.ki {
                         GridRow {
-                            Text("Ki").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                            Text(String(format: "%.2f nM", ki)).font(.system(size: 11, design: .monospaced))
+                            Text("Ki").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                            Text(String(format: "%.2f nM", ki)).font(.subheadline.monospaced())
                         }
                     }
                     if let pKi = entry.pKi {
                         GridRow {
-                            Text("pKi").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                            Text(String(format: "%.2f", pKi)).font(.system(size: 11, design: .monospaced))
+                            Text("pKi").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                            Text(String(format: "%.2f", pKi)).font(.subheadline.monospaced())
                         }
                     }
                     if let ic50 = entry.ic50 {
                         GridRow {
-                            Text("IC50").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                            Text(String(format: "%.2f nM", ic50)).font(.system(size: 11, design: .monospaced))
+                            Text("IC50").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                            Text(String(format: "%.2f nM", ic50)).font(.subheadline.monospaced())
                         }
                     }
                 }
@@ -354,8 +354,8 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     private func ruleBadge(_ name: String, passed: Bool) -> some View {
-        Text(name).font(.system(size: 9, weight: .semibold))
-            .padding(.horizontal, 6).padding(.vertical, 2)
+        Text(name).font(.footnote.weight(.semibold))
+            .padding(.horizontal, 8).padding(.vertical, 2)
             .background(Capsule().fill(passed ? Color.green.opacity(0.2) : Color.red.opacity(0.15)))
             .foregroundStyle(passed ? .green : .red)
             .strikethrough(!passed)
@@ -365,10 +365,10 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     func prepareTab(_ entry: LigandEntry) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             // Quick single-structure preparation
             Label("Quick Prepare", systemImage: "wand.and.stars")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
 
             Toggle("Add hydrogens", isOn: $prepAddHydrogens)
                 .toggleStyle(.switch).controlSize(.small)
@@ -396,10 +396,10 @@ extension LigandDatabaseWindow {
             if entry.isPrepared {
                 HStack(spacing: 4) {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Prepared").font(.system(size: 10, weight: .medium)).foregroundStyle(.green)
+                    Text("Prepared").font(.footnote.weight(.medium)).foregroundStyle(.green)
                     if let date = entry.preparationDate {
                         Text(date.formatted(date: .abbreviated, time: .shortened))
-                            .font(.system(size: 9)).foregroundStyle(.tertiary)
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -408,28 +408,28 @@ extension LigandDatabaseWindow {
 
             // Full ensemble preparation (the main workflow)
             Label("Full Ensemble Preparation", systemImage: "sparkles")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
 
             Text("Generates all chemically probable forms at target pH: protomers, tautomers, and conformers. Each form is fully prepared (polar H, MMFF94 minimized, Gasteiger charges). Boltzmann population weights are assigned based on MMFF94 energy.")
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                Text("Target pH").font(.system(size: 10))
+                Text("Target pH").font(.footnote)
                 Slider(value: $variantPH, in: 1...14, step: 0.1).controlSize(.mini)
-                Text(String(format: "%.1f", variantPH)).font(.system(size: 10, design: .monospaced)).frame(width: 30)
+                Text(String(format: "%.1f", variantPH)).font(.footnote.monospaced()).frame(width: 30)
             }
             HStack {
-                Text("Conformers/form").font(.system(size: 10))
+                Text("Conformers/form").font(.footnote)
                 Spacer()
                 Stepper("\(conformerBudgetPerVariant)", value: $conformerBudgetPerVariant, in: 1...50, step: 1)
                     .controlSize(.small)
             }
             HStack {
-                Text("Energy cutoff").font(.system(size: 10))
+                Text("Energy cutoff").font(.footnote)
                 Slider(value: $variantEnergyCutoff, in: 5...50, step: 1).controlSize(.mini)
-                Text(String(format: "%.0f kcal", variantEnergyCutoff)).font(.system(size: 10, design: .monospaced)).frame(width: 50)
+                Text(String(format: "%.0f kcal", variantEnergyCutoff)).font(.footnote.monospaced()).frame(width: 50)
             }
 
             Button(action: { runEnsemblePreparation(entry) }) {
@@ -454,12 +454,12 @@ extension LigandDatabaseWindow {
                 let nTotal = children.count
                 HStack(spacing: 8) {
                     Label("\(nForms) forms, \(nTotal) entries", systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.green)
                 }
                 Text("Browse in Variants tab. Click entries to inspect in 2D/3D.")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -474,38 +474,38 @@ extension LigandDatabaseWindow {
         let isChildEntry = entry.parentID != nil
         let children = db.children(of: effectiveParentID)
 
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             Label("Tautomers & Protomers", systemImage: "arrow.triangle.2.circlepath")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
 
             if isChildEntry {
                 Text("Viewing variant of parent entry. Generate from the parent entry.")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
             HStack {
-                Text("pH").font(.system(size: 10))
+                Text("pH").font(.footnote)
                 Slider(value: $variantPH, in: 1...14, step: 0.1).controlSize(.mini)
-                Text(String(format: "%.1f", variantPH)).font(.system(size: 10, design: .monospaced)).frame(width: 30)
+                Text(String(format: "%.1f", variantPH)).font(.footnote.monospaced()).frame(width: 30)
             }
             HStack {
-                Text("Max tautomers").font(.system(size: 10))
+                Text("Max tautomers").font(.footnote)
                 Spacer()
                 Stepper("\(variantMaxTautomers)", value: $variantMaxTautomers, in: 1...50).controlSize(.small)
             }
             HStack {
-                Text("Max protomers").font(.system(size: 10))
+                Text("Max protomers").font(.footnote)
                 Spacer()
                 Stepper("\(variantMaxProtomers)", value: $variantMaxProtomers, in: 1...20).controlSize(.small)
             }
             HStack {
-                Text("Energy cutoff").font(.system(size: 10))
+                Text("Energy cutoff").font(.footnote)
                 Slider(value: $variantEnergyCutoff, in: 1...50, step: 1).controlSize(.mini)
-                Text(String(format: "%.0f kcal", variantEnergyCutoff)).font(.system(size: 10, design: .monospaced)).frame(width: 50)
+                Text(String(format: "%.0f kcal", variantEnergyCutoff)).font(.footnote.monospaced()).frame(width: 50)
             }
 
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Button(action: { generateTautomers(entry) }) {
                     Label("Generate Tautomers", systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity)
@@ -529,7 +529,7 @@ extension LigandDatabaseWindow {
             if !children.isEmpty {
                 Divider()
                 Text("\(children.count) variants")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
 
                 ForEach(children) { child in
@@ -537,8 +537,8 @@ extension LigandDatabaseWindow {
                 }
             } else if !isChildEntry {
                 Text("Generate tautomers or protomers to see variants here")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -551,17 +551,17 @@ extension LigandDatabaseWindow {
         let minE = allChildren.compactMap(\.relativeEnergy).min() ?? 0
 
         VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 // Kind badge
                 Text(child.variantKind == .tautomer ? "T" : "P")
-                    .font(.system(size: 7, weight: .bold))
+                    .font(.caption2.weight(.bold))
                     .foregroundStyle(.white)
                     .frame(width: 14, height: 14)
                     .background(Circle().fill(child.variantKind == .tautomer ? Color.purple : Color.cyan))
 
                 // Label
                 Text(child.variantLineage ?? child.name)
-                    .font(.system(size: 10, weight: isSelected ? .semibold : .medium))
+                    .font(.footnote.weight(isSelected ? .semibold : .medium))
                     .lineLimit(1)
 
                 Spacer()
@@ -570,20 +570,20 @@ extension LigandDatabaseWindow {
                 if let energy = child.relativeEnergy {
                     let dE = energy - minE
                     Text(String(format: "%.1f kcal/mol", energy))
-                        .font(.system(size: 8, design: .monospaced))
+                        .font(.caption.monospaced())
                         .foregroundStyle(dE < 1 ? .green : dE < 5 ? .yellow : dE < 15 ? .orange : .red)
                 }
 
                 // Action buttons
                 Button(action: { useVariantForDocking(child) }) {
-                    Image(systemName: "arrow.right.circle").font(.system(size: 10))
+                    Image(systemName: "arrow.right.circle").font(.footnote)
                 }
                 .buttonStyle(.plain).foregroundStyle(.tint)
                 .help("Use for docking")
                 .disabled(child.atoms.isEmpty)
 
                 Button(action: { deleteVariant(child.id) }) {
-                    Image(systemName: "xmark.circle").font(.system(size: 10))
+                    Image(systemName: "xmark.circle").font(.footnote)
                 }
                 .buttonStyle(.plain).foregroundStyle(.red.opacity(0.7))
                 .help("Remove from ensemble (chemically improbable or unwanted)")
@@ -591,8 +591,8 @@ extension LigandDatabaseWindow {
 
             // SMILES preview
             Text(child.smiles)
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
         .padding(.vertical, 3)
@@ -607,18 +607,18 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     func ensembleSummaryTab(_ entry: LigandEntry) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             if entry.forms.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 24))
-                        .foregroundStyle(.tertiary)
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
                     Text("No ensemble generated yet")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                     Text("Run Populate & Prepare to enumerate tautomers, protomers, and conformers.")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
                 .frame(maxWidth: .infinity)
@@ -628,11 +628,11 @@ extension LigandDatabaseWindow {
                 HStack {
                     Label("\(entry.forms.count) forms, \(entry.totalConformerCount) conformers",
                           systemImage: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text("Click a form to preview. Use \u{25C0} \u{25B6} in the viewer to navigate.")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.tertiary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 // Forms table
@@ -645,22 +645,22 @@ extension LigandDatabaseWindow {
                     case .tautomerProtomer: .purple
                     }
 
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         // Kind badge
                         Text(form.kind.symbol)
-                            .font(.system(size: 7, weight: .bold))
+                            .font(.caption2.weight(.bold))
                             .foregroundStyle(.white)
                             .frame(width: 18, height: 16)
-                            .background(RoundedRectangle(cornerRadius: 3).fill(kindColor))
+                            .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
 
                         // Label + SMILES
                         VStack(alignment: .leading, spacing: 1) {
                             Text(form.label)
-                                .font(.system(size: 10, weight: isActive ? .semibold : .regular))
+                                .font(.footnote.weight(isActive ? .semibold : .regular))
                                 .lineLimit(1)
                             Text(form.smiles)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
 
@@ -668,12 +668,12 @@ extension LigandDatabaseWindow {
 
                         // Conformer count
                         Text("\(form.conformerCount) conf")
-                            .font(.system(size: 8, design: .monospaced))
+                            .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
 
                         // Population
                         Text(form.populationString)
-                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .font(.caption.monospaced().weight(.medium))
                             .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
                                              form.boltzmannWeight > 0.1 ? .yellow : .secondary)
                             .frame(width: 38, alignment: .trailing)
@@ -681,12 +681,12 @@ extension LigandDatabaseWindow {
                         // Energy
                         if form.relativeEnergy < 0.01 {
                             Text("best")
-                                .font(.system(size: 8, weight: .medium))
+                                .font(.caption.weight(.medium))
                                 .foregroundStyle(.green)
                                 .frame(width: 50, alignment: .trailing)
                         } else {
                             Text(String(format: "+%.1f", form.relativeEnergy))
-                                .font(.system(size: 8, design: .monospaced))
+                                .font(.caption.monospaced())
                                 .foregroundStyle(.orange)
                                 .frame(width: 50, alignment: .trailing)
                         }
@@ -696,14 +696,14 @@ extension LigandDatabaseWindow {
                             removeForm(entryID: entry.id, formIndex: idx)
                         } label: {
                             Image(systemName: "xmark.circle")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.red.opacity(0.5))
                         .help("Remove this form from the ensemble")
                     }
                     .padding(.vertical, 4)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 8)
                     .background(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
                     .contentShape(Rectangle())
@@ -745,13 +745,13 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     func conformersTab(_ entry: LigandEntry) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             Label("Conformer Browser", systemImage: "cube.transparent")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
 
             HStack {
                 Text("Max conformers")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                 Spacer()
                 Stepper("\(conformerBudgetPerVariant)", value: $conformerBudgetPerVariant, in: 5...200, step: 5)
                     .controlSize(.small)
@@ -768,18 +768,18 @@ extension LigandDatabaseWindow {
             if !conformers.isEmpty {
                 Divider()
                 Text("\(conformers.count) conformers (sorted by MMFF94 energy)")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
 
                 ForEach(conformers) { conf in
                     let isActive = conf.id == selectedConformerIndex
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Text("#\(conf.id + 1)")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.footnote.monospaced().weight(.bold))
                             .foregroundStyle(isActive ? .primary : .secondary)
                             .frame(width: 28, alignment: .trailing)
                         Text(String(format: "%.2f kcal/mol", conf.energy))
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                         Spacer()
                         let minE = conformers.map(\.energy).min() ?? 0
                         let maxE = conformers.map(\.energy).max() ?? 1
@@ -794,7 +794,7 @@ extension LigandDatabaseWindow {
                     }
                     .padding(.vertical, 1)
                     .background(isActive ? Color.accentColor.opacity(0.08) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
                     .contentShape(Rectangle())
                     .onTapGesture { selectedConformerIndex = conf.id }
                 }
@@ -818,10 +818,10 @@ extension LigandDatabaseWindow {
         VStack(alignment: .leading, spacing: 12) {
             // Header
             Label("Populate & Prepare", systemImage: "wand.and.stars")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.headline)
 
             Text("Automated pipeline: add polar H → MMFF94 minimize → Gasteiger charges → enumerate tautomers & protomers at target pH → generate conformers → filter by Boltzmann population. Output replaces the raw molecule with docking-ready ligand(s).")
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -829,56 +829,68 @@ extension LigandDatabaseWindow {
 
             // Configuration
             Label("Configuration", systemImage: "gearshape")
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
 
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
                 GridRow {
-                    Text("Target pH").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("Target pH").font(.footnote).frame(width: 100, alignment: .leading)
                     Slider(value: $variantPH, in: 1...14, step: 0.1).controlSize(.mini)
                     Text(String(format: "%.1f", variantPH))
-                        .font(.system(size: 10, design: .monospaced)).frame(width: 30)
+                        .font(.footnote.monospaced()).frame(width: 30)
                 }
                 GridRow {
-                    Text("pKa threshold").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("pKa method").font(.footnote).frame(width: 100, alignment: .leading)
+                    Picker("", selection: $pkaMethod) {
+                        ForEach(PKaMethod.allCases, id: \.self) { m in
+                            Text(m.rawValue).tag(m)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .controlSize(.small)
+                    .help(pkaMethod.description)
+                    Spacer()
+                }
+                GridRow {
+                    Text("pKa threshold").font(.footnote).frame(width: 100, alignment: .leading)
                     Slider(value: $variantPkaThreshold, in: 0.5...5.0, step: 0.5).controlSize(.mini)
                     Text(String(format: "%.1f", variantPkaThreshold))
-                        .font(.system(size: 10, design: .monospaced)).frame(width: 30)
+                        .font(.footnote.monospaced()).frame(width: 30)
                 }
                 GridRow {
-                    Text("Conformers/form").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("Conformers/form").font(.footnote).frame(width: 100, alignment: .leading)
                     Stepper("\(prepNumConformers)", value: $prepNumConformers, in: 1...100, step: 5)
                         .controlSize(.small)
                     Spacer()
                 }
                 GridRow {
-                    Text("Max tautomers").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("Max tautomers").font(.footnote).frame(width: 100, alignment: .leading)
                     Stepper("\(variantMaxTautomers)", value: $variantMaxTautomers, in: 1...50)
                         .controlSize(.small)
                     Spacer()
                 }
                 GridRow {
-                    Text("Max protomers").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("Max protomers").font(.footnote).frame(width: 100, alignment: .leading)
                     Stepper("\(variantMaxProtomers)", value: $variantMaxProtomers, in: 1...20)
                         .controlSize(.small)
                     Spacer()
                 }
                 GridRow {
-                    Text("Energy cutoff").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("Energy cutoff").font(.footnote).frame(width: 100, alignment: .leading)
                     Slider(value: $variantEnergyCutoff, in: 5...50, step: 1).controlSize(.mini)
                     Text(String(format: "%.0f kcal", variantEnergyCutoff))
-                        .font(.system(size: 10, design: .monospaced)).frame(width: 50)
+                        .font(.footnote.monospaced()).frame(width: 50)
                 }
                 GridRow {
-                    Text("Min population").font(.system(size: 10)).frame(width: 100, alignment: .leading)
+                    Text("Min population").font(.footnote).frame(width: 100, alignment: .leading)
                     Slider(value: $variantMinPopulation, in: 0...20, step: 0.5).controlSize(.mini)
                     Text(String(format: "%.1f%%", variantMinPopulation))
-                        .font(.system(size: 10, design: .monospaced)).frame(width: 50)
+                        .font(.footnote.monospaced()).frame(width: 50)
                 }
             }
 
             Text("Forms with Boltzmann population below \(String(format: "%.1f%%", variantMinPopulation)) will be discarded. Each molecule produces a different number of forms depending on its chemistry.")
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             Divider()
@@ -911,20 +923,20 @@ extension LigandDatabaseWindow {
             if entry.isPrepared || !children.isEmpty {
                 Divider()
                 Label("Output", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.green)
 
                 if entry.isPrepared {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Image(systemName: "molecule").foregroundStyle(.green)
                         VStack(alignment: .leading, spacing: 1) {
                             Text("Input molecule → prepared ligand")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.footnote.weight(.medium))
                             Text("\(entry.atoms.count) atoms, \(entry.conformerCount) conformers")
-                                .font(.system(size: 9)).foregroundStyle(.secondary)
+                                .font(.footnote).foregroundStyle(.secondary)
                             if let date = entry.preparationDate {
                                 Text(date.formatted(date: .abbreviated, time: .shortened))
-                                    .font(.system(size: 8)).foregroundStyle(.tertiary)
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                         }
                         Spacer()
@@ -942,7 +954,7 @@ extension LigandDatabaseWindow {
                 if !children.isEmpty {
                     let nForms = Set(children.map(\.smiles)).count
                     Text("\(nForms) chemical forms, \(children.count) variant entries")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
 
                     ForEach(children) { child in
@@ -955,7 +967,7 @@ extension LigandDatabaseWindow {
             if !entry.isPrepared {
                 Divider()
                 DisclosureGroup("Quick Prepare (single conformer, no variants)") {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Toggle("Add hydrogens", isOn: $prepAddHydrogens)
                             .toggleStyle(.switch).controlSize(.small)
                         Toggle("Energy minimize (MMFF94)", isOn: $prepMinimize)
@@ -970,7 +982,7 @@ extension LigandDatabaseWindow {
                     }
                     .padding(.top, 4)
                 }
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
             }
         }
@@ -1058,10 +1070,10 @@ extension LigandDatabaseWindow {
                 let r: CGFloat = 10
                 let (sym, col) = atomSymbolColor(z)
                 context.fill(Path(ellipseIn: CGRect(x: p.x-r, y: p.y-r, width: r*2, height: r*2)),
-                             with: .color(Color(nsColor: .controlBackgroundColor)))
+                             with: .color(Color(nsColor: .textBackgroundColor)))
                 context.stroke(Path(ellipseIn: CGRect(x: p.x-r, y: p.y-r, width: r*2, height: r*2)),
                                with: .color(col), lineWidth: 1.5)
-                let text = Text(sym).font(.system(size: 11, weight: .bold, design: .monospaced)).foregroundColor(col)
+                let text = Text(sym).font(.subheadline.monospaced().weight(.bold)).foregroundColor(col)
                 context.draw(context.resolve(text), at: p, anchor: .center)
             }
         }

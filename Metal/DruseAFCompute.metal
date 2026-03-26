@@ -8,7 +8,7 @@
 // Pre-computing protein/ligand encoding and K/V projections in the setup kernel
 // eliminates ~95% of redundant work from the per-generation kernels.
 //
-// Architecture: atom_dim=20, hidden=128, heads=4, head_dim=32, rbf=50, 2 cross-attn layers
+// Architecture: atom_dim=20, hidden=256, heads=4, head_dim=64, rbf=50, 3 cross-attn layers
 // Score output: docking_score = pKd × confidence (negated for GA minimization)
 
 #include <metal_stdlib>
@@ -20,28 +20,28 @@ using namespace metal;
 // ============================================================================
 
 // MLP encoders
-#define W_PROT_ENC_0_W   0   // [128, 20]
-#define W_PROT_ENC_0_B   1   // [128]
-#define W_PROT_ENC_2_W   2   // [128, 128]
-#define W_PROT_ENC_2_B   3   // [128]
-#define W_LIG_ENC_0_W    4   // [128, 20]
-#define W_LIG_ENC_0_B    5   // [128]
-#define W_LIG_ENC_2_W    6   // [128, 128]
-#define W_LIG_ENC_2_B    7   // [128]
+#define W_PROT_ENC_0_W   0   // [256, 20]
+#define W_PROT_ENC_0_B   1   // [256]
+#define W_PROT_ENC_2_W   2   // [256, 256]
+#define W_PROT_ENC_2_B   3   // [256]
+#define W_LIG_ENC_0_W    4   // [256, 20]
+#define W_LIG_ENC_0_B    5   // [256]
+#define W_LIG_ENC_2_W    6   // [256, 256]
+#define W_LIG_ENC_2_B    7   // [256]
 
 // Cross-attention layer 0
-#define W_CA0_Q_W        8   // [128, 128]
-#define W_CA0_Q_B        9   // [128]
-#define W_CA0_K_W       10   // [128, 128]
-#define W_CA0_K_B       11   // [128]
-#define W_CA0_V_W       12   // [128, 128]
-#define W_CA0_V_B       13   // [128]
+#define W_CA0_Q_W        8   // [256, 256]
+#define W_CA0_Q_B        9   // [256]
+#define W_CA0_K_W       10   // [256, 256]
+#define W_CA0_K_B       11   // [256]
+#define W_CA0_V_W       12   // [256, 256]
+#define W_CA0_V_B       13   // [256]
 #define W_CA0_RBF_W     14   // [4, 50]
 #define W_CA0_RBF_B     15   // [4]
-#define W_CA0_OUT_W     16   // [128, 128]
-#define W_CA0_OUT_B     17   // [128]
-#define W_CA0_NORM_W    18   // [128]
-#define W_CA0_NORM_B    19   // [128]
+#define W_CA0_OUT_W     16   // [256, 256]
+#define W_CA0_OUT_B     17   // [256]
+#define W_CA0_NORM_W    18   // [256]
+#define W_CA0_NORM_B    19   // [256]
 
 // Cross-attention layer 1
 #define W_CA1_Q_W       20
@@ -57,30 +57,44 @@ using namespace metal;
 #define W_CA1_NORM_W    30
 #define W_CA1_NORM_B    31
 
+// Cross-attention layer 2
+#define W_CA2_Q_W       32
+#define W_CA2_Q_B       33
+#define W_CA2_K_W       34
+#define W_CA2_K_B       35
+#define W_CA2_V_W       36
+#define W_CA2_V_B       37
+#define W_CA2_RBF_W     38
+#define W_CA2_RBF_B     39
+#define W_CA2_OUT_W     40
+#define W_CA2_OUT_B     41
+#define W_CA2_NORM_W    42
+#define W_CA2_NORM_B    43
+
 // Gated attention pooling
-#define W_GATE_0_W      32   // [64, 128]
-#define W_GATE_0_B      33   // [64]
-#define W_GATE_2_W      34   // [1, 64]
-#define W_GATE_2_B      35   // [1]
+#define W_GATE_0_W      44   // [128, 256]
+#define W_GATE_0_B      45   // [128]
+#define W_GATE_2_W      46   // [1, 128]
+#define W_GATE_2_B      47   // [1]
 
 // Affinity head
-#define W_AFF_0_W       36   // [128, 128]
-#define W_AFF_0_B       37   // [128]
-#define W_AFF_3_W       38   // [1, 128]
-#define W_AFF_3_B       39   // [1]
+#define W_AFF_0_W       48   // [256, 256]
+#define W_AFF_0_B       49   // [256]
+#define W_AFF_3_W       50   // [1, 256]
+#define W_AFF_3_B       51   // [1]
 
 // Confidence head
-#define W_CONF_0_W      40   // [64, 128]
-#define W_CONF_0_B      41   // [64]
-#define W_CONF_3_W      42   // [1, 64]
-#define W_CONF_3_B      43   // [1]
+#define W_CONF_0_W      52   // [128, 256]
+#define W_CONF_0_B      53   // [128]
+#define W_CONF_3_W      54   // [1, 128]
+#define W_CONF_3_B      55   // [1]
 
 // Max dimensions
 #define DAF_MAX_PROT 256
 #define DAF_MAX_LIG   64
-#define DAF_HIDDEN   128
+#define DAF_HIDDEN   256
 #define DAF_HEADS      4
-#define DAF_HEAD_DIM  32
+#define DAF_HEAD_DIM  64
 #define DAF_RBF_BINS  50
 #define DAF_ATOM_DIM  20
 
@@ -88,14 +102,16 @@ using namespace metal;
 // Setup buffer layout (pre-computed once per dock, constant during GA)
 // ============================================================================
 
-#define DAF_SETUP_PROT_H  0                                                    // [P, 128]
-#define DAF_SETUP_LIG_H   (DAF_MAX_PROT * DAF_HIDDEN)                        // [L, 128]
-#define DAF_SETUP_K0      (DAF_SETUP_LIG_H + DAF_MAX_LIG * DAF_HIDDEN)       // [P, 128]
-#define DAF_SETUP_V0      (DAF_SETUP_K0 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 128]
-#define DAF_SETUP_K1      (DAF_SETUP_V0 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 128]
-#define DAF_SETUP_V1      (DAF_SETUP_K1 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 128]
-#define DAF_SETUP_FLOATS  (DAF_SETUP_V1 + DAF_MAX_PROT * DAF_HIDDEN)
-// Total: 5*256*128 + 64*128 = 171,776 floats = 671 KB
+#define DAF_SETUP_PROT_H  0                                                    // [P, 256]
+#define DAF_SETUP_LIG_H   (DAF_MAX_PROT * DAF_HIDDEN)                         // [L, 256]
+#define DAF_SETUP_K0      (DAF_SETUP_LIG_H + DAF_MAX_LIG * DAF_HIDDEN)        // [P, 256]
+#define DAF_SETUP_V0      (DAF_SETUP_K0 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 256]
+#define DAF_SETUP_K1      (DAF_SETUP_V0 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 256]
+#define DAF_SETUP_V1      (DAF_SETUP_K1 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 256]
+#define DAF_SETUP_K2      (DAF_SETUP_V1 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 256]
+#define DAF_SETUP_V2      (DAF_SETUP_K2 + DAF_MAX_PROT * DAF_HIDDEN)          // [P, 256]
+#define DAF_SETUP_FLOATS  (DAF_SETUP_V2 + DAF_MAX_PROT * DAF_HIDDEN)
+// Total: 7*256*256 + 64*256 = 475,136 floats = 1,856 KB
 
 // Per-pose intermediate: just transformed ligand positions
 #define DAF_POSE_LIG_POS_FLOATS (DAF_MAX_LIG * 3)  // 192 floats per pose
@@ -299,6 +315,20 @@ kernel void druseAFSetup(
         device float *v1_out = setupBuffer + DAF_SETUP_V1 + atomIdx * DAF_HIDDEN;
         for (uint i = 0; i < DAF_HIDDEN; i++) { k1_out[i] = k1[i]; v1_out[i] = v1[i]; }
 
+        // K/V projections for layer 2
+        device const float *k2_w = getWeight(weights, weightEntries, W_CA2_K_W);
+        device const float *k2_b = getWeight(weights, weightEntries, W_CA2_K_B);
+        device const float *v2_w = getWeight(weights, weightEntries, W_CA2_V_W);
+        device const float *v2_b = getWeight(weights, weightEntries, W_CA2_V_B);
+
+        float k2[DAF_HIDDEN], v2[DAF_HIDDEN];
+        linearLayer(k2, h2, k2_w, k2_b, DAF_HIDDEN, DAF_HIDDEN);
+        linearLayer(v2, h2, v2_w, v2_b, DAF_HIDDEN, DAF_HIDDEN);
+
+        device float *k2_out = setupBuffer + DAF_SETUP_K2 + atomIdx * DAF_HIDDEN;
+        device float *v2_out = setupBuffer + DAF_SETUP_V2 + atomIdx * DAF_HIDDEN;
+        for (uint i = 0; i < DAF_HIDDEN; i++) { k2_out[i] = k2[i]; v2_out[i] = v2[i]; }
+
     } else {
         // --- Ligand atom: encode only ---
         constant float *feat = ligFeatures + atomIdx * DAF_ATOM_DIM;
@@ -421,6 +451,8 @@ kernel void druseAFScore(
     device const float *preV0    = setupBuffer + DAF_SETUP_V0;
     device const float *preK1    = setupBuffer + DAF_SETUP_K1;
     device const float *preV1    = setupBuffer + DAF_SETUP_V1;
+    device const float *preK2    = setupBuffer + DAF_SETUP_K2;
+    device const float *preV2    = setupBuffer + DAF_SETUP_V2;
 
     // Per-lane ligand hidden states (start from pre-computed lig_h, evolve through layers)
     float lig_state[2][DAF_HIDDEN];
@@ -432,8 +464,8 @@ kernel void druseAFScore(
     }
 
     // ---- Cross-attention layers ----
-    for (uint layer = 0; layer < 2; layer++) {
-        uint base = (layer == 0) ? W_CA0_Q_W : W_CA1_Q_W;
+    for (uint layer = 0; layer < 3; layer++) {
+        uint base = (layer == 0) ? W_CA0_Q_W : (layer == 1) ? W_CA1_Q_W : W_CA2_Q_W;
 
         device const float *q_w    = getWeight(weights, weightEntries, base + 0);
         device const float *q_b    = getWeight(weights, weightEntries, base + 1);
@@ -444,8 +476,8 @@ kernel void druseAFScore(
         device const float *norm_w = getWeight(weights, weightEntries, base + 10);
         device const float *norm_b = getWeight(weights, weightEntries, base + 11);
 
-        device const float *preK = (layer == 0) ? preK0 : preK1;
-        device const float *preV = (layer == 0) ? preV0 : preV1;
+        device const float *preK = (layer == 0) ? preK0 : (layer == 1) ? preK1 : preK2;
+        device const float *preV = (layer == 0) ? preV0 : (layer == 1) ? preV1 : preV2;
 
         float invScale = 1.0f / sqrt(float(DAF_HEAD_DIM));
 
@@ -544,6 +576,7 @@ kernel void druseAFScore(
     device const float *gate_w2 = getWeight(weights, weightEntries, W_GATE_2_W);
     device const float *gate_b2 = getWeight(weights, weightEntries, W_GATE_2_B);
 
+    const uint GATE_HIDDEN = DAF_HIDDEN / 2;  // 128
     float gate_logits[2] = {-1e9f, -1e9f};
     float gate_max = -1e9f;
 
@@ -551,11 +584,11 @@ kernel void druseAFScore(
         uint l = lid * 2 + la;
         if (l >= L) continue;
 
-        float g1[64];
-        linearLayer(g1, lig_state[la], gate_w0, gate_b0, 64, D);
-        for (uint i = 0; i < 64; i++) g1[i] = tanh(g1[i]);
+        float g1[DAF_HIDDEN / 2];
+        linearLayer(g1, lig_state[la], gate_w0, gate_b0, GATE_HIDDEN, D);
+        for (uint i = 0; i < GATE_HIDDEN; i++) g1[i] = tanh(g1[i]);
         float g2 = gate_b2[0];
-        for (uint i = 0; i < 64; i++) g2 += gate_w2[i] * g1[i];
+        for (uint i = 0; i < GATE_HIDDEN; i++) g2 += gate_w2[i] * g1[i];
 
         gate_logits[la] = g2;
         gate_max = max(gate_max, g2);
@@ -609,11 +642,12 @@ kernel void druseAFScore(
     device const float *conf_w3 = getWeight(weights, weightEntries, W_CONF_3_W);
     device const float *conf_b3 = getWeight(weights, weightEntries, W_CONF_3_B);
 
-    float conf_h[64];
-    linearLayer(conf_h, complex_repr, conf_w0, conf_b0, 64, D);
-    for (uint i = 0; i < 64; i++) conf_h[i] = silu(conf_h[i]);
+    const uint CONF_HIDDEN = DAF_HIDDEN / 2;  // 128
+    float conf_h[DAF_HIDDEN / 2];
+    linearLayer(conf_h, complex_repr, conf_w0, conf_b0, CONF_HIDDEN, D);
+    for (uint i = 0; i < CONF_HIDDEN; i++) conf_h[i] = silu(conf_h[i]);
     float conf_logit = conf_b3[0];
-    for (uint i = 0; i < 64; i++) conf_logit += conf_w3[i] * conf_h[i];
+    for (uint i = 0; i < CONF_HIDDEN; i++) conf_logit += conf_w3[i] * conf_h[i];
     float confidence = 1.0f / (1.0f + exp(-conf_logit));
 
     // ---- Final score ----
@@ -677,6 +711,8 @@ kernel void druseAFScoreWithGradient(
     device const float *preV0    = setupBuffer + DAF_SETUP_V0;
     device const float *preK1    = setupBuffer + DAF_SETUP_K1;
     device const float *preV1    = setupBuffer + DAF_SETUP_V1;
+    device const float *preK2    = setupBuffer + DAF_SETUP_K2;
+    device const float *preV2    = setupBuffer + DAF_SETUP_V2;
 
     float lig_state[2][DAF_HIDDEN];
     for (uint la = 0; la < 2; la++) {
@@ -691,8 +727,8 @@ kernel void druseAFScoreWithGradient(
     float attnWeightSum[2] = {0.0f, 0.0f};
 
     // Cross-attention layers (same as druseAFScore + attention centroid accumulation)
-    for (uint layer = 0; layer < 2; layer++) {
-        uint base = (layer == 0) ? W_CA0_Q_W : W_CA1_Q_W;
+    for (uint layer = 0; layer < 3; layer++) {
+        uint base = (layer == 0) ? W_CA0_Q_W : (layer == 1) ? W_CA1_Q_W : W_CA2_Q_W;
 
         device const float *q_w    = getWeight(weights, weightEntries, base + 0);
         device const float *q_b    = getWeight(weights, weightEntries, base + 1);
@@ -703,8 +739,8 @@ kernel void druseAFScoreWithGradient(
         device const float *norm_w = getWeight(weights, weightEntries, base + 10);
         device const float *norm_b = getWeight(weights, weightEntries, base + 11);
 
-        device const float *preK = (layer == 0) ? preK0 : preK1;
-        device const float *preV = (layer == 0) ? preV0 : preV1;
+        device const float *preK = (layer == 0) ? preK0 : (layer == 1) ? preK1 : preK2;
+        device const float *preV = (layer == 0) ? preV0 : (layer == 1) ? preV1 : preV2;
 
         float invScale = 1.0f / sqrt(float(DAF_HEAD_DIM));
 
@@ -826,16 +862,17 @@ kernel void druseAFScoreWithGradient(
     device const float *gate_w2 = getWeight(weights, weightEntries, W_GATE_2_W);
     device const float *gate_b2 = getWeight(weights, weightEntries, W_GATE_2_B);
 
+    const uint GATE_HIDDEN = DAF_HIDDEN / 2;  // 128
     float gate_logits[2] = {-1e9f, -1e9f};
     float gate_max = -1e9f;
     for (uint la = 0; la < 2; la++) {
         uint l = lid * 2 + la;
         if (l >= L) continue;
-        float g1[64];
-        linearLayer(g1, lig_state[la], gate_w0, gate_b0, 64, D);
-        for (uint i = 0; i < 64; i++) g1[i] = tanh(g1[i]);
+        float g1[DAF_HIDDEN / 2];
+        linearLayer(g1, lig_state[la], gate_w0, gate_b0, GATE_HIDDEN, D);
+        for (uint i = 0; i < GATE_HIDDEN; i++) g1[i] = tanh(g1[i]);
         float g2 = gate_b2[0];
-        for (uint i = 0; i < 64; i++) g2 += gate_w2[i] * g1[i];
+        for (uint i = 0; i < GATE_HIDDEN; i++) g2 += gate_w2[i] * g1[i];
         gate_logits[la] = g2;
         gate_max = max(gate_max, g2);
     }
@@ -881,11 +918,12 @@ kernel void druseAFScoreWithGradient(
     device const float *conf_w3 = getWeight(weights, weightEntries, W_CONF_3_W);
     device const float *conf_b3 = getWeight(weights, weightEntries, W_CONF_3_B);
 
-    float conf_h[64];
-    linearLayer(conf_h, complex_repr, conf_w0, conf_b0, 64, D);
-    for (uint i = 0; i < 64; i++) conf_h[i] = silu(conf_h[i]);
+    const uint CONF_HIDDEN = DAF_HIDDEN / 2;  // 128
+    float conf_h[DAF_HIDDEN / 2];
+    linearLayer(conf_h, complex_repr, conf_w0, conf_b0, CONF_HIDDEN, D);
+    for (uint i = 0; i < CONF_HIDDEN; i++) conf_h[i] = silu(conf_h[i]);
     float conf_logit = conf_b3[0];
-    for (uint i = 0; i < 64; i++) conf_logit += conf_w3[i] * conf_h[i];
+    for (uint i = 0; i < CONF_HIDDEN; i++) conf_logit += conf_w3[i] * conf_h[i];
     float confidence = 1.0f / (1.0f + exp(-conf_logit));
 
     float docking_score = pkd * confidence;

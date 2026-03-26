@@ -658,6 +658,45 @@ kernel void computeVinaAffinityMaps(
     affinityMaps[typeIdx * params.totalPoints + pointIdx] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
+/// Compute electrostatic potential grid using screened Coulomb with distance-dependent dielectric ε=4r.
+/// Stores Φ(r) = Σ_protein 332.0 * q_p / (4 * r² ) in half precision.
+/// During scoring, E_elec = q_ligand * Φ(r_ligand) via trilinear interpolation.
+kernel void computeElectrostaticGrid(
+    device half                *gridMap      [[buffer(0)]],
+    constant GridProteinAtom   *proteinAtoms [[buffer(1)]],
+    constant GridParams        &params       [[buffer(2)]],
+    uint                        tid          [[thread_position_in_grid]],
+    uint                        lid          [[thread_index_in_threadgroup]])
+{
+    if (tid >= params.totalPoints) return;
+    float3 gridPos = gridPosition(tid, params);
+    float phi = 0.0f;
+
+    threadgroup float3 tilePositions[kAtomTileSize];
+    threadgroup float  tileCharges[kAtomTileSize];
+
+    for (uint base = 0; base < params.numProteinAtoms; base += kAtomTileSize) {
+        uint tileCount = min(kAtomTileSize, params.numProteinAtoms - base);
+        if (lid < tileCount) {
+            uint atomIdx = base + lid;
+            tilePositions[lid] = proteinAtoms[atomIdx].position;
+            tileCharges[lid] = proteinAtoms[atomIdx].charge;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < tileCount; i++) {
+            float r = distance(gridPos, tilePositions[i]);
+            if (r > 12.0f) continue;        // screened Coulomb decays fast
+            r = max(r, 0.8f);               // clamp singularity
+            // E = 332 * q / (ε * r) with ε = 4r → E = 332 * q / (4 * r²)
+            phi += 332.0f * tileCharges[i] / (4.0f * r * r);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    gridMap[tid] = half(clamp(phi, -50.0f, 50.0f));
+}
+
 // ============================================================================
 // MARK: - Pocket Detection
 // ============================================================================
@@ -1114,6 +1153,7 @@ inline float drusinaRamp(float x, float inner, float outer) {
 /// Compute Drusina correction terms:
 ///   - π-π stacking, π-cation, halogen bond, metal coordination (original)
 ///   - salt bridge (group-based, Donald 2011), amide-π stacking, chalcogen bond (extended)
+///   - screened Coulomb (ε=4r), CH-π, cooperativity, torsion strain (new)
 /// Returns total correction energy (kcal/mol, negative = favorable).
 ///
 /// Design principles (Verdonk 2003, Bissantz 2010, Donald 2011):
@@ -1134,9 +1174,14 @@ inline float computeDrusinaCorrections(
     constant HalogenBondInfo     *halogenInfo,
     constant ProteinAmideGPU     *proteinAmides,
     constant ChalcogenBondInfo   *chalcogenInfo,
-    constant SaltBridgeGroupGPU  *saltBridgeGroups)
+    constant SaltBridgeGroupGPU  *saltBridgeGroups,
+    device const half            *elecGrid,
+    constant GridParams          &gridParams,
+    constant ProteinChalcogenGPU *proteinChalcogens,
+    constant TorsionStrainInfo   *torsionStrain)
 {
     float drusinaE = 0.0f;
+    int interactionCount = 0;
 
     // Pre-compute ligand ring centroids and normals for reuse (π-π + amide-π)
     const uint MAX_LIG_RINGS = 8u;
@@ -1193,6 +1238,7 @@ inline float computeDrusinaCorrections(
             if (dotN > 0.8f) {
                 float dd = d - 3.5f;
                 drusinaE += params.wPiPi * dotN * drusinaRamp(dd, 0.3f, 1.0f);
+                interactionCount++;
             }
             // Edge-to-face / T-shaped (perpendicular, |dotN| < 0.4)
             // Optimal 4.8 Å, ramp from 4.2-5.5 Å (Bissantz 2010)
@@ -1200,6 +1246,7 @@ inline float computeDrusinaCorrections(
                 float dd = d - 4.8f;
                 float perpFactor = 1.0f - dotN;  // stronger when more perpendicular
                 drusinaE += params.wPiPi * 0.6f * perpFactor * drusinaRamp(dd, 0.4f, 1.0f);
+                interactionCount++;
             }
         }
     }
@@ -1220,6 +1267,7 @@ inline float computeDrusinaCorrections(
             if (cosA > 0.5f) {
                 float dd = d - 3.8f;
                 drusinaE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
+                interactionCount++;
             }
         }
     }
@@ -1235,6 +1283,7 @@ inline float computeDrusinaCorrections(
             if (cosA > 0.5f) {
                 float dd = d - 3.8f;
                 drusinaE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
+                interactionCount++;
             }
         }
     }
@@ -1265,6 +1314,7 @@ inline float computeDrusinaCorrections(
             float burial = saltBridgeGroups[g].burialFactor;
 
             drusinaE += params.wSaltBridge * distScore * burial;
+            interactionCount++;
         }
     }
 
@@ -1285,22 +1335,34 @@ inline float computeDrusinaCorrections(
             if (dotN > 0.8f) {
                 float dd = d - 3.6f;
                 drusinaE += params.wAmideStack * dotN * drusinaRamp(dd, 0.3f, 0.9f);
+                interactionCount++;
             }
             // Tilted/offset stacking (weaker, broader distance range)
             else if (dotN > 0.6f) {
                 float dd = d - 4.0f;
                 drusinaE += params.wAmideStack * 0.4f * dotN * drusinaRamp(dd, 0.3f, 1.0f);
+                interactionCount++;
             }
         }
     }
 
     // ---- Halogen bonds: C-X...O/N with σ-hole angle check ----
-    // Bissantz 2010: Cl 3.0-3.4 Å, Br 3.0-3.5 Å, I 2.9-3.5 Å
+    // Element-specific optimal distances (Scholfield 2013, Bissantz 2010):
+    //   F: skip (too weak), Cl: 3.27 Å, Br: 3.24 Å, I: 3.17 Å
     // C-X...A angle preferred near 160-180° (sigma-hole alignment)
     for (uint h = 0; h < params.numHalogens; h++) {
         int hi = halogenInfo[h].halogenAtomIndex;
         int ci = halogenInfo[h].carbonAtomIndex;
+        int elemType = halogenInfo[h].elementType;
         if (hi < 0 || ci < 0 || uint(hi) >= nAtoms || uint(ci) >= nAtoms) continue;
+        if (elemType == 0) continue;  // F halogen bonds too weak — skip
+
+        // Element-specific optimal distance (CSD statistics, Scholfield 2013)
+        float optDist = 3.2f;
+        if      (elemType == 1) optDist = 3.27f;  // Cl
+        else if (elemType == 2) optDist = 3.24f;  // Br
+        else if (elemType == 3) optDist = 3.17f;  // I
+
         float3 halPos = positions[hi];
         float3 carPos = positions[ci];
 
@@ -1311,24 +1373,24 @@ inline float computeDrusinaCorrections(
             if (!isAcceptor) continue;
 
             float d = distance(halPos, proteinAtoms[p].position);
-            if (d < 2.5f || d > 3.8f) continue;
+            if (d < 2.5f || d > 4.2f) continue;
 
             // σ-hole directionality: C-X...A angle should be > 140° (cosine < -0.766)
             float3 xToC = normalize(carPos - halPos);
             float3 xToA = normalize(proteinAtoms[p].position - halPos);
             float cosTheta = dot(xToC, xToA);
             if (cosTheta < -0.766f) {
-                // Ramp centered at 3.2 Å (Bissantz 2010 median for Cl/Br)
-                float dd = d - 3.2f;
+                float dd = d - optDist;
                 float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                drusinaE += params.wHalogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.6f);
+                drusinaE += params.wHalogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
+                interactionCount++;
             }
         }
     }
 
     // ---- Chalcogen bonds: C-S...O/N with σ-hole angle check ----
-    // Stricter than halogen: S σ-hole is weaker, angle > 150° (cos < -0.866)
-    // Distance 2.8-3.8 Å, optimal ~3.3 Å (Bissantz 2010)
+    // Relaxed from 150° to 140° (Beno 2015, Pascoe 2017: S σ-hole valid at 140-180°)
+    // Distance 2.8-4.2 Å, optimal ~3.3 Å (Bissantz 2010). Dual σ-holes for thioethers.
     for (uint ch = 0; ch < params.numChalcogens; ch++) {
         int si = chalcogenInfo[ch].sulfurAtomIndex;
         int ci = chalcogenInfo[ch].carbonAtomIndex;
@@ -1343,16 +1405,44 @@ inline float computeDrusinaCorrections(
             if (!isAcceptor) continue;
 
             float d = distance(sPos, proteinAtoms[p].position);
-            if (d < 2.8f || d > 3.8f) continue;
+            if (d < 2.8f || d > 4.2f) continue;
 
-            // σ-hole directionality: C-S-A angle > 150° (cos < -0.866)
+            // σ-hole directionality: C-S-A angle > 140° (cos < -0.766)
             float3 sToC = normalize(cPos - sPos);
             float3 sToA = normalize(proteinAtoms[p].position - sPos);
             float cosTheta = dot(sToC, sToA);
-            if (cosTheta < -0.866f) {
+            if (cosTheta < -0.766f) {
                 float dd = d - 3.3f;
-                float angleFactor = (-cosTheta - 0.866f) / 0.134f;
-                drusinaE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.2f, 0.5f);
+                float angleFactor = (-cosTheta - 0.766f) / 0.234f;
+                drusinaE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
+                interactionCount++;
+            }
+        }
+    }
+
+    // ---- Protein chalcogen bonds: protein S (Met/Cys) → ligand N/O ----
+    // Bidirectional: protein sulfur σ-hole interacting with ligand acceptors
+    for (uint pch = 0; pch < params.numProteinChalcogens; pch++) {
+        float3 sPos = proteinChalcogens[pch].position;
+        float3 bondedCDir = proteinChalcogens[pch].bondedCDir; // direction S→C
+
+        for (uint a = 0; a < nAtoms; a++) {
+            int lt = ligandAtoms[a].vinaType;
+            bool isAcceptor = (lt == VINA_N_A || lt == VINA_N_DA ||
+                               lt == VINA_O_A || lt == VINA_O_DA);
+            if (!isAcceptor) continue;
+
+            float d = distance(positions[a], sPos);
+            if (d < 2.8f || d > 4.2f) continue;
+
+            // σ-hole is opposite C-S bond: check S...A aligns with -bondedCDir
+            float3 sToA = normalize(positions[a] - sPos);
+            float cosTheta = dot(bondedCDir, sToA); // negative when aligned with σ-hole
+            if (cosTheta < -0.766f) {
+                float dd = d - 3.3f;
+                float angleFactor = (-cosTheta - 0.766f) / 0.234f;
+                drusinaE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
+                interactionCount++;
             }
         }
     }
@@ -1371,7 +1461,69 @@ inline float computeDrusinaCorrections(
             if (d > 3.2f) continue;
             float dd = d - 2.4f;
             drusinaE += params.wMetalCoord * drusinaRamp(dd, 0.2f, 0.8f);
+            interactionCount++;
         }
+    }
+
+    // ---- Screened Coulomb (ε=4r, grid-based) ----
+    // Potential grid precomputed from protein charges: Φ(r) = Σ 332*q_p/(4*r²)
+    // E_elec = Σ q_ligand * Φ(r_ligand) via trilinear interpolation
+    float coulombE = 0.0f;
+    for (uint a = 0; a < nAtoms; a++) {
+        float3 r = positions[a];
+        float phi = trilinearInterpolate(elecGrid, r, gridParams.origin,
+                                          gridParams.spacing, gridParams.dims);
+        if (phi < 99.0f)  // skip out-of-grid penalty values
+            coulombE += ligandAtoms[a].charge * phi;
+    }
+    drusinaE += params.wCoulomb * coulombE;
+
+    // ---- CH-π interactions: ligand aliphatic C → protein aromatic rings ----
+    // Weaker individually (~-1 kcal/mol) but very frequent (2-5× per complex).
+    // Score C...ring centroid distance (3.5-5.0 Å) without explicit H.
+    for (uint a = 0; a < nAtoms; a++) {
+        if (ligandAtoms[a].vinaType != VINA_C_H) continue;
+        if (ligandAtoms[a].flags & LIGATOM_FLAG_AROMATIC) continue;
+        float3 cPos = positions[a];
+        for (uint pr = 0; pr < params.numProteinRings; pr++) {
+            float d = distance(cPos, proteinRings[pr].centroid);
+            if (d < 3.5f || d > 5.0f) continue;
+            float3 toC = normalize(cPos - proteinRings[pr].centroid);
+            float cosA = abs(dot(toC, proteinRings[pr].normal));
+            if (cosA > 0.3f) {  // within ~70° of ring normal
+                float dd = d - 4.0f;
+                drusinaE += params.wCHPi * cosA * drusinaRamp(dd, 0.5f, 1.0f);
+                interactionCount++;
+            }
+        }
+    }
+
+    // ---- Torsion strain: amide planarity penalty ----
+    // Amide bonds should be planar (φ ≈ 0 or π). Penalize deviation.
+    float strainE = 0.0f;
+    for (uint t = 0; t < params.numTorsionStrains; t++) {
+        TorsionStrainInfo ts = torsionStrain[t];
+        if (ts.atom0 < 0 || uint(ts.atom3) >= nAtoms) continue;
+        float3 b1 = positions[ts.atom1] - positions[ts.atom0];
+        float3 b2 = positions[ts.atom2] - positions[ts.atom1];
+        float3 b3 = positions[ts.atom3] - positions[ts.atom2];
+        float3 n1 = cross(b1, b2);
+        float3 n2 = cross(b2, b3);
+        float ln1 = length(n1), ln2 = length(n2);
+        if (ln1 < 1e-6f || ln2 < 1e-6f) continue;
+        n1 /= ln1; n2 /= ln2;
+        float cosPhi = clamp(dot(n1, n2), -1.0f, 1.0f);
+        float phi = acos(cosPhi);
+        // Amide: should be 0 or π. Minimum deviation from either.
+        float dev = min(phi, M_PI_F - phi);
+        strainE += ts.forceConstant * dev * dev;
+    }
+    drusinaE += params.wTorsionStrain * strainE;
+
+    // ---- Cooperativity bonus: reward multiple simultaneous interactions ----
+    // Simple count-based: bonus for 2+ scored interaction types
+    if (interactionCount > 1) {
+        drusinaE += params.wCooperativity * float(interactionCount - 1);
     }
 
     return drusinaE;
@@ -1398,6 +1550,9 @@ kernel void scorePosesDrusina(
     constant ProteinAmideGPU     *proteinAmides   [[buffer(15)]],
     constant ChalcogenBondInfo   *chalcogenInfo   [[buffer(16)]],
     constant SaltBridgeGroupGPU  *saltBridgeGroups [[buffer(17)]],
+    device const half            *elecGrid        [[buffer(18)]],
+    constant ProteinChalcogenGPU *proteinChalcogens [[buffer(19)]],
+    constant TorsionStrainInfo   *torsionStrain   [[buffer(20)]],
     uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1435,7 +1590,8 @@ kernel void scorePosesDrusina(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
-        proteinAmides, chalcogenInfo, saltBridgeGroups);
+        proteinAmides, chalcogenInfo, saltBridgeGroups,
+        elecGrid, gridParams, proteinChalcogens, torsionStrain);
 
     pose.stericEnergy      = totalIntermolecular;
     pose.hydrophobicEnergy = 0.0f;
@@ -1463,6 +1619,9 @@ kernel void applyDrusinaCorrection(
     constant ProteinAmideGPU     *proteinAmides   [[buffer(12)]],
     constant ChalcogenBondInfo   *chalcogenInfo   [[buffer(13)]],
     constant SaltBridgeGroupGPU  *saltBridgeGroups [[buffer(14)]],
+    device const half            *elecGrid        [[buffer(15)]],
+    constant ProteinChalcogenGPU *proteinChalcogens [[buffer(16)]],
+    constant TorsionStrainInfo   *torsionStrain   [[buffer(17)]],
     uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1479,7 +1638,8 @@ kernel void applyDrusinaCorrection(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
-        proteinAmides, chalcogenInfo, saltBridgeGroups);
+        proteinAmides, chalcogenInfo, saltBridgeGroups,
+        elecGrid, gridParams, proteinChalcogens, torsionStrain);
 
     pose.drusinaCorrection = drusinaE;
     pose.energy += drusinaE;

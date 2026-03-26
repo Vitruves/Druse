@@ -83,6 +83,13 @@ extension ProteinPreparation {
         )
     }
 
+    /// Canonical bond key for O(1) lookup. Encodes two atom indices as a single UInt64.
+    private static func bondKey(_ a: Int, _ b: Int) -> UInt64 {
+        let lo = UInt64(min(a, b))
+        let hi = UInt64(max(a, b))
+        return (hi << 32) | lo
+    }
+
     static func reconstructMissingHeavyAtoms(
         atoms: [Atom],
         bonds: [Bond]
@@ -90,6 +97,12 @@ extension ProteinPreparation {
         var workingAtoms = atoms
         var workingBonds = bonds
         var addedAtomCount = 0
+
+        // Tier 3: Build Set<UInt64> for O(1) bond existence checks
+        var bondSet = Set<UInt64>(minimumCapacity: bonds.count)
+        for bond in bonds {
+            bondSet.insert(bondKey(bond.atomIndex1, bond.atomIndex2))
+        }
 
         let residueOrder = residueKeys(in: workingAtoms)
         let externalBondedAtoms = externalBondedAtomNamesByResidue(atoms: workingAtoms, bonds: workingBonds)
@@ -142,7 +155,7 @@ extension ProteinPreparation {
                       let atomIndex2 = refreshedAtomIndices[bondTemplate.atomName2],
                       workingAtoms[atomIndex1].element != .H,
                       workingAtoms[atomIndex2].element != .H,
-                      !containsBond(atomIndex1, atomIndex2, bonds: workingBonds) else {
+                      !bondSet.contains(bondKey(atomIndex1, atomIndex2)) else {
                     continue
                 }
 
@@ -152,10 +165,21 @@ extension ProteinPreparation {
                     atomIndex2: atomIndex2,
                     order: bondTemplate.order
                 ))
+                bondSet.insert(bondKey(atomIndex1, atomIndex2))
             }
         }
 
         return (workingAtoms, workingBonds, addedAtomCount)
+    }
+
+    /// Builds a pre-computed adjacency list from bonds, for O(1) neighbor lookup per atom.
+    private static func buildAdjacencyList(atomCount: Int, bonds: [Bond]) -> [[Int]] {
+        var adj = [[Int]](repeating: [], count: atomCount)
+        for bond in bonds {
+            adj[bond.atomIndex1].append(bond.atomIndex2)
+            adj[bond.atomIndex2].append(bond.atomIndex1)
+        }
+        return adj
     }
 
     static func addTemplateHydrogens(
@@ -175,6 +199,9 @@ extension ProteinPreparation {
         var workingAtoms = stripped.atoms
         var workingBonds = stripped.bonds
         var addedAtomCount = 0
+
+        // Tier 3: Pre-build adjacency list for O(degree) neighbor lookups instead of O(B) scans
+        var adjacency = buildAdjacencyList(atomCount: workingAtoms.count, bonds: workingBonds)
 
         let residueOrder = residueKeys(in: workingAtoms)
         let externalBondedAtoms = externalBondedAtomNamesByResidue(atoms: workingAtoms, bonds: workingBonds)
@@ -266,7 +293,10 @@ extension ProteinPreparation {
                 let bondLen = simd_distance(hPosition, workingAtoms[parentAtomIndex].position)
                 if bondLen > 5.0 {
                     let parentPos = workingAtoms[parentAtomIndex].position
-                    let neighborPositions = bondedNeighborPositions(of: parentAtomIndex, atoms: workingAtoms, bonds: workingBonds)
+                    // Tier 3: Use adjacency list for O(degree) neighbor lookup
+                    let neighborPositions = parentAtomIndex < adjacency.count
+                        ? adjacency[parentAtomIndex].map { workingAtoms[$0].position }
+                        : bondedNeighborPositions(of: parentAtomIndex, atoms: workingAtoms, bonds: workingBonds)
                     hPosition = placeHydrogenLike(on: parentPos, awayFrom: neighborPositions, distance: 1.0)
                 }
 
@@ -286,6 +316,11 @@ extension ProteinPreparation {
                     atomIndex2: hydrogenIndex,
                     order: .single
                 ))
+                // Maintain adjacency list for newly added atoms
+                adjacency.append([parentAtomIndex])  // hydrogenIndex's neighbors
+                if parentAtomIndex < adjacency.count - 1 {
+                    adjacency[parentAtomIndex].append(hydrogenIndex)
+                }
                 addedAtomCount += 1
             }
 
@@ -295,9 +330,13 @@ extension ProteinPreparation {
                 })
                 if let extraHydrogenName = nextTerminalHydrogenName(existingHydrogenNames: existingHydrogenNames) {
                     let extraHydrogenIndex = workingAtoms.count
+                    // Tier 3: Use adjacency list for O(degree) neighbor lookup
+                    let nitrogenNeighborPositions = nitrogenIndex < adjacency.count
+                        ? adjacency[nitrogenIndex].map { workingAtoms[$0].position }
+                        : bondedNeighborPositions(of: nitrogenIndex, atoms: workingAtoms, bonds: workingBonds)
                     let position = placeHydrogenLike(
                         on: workingAtoms[nitrogenIndex].position,
-                        awayFrom: bondedNeighborPositions(of: nitrogenIndex, atoms: workingAtoms, bonds: workingBonds),
+                        awayFrom: nitrogenNeighborPositions,
                         distance: 1.01
                     )
                     workingAtoms.append(Atom(
@@ -316,6 +355,11 @@ extension ProteinPreparation {
                         atomIndex2: extraHydrogenIndex,
                         order: .single
                     ))
+                    // Maintain adjacency list
+                    adjacency.append([nitrogenIndex])
+                    if nitrogenIndex < adjacency.count - 1 {
+                        adjacency[nitrogenIndex].append(extraHydrogenIndex)
+                    }
                     addedAtomCount += 1
                 }
             }

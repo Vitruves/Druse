@@ -24,14 +24,13 @@ extension AppViewModel {
         leadOpt.referenceDescriptors = hit.descriptors
         if !hit.bestPoseAtoms.isEmpty {
             // Build a minimal DockingResult for the reference pose
-            var refResult = DockingResult(
+            let refResult = DockingResult(
                 id: 0,
                 pose: DockPoseSwift(translation: .zero, rotation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1), torsions: []),
                 energy: hit.bestEnergy, stericEnergy: 0, hydrophobicEnergy: 0,
                 hbondEnergy: 0, torsionPenalty: 0, generation: 0,
                 transformedAtomPositions: hit.bestPoseAtoms
             )
-            refResult.mlDockingScore = hit.mlScore
             leadOpt.referenceResult = refResult
         }
         log.info("Reference for lead optimization: \(hit.name) (from screening)", category: .molecule)

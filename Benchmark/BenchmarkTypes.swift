@@ -60,7 +60,6 @@ struct BenchmarkResultEntry: Codable {
     let pdbId: String
     var bestEnergy: Float             // score from the GA's scoring method
     var bestRmsd: Float?              // vs crystal pose
-    var mlRescorePKd: Float?          // optional post-dock ML rescore
     var experimentalPKd: Float?
     var numPoses: Int
     var dockingTimeMs: Double
@@ -74,7 +73,6 @@ struct BenchmarkResultEntry: Codable {
         case pdbId = "pdb_id"
         case bestEnergy = "best_energy"
         case bestRmsd = "best_rmsd"
-        case mlRescorePKd = "ml_rescore_pKd"
         case experimentalPKd = "experimental_pKd"
         case numPoses = "num_poses"
         case dockingTimeMs = "docking_time_ms"

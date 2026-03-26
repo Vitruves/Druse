@@ -5,12 +5,13 @@ struct DockingTabView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var showPreDockSheet = false
 
-    /// Available scoring methods: Vina and Drusina always, Druse Affinity only when ML model loaded.
+    /// Available scoring methods: Vina, Drusina, DruseAF (Metal), and PIGNet2 if weights present.
     private var scoringMethodsAvailable: [ScoringMethod] {
-        if viewModel.druseMLScoring.isAvailable {
-            return ScoringMethod.allCases
+        var methods: [ScoringMethod] = [.vina, .drusina, .druseAffinity]
+        if Bundle.main.url(forResource: "PIGNet2", withExtension: "weights") != nil {
+            methods.append(.pignet2)
         }
-        return [.vina, .drusina]
+        return methods
     }
 
     // Grid box state is in viewModel so it persists across tab switches
@@ -84,62 +85,64 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private var ligandSummarySection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label(viewModel.docking.batchQueue.count > 1 ? "Ligands" : "Ligand",
                       systemImage: viewModel.docking.batchQueue.count > 1 ? "tray.full" : "hexagon")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 Button(action: { openWindow(id: "ligand-database") }) {
                     Image(systemName: "tablecells")
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .padding(4)
                         .background(Color.accentColor.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .help("Open Ligand Database (Cmd+L)")
+                .plainButtonAccessibility(AccessibilityID.dockOpenLigandDB)
             }
 
             if viewModel.docking.batchQueue.count > 1 {
                 // Batch mode: show general docking info
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Image(systemName: "tray.full.fill")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.cyan)
                         Text("\(viewModel.docking.batchQueue.count) ligands to dock")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.subheadline.weight(.medium))
                         Spacer()
                         Button(action: {
                             viewModel.docking.batchQueue = []
                             viewModel.clearLigand()
                         }) {
                             Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 14))
+                                .font(.body)
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
                         .help("Clear batch queue")
+                        .plainButtonAccessibility(AccessibilityID.dockClearBatch)
                     }
 
                     // MW range summary
                     let mws = viewModel.docking.batchQueue.compactMap { $0.descriptors?.molecularWeight }
                     if let minMW = mws.min(), let maxMW = mws.max() {
                         Text(String(format: "MW range: %.0f \u{2013} %.0f", minMW, maxMW))
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                     }
 
                     let prepCount = viewModel.docking.batchQueue.filter(\.isPrepared).count
                     Text("\(prepCount)/\(viewModel.docking.batchQueue.count) prepared")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(prepCount == viewModel.docking.batchQueue.count ? .green : .orange)
                 }
-                .padding(6)
+                .padding(8)
                 .background(Color.cyan.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
 
                 // Reopen Ligand Database button
                 Button(action: { openWindow(id: "ligand-database") }) {
@@ -150,29 +153,30 @@ struct DockingTabView: View {
                 .controlSize(.small)
             } else if let lig = viewModel.molecules.ligand {
                 // Single ligand mode
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.green)
                     Text(lig.name)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .lineLimit(1)
                     Spacer()
                     Text("\(lig.atomCount) atoms")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
 
                     Button(action: { viewModel.removeLigandFromView() }) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
                     .help("Remove active ligand")
+                    .plainButtonAccessibility(AccessibilityID.dockRemoveLigand)
                 }
-                .padding(6)
+                .padding(8)
                 .background(Color.green.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
                 Button(action: { openWindow(id: "ligand-database") }) {
                     Label("Open Database to select ligand", systemImage: "plus.circle")
@@ -190,7 +194,7 @@ struct DockingTabView: View {
     private var pocketDetectionSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Binding Site", systemImage: "target")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             // Detection methods
             HStack(spacing: 4) {
@@ -202,6 +206,7 @@ struct DockingTabView: View {
                 .controlSize(.small)
                 .disabled(viewModel.molecules.protein == nil)
                 .help("Alpha-sphere + DBSCAN pocket detection")
+                .accessibilityIdentifier(AccessibilityID.dockDetectAuto)
 
                 Button(action: { viewModel.detectPocketsML() }) {
                     Label("ML", systemImage: "brain")
@@ -211,6 +216,7 @@ struct DockingTabView: View {
                 .controlSize(.small)
                 .disabled(viewModel.molecules.protein == nil || !viewModel.pocketDetectorML.isAvailable)
                 .help("ML-based pocket detection (GNN)")
+                .accessibilityIdentifier(AccessibilityID.dockDetectML)
 
                 Button(action: { detectFromLigand() }) {
                     Label("Ligand", systemImage: "hexagon")
@@ -220,6 +226,7 @@ struct DockingTabView: View {
                 .controlSize(.small)
                 .disabled(viewModel.molecules.protein == nil || viewModel.molecules.ligand == nil)
                 .help("Define pocket around current ligand")
+                .accessibilityIdentifier(AccessibilityID.dockDetectLigand)
             }
             HStack(spacing: 4) {
                 Button(action: { pocketFromSelection() }) {
@@ -230,6 +237,7 @@ struct DockingTabView: View {
                 .controlSize(.small)
                 .disabled(viewModel.molecules.protein == nil || viewModel.workspace.selectedResidueIndices.isEmpty)
                 .help("Define pocket from selected residues")
+                .accessibilityIdentifier(AccessibilityID.dockDetectSelection)
             }
 
             // Detected pockets list
@@ -249,22 +257,22 @@ struct DockingTabView: View {
     @ViewBuilder
     private func pocketRow(_ pocket: BindingPocket) -> some View {
         let isSelected = viewModel.docking.selectedPocket?.id == pocket.id
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Circle()
                 .fill(isSelected ? .green : .gray)
                 .frame(width: 6, height: 6)
 
             Text("Pocket")
-                .font(.system(size: 10, weight: .medium))
+                .font(.footnote.weight(.medium))
 
             Spacer()
 
             Text(String(format: "%.0f \u{00C5}\u{00B3}", pocket.volume))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
 
             Text("\(pocket.residueIndices.count) res")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
         }
         .padding(4)
@@ -286,11 +294,12 @@ struct DockingTabView: View {
 
             Button(action: { viewModel.focusOnPocket(pocket) }) {
                 Label("Focus", systemImage: "scope")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
             .help("Zoom to pocket with Z-clipping slab")
+            .accessibilityIdentifier(AccessibilityID.dockFocusPocket)
         }
     }
 
@@ -301,24 +310,25 @@ struct DockingTabView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Grid Box", systemImage: "cube.transparent")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 // Show grid toggle
                 Button(action: { applyGridBoxFromSliders() }) {
                     Image(systemName: "arrow.right.circle")
-                        .font(.system(size: 12))
+                        .font(.callout)
                         .padding(3)
                         .background(Color.accentColor.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
                 .help("Apply grid box to viewport")
+                .plainButtonAccessibility(AccessibilityID.dockApplyGrid)
             }
 
             // Center controls
             VStack(alignment: .leading, spacing: 3) {
                 Text("Center")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
                 gridAxisRow("X", value: gridCenterBinding(\.x), range: -200...200)
                 gridAxisRow("Y", value: gridCenterBinding(\.y), range: -200...200)
@@ -328,7 +338,7 @@ struct DockingTabView: View {
             // Half-size controls
             VStack(alignment: .leading, spacing: 3) {
                 Text("Half-size")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
                 gridAxisRow("X", value: gridHalfBinding(\.x), range: 2...50)
                 gridAxisRow("Y", value: gridHalfBinding(\.y), range: 2...50)
@@ -337,7 +347,7 @@ struct DockingTabView: View {
 
             // Quick placement buttons
             Text("Center on")
-                .font(.system(size: 10, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 4) {
@@ -349,6 +359,7 @@ struct DockingTabView: View {
                 .controlSize(.small)
                 .disabled(viewModel.molecules.protein == nil)
                 .help("Center grid on protein centroid")
+                .accessibilityIdentifier(AccessibilityID.dockGridProtein)
 
                 if viewModel.molecules.ligand != nil {
                     Button(action: { placeGridAtLigand() }) {
@@ -358,6 +369,7 @@ struct DockingTabView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .help("Center grid on ligand position")
+                    .accessibilityIdentifier(AccessibilityID.dockGridLigand)
                 }
 
                 if !viewModel.workspace.selectedResidueIndices.isEmpty {
@@ -368,6 +380,7 @@ struct DockingTabView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .help("Center grid on selected residues")
+                    .accessibilityIdentifier(AccessibilityID.dockGridSelection)
                 }
 
                 if viewModel.docking.selectedPocket != nil {
@@ -378,6 +391,7 @@ struct DockingTabView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .help("Reset grid to detected pocket")
+                    .accessibilityIdentifier(AccessibilityID.dockGridPocket)
                 }
             }
         }
@@ -387,7 +401,7 @@ struct DockingTabView: View {
     private func gridAxisRow(_ axis: String, value: Binding<Float>, range: ClosedRange<Float>) -> some View {
         HStack(spacing: 4) {
             Text(axis)
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .font(.footnote.bold().monospaced())
                 .frame(width: 12, alignment: .trailing)
                 .foregroundStyle(.secondary)
             Slider(value: value, in: range, step: 0.5)
@@ -396,7 +410,7 @@ struct DockingTabView: View {
                     applyGridBoxFromSliders()
                 }
             Text(String(format: "%.1f \u{00C5}", value.wrappedValue))
-                .font(.system(size: 9, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 44, alignment: .trailing)
         }
@@ -410,7 +424,7 @@ struct DockingTabView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Pocket View", systemImage: "rectangle.split.3x1")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 Toggle("", isOn: Binding(
                     get: { vm.workspace.enableClipping },
@@ -438,7 +452,7 @@ struct DockingTabView: View {
                     // Slab thickness slider
                     HStack(spacing: 4) {
                         Text("Thickness")
-                            .font(.system(size: 9, weight: .medium))
+                            .font(.footnote.weight(.medium))
                             .foregroundStyle(.secondary)
                             .frame(width: 52, alignment: .leading)
                         Slider(
@@ -454,7 +468,7 @@ struct DockingTabView: View {
                         )
                         .controlSize(.mini)
                         Text(String(format: "%.1f \u{00C5}", vm.workspace.slabThickness))
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(vm.workspace.slabThickness < 10 ? .orange : .secondary)
                             .frame(width: 44, alignment: .trailing)
                     }
@@ -462,7 +476,7 @@ struct DockingTabView: View {
                     // Slab offset slider
                     HStack(spacing: 4) {
                         Text("Offset")
-                            .font(.system(size: 9, weight: .medium))
+                            .font(.footnote.weight(.medium))
                             .foregroundStyle(.secondary)
                             .frame(width: 52, alignment: .leading)
                         Slider(
@@ -478,7 +492,7 @@ struct DockingTabView: View {
                         )
                         .controlSize(.mini)
                         Text(String(format: "%+.1f \u{00C5}", vm.workspace.slabOffset))
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                             .frame(width: 44, alignment: .trailing)
                     }
@@ -489,17 +503,22 @@ struct DockingTabView: View {
                             Button(preset) {
                                 applySlabPreset(preset)
                             }
-                            .font(.system(size: 9))
+                            .font(.footnote)
                             .controlSize(.mini)
                             .buttonStyle(.bordered)
                             .help("Z-slab \(preset.lowercased()) clipping around the pocket")
+                            .accessibilityIdentifier(
+                                preset == "Tight" ? AccessibilityID.dockSlabTight :
+                                preset == "Medium" ? AccessibilityID.dockSlabMedium :
+                                AccessibilityID.dockSlabWide
+                            )
                         }
                     }
                 }
             } else {
                 Text("Enable to clip the view around the pocket for clean binding site visualization")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -528,19 +547,19 @@ struct DockingTabView: View {
     private var dockingConfigSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Configuration", systemImage: "gearshape")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             // Presets row
             HStack(spacing: 4) {
                 Text("Preset")
-                    .font(.system(size: 11))
+                    .font(.subheadline)
                 Spacer()
                 ForEach(["Auto", "Fast", "Standard", "Thorough"], id: \.self) { preset in
                     let isActive = isPresetActive(preset)
                     Button(preset) {
                         applyPreset(preset)
                     }
-                    .font(.system(size: 9, weight: isActive ? .bold : .regular))
+                    .font(.footnote.weight(isActive ? .bold : .regular))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(isActive ? Color.accentColor.opacity(0.25) : Color.secondary.opacity(0.1))
@@ -553,10 +572,10 @@ struct DockingTabView: View {
             if viewModel.docking.dockingConfig.autoMode {
                 HStack(spacing: 4) {
                     Image(systemName: "wand.and.stars")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.purple)
                     Text("Parameters adapt to protein size, pocket shape, and ligand flexibility")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 2)
@@ -590,7 +609,7 @@ struct DockingTabView: View {
                 get: { viewModel.docking.dockingConfig.enableFlexibility },
                 set: { viewModel.docking.dockingConfig.enableFlexibility = $0 }
             ))
-            .font(.system(size: 11))
+            .font(.subheadline)
             .help("Allow rotatable bonds to flex during docking")
 
             configRow("Grid Spacing") {
@@ -611,10 +630,10 @@ struct DockingTabView: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
                     Text("Mutation Rate")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                     Spacer()
                     Text(String(format: "%.3f", viewModel.docking.dockingConfig.mutationRate))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 Slider(
@@ -622,10 +641,93 @@ struct DockingTabView: View {
                         get: { viewModel.docking.dockingConfig.mutationRate },
                         set: { viewModel.docking.dockingConfig.mutationRate = $0 }
                     ),
-                    in: 0.01...0.10,
+                    in: 0.01...0.25,
                     step: 0.005
                 )
                 .controlSize(.small)
+            }
+
+            DisclosureGroup("Exploration") {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Exploration Phase Ratio")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(String(format: "%.2f", viewModel.docking.dockingConfig.explorationPhaseRatio))
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.docking.dockingConfig.explorationPhaseRatio },
+                            set: { viewModel.docking.dockingConfig.explorationPhaseRatio = $0 }
+                        ),
+                        in: 0.2...0.8,
+                        step: 0.05
+                    )
+                    .controlSize(.small)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Local Search Freq.")
+                            .font(.subheadline)
+                        Spacer()
+                        Text("every \(viewModel.docking.dockingConfig.explorationLocalSearchFrequency)th gen")
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Stepper(
+                        value: Binding(
+                            get: { viewModel.docking.dockingConfig.explorationLocalSearchFrequency },
+                            set: { viewModel.docking.dockingConfig.explorationLocalSearchFrequency = $0 }
+                        ),
+                        in: 1...10
+                    ) {
+                        EmptyView()
+                    }
+                    .controlSize(.small)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("MC Temperature")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(String(format: "%.1f", viewModel.docking.dockingConfig.mcTemperature))
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.docking.dockingConfig.mcTemperature },
+                            set: { viewModel.docking.dockingConfig.mcTemperature = $0 }
+                        ),
+                        in: 0.5...4.0,
+                        step: 0.1
+                    )
+                    .controlSize(.small)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Exploration Mutation")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(String(format: "%.2f", viewModel.docking.dockingConfig.explorationMutationRate))
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.docking.dockingConfig.explorationMutationRate },
+                            set: { viewModel.docking.dockingConfig.explorationMutationRate = $0 }
+                        ),
+                        in: 0.10...0.50,
+                        step: 0.01
+                    )
+                    .controlSize(.small)
+                }
             }
         }
     }
@@ -670,7 +772,7 @@ struct DockingTabView: View {
     private func configRow<Content: View>(_ label: String, @ViewBuilder control: () -> Content) -> some View {
         HStack {
             Text(label)
-                .font(.system(size: 11))
+                .font(.subheadline)
             Spacer()
             control()
         }
@@ -680,7 +782,7 @@ struct DockingTabView: View {
     private func intField(value: Binding<Int>) -> some View {
         TextField("", value: value, format: .number)
             .textFieldStyle(.roundedBorder)
-            .font(.system(size: 10, design: .monospaced))
+            .font(.footnote.monospaced())
             .frame(width: 70)
             .multilineTextAlignment(.trailing)
     }
@@ -691,10 +793,10 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private var flexibleResidueSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Receptor Flexibility", systemImage: "figure.flexibility")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if !viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.isEmpty
@@ -702,7 +804,7 @@ struct DockingTabView: View {
                     Button("Clear") {
                         viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.removeAll()
                     }
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .buttonStyle(.plain)
                     .foregroundStyle(.red)
                     .help("Remove all flexible residues (use rigid receptor)")
@@ -714,10 +816,10 @@ struct DockingTabView: View {
             Toggle(isOn: $flexVM.docking.flexibleResidueConfig.autoFlex) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Soft Receptor Flexibility")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                     Text("Pocket-lining sidechains adjust gently during docking")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
             }
             .toggleStyle(.switch)
@@ -738,7 +840,7 @@ struct DockingTabView: View {
                     )
                     if autoIndices.isEmpty {
                         Text("No rotatable residues lining this pocket")
-                            .font(.system(size: 9))
+                            .font(.footnote)
                             .foregroundStyle(.orange)
                     } else {
                         let names = autoIndices.compactMap { seq -> String? in
@@ -747,12 +849,12 @@ struct DockingTabView: View {
                         HStack(spacing: 4) {
                             ForEach(names, id: \.self) { name in
                                 Text(name)
-                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                    .padding(.horizontal, 5)
+                                    .font(.footnote.weight(.medium).monospaced())
+                                    .padding(.horizontal, 4)
                                     .padding(.vertical, 2)
                                     .background(Color.purple.opacity(0.1))
                                     .foregroundStyle(.purple.opacity(0.8))
-                                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
                             }
                         }
 
@@ -763,16 +865,16 @@ struct DockingTabView: View {
                         }.reduce(0, +)
 
                         Text("\(autoIndices.count) residue(s), \(totalChi) chi angle(s) — soft weight, small perturbations")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
             } else {
                 // Manual residue selection (existing behavior)
                 if viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.isEmpty {
                     Text("Or select residues manually in the sequence panel or 3D viewport for full induced-fit docking.")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 } else {
                     let flexIndices = viewModel.docking.flexibleResidueConfig.flexibleResidueIndices
                     let residueNames = flexIndices.compactMap { seq -> String? in
@@ -786,12 +888,12 @@ struct DockingTabView: View {
                     HStack(spacing: 4) {
                         ForEach(residueNames, id: \.self) { name in
                             Text(name)
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                .padding(.horizontal, 5)
+                                .font(.footnote.weight(.medium).monospaced())
+                                .padding(.horizontal, 4)
                                 .padding(.vertical, 2)
                                 .background(Color.purple.opacity(0.15))
                                 .foregroundStyle(.purple)
-                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                     }
 
@@ -802,13 +904,13 @@ struct DockingTabView: View {
                     }.reduce(0, +)
 
                     Text("\(flexIndices.count) residue(s), \(totalChi) chi angle(s)")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 if viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.count >= FlexibleResidueConfig.maxFlexibleResidues {
                     Text("Maximum \(FlexibleResidueConfig.maxFlexibleResidues) flexible residues reached")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.orange)
                 }
             }
@@ -817,26 +919,26 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private var constraintSummarySection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Constraints (\(viewModel.docking.pharmacophoreConstraints.count))",
                       systemImage: "scope")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Clear All") {
                     viewModel.docking.pharmacophoreConstraints.removeAll()
                 }
-                .font(.system(size: 9))
+                .font(.footnote)
                 .buttonStyle(.plain)
                 .foregroundStyle(.red)
                 .help("Remove all pharmacophore constraints")
             }
 
             ForEach(Array(viewModel.docking.pharmacophoreConstraints.enumerated()), id: \.element.id) { idx, constraint in
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     Image(systemName: constraint.interactionType.icon)
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .frame(width: 14)
                         .foregroundColor(Color(
                             red: Double(constraint.interactionType.color.x),
@@ -845,27 +947,27 @@ struct DockingTabView: View {
                         ))
 
                     Text(constraint.targetLabel)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .lineLimit(1)
 
                     Spacer()
 
                     Text(constraint.interactionType.rawValue)
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
 
                     Text(constraint.strength.isHard ? "Hard" : "Soft")
-                        .font(.system(size: 8, weight: .medium))
+                        .font(.caption.weight(.medium))
                         .padding(.horizontal, 4)
                         .padding(.vertical, 1)
                         .background(constraint.strength.isHard ? Color.red.opacity(0.2) : Color.orange.opacity(0.2))
-                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
 
                     Button(action: {
                         viewModel.docking.pharmacophoreConstraints.remove(at: idx)
                     }) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
@@ -886,10 +988,10 @@ struct DockingTabView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text("Beam Width")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                     Spacer()
                     Text("\(viewModel.docking.dockingConfig.fragment.beamWidth)")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.footnote.monospaced())
                 }
                 Slider(
                     value: Binding(
@@ -906,9 +1008,9 @@ struct DockingTabView: View {
                     } label: {
                         HStack(spacing: 3) {
                             Image(systemName: "pencil.and.outline")
-                                .font(.system(size: 9))
+                                .font(.footnote)
                             Text(viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil ? "Edit Scaffold" : "Enforce Scaffold")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 3)
@@ -922,7 +1024,7 @@ struct DockingTabView: View {
                             viewModel.docking.dockingConfig.fragment.scaffoldMode = .auto
                         } label: {
                             Image(systemName: "xmark")
-                                .font(.system(size: 9))
+                                .font(.footnote)
                         }
                         .buttonStyle(.bordered)
                         .tint(.red)
@@ -931,7 +1033,7 @@ struct DockingTabView: View {
 
                 if let scaffold = viewModel.docking.dockingConfig.fragment.scaffoldSMARTS {
                     Text("Scaffold: \(scaffold)")
-                        .font(.system(size: 8, design: .monospaced))
+                        .font(.caption.monospaced())
                         .foregroundStyle(.orange)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -944,7 +1046,7 @@ struct DockingTabView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text("Replicas")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                     Spacer()
                     Picker("", selection: Binding(
                         get: { viewModel.docking.dockingConfig.replicaExchange.numReplicas },
@@ -961,10 +1063,10 @@ struct DockingTabView: View {
 
                 HStack {
                     Text("T range")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                     Spacer()
                     Text("\(String(format: "%.1f", viewModel.docking.dockingConfig.replicaExchange.minTemperature))–\(String(format: "%.1f", viewModel.docking.dockingConfig.replicaExchange.maxTemperature)) kcal/mol")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.footnote.monospaced())
                 }
             }
             .padding(.top, 2)
@@ -974,10 +1076,10 @@ struct DockingTabView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text("Denoising Steps")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                     Spacer()
                     Text("\(viewModel.docking.dockingConfig.diffusion.numDenoisingSteps)")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.footnote.monospaced())
                 }
                 Slider(
                     value: Binding(
@@ -990,7 +1092,7 @@ struct DockingTabView: View {
 
                 HStack {
                     Text("Schedule")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                     Spacer()
                     Picker("", selection: Binding(
                         get: { viewModel.docking.dockingConfig.diffusion.noiseSchedule },
@@ -1001,11 +1103,11 @@ struct DockingTabView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 160)
+                    .frame(minWidth: 200, maxWidth: 260)
                 }
 
                 Text("Requires DruseAF weights")
-                    .font(.system(size: 8))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .padding(.top, 2)
@@ -1026,21 +1128,24 @@ struct DockingTabView: View {
 
             // Search method selector
             @Bindable var vm = viewModel
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Search Method")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
 
-                HStack(spacing: 4) {
+            Divider()
+                .padding(.vertical, 2)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Search Method")
+                    .font(.subheadline.weight(.semibold))
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 4) {
                     ForEach(SearchMethod.allCases, id: \.self) { method in
                         Button {
                             vm.docking.dockingConfig.searchMethod = method
                         } label: {
-                            HStack(spacing: 3) {
+                            HStack(spacing: 4) {
                                 Image(systemName: method.icon)
-                                    .font(.system(size: 10))
+                                    .font(.subheadline)
                                 Text(method.shortLabel)
-                                    .font(.system(size: 10, weight: .medium))
+                                    .font(.subheadline.weight(.medium))
                             }
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 4)
@@ -1053,32 +1158,34 @@ struct DockingTabView: View {
                 }
 
                 Text(viewModel.docking.dockingConfig.searchMethod.description)
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
 
                 // Search method specific options
                 searchMethodOptionsSection
             }
 
-            // Scoring function selector
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Scoring Function")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
+            Divider()
+                .padding(.vertical, 2)
 
-                HStack(spacing: 6) {
+            // Scoring function selector
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Scoring Function")
+                    .font(.subheadline.weight(.semibold))
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 4) {
                     ForEach(scoringMethodsAvailable, id: \.self) { method in
                         Button {
                             vm.docking.scoringMethod = method
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: method.icon)
-                                    .font(.system(size: 11))
+                                    .font(.subheadline)
                                 Text(method.shortLabel)
-                                    .font(.system(size: 11, weight: .medium))
+                                    .font(.subheadline.weight(.medium))
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 5)
+                            .padding(.vertical, 4)
                         }
                         .buttonStyle(.bordered)
                         .tint(vm.docking.scoringMethod == method ? .accentColor : .secondary)
@@ -1088,32 +1195,77 @@ struct DockingTabView: View {
                 }
 
                 Text(viewModel.docking.scoringMethod.description)
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+
+            Divider()
+                .padding(.vertical, 2)
+
+            // Ensemble multi-start docking
+            if !viewModel.docking.ligandForms.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(isOn: Binding(
+                        get: { viewModel.docking.dockingConfig.ensemble.enabled },
+                        set: { viewModel.docking.dockingConfig.ensemble.enabled = $0 }
+                    )) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.footnote)
+                            Text("Ensemble docking")
+                                .font(.subheadline)
+                            let forms = viewModel.docking.ligandForms
+                            let qualifying = forms.filter { $0.boltzmannWeight >= viewModel.docking.dockingConfig.ensemble.populationCutoff }
+                            Text("(\(qualifying.count) forms)")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.mini)
+                    .help("Dock all qualifying tautomers/protomers x conformers as separate GA starting geometries")
+
+                    if viewModel.docking.dockingConfig.ensemble.enabled {
+                        HStack {
+                            Text("Pop. cutoff")
+                                .font(.footnote)
+                            Spacer()
+                            Text("\(String(format: "%.0f", viewModel.docking.dockingConfig.ensemble.populationCutoff * 100))%")
+                                .font(.footnote.monospaced())
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { viewModel.docking.dockingConfig.ensemble.populationCutoff },
+                                set: { viewModel.docking.dockingConfig.ensemble.populationCutoff = $0 }
+                            ),
+                            in: 0.01...0.50, step: 0.01
+                        )
+                        .controlSize(.mini)
+                    }
+                }
             }
 
             // Post-docking refinement options
             VStack(alignment: .leading, spacing: 4) {
                 Text("Post-docking Refinement")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .padding(.top, 4)
 
-                // ML rescoring
-                if viewModel.druseRescoring.isAvailable &&
-                   (viewModel.docking.scoringMethod == .vina || viewModel.docking.scoringMethod == .drusina) {
-                    Toggle(isOn: $vm.docking.usePostDockingRefinement) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "brain")
-                                .font(.system(size: 10))
-                            Text("ML rescoring")
-                                .font(.system(size: 11))
-                        }
+                // DruseAF v4 neural rescoring
+                Toggle(isOn: Binding(
+                    get: { viewModel.docking.dockingConfig.useAFv4Rescore },
+                    set: { viewModel.docking.dockingConfig.useAFv4Rescore = $0 }
+                )) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "brain")
+                            .font(.footnote)
+                        Text("DruseAF rescoring")
+                            .font(.subheadline)
                     }
-                    .toggleStyle(.checkbox)
-                    .controlSize(.mini)
-                    .help("Refine pose ranking with a secondary neural network (blends ML + physics energies)")
                 }
+                .toggleStyle(.checkbox)
+                .controlSize(.mini)
+                .help("Re-rank top poses with DruseAF v4 pairwise geometric network (pKd prediction + pose confidence). ~0.1ms/pose.")
 
                 // GFN2-xTB rescoring
                 Toggle(isOn: Binding(
@@ -1122,9 +1274,9 @@ struct DockingTabView: View {
                 )) {
                     HStack(spacing: 4) {
                         Image(systemName: "atom")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                         Text("GFN2-xTB rescoring")
-                            .font(.system(size: 11))
+                            .font(.subheadline)
                     }
                 }
                 .toggleStyle(.checkbox)
@@ -1136,7 +1288,7 @@ struct DockingTabView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("Solvation")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Picker("", selection: Binding(
@@ -1156,7 +1308,7 @@ struct DockingTabView: View {
 
                         HStack {
                             Text("Opt Level")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Picker("", selection: Binding(
@@ -1176,7 +1328,7 @@ struct DockingTabView: View {
 
                         HStack {
                             Text("Top poses")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                                 .foregroundStyle(.secondary)
                             Spacer()
                             TextField("", value: Binding(
@@ -1184,14 +1336,14 @@ struct DockingTabView: View {
                                 set: { viewModel.docking.dockingConfig.gfn2Refinement.topPosesToRefine = max(1, $0) }
                             ), format: .number)
                             .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .frame(width: 45)
                         }
                         .help("Number of top-ranked poses to optimize with GFN2-xTB")
 
                         HStack {
                             Text("Blend")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                                 .foregroundStyle(.secondary)
                             Slider(
                                 value: Binding(
@@ -1202,7 +1354,7 @@ struct DockingTabView: View {
                             )
                             .controlSize(.mini)
                             Text(String(format: "%.0f%%", viewModel.docking.dockingConfig.gfn2Refinement.blendWeight * 100))
-                                .font(.system(size: 9, design: .monospaced))
+                                .font(.footnote.monospaced())
                                 .foregroundStyle(.secondary)
                                 .frame(width: 28)
                         }
@@ -1233,6 +1385,7 @@ struct DockingTabView: View {
             .controlSize(.small)
             .disabled(!canDock)
             .help("Launch GPU-accelerated molecular docking with the configured scoring method and GA parameters")
+            .accessibilityIdentifier(AccessibilityID.dockStartButton)
 
             // VRAM usage warning
             if let engine = viewModel.docking.dockingEngine, let pocket = viewModel.docking.selectedPocket {
@@ -1251,10 +1404,10 @@ struct DockingTabView: View {
                 if estimate.usageRatio > 0.7 {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.orange)
                         Text("VRAM: \(String(format: "%.0f", estimate.totalMB))MB / \(String(format: "%.0f", estimate.deviceBudgetMB))MB")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.orange)
                     }
                     .help("High GPU memory usage — grid spacing may be coarsened automatically")
@@ -1279,12 +1432,12 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private func requirementLabel(_ text: String) -> some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 4) {
             Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.red.opacity(0.7))
             Text(text)
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -1296,15 +1449,22 @@ struct DockingTabView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Docking in progress", systemImage: "bolt.fill")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.yellow)
                 Spacer()
                 // Compact generation counter
                 let gen = viewModel.docking.dockingGeneration + 1
                 let total = viewModel.docking.dockingTotalGenerations
-                Text("Gen \(gen)/\(total)")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                let ep = viewModel.docking.ensembleProgress
+                if ep.total > 1 {
+                    Text("Start \(ep.current + 1)/\(ep.total) Gen \(gen)/\(total)")
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Gen \(gen)/\(total)")
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                }
             }
 
             // Compact progress bar
@@ -1317,8 +1477,8 @@ struct DockingTabView: View {
             .tint(.cyan)
 
             Text("Live scores visible in viewport (top-right)")
-                .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
 
             Button(action: {
                 if viewModel.docking.isBatchDocking {
@@ -1334,6 +1494,7 @@ struct DockingTabView: View {
             .controlSize(.small)
             .tint(.red)
             .help("Cancel the active docking run and keep the best pose found so far")
+            .accessibilityIdentifier(AccessibilityID.dockCancelButton)
         }
     }
 
@@ -1344,43 +1505,37 @@ struct DockingTabView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Docking Statistics", systemImage: "chart.bar.xaxis")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 if viewModel.docking.dockingDuration > 0 {
                     Text(formatDuration(viewModel.docking.dockingDuration))
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
             }
 
             // Key statistics grid
             let results = viewModel.docking.dockingResults
-            let isMLScoring = viewModel.docking.scoringMethod == .druseAffinity
             let clusterIDs = Set(results.map(\.clusterID))
 
             HStack(spacing: 8) {
-                if isMLScoring, let best = results.first, let pKd = best.mlPKd {
-                    let display = viewModel.docking.affinityDisplayUnit.format(pKd)
-                    statCell("Best", display, color: pKd > 8 ? .green : pKd > 5 ? .yellow : .orange)
-                } else {
-                    let energies = results.map(\.energy)
-                    statCell("Best", String(format: "%.1f", energies.min() ?? 0),
-                             color: (energies.min() ?? 0) < -6 ? .green : .yellow)
-                    statCell("Mean", String(format: "%.1f", energies.isEmpty ? 0 : energies.reduce(0, +) / Float(energies.count)),
-                             color: .secondary)
-                }
+                let energies = results.map(\.energy)
+                statCell("Best", String(format: "%.1f", energies.min() ?? 0),
+                         color: (energies.min() ?? 0) < -6 ? .green : .yellow)
+                statCell("Mean", String(format: "%.1f", energies.isEmpty ? 0 : energies.reduce(0, +) / Float(energies.count)),
+                         color: .secondary)
                 statCell("Poses", "\(results.count)", color: .blue)
                 statCell("Clusters", "\(clusterIDs.count)", color: .cyan)
             }
-            .padding(6)
+            .padding(8)
             .frame(maxWidth: .infinity)
-            .background(RoundedRectangle(cornerRadius: 5).fill(Color.green.opacity(0.06)))
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.green.opacity(0.06)))
 
             // Best pose scoring breakdown
             if let best = results.first {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Best Pose Breakdown")
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
                     HStack(spacing: 8) {
                         scoreItem("vdW", best.vdwEnergy)
@@ -1403,7 +1558,7 @@ struct DockingTabView: View {
             // GA/search statistics
             VStack(alignment: .leading, spacing: 3) {
                 Text("Search Summary")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
                     statMini("Generations", "\(viewModel.docking.dockingTotalGenerations)")
@@ -1429,10 +1584,10 @@ struct DockingTabView: View {
     private func statCell(_ label: String, _ value: String, color: Color) -> some View {
         VStack(spacing: 2) {
             Text(value)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .font(.subheadline.weight(.medium).monospaced())
                 .foregroundStyle(color)
             Text(label)
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
@@ -1442,10 +1597,10 @@ struct DockingTabView: View {
     private func scoreItem(_ label: String, _ value: Float) -> some View {
         VStack(spacing: 1) {
             Text(String(format: "%.1f", value))
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.footnote.weight(.medium).monospaced())
                 .foregroundStyle(value < 0 ? .green : .red)
             Text(label)
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -1454,10 +1609,10 @@ struct DockingTabView: View {
     private func statMini(_ label: String, _ value: String) -> some View {
         HStack(spacing: 3) {
             Text(label + ":")
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
             Text(value)
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(.footnote.weight(.medium).monospaced())
                 .foregroundStyle(.primary)
         }
     }
@@ -1476,15 +1631,15 @@ struct DockingTabView: View {
         VStack(spacing: 2) {
             HStack(spacing: 2) {
                 Text(value)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .font(.subheadline.weight(.medium).monospaced())
                 if !unit.isEmpty {
                     Text(unit)
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
             Text(label)
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }

@@ -78,6 +78,58 @@ extension AppViewModel {
         )
     }
 
+    // MARK: - Prepared Protein Cache
+
+    /// Returns a prepared protein for docking scoring, using a cache to avoid re-running
+    /// the full preparation pipeline (H addition, H-bond network, Gasteiger charges)
+    /// when the protein and pH haven't changed.
+    func preparedProteinForDocking(
+        protein: Molecule, pH: Float
+    ) async -> (protein: Molecule, report: ProteinPreparation.DockingPreparationReport) {
+        // Build a lightweight cache key from atom count + name + pH
+        var hasher = Hasher()
+        hasher.combine(protein.atoms.count)
+        hasher.combine(protein.name)
+        hasher.combine(pH)
+        let key = hasher.finalize()
+
+        if let cached = docking.preparedProteinCache, cached.key == key {
+            log.info("[Preparation] Using cached prepared receptor (\(cached.protein.atoms.count) atoms)", category: .dock)
+            return (cached.protein, cached.report)
+        }
+
+        let proteinAtoms = protein.atoms
+        let proteinBonds = protein.bonds
+        let pdbContent = molecules.rawPDBContent
+        let hCount = proteinAtoms.filter { $0.element == .H }.count
+        log.info("[Preparation] Preparing receptor for scoring (\(proteinAtoms.count) atoms, \(hCount) H, pH \(pH), rawPDB=\(pdbContent != nil ? "\(pdbContent!.count) chars" : "nil"))...", category: .dock)
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let prepared = await Task.detached {
+            ProteinPreparation.prepareForDocking(
+                atoms: proteinAtoms,
+                bonds: proteinBonds,
+                rawPDBContent: pdbContent,
+                pH: pH
+            )
+        }.value
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+
+        let scoringProtein = Molecule(
+            name: protein.name,
+            atoms: prepared.atoms,
+            bonds: prepared.bonds,
+            title: protein.title,
+            smiles: protein.smiles
+        )
+        scoringProtein.secondaryStructureAssignments = protein.secondaryStructureAssignments
+
+        docking.preparedProteinCache = .init(protein: scoringProtein, report: prepared.report, key: key)
+        log.info("[Preparation] Receptor prepared in \(String(format: "%.1f", elapsed))s: \(prepared.atoms.count) atoms (+\(prepared.report.hydrogensAdded) H, \(prepared.report.nonZeroChargeAtoms) charged, \(prepared.report.rdkitChargeMatches) RDKit matches)", category: .dock)
+
+        return (scoringProtein, prepared.report)
+    }
+
     // MARK: - Docking
 
     func runDocking() {
@@ -122,32 +174,8 @@ extension AppViewModel {
                 return
             }
 
-            let proteinAtoms = prot.atoms
-            let proteinBonds = prot.bonds
             let dockingPH = molecules.protonationPH
-            let pdbContent = molecules.rawPDBContent
-            let preparedProtein = await Task.detached {
-                ProteinPreparation.prepareForDocking(
-                    atoms: proteinAtoms,
-                    bonds: proteinBonds,
-                    rawPDBContent: pdbContent,
-                    pH: dockingPH
-                )
-            }.value
-
-            let scoringProtein = Molecule(
-                name: prot.name,
-                atoms: preparedProtein.atoms,
-                bonds: preparedProtein.bonds,
-                title: prot.title,
-                smiles: prot.smiles
-            )
-            scoringProtein.secondaryStructureAssignments = prot.secondaryStructureAssignments
-            log.info(
-                "Using prepared receptor for scoring: +\(preparedProtein.report.hydrogensAdded) H via \(preparedProtein.report.hydrogenMethod), " +
-                "\(preparedProtein.report.nonZeroChargeAtoms) charged atoms, \(preparedProtein.report.rdkitChargeMatches) RDKit charge matches",
-                category: .dock
-            )
+            let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH)
 
             // Ensure grid box stays visible during docking; hide original ligand
             // (the live ghost pose renders the moving ligand in the pocket)
@@ -237,13 +265,7 @@ extension AppViewModel {
 
             let origLig = self.docking.originalDockingLigand ?? lig
 
-            let useMLLive = docking.scoringMethod == .druseAffinity && druseMLScoring.isAvailable
-            log.info("  ML live scoring: \(useMLLive ? "enabled" : "disabled") (method=\(docking.scoringMethod.rawValue), mlAvailable=\(druseMLScoring.isAvailable))", category: .dock)
             log.info("  Original ligand: \(origLig.name), \(origLig.atoms.count) atoms, \(origLig.bonds.count) bonds", category: .dock)
-            let liveScoringProteinAtoms = scoringProtein.atoms
-            let liveScoringProteinBonds = scoringProtein.bonds
-            let livePocketCenter = pocket.center
-            let liveLigandBonds = origLig.bonds
 
             engine.onPoseUpdate = { [weak self] result, interactions in
                 Task { @MainActor [weak self] in
@@ -253,29 +275,6 @@ extension AppViewModel {
                     // Use lightweight ghost pose pipeline — avoids full pushToRenderer() rebuild
                     if let (newAtoms, newBonds) = self.buildTransformedLigand(result: result, originalLigand: origLig) {
                         self.renderer?.updateGhostPose(atoms: newAtoms, bonds: newBonds)
-
-                        // Live ML affinity scoring on current best pose.
-                        // Cancel any in-flight prediction and start a fresh one so the
-                        // displayed pKi always reflects the latest best pose.
-                        if useMLLive {
-                            self.docking.liveScoringTask?.cancel()
-                            let capturedAtoms = newAtoms
-                            self.docking.liveScoringTask = Task { @MainActor [weak self] in
-                                guard let self, !Task.isCancelled else { return }
-                                let features = DruseScoreFeatureExtractor.extract(
-                                    proteinAtoms: liveScoringProteinAtoms,
-                                    ligandAtoms: capturedAtoms,
-                                    pocketCenter: livePocketCenter,
-                                    proteinBonds: liveScoringProteinBonds,
-                                    ligandBonds: liveLigandBonds
-                                )
-                                guard !Task.isCancelled else { return }
-                                if let pred = await self.druseMLScoring.score(features: features) {
-                                    guard !Task.isCancelled else { return }
-                                    self.docking.dockingBestPKi = pred.pKd
-                                }
-                            }
-                        }
                     }
                     if !interactions.isEmpty {
                         self.renderer?.updateInteractionLines(interactions)
@@ -300,52 +299,74 @@ extension AppViewModel {
                 log.info("Pharmacophore constraints: \(activeConstraints.count) active", category: .dock)
             }
 
-            log.info("Launching GA docking engine...", category: .dock)
-            let results = await engine.runDocking(
-                ligand: lig, pocket: pocket,
-                config: docking.dockingConfig,
-                scoringMethod: docking.scoringMethod)
+            // Build list of starting molecules for GA
+            let ensembleCfg = docking.dockingConfig.ensemble
+            let startingMolecules = buildEnsembleStartingMolecules(
+                primaryLigand: lig,
+                forms: docking.ligandForms,
+                config: ensembleCfg
+            )
+            let isMultiStart = startingMolecules.count > 1
+            if isMultiStart {
+                log.info("Ensemble docking: \(startingMolecules.count) starting geometries " +
+                         "(cutoff=\(String(format: "%.0f%%", ensembleCfg.populationCutoff * 100)))",
+                         category: .dock)
+                docking.ensembleProgress = (0, startingMolecules.count)
+            }
 
-            log.info("GA complete: \(results.count) poses returned", category: .dock)
+            log.info("Launching GA docking engine...", category: .dock)
+
+            var allResults: [DockingResult] = []
+            for (startIdx, start) in startingMolecules.enumerated() {
+                guard !Task.isCancelled else { break }
+                if isMultiStart {
+                    docking.ensembleProgress = (startIdx, startingMolecules.count)
+                    workspace.statusMessage = "Docking \(start.label) (\(startIdx + 1)/\(startingMolecules.count))..."
+                    log.info("  Start \(startIdx + 1)/\(startingMolecules.count): \(start.label) (pop=\(String(format: "%.1f%%", start.population * 100)))", category: .dock)
+                }
+
+                let startResults = await engine.runDocking(
+                    ligand: start.molecule, pocket: pocket,
+                    config: docking.dockingConfig,
+                    scoringMethod: docking.scoringMethod)
+
+                // Apply population weighting if enabled
+                if ensembleCfg.populationWeighting && start.population < 1.0 {
+                    let rt = 0.592  // RT at 298K in kcal/mol
+                    let penalty = -rt * Foundation.log(max(start.population, 1e-10))
+                    for var result in startResults {
+                        result.energy += Float(penalty)
+                        result.formLabel = start.label
+                        result.formPopulation = Float(start.population)
+                        allResults.append(result)
+                    }
+                } else {
+                    for var result in startResults {
+                        result.formLabel = start.label
+                        result.formPopulation = Float(start.population)
+                        allResults.append(result)
+                    }
+                }
+            }
+            if isMultiStart {
+                docking.ensembleProgress = (startingMolecules.count, startingMolecules.count)
+            }
+
+            // Sort all results across all starts by energy
+            let results = allResults.sorted { $0.energy < $1.energy }
+
+            log.info("GA complete: \(results.count) poses returned\(isMultiStart ? " from \(startingMolecules.count) starts" : "")", category: .dock)
             if let best = results.first {
                 log.info("  Best pose: E=\(String(format: "%.3f", best.energy)) kcal/mol, " +
-                         "cluster=\(best.clusterID), gen=\(best.generation)", category: .dock)
+                         "cluster=\(best.clusterID), gen=\(best.generation)" +
+                         (best.formLabel != nil ? ", form=\(best.formLabel!)" : ""),
+                         category: .dock)
             }
 
             // Signal that GA search is done — post-processing begins
             workspace.statusMessage = "Post-processing docking results..."
 
-            var rankedResults: [DockingResult]
-
-            // Primary ML scoring (DruseScorePKi) — replaces Vina as the ranking function
-            if docking.scoringMethod == .druseAffinity && druseMLScoring.isAvailable, let pocket = docking.selectedPocket {
-                workspace.statusMessage = "Druse Affinity scoring..."
-                log.info("Scoring with Druse Affinity (pKi)...", category: .dock)
-                rankedResults = await druseMLScoring.scorePoses(
-                    results: results,
-                    proteinAtoms: scoringProtein.atoms,
-                    ligandAtoms: origLig.atoms,
-                    pocketCenter: pocket.center,
-                    proteinBonds: scoringProtein.bonds,
-                    ligandBonds: origLig.bonds
-                )
-                log.success("Druse Affinity scoring complete", category: .dock)
-            } else if docking.usePostDockingRefinement && druseRescoring.isAvailable, let pocket = docking.selectedPocket {
-                // Post-docking ML refinement (secondary model, blends with Vina)
-                log.info("Post-docking ML refinement...", category: .dock)
-                let reranked = await druseRescoring.rerankPoses(
-                    results: results,
-                    proteinAtoms: scoringProtein.atoms,
-                    ligandAtoms: origLig.atoms,
-                    pocketCenter: pocket.center,
-                    proteinBonds: scoringProtein.bonds,
-                    ligandBonds: origLig.bonds
-                )
-                rankedResults = reranked
-                log.success("Post-docking refinement complete", category: .dock)
-            } else {
-                rankedResults = results
-            }
+            var rankedResults = results
 
             let openMMRefiner = OpenMMPocketRefiner.shared
             if openMMRefiner.isAvailable {
@@ -439,14 +460,7 @@ extension AppViewModel {
             let clusterCount = Set(results.map(\.clusterID)).count
             let elapsed = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
             if let best = rankedResults.first {
-                if docking.scoringMethod == .druseAffinity, let pKd = best.mlPKd {
-                    let display = docking.affinityDisplayUnit.format(pKd)
-                    let unit = docking.affinityDisplayUnit.unitLabel
-                    log.success(String(format: "Docking complete: best %@ %@, conf %.0f%%, %d poses, %d clusters (%.1fs)",
-                                       display, unit, (best.mlPoseConfidence ?? 0) * 100,
-                                       rankedResults.count, clusterCount, elapsed), category: .dock)
-                    workspace.statusMessage = "Best: \(display) \(unit)"
-                } else if docking.scoringMethod == .drusina {
+                if docking.scoringMethod == .drusina {
                     let drCorr = best.drusinaCorrection
                     log.success(String(format: "Docking complete (Drusina): best %.1f kcal/mol (correction: %.2f), %d poses, %d clusters (%.1fs)",
                                        best.energy, drCorr, rankedResults.count, clusterCount, elapsed), category: .dock)
@@ -474,6 +488,81 @@ extension AppViewModel {
         renderer?.clearGhostPose()
         pushToRenderer()
         log.info("Docking stopped", category: .dock)
+    }
+
+    // MARK: - Ensemble Starting Molecules
+
+    struct EnsembleStart {
+        let molecule: Molecule
+        let label: String
+        let population: Double
+    }
+
+    /// Build the list of starting molecules for multi-start docking.
+    /// When ensemble is disabled or no forms are available, returns just the primary ligand.
+    func buildEnsembleStartingMolecules(
+        primaryLigand: Molecule,
+        forms: [ChemicalForm],
+        config: EnsembleDockingConfig
+    ) -> [EnsembleStart] {
+        guard config.enabled, !forms.isEmpty else {
+            return [EnsembleStart(molecule: primaryLigand, label: "primary", population: 1.0)]
+        }
+
+        var starts: [EnsembleStart] = []
+        let qualifyingForms = forms.filter { $0.boltzmannWeight >= config.populationCutoff }
+
+        if qualifyingForms.isEmpty {
+            // All forms below cutoff — fall back to best form
+            return [EnsembleStart(molecule: primaryLigand, label: "primary", population: 1.0)]
+        }
+
+        for form in qualifyingForms {
+            let conformers = form.conformers
+            guard !conformers.isEmpty else { continue }
+
+            let maxConf = config.maxConformersPerForm > 0
+                ? min(config.maxConformersPerForm, conformers.count)
+                : conformers.count
+
+            for confIdx in 0..<maxConf {
+                let conf = conformers[confIdx]
+                let mol = Molecule(
+                    name: primaryLigand.name,
+                    atoms: conf.atoms,
+                    bonds: conf.bonds,
+                    title: form.smiles,
+                    smiles: form.smiles
+                )
+                let label = "\(form.label)_conf\(confIdx)"
+                starts.append(EnsembleStart(
+                    molecule: mol,
+                    label: label,
+                    population: form.boltzmannWeight
+                ))
+            }
+        }
+
+        if starts.isEmpty {
+            return [EnsembleStart(molecule: primaryLigand, label: "primary", population: 1.0)]
+        }
+        return starts
+    }
+
+    /// Count qualifying ensemble starts for UI display (without building molecules).
+    func countEnsembleStarts(forms: [ChemicalForm], config: EnsembleDockingConfig) -> (forms: Int, conformers: Int, total: Int) {
+        guard config.enabled, !forms.isEmpty else { return (0, 0, 1) }
+        let qualifying = forms.filter { $0.boltzmannWeight >= config.populationCutoff }
+        guard !qualifying.isEmpty else { return (0, 0, 1) }
+        var total = 0
+        var totalConformers = 0
+        for form in qualifying {
+            let n = form.conformers.count
+            let maxConf = config.maxConformersPerForm > 0 ? min(config.maxConformersPerForm, n) : n
+            total += maxConf
+            totalConformers += n
+        }
+        return (qualifying.count, totalConformers, max(total, 1))
     }
 
     /// Remove all displayed poses and interaction lines from the 3D viewport.
@@ -690,9 +779,9 @@ extension AppViewModel {
                 String(format: "%.2f", r.torsionPenalty),
                 r.strainEnergy.map { String(format: "%.2f", $0) } ?? "",
                 "\(r.generation)",
-                r.mlPKd.map { String(format: "%.3f", $0) } ?? "",
-                r.mlPoseConfidence.map { String(format: "%.3f", $0) } ?? "",
-                r.mlDockingScore.map { String(format: "%.3f", $0) } ?? ""
+                "",
+                "",
+                ""
             ]
             rows.append(fields.joined(separator: ","))
         }
@@ -702,16 +791,8 @@ extension AppViewModel {
     // MARK: - ML Model Loading
 
     func loadMLModels() {
-        druseMLScoring.loadModel()
-        druseRescoring.loadModel()
         pocketDetectorML.loadModel()
         admetPredictor.loadModels()
-        if druseMLScoring.isAvailable {
-            log.success("Druse Affinity (pKi) model loaded", category: .dock)
-        }
-        if druseRescoring.isAvailable {
-            log.success("Post-docking refinement model loaded", category: .dock)
-        }
         if pocketDetectorML.isAvailable {
             log.success("PocketDetector ML model loaded", category: .dock)
         }

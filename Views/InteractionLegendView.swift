@@ -12,14 +12,14 @@ struct InteractionLegendView: View {
 
     var body: some View {
         if !presentTypes.isEmpty {
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text("Interactions")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.footnote.weight(.bold))
                     .foregroundStyle(.secondary)
 
                 ForEach(presentTypes, id: \.rawValue) { type in
                     let count = interactions.filter { $0.type == type }.count
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         RoundedRectangle(cornerRadius: 1.5)
                             .fill(Color(
                                 red: Double(type.color.x),
@@ -29,16 +29,16 @@ struct InteractionLegendView: View {
                             .frame(width: 16, height: 4)
 
                         Text(type.label)
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.primary)
 
                         Text("(\(count))")
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                     }
                 }
             }
-            .padding(10)
+            .padding(12)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }

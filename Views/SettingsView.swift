@@ -150,7 +150,7 @@ struct SettingsView: View {
                 HStack {
                     TextField("Path", text: $logFileDirectory)
                         .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.subheadline.monospaced())
                         .onChange(of: logFileDirectory) { _, newPath in
                             LogSettings.logDirectory = newPath
                         }
@@ -177,10 +177,10 @@ struct SettingsView: View {
                 if let url = ActivityLog.shared.currentLogFileURL {
                     HStack(spacing: 4) {
                         Image(systemName: "doc.text.fill")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.green)
                         Text("Current: \(url.lastPathComponent)")
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                         Spacer()

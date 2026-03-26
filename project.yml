@@ -22,6 +22,9 @@ targets:
       - path: Models
         excludes:
           - "new-models-2/**"
+          - "druse-models/*.mlpackage"
+      - path: Models/druse-models/PocketDetector.mlpackage
+        buildPhase: sources
       - path: Renderer
       - path: Metal
         buildPhase: sources
@@ -123,4 +126,16 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.druse.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+  DruseUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Druse
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.druse.uitests
         GENERATE_INFOPLIST_FILE: YES

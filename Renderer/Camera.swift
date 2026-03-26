@@ -54,32 +54,55 @@ final class Camera {
 
     // MARK: - Rotation (Arcball)
 
-    func beginRotation(at screenPoint: SIMD2<Float>) {
+    /// Whether the current drag is a Z-roll (Ctrl+drag) vs normal XY orbit.
+    private var isZRoll = false
+
+    func beginRotation(at screenPoint: SIMD2<Float>, zRoll: Bool = false) {
         isDragging = true
+        isZRoll = zRoll
         dragStartOrientation = orientation
         dragStartPoint = screenPoint
     }
 
     func updateRotation(to screenPoint: SIMD2<Float>, viewportSize: SIMD2<Float>) {
         guard isDragging else { return }
-        let delta = screenPoint - dragStartPoint
-        let sensitivity: Float = 5.0 / max(viewportSize.x, viewportSize.y)
 
-        let angleX = delta.x * sensitivity
-        let angleY = delta.y * sensitivity
+        if isZRoll {
+            // Ctrl+drag: rotate around the view axis (Z-roll / spin).
+            // Angle is determined by the angular change of the cursor position
+            // relative to the viewport center.
+            let center = viewportSize * 0.5
+            let startVec = dragStartPoint - center
+            let currVec = screenPoint - center
 
-        // Turntable-style rotation (standard molecular viewer):
-        // - Horizontal drag: orbit around global Y (keeps "up" consistent)
-        // - Vertical drag: orbit around camera's local right axis (prevents gimbal lock)
-        let rotYaw = Quat.fromAxisAngle(SIMD3<Float>(0, 1, 0), angle: -angleX)
-        let cameraRight = dragStartOrientation.rotate(SIMD3<Float>(1, 0, 0))
-        let rotPitch = Quat.fromAxisAngle(cameraRight, angle: -angleY)
+            let startAngle = atan2(startVec.y, startVec.x)
+            let currAngle = atan2(currVec.y, currVec.x)
+            let rollAngle = currAngle - startAngle
 
-        orientation = (rotYaw * rotPitch * dragStartOrientation).normalized
+            let viewForward = dragStartOrientation.rotate(SIMD3<Float>(0, 0, 1))
+            let rotRoll = Quat.fromAxisAngle(viewForward, angle: rollAngle)
+            orientation = (rotRoll * dragStartOrientation).normalized
+        } else {
+            // Normal drag: turntable-style orbit
+            let delta = screenPoint - dragStartPoint
+            let sensitivity: Float = 5.0 / max(viewportSize.x, viewportSize.y)
+
+            let angleX = delta.x * sensitivity
+            let angleY = delta.y * sensitivity
+
+            // - Horizontal drag: orbit around global Y (keeps "up" consistent)
+            // - Vertical drag: orbit around camera's local right axis (prevents gimbal lock)
+            let rotYaw = Quat.fromAxisAngle(SIMD3<Float>(0, 1, 0), angle: -angleX)
+            let cameraRight = dragStartOrientation.rotate(SIMD3<Float>(1, 0, 0))
+            let rotPitch = Quat.fromAxisAngle(cameraRight, angle: -angleY)
+
+            orientation = (rotYaw * rotPitch * dragStartOrientation).normalized
+        }
     }
 
     func endRotation() {
         isDragging = false
+        isZRoll = false
     }
 
     // MARK: - Pan

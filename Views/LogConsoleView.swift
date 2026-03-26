@@ -46,28 +46,28 @@ struct LogConsoleView: View {
                             .fill(Color.secondary.opacity(0.4))
                             .frame(width: 36, height: 3)
                     )
-                    .background(.ultraThinMaterial)
+                    .background(Color(nsColor: .windowBackgroundColor))
             }
 
             // Toggle bar
             HStack(spacing: 8) {
                 Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } }) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.footnote.weight(.bold))
                 }
                 .buttonStyle(.plain)
 
                 Image(systemName: "terminal.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
 
                 Text("Console")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.primary)
 
                 Text("\(log.entries.count)")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .padding(.horizontal, 5)
+                    .font(.footnote.weight(.medium).monospaced())
+                    .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(.quaternary)
                     .clipShape(Capsule())
@@ -87,7 +87,7 @@ struct LogConsoleView: View {
 
                     Button(action: { log.clear() }) {
                         Image(systemName: "trash")
-                            .font(.system(size: 11))
+                            .font(.subheadline)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -97,17 +97,17 @@ struct LogConsoleView: View {
                     HStack(spacing: 4) {
                         Image(systemName: last.level.icon)
                             .foregroundStyle(last.level.color)
-                            .font(.system(size: 10))
+                            .font(.footnote)
                         Text(last.message)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                            .font(.subheadline.monospaced())
+                            .foregroundStyle(.primary)
                             .lineLimit(1)
                     }
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial)
+            .padding(.vertical, 8)
+            .background(Color(nsColor: .windowBackgroundColor))
 
             Divider()
 
@@ -130,33 +130,33 @@ struct LogConsoleView: View {
                     }
                 }
                 .frame(height: consoleHeight)
-                .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+                .background(Color(nsColor: .controlBackgroundColor))
             }
         }
     }
 
     @ViewBuilder
     private func logEntryRow(_ entry: LogEntry) -> some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(alignment: .top, spacing: 8) {
             Text(entry.formattedTime)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(.footnote.monospaced())
+                .foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
 
             Image(systemName: entry.level.icon)
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(entry.level.color)
                 .frame(width: 14)
 
             Text(entry.category.rawValue)
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(.footnote.weight(.medium).monospaced())
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
                 .background(Color.accentColor.opacity(0.15))
-                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
 
             Text(entry.message)
-                .font(.system(size: 11, design: .monospaced))
+                .font(.subheadline.monospaced())
                 .foregroundStyle(.primary)
                 .lineLimit(2)
 

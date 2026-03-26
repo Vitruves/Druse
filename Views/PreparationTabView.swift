@@ -22,36 +22,36 @@ struct PreparationTabView: View {
     private func proteinInfo(_ prot: Molecule) -> some View {
         // Header
         Label("Protein: \(prot.name)", systemImage: "cube")
-            .font(.system(size: 12, weight: .semibold))
+            .font(.callout.weight(.semibold))
 
         // Chain summary
         if let report = viewModel.molecules.preparationReport {
             VStack(alignment: .leading, spacing: 4) {
                 Label("Structure", systemImage: "link")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
 
                 ForEach(report.chainSummary, id: \.chainID) { chain in
                     HStack {
                         Text("Chain \(chain.chainID)")
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.subheadline.monospaced())
                         Spacer()
                         Text("\(chain.residueCount) res")
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                         Text(chain.type)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
                 if report.waterCount > 0 {
                     HStack {
                         Text("Waters")
-                            .font(.system(size: 11))
+                            .font(.subheadline)
                         Spacer()
                         Text("\(report.waterCount)")
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.subheadline.monospaced())
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -59,29 +59,29 @@ struct PreparationTabView: View {
                 if !report.hetGroups.isEmpty {
                     HStack {
                         Text("HETATM")
-                            .font(.system(size: 11))
+                            .font(.subheadline)
                         Spacer()
                         Text(report.hetGroups.map(\.name).joined(separator: ", "))
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
             }
             .padding(8)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+            .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 6))
 
             // Missing residues
             if !report.missingResidues.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Label("Missing Residues", systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .foregroundStyle(.orange)
 
                     ForEach(report.missingResidues, id: \.gapStart) { gap in
                         Text("Chain \(gap.chainID): \(gap.gapStart)\u{2013}\(gap.gapEnd)")
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -90,7 +90,7 @@ struct PreparationTabView: View {
             if !report.chainBreaks.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Label("Chain Breaks", systemImage: "scissors")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .foregroundStyle(.orange)
 
                     ForEach(Array(report.chainBreaks.enumerated()), id: \.offset) { _, chainBreak in
@@ -98,7 +98,7 @@ struct PreparationTabView: View {
                             "Chain \(chainBreak.chainID): \(chainBreak.previousResidueSeq)->\(chainBreak.nextResidueSeq)" +
                             (chainBreak.isCapped ? " (capped)" : " (uncapped)")
                         )
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                     }
                 }
@@ -107,20 +107,20 @@ struct PreparationTabView: View {
             if !report.residueCompleteness.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Label("Residue Completeness", systemImage: "checklist")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .foregroundStyle(.orange)
 
                     ForEach(Array(report.residueCompleteness.prefix(6)), id: \.self) { residue in
                         Text("Chain \(residue.chainID) \(residue.residueName) \(residue.residueSeq): \(residue.summary)")
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
 
                     if report.residueCompleteness.count > 6 {
                         Text("+\(report.residueCompleteness.count - 6) more incomplete residue(s)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -131,7 +131,7 @@ struct PreparationTabView: View {
         // Actions
         VStack(alignment: .leading, spacing: 8) {
             Label("Preparation", systemImage: "wand.and.stars")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             // Water management
             HStack(spacing: 4) {
@@ -141,6 +141,7 @@ struct PreparationTabView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .accessibilityIdentifier(AccessibilityID.prepRemoveWaters)
 
                 Button(action: { viewModel.keepPocketWaters() }) {
                     Label("Keep Pocket Waters", systemImage: "drop.circle")
@@ -150,6 +151,7 @@ struct PreparationTabView: View {
                 .controlSize(.small)
                 .disabled(viewModel.docking.selectedPocket == nil)
                 .help("Remove bulk waters but keep those within \(String(format: "%.0f", viewModel.molecules.pocketWaterRadius)) Å of the pocket center as bridging waters for docking.")
+                .accessibilityIdentifier(AccessibilityID.prepKeepPocketWaters)
             }
 
             if !viewModel.molecules.keptWaterKeys.isEmpty {
@@ -162,6 +164,7 @@ struct PreparationTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .accessibilityIdentifier(AccessibilityID.prepRemoveNonStandard)
 
             // Remove alt conformations
             Button(action: { viewModel.removeAltConfs() }) {
@@ -170,12 +173,13 @@ struct PreparationTabView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .accessibilityIdentifier(AccessibilityID.prepRemoveAltConfs)
 
             Divider()
 
             // Hydrogen addition
             Label("Hydrogens", systemImage: "atom")
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
 
             Button(action: { viewModel.addHydrogens() }) {
@@ -186,6 +190,7 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .disabled(viewModel.molecules.protein == nil)
             .help("Add all hydrogens (polar + nonpolar) from residue templates.")
+            .accessibilityIdentifier(AccessibilityID.prepAddHydrogens)
 
             // Polar hydrogens at pH with slider
             protonationSection
@@ -198,12 +203,13 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .disabled(!viewModel.proteinHasHydrogens)
             .help("Strip all hydrogen atoms from the protein.")
+            .accessibilityIdentifier(AccessibilityID.prepRemoveHydrogens)
 
             Divider()
 
             // Native / RDKit-backed preparation
             Label("Preparation Pipeline", systemImage: "cpu")
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
 
             chargeMethodSection
@@ -224,15 +230,17 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .disabled(viewModel.molecules.protein == nil || viewModel.molecules.isMinimizing)
             .help("Apply protonation at current pH and assign charges. Protein structure is preserved.")
+            .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
 
-            // Fix Missing Residues (detection)
-            Button(action: { viewModel.detectAndReportMissingResidues() }) {
+            // Detect & Fix Missing Residues
+            Button(action: { viewModel.detectAndFixMissingResidues() }) {
                 Label("Fix Missing Residues", systemImage: "bandage")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Detect gaps in residue numbering and report them in the console. Actual loop modeling requires external tools.")
+            .help("Detect gaps in residue numbering, rebuild missing heavy atoms from templates, and add missing loops (≤15 residues).")
+            .accessibilityIdentifier(AccessibilityID.prepFixMissing)
 
             Button(action: { viewModel.analyzeMissingAtoms() }) {
                 Label("Analyze Missing Atoms", systemImage: "checklist")
@@ -241,6 +249,7 @@ struct PreparationTabView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .help("Compare standard residues against bundled templates and report missing heavy atoms, missing hydrogens, and extra atoms.")
+            .accessibilityIdentifier(AccessibilityID.prepAnalyzeMissing)
 
             Button(action: { viewModel.repairMissingAtoms() }) {
                 Label("Repair Missing Atoms", systemImage: "wrench.and.screwdriver")
@@ -249,6 +258,7 @@ struct PreparationTabView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .help("Rebuild missing standard-residue heavy atoms from bundled geometry templates.")
+            .accessibilityIdentifier(AccessibilityID.prepRepairMissing)
 
             // Bridging Waters (was Solvation Shell)
             Button(action: { viewModel.keepPocketWaters() }) {
@@ -259,6 +269,7 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .disabled(viewModel.docking.selectedPocket == nil)
             .help("Keep water molecules near the pocket as part of the rigid receptor for docking. Select a pocket first.")
+            .accessibilityIdentifier(AccessibilityID.prepRetainBridgingWaters)
         }
 
         Divider()
@@ -266,7 +277,7 @@ struct PreparationTabView: View {
         // Stats
         VStack(alignment: .leading, spacing: 4) {
             Label("Statistics", systemImage: "chart.bar")
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
 
             statRow("Atoms", "\(prot.atomCount)")
@@ -287,21 +298,21 @@ struct PreparationTabView: View {
         HStack(spacing: 4) {
             Image(systemName: "drop.fill")
                 .foregroundStyle(.blue)
-                .font(.system(size: 9))
+                .font(.footnote)
             Text("\(viewModel.molecules.keptWaterKeys.count) bridging water(s) retained")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
         .padding(.leading, 4)
 
         HStack {
             Text("Radius")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
             Slider(value: $vm.molecules.pocketWaterRadius, in: 2.0...10.0, step: 0.5)
                 .controlSize(.mini)
             Text("\(String(format: "%.1f", viewModel.molecules.pocketWaterRadius)) Å")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 40, alignment: .trailing)
         }
@@ -320,7 +331,7 @@ struct PreparationTabView: View {
                     Label("Add Polar Hydrogens", systemImage: "flask")
                     Spacer()
                     Text("pH \(String(format: "%.1f", viewModel.molecules.protonationPH))")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .font(.footnote.monospaced().weight(.medium))
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -329,10 +340,11 @@ struct PreparationTabView: View {
             .controlSize(.small)
             .disabled(viewModel.molecules.protein == nil)
             .help("Add polar hydrogens (N-H, O-H, S-H) with pH-dependent protonation states.")
+            .accessibilityIdentifier(AccessibilityID.prepAddPolarH)
 
             HStack(spacing: 6) {
                 Text("pH")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
                     .frame(width: 18, alignment: .trailing)
 
@@ -340,7 +352,7 @@ struct PreparationTabView: View {
                     .controlSize(.mini)
 
                 Text(String(format: "%.1f", viewModel.molecules.protonationPH))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
                     .frame(width: 28, alignment: .trailing)
             }
@@ -355,8 +367,8 @@ struct PreparationTabView: View {
                 pkaRow("LYS", 10.53)
                 pkaRow("ARG", 12.48)
             }
-            .padding(6)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+            .padding(8)
+            .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 4))
         }
     }
@@ -392,6 +404,7 @@ struct PreparationTabView: View {
                 }
                 return viewModel.molecules.protein == nil
             }())
+            .accessibilityIdentifier(AccessibilityID.prepAssignCharges)
         }
     }
 
@@ -409,14 +422,14 @@ struct PreparationTabView: View {
 
         return HStack(spacing: 6) {
             Text(residue)
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.footnote.monospaced().weight(.medium))
                 .frame(width: 32, alignment: .leading)
             Text(String(format: "%.2f", pKa))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 38, alignment: .trailing)
             Text(chargeState)
-                .font(.system(size: 10, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(color)
         }
     }
@@ -424,11 +437,11 @@ struct PreparationTabView: View {
     private func statRow(_ label: String, _ value: String) -> some View {
         HStack {
             Text(label)
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
             Spacer()
             Text(value)
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
         }
     }
 }

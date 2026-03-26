@@ -21,16 +21,29 @@ extension LigandDatabaseWindow {
     }
 
     func buildImportPreview(url: URL, fileType: ImportFileType) throws -> ImportPreview {
-        let content = try String(contentsOf: url, encoding: .utf8)
-
+        // For CSV/SMI, only read the first ~8KB for preview (header + a few sample rows).
+        // SDF needs full content for property key discovery.
         switch fileType {
         case .csv:
-            return buildCSVPreview(content: content, url: url)
+            let previewContent = try Self.readHead(url: url, maxBytes: 8192)
+            return buildCSVPreview(content: previewContent, url: url)
         case .smi:
-            return buildSMIPreview(content: content, url: url)
+            let previewContent = try Self.readHead(url: url, maxBytes: 8192)
+            return buildSMIPreview(content: previewContent, url: url)
         case .sdf:
+            let content = try String(contentsOf: url, encoding: .utf8)
             return buildSDFPreview(content: content, url: url)
         }
+    }
+
+    /// Read only the first `maxBytes` of a file (enough for preview).
+    private static func readHead(url: URL, maxBytes: Int) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { handle.closeFile() }
+        guard let data = handle.readData(ofLength: maxBytes) as Data? else {
+            return ""
+        }
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     func buildCSVPreview(content: String, url: URL) -> ImportPreview {
@@ -54,12 +67,21 @@ extension LigandDatabaseWindow {
                 return i < cols.count ? cols[i] : nil
             }
             var mapping = ImportColumnMapping(sourceHeader: header, sampleValues: samples)
-            // Auto-suggest based on header name
             mapping.target = suggestTarget(for: header)
             columns.append(mapping)
         }
 
-        return ImportPreview(columns: columns, rowCount: dataRows.count, fileURL: url, fileType: .csv)
+        // Estimate total rows from file size (preview may be truncated)
+        let estimatedRows: Int
+        if let fileSize = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int,
+           fileSize > content.utf8.count, !dataRows.isEmpty {
+            let avgRowSize = content.utf8.count / (dataRows.count + 1)
+            estimatedRows = max(dataRows.count, fileSize / max(avgRowSize, 1) - 1)
+        } else {
+            estimatedRows = dataRows.count
+        }
+
+        return ImportPreview(columns: columns, rowCount: estimatedRows, fileURL: url, fileType: .csv)
     }
 
     func buildSMIPreview(content: String, url: URL) -> ImportPreview {
@@ -90,7 +112,17 @@ extension LigandDatabaseWindow {
             columns.append(mapping)
         }
 
-        return ImportPreview(columns: columns, rowCount: lines.count, fileURL: url, fileType: .smi)
+        // Estimate total rows from file size (preview may be truncated)
+        let estimatedRows: Int
+        if let fileSize = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int,
+           fileSize > content.utf8.count, !lines.isEmpty {
+            let avgLineSize = content.utf8.count / lines.count
+            estimatedRows = max(lines.count, fileSize / max(avgLineSize, 1))
+        } else {
+            estimatedRows = lines.count
+        }
+
+        return ImportPreview(columns: columns, rowCount: estimatedRows, fileURL: url, fileType: .smi)
     }
 
     func buildSDFPreview(content: String, url: URL) -> ImportPreview {
@@ -147,72 +179,108 @@ extension LigandDatabaseWindow {
     }
 
     func performCSVImport(_ preview: ImportPreview) throws {
-        let content = try String(contentsOf: preview.fileURL, encoding: .utf8)
-        let rows = content.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        guard rows.count > 1 else { return }
+        let url = preview.fileURL
+        let columns = preview.columns
 
-        let separator: Character = rows[0].contains("\t") ? "\t" : ","
-        let dataRows = Array(rows.dropFirst())
+        let smilesIdx = columns.firstIndex { $0.target == .smiles }
+        let nameIdx = columns.firstIndex { $0.target == .name }
+        let kiIdx = columns.firstIndex { $0.target == .ki }
+        let pKiIdx = columns.firstIndex { $0.target == .pKi }
+        let ic50Idx = columns.firstIndex { $0.target == .ic50 }
 
-        let smilesIdx = preview.columns.firstIndex { $0.target == .smiles }
-        let nameIdx = preview.columns.firstIndex { $0.target == .name }
-        let kiIdx = preview.columns.firstIndex { $0.target == .ki }
-        let pKiIdx = preview.columns.firstIndex { $0.target == .pKi }
-        let ic50Idx = preview.columns.firstIndex { $0.target == .ic50 }
+        db.isProcessing = true
+        db.processingMessage = "Reading CSV file..."
 
-        var count = 0
-        let baseIndex = db.entries.count
-        for (offset, row) in dataRows.enumerated() {
-            let cols = row.split(separator: separator, omittingEmptySubsequences: false).map {
-                $0.trimmingCharacters(in: .whitespaces)
+        Task {
+            // Parse off main thread
+            let parsed: [LigandEntry] = await Task.detached {
+                guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+                let rows = content.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                guard rows.count > 1 else { return [] }
+
+                let separator: Character = rows[0].contains("\t") ? "\t" : ","
+                let dataRows = rows.dropFirst()
+
+                var entries: [LigandEntry] = []
+                entries.reserveCapacity(dataRows.count)
+                for (offset, row) in dataRows.enumerated() {
+                    let cols = row.split(separator: separator, omittingEmptySubsequences: false).map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }
+                    let smiles = smilesIdx.flatMap { $0 < cols.count ? cols[$0] : nil } ?? ""
+                    let name = nameIdx.flatMap { $0 < cols.count && !cols[$0].isEmpty ? cols[$0] : nil } ?? "Mol_\(offset + 1)"
+                    let ki = kiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                    let pKi = pKiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                    let ic50 = ic50Idx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+
+                    guard !smiles.isEmpty || !name.isEmpty else { continue }
+                    entries.append(LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50))
+                }
+                return entries
+            }.value
+
+            // Single batch insert — triggers didSet (and save) only once
+            let count = parsed.count
+            db.batchMutate { entries in
+                entries.reserveCapacity(entries.count + count)
+                entries.append(contentsOf: parsed)
             }
-            let smiles = smilesIdx.flatMap { $0 < cols.count ? cols[$0] : nil } ?? ""
-            let name = nameIdx.flatMap { $0 < cols.count && !cols[$0].isEmpty ? cols[$0] : nil } ?? "Mol_\(baseIndex + offset + 1)"
-            let ki = kiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
-            let pKi = pKiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
-            let ic50 = ic50Idx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
-
-            guard !smiles.isEmpty || !name.isEmpty else { continue }
-            let entry = LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50)
-            db.add(entry)
-            count += 1
+            db.isProcessing = false
+            db.processingMessage = ""
+            viewModel.log.success("Imported \(count) ligands from CSV", category: .molecule)
         }
-        viewModel.log.success("Imported \(count) ligands from CSV", category: .molecule)
     }
 
     func performSMIImport(_ preview: ImportPreview) throws {
-        let content = try String(contentsOf: preview.fileURL, encoding: .utf8)
-        let lines = content.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        let url = preview.fileURL
+        let columns = preview.columns
 
-        let firstLine = lines.first ?? ""
-        let separator: Character = firstLine.contains("\t") ? "\t" : " "
+        let smilesIdx = columns.firstIndex { $0.target == .smiles }
+        let nameIdx = columns.firstIndex { $0.target == .name }
+        let kiIdx = columns.firstIndex { $0.target == .ki }
+        let pKiIdx = columns.firstIndex { $0.target == .pKi }
+        let ic50Idx = columns.firstIndex { $0.target == .ic50 }
 
-        let smilesIdx = preview.columns.firstIndex { $0.target == .smiles }
-        let nameIdx = preview.columns.firstIndex { $0.target == .name }
-        let kiIdx = preview.columns.firstIndex { $0.target == .ki }
-        let pKiIdx = preview.columns.firstIndex { $0.target == .pKi }
-        let ic50Idx = preview.columns.firstIndex { $0.target == .ic50 }
+        db.isProcessing = true
+        db.processingMessage = "Reading SMI file..."
 
-        var count = 0
-        let baseIndex = db.entries.count
-        for (offset, line) in lines.enumerated() {
-            let cols = line.split(separator: separator, maxSplits: 10).map(String.init)
-            let smiles = smilesIdx.flatMap { $0 < cols.count ? cols[$0] : nil } ?? ""
-            let name = nameIdx.flatMap { $0 < cols.count && !cols[$0].isEmpty ? cols[$0] : nil } ?? "Mol_\(baseIndex + offset + 1)"
-            let ki = kiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
-            let pKi = pKiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
-            let ic50 = ic50Idx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+        Task {
+            let parsed: [LigandEntry] = await Task.detached {
+                guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+                let lines = content.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && !$0.hasPrefix("#") }
 
-            guard !smiles.isEmpty else { continue }
-            let entry = LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50)
-            db.add(entry)
-            count += 1
+                let firstLine = lines.first ?? ""
+                let separator: Character = firstLine.contains("\t") ? "\t" : " "
+
+                var entries: [LigandEntry] = []
+                entries.reserveCapacity(lines.count)
+                for (offset, line) in lines.enumerated() {
+                    let cols = line.split(separator: separator, maxSplits: 10).map(String.init)
+                    let smiles = smilesIdx.flatMap { $0 < cols.count ? cols[$0] : nil } ?? ""
+                    let name = nameIdx.flatMap { $0 < cols.count && !cols[$0].isEmpty ? cols[$0] : nil } ?? "Mol_\(offset + 1)"
+                    let ki = kiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                    let pKi = pKiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+                    let ic50 = ic50Idx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
+
+                    guard !smiles.isEmpty else { continue }
+                    entries.append(LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50))
+                }
+                return entries
+            }.value
+
+            let count = parsed.count
+            db.batchMutate { entries in
+                entries.reserveCapacity(entries.count + count)
+                entries.append(contentsOf: parsed)
+            }
+            db.isProcessing = false
+            db.processingMessage = ""
+            viewModel.log.success("Imported \(count) ligands from SMI", category: .molecule)
         }
-        viewModel.log.success("Imported \(count) ligands from SMI", category: .molecule)
     }
 
     func performSDFImport(_ preview: ImportPreview) throws {
@@ -229,8 +297,12 @@ extension LigandDatabaseWindow {
         let mapping = propertyMapping
         viewModel.log.info("Importing \(mols.count) molecules from SDF...", category: .molecule)
 
+        db.isProcessing = true
+        db.processingMessage = "Importing \(mols.count) molecules from SDF..."
+
         Task {
-            var count = 0
+            var parsed: [LigandEntry] = []
+            parsed.reserveCapacity(molData.count)
             for mol in molData {
                 var ki: Float?
                 var pKi: Float?
@@ -260,22 +332,26 @@ extension LigandDatabaseWindow {
                     smiles = s
                 } else {
                     smiles = await Task.detached {
-                        // Prefer mol block path (handles 2D/3D correctly)
                         if let mb = molBlockText, let s = RDKitBridge.smilesFromMolBlock(mb) {
                             return s
                         }
-                        // Fallback to atom/bond reconstruction
                         return RDKitBridge.atomsBondsToSMILES(atoms: molAtoms, bonds: molBonds)
                     }.value ?? ""
                 }
 
-                let entry = LigandEntry(
+                parsed.append(LigandEntry(
                     name: name, smiles: smiles, atoms: mol.atoms, bonds: mol.bonds,
                     isPrepared: true, ki: ki, pKi: pKi, ic50: ic50
-                )
-                db.add(entry)
-                count += 1
+                ))
             }
+
+            let count = parsed.count
+            db.batchMutate { entries in
+                entries.reserveCapacity(entries.count + count)
+                entries.append(contentsOf: parsed)
+            }
+            db.isProcessing = false
+            db.processingMessage = ""
             viewModel.log.success("Imported \(count) ligands from SDF", category: .molecule)
         }
     }

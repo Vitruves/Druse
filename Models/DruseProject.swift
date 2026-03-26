@@ -265,7 +265,7 @@ struct SerializedDockingResult: Codable {
     let tx, ty, tz, qx, qy, qz, qw: Float
     let torsions: [Float]
     let positions: [Float]
-    let mlDockingScore, mlPKd, mlPoseConfidence, refinementEnergy: Float?
+    let refinementEnergy: Float?
 
     init(from r: DockingResult) {
         id = r.id; energy = r.energy; stericEnergy = r.stericEnergy
@@ -277,8 +277,7 @@ struct SerializedDockingResult: Codable {
         qz = r.pose.rotation.imag.z; qw = r.pose.rotation.real
         torsions = r.pose.torsions
         positions = r.transformedAtomPositions.flatMap { [$0.x, $0.y, $0.z] }
-        mlDockingScore = r.mlDockingScore; mlPKd = r.mlPKd
-        mlPoseConfidence = r.mlPoseConfidence; refinementEnergy = r.refinementEnergy
+        refinementEnergy = r.refinementEnergy
     }
 
     func toResult() -> DockingResult {
@@ -294,8 +293,7 @@ struct SerializedDockingResult: Codable {
             torsionPenalty: torsionPenalty, generation: generation
         )
         r.clusterID = clusterID; r.clusterRank = clusterRank
-        r.mlDockingScore = mlDockingScore; r.mlPKd = mlPKd
-        r.mlPoseConfidence = mlPoseConfidence; r.refinementEnergy = refinementEnergy
+        r.refinementEnergy = refinementEnergy
         var pos: [SIMD3<Float>] = []
         for i in stride(from: 0, to: positions.count - 2, by: 3) {
             pos.append(.init(positions[i], positions[i+1], positions[i+2]))

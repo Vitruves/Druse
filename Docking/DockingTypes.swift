@@ -7,24 +7,24 @@ import simd
 struct DockingConfig: Sendable {
     // Population and search
     var populationSize: Int = 300
-    var numRuns: Int = 1             // independent Monte Carlo trajectory batches
+    var numRuns: Int = 3             // independent Monte Carlo trajectory batches
     var generationsPerRun: Int = 300 // Monte Carlo steps per run
     var gridSpacing: Float = 0.375
 
     // Search operators
-    var mutationRate: Float = 0.08
+    var mutationRate: Float = 0.10
     var crossoverRate: Float = 0.75
     var translationStep: Float = 2.0 // Angstroms, aligned with Vina mutation amplitude
     var rotationStep: Float = 0.3    // radians (~17°)
     var torsionStep: Float = 0.8     // radians (~46°) — large enough to escape tangled conformers
-    var mcTemperature: Float = 1.2   // kcal/mol, matches Vina's default Metropolis temperature
+    var mcTemperature: Float = 1.5   // kcal/mol, matches Vina's default Metropolis temperature
     var explicitRerankTopClusters: Int = 12 // top basin representatives rescored against explicit receptor atoms
     var explicitRerankVariantsPerCluster: Int = 4 // seeded local refinement around each top basin representative
     var explicitRerankLocalSearchSteps: Int = 20 // short second-pass refinement on rerank seeds
 
     // Local search (Vina-like basin hopping: refine every MC step by default)
-    var localSearchFrequency: Int = 1   // every N generations
-    var localSearchSteps: Int = 30      // gradient descent steps per refinement
+    var localSearchFrequency: Int = 3   // every N generations
+    var localSearchSteps: Int = 20      // gradient descent steps per refinement
     var liveUpdateFrequency: Int = 10   // visual update every N generations (higher = fewer GPU syncs = faster)
 
     // Flexibility
@@ -45,13 +45,15 @@ struct DockingConfig: Sendable {
 
     // Exploration: broader initial search with higher translation/rotation steps
     // before switching to fine-grained local refinement
-    var explorationPhaseRatio: Float = 0.4  // first 40% of generations use broader search
-    var explorationTranslationStep: Float = 4.0  // wider initial translation (vs 2.0 during refinement)
-    var explorationRotationStep: Float = 0.6     // wider initial rotation (vs 0.3)
-    var explorationMutationRate: Float = 0.15    // higher mutation during exploration
+    var explorationPhaseRatio: Float = 0.55  // first 55% of generations use broader search
+    var explorationTranslationStep: Float = 5.0  // wider initial translation (vs 2.0 during refinement)
+    var explorationRotationStep: Float = 0.8     // wider initial rotation (vs 0.3)
+    var explorationMutationRate: Float = 0.25    // higher mutation during exploration
+    var explorationLocalSearchFrequency: Int = 8  // during exploration, LS only every 8th gen
 
-    // GFN2-xTB post-docking refinement
+    // Post-docking refinement
     var gfn2Refinement: GFN2RefinementConfig = GFN2RefinementConfig()
+    var useAFv4Rescore: Bool = false  // DruseAF v4 PGN neural rescoring of top poses
 
     // Search method
     var searchMethod: SearchMethod = .genetic
@@ -64,6 +66,9 @@ struct DockingConfig: Sendable {
 
     // Parallel Tempering config
     var replicaExchange: ParallelTemperingConfig = ParallelTemperingConfig()
+
+    // Ensemble multi-start docking: dock all qualifying forms × conformers
+    var ensemble: EnsembleDockingConfig = EnsembleDockingConfig()
 
     // Auto mode: adapt parameters to protein/ligand/pocket complexity
     var autoMode: Bool = false
@@ -136,6 +141,25 @@ struct DockingConfig: Sendable {
 
         return config
     }
+}
+
+// MARK: - Ensemble Multi-Start Docking Config
+
+struct EnsembleDockingConfig: Sendable {
+    /// Enable multi-start docking across chemical forms and conformers.
+    var enabled: Bool = false
+
+    /// Minimum Boltzmann population fraction to include a form (0.0–1.0).
+    /// Forms below this cutoff are excluded. E.g., 0.10 = skip forms < 10%.
+    var populationCutoff: Double = 0.05
+
+    /// Maximum conformers per qualifying form to use as GA starting geometries.
+    /// 0 = use all available conformers.
+    var maxConformersPerForm: Int = 3
+
+    /// Whether to weight/rank results by form population.
+    /// When true, composite score = docking_energy - RT*ln(population).
+    var populationWeighting: Bool = true
 }
 
 // MARK: - Fragment-Based Docking Config
@@ -228,11 +252,6 @@ struct DockingResult: Identifiable, Sendable {
     var transformedAtomPositions: [SIMD3<Float>] = []
     var refinementEnergy: Float? = nil
 
-    // Druse ML scoring outputs (populated when scoring method is .druseAffinity)
-    var mlDockingScore: Float? = nil    // pKd * confidence (primary ranking value)
-    var mlPKd: Float? = nil             // predicted -log10(Kd)
-    var mlPoseConfidence: Float? = nil  // 0-1, how native-like the pose is
-
     // Drusina extended scoring correction (populated when scoring method is .drusina)
     var drusinaCorrection: Float = 0
 
@@ -249,12 +268,17 @@ struct DockingResult: Identifiable, Sendable {
     var gfn2Converged: Bool? = nil          // optimization converged?
     var gfn2OptSteps: Int? = nil            // optimization steps taken
 
+    // Ensemble multi-start metadata
+    var formLabel: String? = nil            // chemical form label (e.g. "Taut2", "prot_Amine+Taut1")
+    var formPopulation: Float? = nil        // Boltzmann population fraction of this form
+
     /// The display score depending on the active scoring method.
     func displayScore(method: ScoringMethod) -> Float {
         switch method {
         case .vina:          return energy
         case .drusina:       return energy  // energy already includes Drusina corrections
-        case .druseAffinity: return mlDockingScore ?? energy
+        case .druseAffinity: return energy
+        case .pignet2:       return energy  // physics-decomposed kcal/mol
         }
     }
 

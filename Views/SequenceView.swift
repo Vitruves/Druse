@@ -132,9 +132,9 @@ struct SequenceView: View {
             // Header
             HStack {
                 Label("Sequence", systemImage: "textformat.abc")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     ssLegendDot(.helix)
                     ssLegendDot(.sheet)
                     ssLegendDot(.coil)
@@ -148,10 +148,10 @@ struct SequenceView: View {
             if !viewModel.workspace.selectedResidueIndices.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "scope")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.cyan)
                     Text("\(viewModel.workspace.selectedResidueIndices.count) selected")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.cyan)
                     Spacer()
                     Button {
@@ -161,10 +161,11 @@ struct SequenceView: View {
                         viewModel.pushToRenderer()
                     } label: {
                         Text("Clear")
-                            .font(.system(size: 9))
+                            .font(.footnote)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier(AccessibilityID.seqClearSelection)
                 }
             }
 
@@ -173,18 +174,18 @@ struct SequenceView: View {
             let naChains = prot.chains.filter { $0.type == .nucleicAcid }
             if proteinChains.isEmpty && naChains.isEmpty {
                 Text("No protein or nucleic acid chains found")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             } else {
                 ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 8) {
                         ForEach(proteinChains, id: \.id) { chain in
                             chainSection(chain, prot: prot)
                         }
                         if !naChains.isEmpty {
                             Divider().padding(.vertical, 2)
                             Label("Nucleic Acid", systemImage: "helix")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(.orange)
                             ForEach(naChains, id: \.id) { chain in
                                 naChainSection(chain, prot: prot)
@@ -214,13 +215,18 @@ struct SequenceView: View {
             .buttonStyle(.borderless)
             .help("Copy sequence to clipboard")
             .controlSize(.small)
+            .accessibilityIdentifier(AccessibilityID.seqCopySequence)
 
             // Select by SS menu
             Menu {
                 Button("All Helices") { viewModel.selectBySecondaryStructure(.helix) }
+                    .accessibilityIdentifier(AccessibilityID.seqSelectHelices)
                 Button("All Sheets") { viewModel.selectBySecondaryStructure(.sheet) }
+                    .accessibilityIdentifier(AccessibilityID.seqSelectSheets)
                 Button("All Coils") { viewModel.selectBySecondaryStructure(.coil) }
+                    .accessibilityIdentifier(AccessibilityID.seqSelectCoils)
                 Button("All Turns") { viewModel.selectBySecondaryStructure(.turn) }
+                    .accessibilityIdentifier(AccessibilityID.seqSelectTurns)
             } label: {
                 Image(systemName: "line.3.horizontal.decrease.circle")
             }
@@ -238,11 +244,11 @@ struct SequenceView: View {
                 .count
             if naCount > 0 {
                 Text("\(aaCount) aa + \(naCount) nt")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
                 Text("\(aaCount) residues")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
         }
@@ -269,18 +275,19 @@ struct SequenceView: View {
                     }
                 } label: {
                     Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .frame(width: 12)
                 }
                 .buttonStyle(.plain)
+                .help(isCollapsed ? "Expand chain \(chain.id)" : "Collapse chain \(chain.id)")
 
                 Text("Chain \(chain.id)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.footnote.monospaced().weight(.semibold))
                     .foregroundStyle(chain.displayColor)
 
                 Text("\(residueEntries.count) res")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
 
                 Spacer()
 
@@ -311,7 +318,7 @@ struct SequenceView: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 .menuStyle(.borderlessButton)
@@ -417,25 +424,26 @@ struct SequenceView: View {
                     }
                 } label: {
                     Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .frame(width: 12)
                 }
                 .buttonStyle(.plain)
+                .help(isCollapsed ? "Expand chain \(chain.id)" : "Collapse chain \(chain.id)")
 
                 Text("Chain \(chain.id)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.footnote.monospaced().weight(.semibold))
                     .foregroundStyle(chain.displayColor)
 
                 Text(isDNA ? "DNA" : "RNA")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Capsule().fill(Color.orange.opacity(0.2)))
                     .foregroundStyle(.orange)
 
                 Text("\(residueEntries.count) nt")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
 
                 Spacer()
             }
@@ -452,24 +460,24 @@ struct SequenceView: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(stride(from: 0, to: chunks.count, by: 6).enumerated()), id: \.offset) { _, rowStart in
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             // Position label
                             let pos = rowStart * 10 + 1
                             Text("\(pos)")
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
                                 .frame(width: 30, alignment: .trailing)
 
                             ForEach(rowStart..<min(rowStart + 6, chunks.count), id: \.self) { ci in
                                 Text(chunks[ci])
-                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .font(.subheadline.monospaced().weight(.medium))
                                     .foregroundStyle(naBaseColor(chunks[ci]))
                             }
                             Spacer()
                         }
                     }
                 }
-                .padding(6)
+                .padding(8)
             }
         }
         .padding(.vertical, 2)
@@ -528,6 +536,7 @@ struct SequenceView: View {
             Button("Delete \(selCount) Selected Residue\(selCount > 1 ? "s" : "")") {
                 showDeleteConfirm = true
             }
+            .accessibilityIdentifier(AccessibilityID.seqDeleteSelected)
 
             Button("Create Subset from Selection") {
                 viewModel.createSubsetFromSelection()
@@ -653,7 +662,7 @@ struct SequenceView: View {
                 .fill(ssColor(ss))
                 .frame(width: 7, height: 7)
             Text(ssLabel(ss))
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -669,28 +678,28 @@ struct SequenceView: View {
             let res = prot.residues[first]
             VStack(alignment: .leading, spacing: 4) {
                 Label("Selected", systemImage: "scope")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                 HStack {
                     Text("\(res.name) \(res.sequenceNumber)")
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .font(.callout.monospaced().weight(.medium))
                     Text("Chain \(res.chainID)")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 Text("\(res.atomIndices.count) atoms")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         } else {
             VStack(alignment: .leading, spacing: 4) {
                 Label("Selected (\(sortedSelected.count) residues)", systemImage: "scope")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
 
                 let ranges = condenseRanges(sortedSelected, prot: prot)
                 Text(ranges)
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
 
@@ -698,8 +707,8 @@ struct SequenceView: View {
                     idx < prot.residues.count ? sum + prot.residues[idx].atomIndices.count : sum
                 }
                 Text("\(totalAtoms) atoms total")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -935,10 +944,10 @@ private struct SequenceCanvas<MenuContent: View>: View {
             rects = computed
         }
 
-        let residueFont = Font.system(size: 10, weight: .medium, design: .monospaced)
-        let residueFontBold = Font.system(size: 10, weight: .bold, design: .monospaced)
+        let residueFont = Font.footnote.monospaced().weight(.medium)
+        let residueFontBold = Font.footnote.monospaced().weight(.bold)
         let numberFont = Font.system(size: 6, design: .monospaced)
-        let gapFont = Font.system(size: 9, weight: .medium, design: .monospaced)
+        let gapFont = Font.footnote.monospaced().weight(.medium)
 
         for (i, cell) in cells.enumerated() {
             guard i < rects.count else { break }
@@ -966,7 +975,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
                 if isSelected {
                     context.stroke(Path(cellRect), with: .color(.cyan), lineWidth: 1)
                 } else if isHovered {
-                    context.stroke(Path(cellRect), with: .color(.white.opacity(0.3)), lineWidth: 1)
+                    context.stroke(Path(cellRect), with: .color(.primary.opacity(0.3)), lineWidth: 1)
                 }
 
                 // Residue number every 10
@@ -982,7 +991,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
                 // One-letter code
                 let letterText = Text(entry.oneLetterCode)
                     .font(isSelected ? residueFontBold : residueFont)
-                    .foregroundColor(isSelected ? .white : .secondary)
+                    .foregroundColor(isSelected ? .primary : .secondary)
                 context.draw(context.resolve(letterText),
                              at: CGPoint(x: cellRect.midX, y: cellRect.midY),
                              anchor: .center)

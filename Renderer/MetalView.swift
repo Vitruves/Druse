@@ -136,12 +136,12 @@ struct MetalView: NSViewRepresentable {
                 return
             }
 
-            // Control+drag or plain drag => orbit rotation
-            // Control+drag is an explicit pivot control (same as plain drag)
+            // Plain drag => orbit rotation, Ctrl+drag => Z-roll (spin around view axis)
+            let hasControl = event.modifierFlags.contains(.control)
             isShiftDrag = false
             isBoxSelecting = false
             let screenPt = screenPoint(from: loc, in: view)
-            renderer.camera.beginRotation(at: screenPt)
+            renderer.camera.beginRotation(at: screenPt, zRoll: hasControl)
         }
 
         func handleMouseDragged(_ event: NSEvent, in view: NSView) {

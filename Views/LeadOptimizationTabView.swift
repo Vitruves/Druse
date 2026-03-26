@@ -52,34 +52,34 @@ struct LeadOptimizationTabView: View {
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: 32))
-                .foregroundStyle(.tertiary)
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
             Text("No Reference Ligand")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.headline)
                 .foregroundStyle(.secondary)
             Text("To start lead optimization:")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Label("Run docking in the Docking tab", systemImage: "1.circle")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                 Label("Go to Results tab", systemImage: "2.circle")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 4) {
                     Label("Click", systemImage: "3.circle")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                     Label("Optimize", systemImage: "arrow.triangle.branch")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Color.primary.opacity(0.06))
                         .clipShape(RoundedRectangle(cornerRadius: 4))
                     Text("on a pose")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -92,26 +92,26 @@ struct LeadOptimizationTabView: View {
 
     @ViewBuilder
     private var referenceSummary: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Label("Reference", systemImage: "target")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(viewModel.leadOpt.referenceName)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                     Text(viewModel.leadOpt.referenceSMILES.prefix(50) + (viewModel.leadOpt.referenceSMILES.count > 50 ? "..." : ""))
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 if let energy = viewModel.leadOpt.referenceResult?.energy {
                     VStack(alignment: .trailing, spacing: 1) {
                         Text(String(format: "%.1f", energy))
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .font(.callout.monospaced().weight(.bold))
                         Text("kcal/mol")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.tertiary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -127,7 +127,7 @@ struct LeadOptimizationTabView: View {
                     propertyBadge("RotB", "\(desc.rotatableBonds)")
                     if desc.lipinski {
                         Text("Lipinski")
-                            .font(.system(size: 8, weight: .semibold))
+                            .font(.caption.weight(.semibold))
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.green.opacity(0.2)))
@@ -146,12 +146,12 @@ struct LeadOptimizationTabView: View {
 
         VStack(alignment: .leading, spacing: 8) {
             Label("Generation", systemImage: "wand.and.stars")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
 
             HStack {
                 Text("Count")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                 Picker("", selection: $vm.leadOpt.analogCount) {
                     ForEach([10, 25, 50, 100], id: \.self) { n in
@@ -164,12 +164,12 @@ struct LeadOptimizationTabView: View {
 
             HStack {
                 Text("Similarity")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                 Slider(value: $vm.leadOpt.similarityThreshold, in: 0.3...0.95, step: 0.05)
                     .controlSize(.mini)
                 Text(String(format: "%.0f%%", viewModel.leadOpt.similarityThreshold * 100))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
                     .frame(width: 30)
             }
@@ -182,7 +182,7 @@ struct LeadOptimizationTabView: View {
 
             // Property direction sliders
             Label("Property Direction", systemImage: "slider.horizontal.3")
-                .font(.system(size: 10, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
 
             directionSlider("Polarity", value: $vm.leadOpt.polarityDirection, low: "Less", high: "More")
@@ -197,17 +197,17 @@ struct LeadOptimizationTabView: View {
         VStack(spacing: 1) {
             HStack {
                 Text(label)
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(width: 70, alignment: .leading)
                 Text(low)
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Slider(value: value, in: -1...1, step: 0.1)
                     .controlSize(.mini)
                 Text(high)
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -218,9 +218,9 @@ struct LeadOptimizationTabView: View {
     private var admetFilterSection: some View {
         @Bindable var vm = viewModel
 
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Label("ADMET Filters", systemImage: "shield.checkered")
-                .font(.system(size: 10, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 12) {
@@ -238,12 +238,12 @@ struct LeadOptimizationTabView: View {
 
             HStack {
                 Text("Max LogP")
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                 Slider(value: $vm.leadOpt.maxLogP, in: 1...8, step: 0.5)
                     .controlSize(.mini)
                 Text(String(format: "%.1f", viewModel.leadOpt.maxLogP))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 25)
             }
         }
@@ -253,7 +253,7 @@ struct LeadOptimizationTabView: View {
 
     @ViewBuilder
     private var generateButton: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Button(action: { viewModel.generateOptimizedAnalogs() }) {
                 HStack {
                     Label("Generate Analogs", systemImage: "sparkles")
@@ -267,6 +267,7 @@ struct LeadOptimizationTabView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
             .disabled(viewModel.leadOpt.isGenerating || !viewModel.leadOpt.hasReference)
+            .accessibilityIdentifier(AccessibilityID.leadGenerate)
 
             if viewModel.leadOpt.isGenerating {
                 ProgressView(value: Double(viewModel.leadOpt.generationProgress))
@@ -279,28 +280,28 @@ struct LeadOptimizationTabView: View {
 
     @ViewBuilder
     private var analogList: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 let passed = viewModel.leadOpt.analogs.filter { $0.status != .filtered && $0.status != .failed }.count
                 let filtered = viewModel.leadOpt.analogs.filter { $0.status == .filtered }.count
                 let failed = viewModel.leadOpt.analogs.filter { $0.status == .failed }.count
                 let total = viewModel.leadOpt.analogs.count
                 Label("\(passed) Passed", systemImage: "list.bullet")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(passed > 0 ? .primary : .secondary)
                 if total > 0 {
                     Text("\(total) generated")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 if filtered > 0 {
                     Text("\(filtered) filtered")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.orange)
                 }
                 if failed > 0 {
                     Text("\(failed) failed")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.red)
                 }
                 Spacer()
@@ -308,9 +309,10 @@ struct LeadOptimizationTabView: View {
                     viewModel.leadOpt.analogs.removeAll()
                     viewModel.leadOpt.selectedAnalogIndex = nil
                 }
-                .font(.system(size: 9))
+                .font(.footnote)
                 .buttonStyle(.plain)
                 .foregroundStyle(.red)
+                .accessibilityIdentifier(AccessibilityID.leadClear)
             }
 
             ForEach(Array(viewModel.leadOpt.analogs.prefix(40).enumerated()), id: \.element.id) { idx, analog in
@@ -318,8 +320,8 @@ struct LeadOptimizationTabView: View {
             }
             if viewModel.leadOpt.analogs.count > 40 {
                 Text("+ \(viewModel.leadOpt.analogs.count - 40) more")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
             }
         }
@@ -329,7 +331,7 @@ struct LeadOptimizationTabView: View {
     private func analogRow(index: Int, analog: LeadOptAnalog) -> some View {
         let isSelected = viewModel.leadOpt.selectedAnalogIndex == index
 
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             // Status indicator
             Circle()
                 .fill(analog.status.color)
@@ -338,11 +340,11 @@ struct LeadOptimizationTabView: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     Text(analog.name)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .lineLimit(1)
                     if let energy = analog.bestEnergy {
                         Text(String(format: "%.1f", energy))
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(.footnote.monospaced().weight(.semibold))
                             .foregroundStyle(energy < -6 ? .green : energy < 0 ? .yellow : .red)
                     }
                 }
@@ -355,7 +357,7 @@ struct LeadOptimizationTabView: View {
                     }
                     if analog.status == .filtered {
                         Text("filtered")
-                            .font(.system(size: 8, weight: .medium))
+                            .font(.caption.weight(.medium))
                             .foregroundStyle(.orange)
                     }
                 }
@@ -368,7 +370,7 @@ struct LeadOptimizationTabView: View {
                     viewModel.leadOpt.selectedAnalogIndex = index
                     viewModel.applyAnalogPose(at: index)
                 }
-                .font(.system(size: 9))
+                .font(.footnote)
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
             }
@@ -389,7 +391,7 @@ struct LeadOptimizationTabView: View {
     private func deltaLabel(_ label: String, _ value: Float, format: String) -> some View {
         let color: Color = value > 0 ? .orange : value < 0 ? .blue : .secondary
         Text("\(label):\(String(format: format, value))")
-            .font(.system(size: 8, design: .monospaced))
+            .font(.caption.monospaced())
             .foregroundStyle(color)
     }
 
@@ -397,7 +399,7 @@ struct LeadOptimizationTabView: View {
 
     @ViewBuilder
     private var dockingControls: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Button(action: { viewModel.dockAnalogs() }) {
                     HStack {
@@ -412,12 +414,14 @@ struct LeadOptimizationTabView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(viewModel.leadOpt.isDocking || viewModel.leadOpt.analogs.filter({ $0.status == .generated }).isEmpty)
+                .accessibilityIdentifier(AccessibilityID.leadDockAll)
 
                 if viewModel.leadOpt.isDocking {
                     Button("Stop") { viewModel.cancelLeadOptimization() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .tint(.red)
+                        .accessibilityIdentifier(AccessibilityID.leadStop)
                 }
             }
 
@@ -426,13 +430,13 @@ struct LeadOptimizationTabView: View {
                 ProgressView(value: Double(prog.current), total: Double(max(prog.total, 1)))
                     .controlSize(.small)
                 Text("Docking \(prog.current)/\(prog.total)")
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
             if viewModel.leadOpt.dockedAnalogCount > 0 {
                 Text("\(viewModel.leadOpt.dockedAnalogCount) analog(s) docked")
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
         }
@@ -446,30 +450,31 @@ struct LeadOptimizationTabView: View {
             let analog = viewModel.leadOpt.analogs[idx]
             let refEnergy = viewModel.leadOpt.referenceResult?.energy
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Label("Comparison", systemImage: "arrow.left.arrow.right")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.subheadline.weight(.semibold))
                     Spacer()
                     Button("Full Comparison") {
                         viewModel.leadOpt.showComparison = true
                     }
-                    .font(.system(size: 9))
+                    .font(.footnote)
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .disabled(analog.status != .docked)
+                    .accessibilityIdentifier(AccessibilityID.leadComparison)
                 }
 
                 HStack(spacing: 16) {
                     VStack(alignment: .center, spacing: 2) {
                         Text("Reference")
-                            .font(.system(size: 8, weight: .medium))
+                            .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                         Text(String(format: "%.1f", refEnergy ?? 0))
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .font(.body.monospaced().weight(.bold))
                         Text("kcal/mol")
-                            .font(.system(size: 7))
-                            .foregroundStyle(.tertiary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
 
@@ -478,21 +483,21 @@ struct LeadOptimizationTabView: View {
 
                     VStack(alignment: .center, spacing: 2) {
                         Text(analog.name)
-                            .font(.system(size: 8, weight: .medium))
+                            .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                         if let e = analog.bestEnergy {
                             Text(String(format: "%.1f", e))
-                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                .font(.body.monospaced().weight(.bold))
                                 .foregroundStyle(e < (refEnergy ?? 0) ? .green : .orange)
                         } else {
                             Text("—")
-                                .font(.system(size: 13))
-                                .foregroundStyle(.tertiary)
+                                .font(.body)
+                                .foregroundStyle(.secondary)
                         }
                         Text("kcal/mol")
-                            .font(.system(size: 7))
-                            .foregroundStyle(.tertiary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -501,7 +506,7 @@ struct LeadOptimizationTabView: View {
 
                 if let rmsd = analog.rmsdToReference {
                     Text("RMSD to reference: \(String(format: "%.2f", rmsd)) Å")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -514,10 +519,10 @@ struct LeadOptimizationTabView: View {
     private func propertyBadge(_ label: String, _ value: String) -> some View {
         VStack(spacing: 0) {
             Text(value)
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(.footnote.monospaced().weight(.medium))
             Text(label)
-                .font(.system(size: 7))
-                .foregroundStyle(.tertiary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
         .frame(minWidth: 30)
     }

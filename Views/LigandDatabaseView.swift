@@ -10,27 +10,27 @@ struct LigandDatabaseView: View {
     private var db: LigandDatabase { viewModel.ligandDB }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             // Header with molecule/ligand counts
             HStack {
                 Label("Ligand Database", systemImage: "tray.full")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 if db.count > 0 {
                     let prepared = db.entries.filter(\.isPrepared).count
                     let total = db.topLevelEntries.count
-                    HStack(spacing: 3) {
+                    HStack(spacing: 4) {
                         Text("\(total)")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .font(.footnote.monospaced().weight(.bold))
                             .foregroundStyle(.secondary)
                         Image(systemName: "arrow.right")
-                            .font(.system(size: 7))
+                            .font(.caption2)
                             .foregroundStyle(.tertiary)
                         Text("\(prepared)")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .font(.footnote.monospaced().weight(.bold))
                             .foregroundStyle(.green)
                     }
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 2)
                     .background(Color.accentColor.opacity(0.1))
                     .clipShape(Capsule())
@@ -40,38 +40,39 @@ struct LigandDatabaseView: View {
 
             // Active ligand badge
             if let lig = viewModel.molecules.ligand {
-                HStack(spacing: 5) {
+                HStack(spacing: 4) {
                     Image(systemName: "hexagon.fill")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.green)
                     Text(lig.name)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .lineLimit(1)
                     Spacer()
                     Text("\(lig.atomCount) atoms")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                     Button(action: { viewModel.removeLigandFromView() }) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 13))
+                            .font(.body)
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
                     .help("Remove ligand from view and database")
+                    .plainButtonAccessibility(AccessibilityID.ligClearLigand)
                 }
-                .padding(6)
+                .padding(8)
                 .background(Color.green.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
-                HStack(spacing: 5) {
+                HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.orange)
                     Text("No active ligand")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-                .padding(6)
+                .padding(8)
                 .background(Color.orange.opacity(0.06))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             }
@@ -80,12 +81,13 @@ struct LigandDatabaseView: View {
             HStack(spacing: 4) {
                 TextField("SMILES", text: $smilesInput)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .onSubmit { if !smilesInput.isEmpty { addFromSMILES() } }
+                    .accessibilityIdentifier(AccessibilityID.ligSmilesField)
 
                 if showAddConfirmation {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 14))
+                        .font(.body)
                         .foregroundStyle(.green)
                         .transition(.scale.combined(with: .opacity))
                 } else {
@@ -93,6 +95,7 @@ struct LigandDatabaseView: View {
                         .controlSize(.mini)
                         .disabled(smilesInput.isEmpty)
                         .help("Add SMILES to ligand database")
+                        .accessibilityIdentifier(AccessibilityID.ligAddSmiles)
                 }
             }
             .animation(.easeInOut(duration: 0.2), value: showAddConfirmation)
@@ -105,6 +108,7 @@ struct LigandDatabaseView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .help("Open full database window (Cmd+L)")
+            .accessibilityIdentifier(AccessibilityID.ligOpenManager)
 
             // Save/Load
             HStack(spacing: 4) {
@@ -119,6 +123,7 @@ struct LigandDatabaseView: View {
                 .controlSize(.mini)
                 .disabled(db.count == 0)
                 .help("Save ligand database to disk")
+                .accessibilityIdentifier(AccessibilityID.ligSaveDB)
 
                 Button(action: {
                     db.load()
@@ -129,28 +134,29 @@ struct LigandDatabaseView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .help("Load ligand database from disk")
+                .accessibilityIdentifier(AccessibilityID.ligLoadDB)
             }
 
             Divider()
 
             // Quick-pick: show up to 8 prepared ligands for fast docking selection
             if db.entries.isEmpty {
-                VStack(spacing: 6) {
+                VStack(spacing: 8) {
                     Image(systemName: "tray")
-                        .font(.system(size: 20))
+                        .font(.title3)
                         .foregroundStyle(.tertiary)
                     Text("Database empty")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.tertiary)
                     Text("Add SMILES or open Database Manager")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.quaternary)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 8)
             } else {
                 Text("Quick select for docking:")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
 
                 let prepared = db.entries.filter { $0.isPrepared }
@@ -158,7 +164,7 @@ struct LigandDatabaseView: View {
 
                 if prepared.isEmpty && !unprepared.isEmpty {
                     Text("\(unprepared.count) molecules not yet prepared — open Database Manager and run Populate & Prepare")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.orange.opacity(0.8))
                 }
 
@@ -168,7 +174,7 @@ struct LigandDatabaseView: View {
 
                 if prepared.count > 8 {
                     Text("+ \(prepared.count - 8) more — open Database Manager")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -189,20 +195,20 @@ struct LigandDatabaseView: View {
                 .frame(width: 6, height: 6)
 
             Text(entry.name)
-                .font(.system(size: 10, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .lineLimit(1)
 
             Spacer()
 
             if let d = entry.descriptors {
                 Text(String(format: "%.0f Da", d.molecularWeight))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
 
             Button(action: { useAsLigand(entry) }) {
                 Text(isActive ? "Active" : "Use")
-                    .font(.system(size: 9))
+                    .font(.footnote)
             }
             .controlSize(.mini)
             .buttonStyle(.bordered)
@@ -236,6 +242,6 @@ struct LigandDatabaseView: View {
             return
         }
         let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds, title: entry.smiles, smiles: entry.smiles)
-        viewModel.setLigandForDocking(mol, entryID: entry.id)
+        viewModel.setLigandForDocking(mol, entryID: entry.id, forms: entry.forms)
     }
 }

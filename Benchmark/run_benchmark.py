@@ -19,7 +19,7 @@ Usage examples:
   python Benchmark/run_benchmark.py --casf --scoring drusina --gfn2-rescoring
 
   # All scoring methods, full dataset
-  python Benchmark/run_benchmark.py --casf --scoring vina,drusina,druseaf,gfn2
+  python Benchmark/run_benchmark.py --casf --scoring vina,drusina,druseaf,pignet2,gfn2
 
   # Thorough: large population, flexible residues, GFN2 geometry optimization
   python Benchmark/run_benchmark.py --casf --scoring drusina \\
@@ -58,6 +58,7 @@ SCORING_TESTS = {
     "vina":     "testCASF_Vina",
     "drusina":  "testCASF_Drusina",
     "druseaf":  "testCASF_DruseAF",
+    "pignet2":  "testCASF_PIGNet2",
     "gfn2":     "testCASF_DrusinaGFN2",
     "all":      "testCASF_All",
 }
@@ -66,6 +67,7 @@ SCORING_LABELS = {
     "vina":     "Vina",
     "drusina":  "Drusina",
     "druseaf":  "Druse Affinity",
+    "pignet2":  "PIGNet2",
     "gfn2":     "Drusina+GFN2",
 }
 
@@ -88,7 +90,7 @@ def parse_args():
     # ── Scoring ──────────────────────────────────────────────────────────
     sc = p.add_argument_group("Scoring Method")
     sc.add_argument("--scoring", type=str, default="vina",
-                    help="Scoring method(s): vina, drusina, druseaf, gfn2, all "
+                    help="Scoring method(s): vina, drusina, druseaf, pignet2, gfn2, all "
                          "(comma-separated for multiple runs, e.g. vina,drusina)")
     sc.add_argument("--gfn2-rescoring", action="store_true",
                     help="Post-docking GFN2-xTB rescoring: compute D4 dispersion + "
@@ -342,7 +344,7 @@ def resolve_scoring_methods(args, run_timestamp: str) -> list:
     """Parse --scoring flag into list of (method_key, test_name, output_file)."""
     raw = args.scoring.lower().strip()
     if raw == "all":
-        methods = ["vina", "drusina", "druseaf", "gfn2"]
+        methods = ["vina", "drusina", "druseaf", "pignet2", "gfn2"]
     else:
         methods = [m.strip() for m in raw.split(",")]
 

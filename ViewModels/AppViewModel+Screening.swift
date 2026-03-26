@@ -49,31 +49,18 @@ extension AppViewModel {
                 return
             }
 
-            // Prepare protein for scoring (same as single docking path)
-            let proteinAtoms = prot.atoms
-            let proteinBonds = prot.bonds
+            // Prepare protein for scoring (uses cache — instant if protein/pH unchanged)
             let dockingPH = molecules.protonationPH
-            let pdbContent = molecules.rawPDBContent
-            log.info("[Batch] Preparing receptor for scoring...", category: .dock)
-            let preparedProtein = await Task.detached {
-                ProteinPreparation.prepareForDocking(
-                    atoms: proteinAtoms,
-                    bonds: proteinBonds,
-                    rawPDBContent: pdbContent,
-                    pH: dockingPH
-                )
-            }.value
-            let scoringProtein = Molecule(
-                name: prot.name,
-                atoms: preparedProtein.atoms,
-                bonds: preparedProtein.bonds,
-                title: prot.title,
-                smiles: prot.smiles
-            )
-            scoringProtein.secondaryStructureAssignments = prot.secondaryStructureAssignments
-            log.info("[Batch] Receptor prepared: \(scoringProtein.atoms.count) atoms (+\(preparedProtein.report.hydrogensAdded) H)", category: .dock)
+            let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH)
 
             engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
+
+            // Bind pharmacophore buffers (required by all scoring kernels, even if empty)
+            engine.prepareConstraintBuffers(
+                docking.pharmacophoreConstraints.filter(\.isEnabled),
+                atoms: scoringProtein.atoms,
+                residues: scoringProtein.residues
+            )
             log.success("[Batch] Grid maps computed", category: .dock)
 
             for (i, entry) in prepared.enumerated() {
@@ -154,36 +141,47 @@ extension AppViewModel {
                 docking.dockingBestEnergy = .infinity
                 docking.dockingGeneration = 0
                 docking.dockingTotalGenerations = batchConfig.numGenerations
-                var results = await engine.runDocking(ligand: mol, pocket: pocket, config: batchConfig,
-                                                      scoringMethod: docking.scoringMethod)
-                docking.isDocking = false
-                log.info("[Batch] \(entry.name): \(results.count) poses returned", category: .dock)
 
-                // Apply ML scoring if selected
-                if docking.scoringMethod == .druseAffinity && druseMLScoring.isAvailable {
-                    log.info("[Batch] Running Druse Affinity scoring for \(entry.name)...", category: .dock)
-                    let heavyLigAtoms = mol.atoms.filter { $0.element != .H }
-                    results = await druseMLScoring.scorePoses(
-                        results: results,
-                        proteinAtoms: scoringProtein.atoms,
-                        ligandAtoms: heavyLigAtoms,
-                        pocketCenter: pocket.center,
-                        proteinBonds: scoringProtein.bonds,
-                        ligandBonds: mol.bonds
-                    )
-                    log.info("[Batch] Druse AF scoring complete for \(entry.name)", category: .dock)
-                }
+                // Build ensemble starts for this entry
+                let ensembleCfg = batchConfig.ensemble
+                let starts = buildEnsembleStartingMolecules(
+                    primaryLigand: mol, forms: entry.forms, config: ensembleCfg
+                )
 
-                docking.batchResults.append((ligandName: entry.name, results: results))
+                var entryResults: [DockingResult] = []
+                for start in starts {
+                    guard !Task.isCancelled, docking.isBatchDocking else { break }
+                    let startResults = await engine.runDocking(
+                        ligand: start.molecule, pocket: pocket,
+                        config: batchConfig, scoringMethod: docking.scoringMethod)
 
-                if let best = results.first {
-                    if docking.scoringMethod == .druseAffinity, let pKd = best.mlPKd {
-                        let display = docking.affinityDisplayUnit.format(pKd)
-                        let unit = docking.affinityDisplayUnit.unitLabel
-                        log.info("  \(entry.name) best: \(display) \(unit)", category: .dock)
+                    if ensembleCfg.populationWeighting && start.population < 1.0 {
+                        let rt = 0.592
+                        let penalty = -rt * Foundation.log(max(start.population, 1e-10))
+                        for var result in startResults {
+                            result.energy += Float(penalty)
+                            result.formLabel = start.label
+                            result.formPopulation = Float(start.population)
+                            entryResults.append(result)
+                        }
                     } else {
-                        log.info(String(format: "  %@ best: %.1f kcal/mol", entry.name, best.energy), category: .dock)
+                        for var result in startResults {
+                            result.formLabel = start.label
+                            result.formPopulation = Float(start.population)
+                            entryResults.append(result)
+                        }
                     }
+                }
+                entryResults.sort { $0.energy < $1.energy }
+
+                docking.isDocking = false
+                let startStr = starts.count > 1 ? " (\(starts.count) starts)" : ""
+                log.info("[Batch] \(entry.name): \(entryResults.count) poses returned\(startStr)", category: .dock)
+
+                docking.batchResults.append((ligandName: entry.name, results: entryResults))
+
+                if let best = entryResults.first {
+                    log.info(String(format: "  %@ best: %.1f kcal/mol", entry.name, best.energy), category: .dock)
                     applyDockingPose(best, originalLigand: mol)
                 }
             }
@@ -191,18 +189,10 @@ extension AppViewModel {
             docking.batchProgress = (prepared.count, prepared.count)
             docking.isBatchDocking = false
 
-            if docking.scoringMethod == .druseAffinity {
-                docking.batchResults.sort { a, b in
-                    let bestA = a.results.first?.mlDockingScore ?? -.infinity
-                    let bestB = b.results.first?.mlDockingScore ?? -.infinity
-                    return bestA > bestB
-                }
-            } else {
-                docking.batchResults.sort { a, b in
-                    let bestA = a.results.first?.energy ?? .infinity
-                    let bestB = b.results.first?.energy ?? .infinity
-                    return bestA < bestB
-                }
+            docking.batchResults.sort { a, b in
+                let bestA = a.results.first?.energy ?? .infinity
+                let bestB = b.results.first?.energy ?? .infinity
+                return bestA < bestB
             }
 
             if let bestBatch = docking.batchResults.first, let bestResult = bestBatch.results.first {
@@ -220,13 +210,7 @@ extension AppViewModel {
                 showGridBoxForPocket(pocket)
             }
 
-            if docking.scoringMethod == .druseAffinity, let best = docking.batchResults.first?.results.first, let pKd = best.mlPKd {
-                let display = docking.affinityDisplayUnit.format(pKd)
-                let unit = docking.affinityDisplayUnit.unitLabel
-                log.success("Batch complete: \(docking.batchResults.count) ligands, best: \(docking.batchResults.first?.ligandName ?? "?") (\(display) \(unit))", category: .dock)
-            } else {
-                log.success("Batch complete: \(docking.batchResults.count) ligands, best: \(docking.batchResults.first?.ligandName ?? "?") (\(String(format: "%.1f", docking.batchResults.first?.results.first?.energy ?? 0)) kcal/mol)", category: .dock)
-            }
+            log.success("Batch complete: \(docking.batchResults.count) ligands, best: \(docking.batchResults.first?.ligandName ?? "?") (\(String(format: "%.1f", docking.batchResults.first?.results.first?.energy ?? 0)) kcal/mol)", category: .dock)
             workspace.statusMessage = "Batch complete — \(docking.batchResults.count) ligands ranked"
         }
     }
@@ -349,7 +333,6 @@ extension AppViewModel {
                 dockingEngine: engine,
                 protein: prot,
                 pocket: pocket,
-                mlScorer: pipeline.config.useMLReranking && druseRescoring.isAvailable ? druseRescoring : nil,
                 admetPredictor: pipeline.config.admetFilter && admetPredictor.isAvailable ? admetPredictor : nil,
                 constraints: docking.pharmacophoreConstraints
             )

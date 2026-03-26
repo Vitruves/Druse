@@ -78,6 +78,7 @@ final class Renderer: NSObject {
     var selectedAtomIndex: Int = -1
     var selectedResidueAtomIndices: Set<Int> = []
     var renderMode: RenderMode = .ballAndStick
+    var ligandRenderMode: RenderMode?
     var lightingMode: Int32 = 0 // 0 = uniform, 1 = directional
     var themeMode: Int32 = 0    // 0 = dark, 1 = light
     var backgroundOpacity: Float = 1.0
@@ -345,7 +346,8 @@ final class Renderer: NSObject {
 
     private func rebuildInstanceBuffers() {
         // Atom instances
-        let atomScale = renderMode.atomRadiusScale
+        let protAtomScale = renderMode.atomRadiusScale
+        let ligAtomScale = (ligandRenderMode ?? renderMode).atomRadiusScale
         var atomInstances: [AtomInstance] = []
         atomInstances.reserveCapacity(currentAtoms.count)
 
@@ -356,6 +358,7 @@ final class Renderer: NSObject {
 
             // Apply color overrides
             let isProteinAtom = atom.id < proteinAtomCount
+            let atomScale = isProteinAtom ? protAtomScale : ligAtomScale
             var color = atom.element.color
             if !chainColorMap.isEmpty, isProteinAtom {
                 // Per-chain coloring mode
@@ -397,8 +400,9 @@ final class Renderer: NSObject {
         }
 
         // Bond instances
-        let bondScale = renderMode.bondRadiusScale
-        guard bondScale > 0 else {
+        let protBondScale = renderMode.bondRadiusScale
+        let ligBondScale = (ligandRenderMode ?? renderMode).bondRadiusScale
+        guard protBondScale > 0 || ligBondScale > 0 else {
             bondInstanceCount = 0
             // Keep bondInstanceBuffer and bondInstanceCapacity intact so bonds
             // reappear immediately when switching back to a bond-showing mode.
@@ -432,6 +436,11 @@ final class Renderer: NSObject {
 
             let cA = atomColor(a1)
             let cB = atomColor(a2)
+
+            // Use ligand scale if either atom is a ligand atom
+            let isLigandBond = a1.id >= proteinAtomCount || a2.id >= proteinAtomCount
+            let bondScale = isLigandBond ? ligBondScale : protBondScale
+            if bondScale <= 0 { continue }
 
             switch bond.order {
             case .single:

@@ -45,13 +45,6 @@ struct DruseApp: App {
                     viewModel.log.success("Saved \(viewModel.ligandDB.count) ligands", category: .molecule)
                 }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
-                Divider()
-                Button("Load Caffeine") { viewModel.loadCaffeine() }
-                    .keyboardShortcut("1", modifiers: [.command, .shift])
-                Button("Load Ala Dipeptide") { viewModel.loadAlanineDipeptide() }
-                    .keyboardShortcut("2", modifiers: [.command, .shift])
-                Button("Load Both") { viewModel.loadBoth() }
-                    .keyboardShortcut("3", modifiers: [.command, .shift])
             }
 
             // View menu additions
@@ -80,6 +73,14 @@ struct DruseApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             }
+
+            // Help menu
+            CommandGroup(replacing: .help) {
+                Button("Druse Help") {
+                    openWindow(id: "druse-help")
+                }
+                .keyboardShortcut("?", modifiers: .command)
+            }
         }
 
         Settings {
@@ -95,6 +96,16 @@ struct DruseApp: App {
                 .preferredColorScheme(selectedColorScheme)
         }
         .defaultSize(width: 1200, height: 700)
+        .windowStyle(.titleBar)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        // Help window
+        Window("Druse Help", id: "druse-help") {
+            DruseHelpView()
+                .preferredColorScheme(selectedColorScheme)
+        }
+        .defaultSize(width: 860, height: 680)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)

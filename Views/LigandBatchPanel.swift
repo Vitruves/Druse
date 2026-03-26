@@ -77,6 +77,17 @@ extension LigandDatabaseWindow {
             // Configuration (same parameters as single entry)
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
                 GridRow {
+                    Text("pKa method").font(.system(size: 10)).frame(width: 90, alignment: .leading)
+                    Picker("", selection: $pkaMethod) {
+                        ForEach(PKaMethod.allCases, id: \.self) { m in
+                            Text(m.rawValue).tag(m)
+                        }
+                    }
+                    .pickerStyle(.segmented).controlSize(.small)
+                    .help(pkaMethod.description)
+                    Spacer()
+                }
+                GridRow {
                     Text("Target pH").font(.system(size: 10)).frame(width: 90, alignment: .leading)
                     Slider(value: $variantPH, in: 1...14, step: 0.1).controlSize(.mini)
                     Text(String(format: "%.1f", variantPH))

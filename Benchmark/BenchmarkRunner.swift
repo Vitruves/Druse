@@ -24,7 +24,6 @@ final class BenchmarkRunner: XCTestCase {
     // MARK: - Shared Engine & DruseAF Scorer
 
     @MainActor private static var _engine: DockingEngine?
-    @MainActor private static var _druseAF: DruseMLScoringInference?
 
     @MainActor
     private func engine() throws -> DockingEngine {
@@ -36,17 +35,6 @@ final class BenchmarkRunner: XCTestCase {
         Self._engine = e
         print("[Benchmark] DockingEngine on \(device.name)")
         return e
-    }
-
-    /// DruseAF primary scorer (DruseScorePKi.mlpackage) — scores poses in pKd units.
-    @MainActor
-    private func druseAFScorer() -> DruseMLScoringInference {
-        if let s = Self._druseAF { return s }
-        let s = DruseMLScoringInference()
-        s.loadModel()
-        Self._druseAF = s
-        print("[Benchmark] DruseAF scorer: \(s.isAvailable ? "loaded (pKd scoring)" : "UNAVAILABLE")")
-        return s
     }
 
     private var projectRoot: URL {
@@ -167,7 +155,6 @@ final class BenchmarkRunner: XCTestCase {
                 pdbId: complex.pdbId,
                 bestEnergy: .infinity,
                 bestRmsd: nil,
-                mlRescorePKd: nil,
                 experimentalPKd: complex.pKd,
                 numPoses: 0,
                 dockingTimeMs: 0,
@@ -226,25 +213,7 @@ final class BenchmarkRunner: XCTestCase {
                     config: config, scoringMethod: scoringMethod
                 )
 
-                // 7. DruseAF: rescore GA poses with CoreML DruseScorePKi for pKi output
-                let results: [DockingResult]
-                if scoringMethod == .druseAffinity {
-                    let scorer = druseAFScorer()
-                    if scorer.isAvailable {
-                        results = await scorer.scorePoses(
-                            results: gaResults,
-                            proteinAtoms: protein.atoms,
-                            ligandAtoms: ligand.atoms,
-                            pocketCenter: pocket.center,
-                            proteinBonds: protein.bonds,
-                            ligandBonds: ligand.bonds
-                        )
-                    } else {
-                        throw BenchmarkError.step("DruseAF model unavailable")
-                    }
-                } else {
-                    results = gaResults
-                }
+                let results = gaResults
 
                 let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
 
@@ -252,13 +221,7 @@ final class BenchmarkRunner: XCTestCase {
                 entry.dockingTimeMs = elapsed
 
                 if let best = results.first {
-                    // DruseAF: use ML docking_score (pKd × confidence); others: Vina energy
-                    if scoringMethod == .druseAffinity {
-                        entry.bestEnergy = best.mlDockingScore ?? best.energy
-                        entry.mlRescorePKd = best.mlPKd
-                    } else {
-                        entry.bestEnergy = best.energy
-                    }
+                    entry.bestEnergy = best.energy
                     entry.success = true
 
                     // RMSD
@@ -287,11 +250,7 @@ final class BenchmarkRunner: XCTestCase {
 
                     let rmsd = entry.bestRmsd.map { String(format: "%.2f", $0) } ?? "N/A"
                     let gfn2Str = entry.gfn2Energy.map { String(format: "  GFN2=%.0f", $0) } ?? ""
-                    if scoringMethod == .druseAffinity, let pKi = best.mlPKd, let conf = best.mlPoseConfidence {
-                        print("  [\(idx+1)/\(total)] \(complex.pdbId)  pKi=\(String(format: "%.2f", pKi))  conf=\(String(format: "%.0f%%", conf * 100))  RMSD=\(rmsd)A  \(String(format: "%.0f", elapsed))ms")
-                    } else {
-                        print("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
-                    }
+                    print("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
                     fflush(stdout)
                     succeeded += 1
                 } else {
@@ -351,14 +310,6 @@ final class BenchmarkRunner: XCTestCase {
         let scored = ok.filter { $0.experimentalPKd != nil }
         if scored.count >= 3 {
             print("\n  Scoring Power:")
-
-            // ML pKd correlation (DruseAF)
-            let mlScored = scored.filter { $0.mlRescorePKd != nil }
-            if mlScored.count >= 3 {
-                let rML = pearsonR(mlScored.map { $0.experimentalPKd! },
-                                    mlScored.map { $0.mlRescorePKd! })
-                print("    Pearson r (DruseAF pKi vs exp): \(String(format: "%.4f", rML))  (n=\(mlScored.count))")
-            }
 
             // Vina/Drusina energy correlation
             let r = pearsonR(scored.map { $0.experimentalPKd! }, scored.map(\.bestEnergy))

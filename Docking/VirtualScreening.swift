@@ -19,8 +19,6 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         var gaRefinementFraction: Float = 0.35
         var minimumGARefinementCount: Int = 128
         var gaRefinementMaxLigands: Int = 4_096
-        var useMLReranking: Bool = true
-        var mlRerankTopN: Int = 10_000
         var admetFilter: Bool = true
         var openMMRefineTopN: Int = 25
         var gfn2RefineTopN: Int = 0  // 0 = disabled; >0 = refine top N hits with GFN2-xTB (D4 + solvation)
@@ -102,7 +100,6 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         dockingEngine: DockingEngine,
         protein: Molecule,
         pocket: BindingPocket,
-        mlScorer: DruseRescoringInference?,
         admetPredictor: ADMETPredictor?,
         constraints: [PharmacophoreConstraintDef] = []
     ) async {
@@ -344,45 +341,6 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         }
 
         allHits.sort { $0.bestEnergy < $1.bestEnergy }
-
-        // Phase 3: ML re-ranking of top hits
-        if config.useMLReranking, let scorer = mlScorer, scorer.isAvailable {
-            let topN = min(config.mlRerankTopN, allHits.count)
-            state = .reranking(current: 0, total: topN)
-
-            let proteinAtoms = protein.atoms.filter { $0.element != .H }
-
-            for i in 0..<topN {
-                if isCancelled { state = .idle; return }
-
-                var atoms = allHits[i].ligandAtoms
-                for j in 0..<atoms.count {
-                    if j < allHits[i].bestPoseAtoms.count {
-                        atoms[j].position = allHits[i].bestPoseAtoms[j]
-                    }
-                }
-
-                let features = DruseScoreFeatureExtractor.extract(
-                    proteinAtoms: proteinAtoms,
-                    ligandAtoms: atoms,
-                    pocketCenter: pocket.center,
-                    proteinBonds: protein.bonds,
-                    ligandBonds: allHits[i].ligandBonds
-                )
-
-                if let pred = await scorer.score(features: features) {
-                    allHits[i].mlScore = pred.pKd
-                    allHits[i].compositeScore = 0.3 * allHits[i].bestEnergy + 0.7 * (-pred.pKd * 1.364)
-                }
-
-                if i % 100 == 0 {
-                    state = .reranking(current: i, total: topN)
-                    progress = 0.8 + Float(i) / Float(topN) * 0.15
-                }
-            }
-
-            allHits.sort { $0.compositeScore < $1.compositeScore }
-        }
 
         if config.openMMRefineTopN > 0 {
             allHits = await refineTopHitsWithOpenMM(

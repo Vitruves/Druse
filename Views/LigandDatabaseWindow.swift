@@ -2,6 +2,23 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+// MARK: - pKa Method
+
+/// Controls how ionizable-site pKa values are determined during Populate & Prepare.
+enum PKaMethod: String, CaseIterable {
+    /// Use the built-in SMARTS lookup table (fast, ~ms per molecule).
+    case table = "Table"
+    /// Compute pKa via GFN2-xTB single-point energies on protonated/deprotonated forms (slow, ~seconds per site).
+    case gfn2 = "GFN2-xTB"
+
+    var description: String {
+        switch self {
+        case .table: return "Fast lookup table (~345 SMARTS rules)"
+        case .gfn2: return "GFN2-xTB quantum chemistry (accurate but slow)"
+        }
+    }
+}
+
 // MARK: - Ligand Database Manager Window
 
 struct LigandDatabaseWindow: View {
@@ -64,6 +81,7 @@ struct LigandDatabaseWindow: View {
     @State var variantEnergyCutoff: Double = 10.0
     @State var variantPkaThreshold: Double = 2.0
     @State var variantMinPopulation: Double = 1.0  // minimum Boltzmann population % to keep a form
+    @State var pkaMethod: PKaMethod = .table
     @State var selectedVariantID: UUID?
     @State var conformerBudgetPerVariant: Int = 20
     @State var selectedFormIndex: Int = 0
@@ -205,8 +223,8 @@ struct LigandDatabaseWindow: View {
                             VStack {
                                 Spacer()
                                 Text("Select a ligand to view details")
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(.tertiary)
+                                    .font(.body)
+                                    .foregroundStyle(.secondary)
                                 Spacer()
                             }
                             .frame(maxWidth: .infinity)
@@ -225,7 +243,7 @@ struct LigandDatabaseWindow: View {
             Divider()
             statusBar
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(.background)
         .sheet(isPresented: $showImportMapping) {
             ImportMappingSheet(preview: $importPreview) { finalPreview in
                 performMappedImport(finalPreview)
@@ -343,12 +361,12 @@ struct LigandDatabaseWindow: View {
             TextField("Search...", text: $searchText)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 140)
-                .font(.system(size: 11))
+                .font(.subheadline)
 
             Toggle("Lipinski", isOn: $lipinskiFilter)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
-                .font(.system(size: 10))
+                .font(.footnote)
 
             // Save/Load/Export
             Menu {
@@ -376,14 +394,14 @@ struct LigandDatabaseWindow: View {
             Button(action: { toggleSelectAll() }) {
                 Image(systemName: selectedIDs.count == flatRows.count && !flatRows.isEmpty
                       ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 12))
+                    .font(.callout)
             }
             .buttonStyle(.plain)
             .help("Select all / none")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     // MARK: - SMILES Entry (inline, shown below toolbar)
@@ -397,7 +415,7 @@ struct LigandDatabaseWindow: View {
 
                 TextField("Name", text: $nameInput)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11))
+                    .font(.subheadline)
                     .frame(width: 120)
 
                 Button("Add") {
@@ -420,13 +438,13 @@ struct LigandDatabaseWindow: View {
 
                 Button(action: { showSMILESEntry = false }) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                 }
                 .buttonStyle(.plain)
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+            .padding(.vertical, 8)
+            .background(Color(nsColor: .controlBackgroundColor))
         }
     }
 
@@ -441,7 +459,7 @@ struct LigandDatabaseWindow: View {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text(processingMessage)
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 4)
@@ -469,7 +487,7 @@ struct LigandDatabaseWindow: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+            .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
@@ -502,7 +520,7 @@ struct LigandDatabaseWindow: View {
                         Text(title)
                         if isSorted {
                             Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                                .font(.system(size: 9))
+                                .font(.footnote)
                         }
                     }
                 }
@@ -511,7 +529,7 @@ struct LigandDatabaseWindow: View {
                 Text(title)
             }
         }
-        .font(.system(size: 9, weight: isSorted ? .bold : .semibold))
+        .font(.footnote.weight(isSorted ? .bold : .semibold))
         .foregroundStyle(isSorted ? .primary : .secondary)
         .frame(width: width, alignment: alignment)
         .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
@@ -532,7 +550,7 @@ struct LigandDatabaseWindow: View {
                 else { selectedIDs.insert(row.id) }
             } label: {
                 Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 11))
+                    .font(.subheadline)
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.plain)
@@ -547,24 +565,24 @@ struct LigandDatabaseWindow: View {
                 case .tautomerProtomer: .purple
                 }
                 Text(kind.symbol)
-                    .font(.system(size: 7, weight: .bold))
+                    .font(.caption2.weight(.bold))
                     .foregroundStyle(.white)
                     .frame(width: 18, height: 14)
-                    .background(RoundedRectangle(cornerRadius: 3).fill(kindColor))
+                    .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
                     .frame(width: 28)
             } else {
-                Text("—").font(.system(size: 8)).foregroundStyle(.tertiary).frame(width: 28)
+                Text("—").font(.caption).foregroundStyle(.secondary).frame(width: 28)
             }
 
             // Name
             Text(row.name)
-                .font(.system(size: 10, weight: row.kind == .parent || row.kind == nil ? .regular : .regular))
+                .font(.footnote)
                 .lineLimit(1)
                 .frame(width: 140, alignment: .leading)
 
             // SMILES
             Text(row.smiles)
-                .font(.system(size: 9, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -573,54 +591,54 @@ struct LigandDatabaseWindow: View {
             // Population %
             if row.population > 0 {
                 Text(String(format: "%.0f%%", row.population * 100))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(row.population > 0.3 ? .green : row.population > 0.1 ? .yellow : .secondary)
                     .frame(width: 42, alignment: .trailing)
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 42, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
             }
 
             // Relative energy
             if row.form != nil {
                 if row.relativeEnergy < 0.01 {
-                    Text("best").font(.system(size: 8, weight: .medium)).foregroundStyle(.green).frame(width: 42, alignment: .trailing)
+                    Text("best").font(.caption.weight(.medium)).foregroundStyle(.green).frame(width: 42, alignment: .trailing)
                 } else {
                     Text(String(format: "+%.1f", row.relativeEnergy))
-                        .font(.system(size: 8, design: .monospaced)).foregroundStyle(.orange).frame(width: 42, alignment: .trailing)
+                        .font(.caption.monospaced()).foregroundStyle(.orange).frame(width: 42, alignment: .trailing)
                 }
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 42, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
             }
 
             // Conformer count
             Text(row.conformerCount > 0 ? "\(row.conformerCount)" : "—")
-                .font(.system(size: 9, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(row.conformerCount > 0 ? .primary : .tertiary)
                 .frame(width: 36, alignment: .trailing)
 
             // Descriptors
             if let d = row.descriptors {
-                Text(String(format: "%.0f", d.molecularWeight)).font(.system(size: 9, design: .monospaced)).frame(width: 52, alignment: .trailing)
-                Text(String(format: "%.1f", d.logP)).font(.system(size: 9, design: .monospaced)).frame(width: 42, alignment: .trailing)
-                Text("\(d.hbd)").font(.system(size: 9, design: .monospaced)).frame(width: 30, alignment: .trailing)
-                Text("\(d.hba)").font(.system(size: 9, design: .monospaced)).frame(width: 30, alignment: .trailing)
-                Text(String(format: "%.0f", d.tpsa)).font(.system(size: 9, design: .monospaced)).frame(width: 42, alignment: .trailing)
-                Text("\(d.rotatableBonds)").font(.system(size: 9, design: .monospaced)).frame(width: 30, alignment: .trailing)
+                Text(String(format: "%.0f", d.molecularWeight)).font(.footnote.monospaced()).frame(width: 52, alignment: .trailing)
+                Text(String(format: "%.1f", d.logP)).font(.footnote.monospaced()).frame(width: 42, alignment: .trailing)
+                Text("\(d.hbd)").font(.footnote.monospaced()).frame(width: 30, alignment: .trailing)
+                Text("\(d.hba)").font(.footnote.monospaced()).frame(width: 30, alignment: .trailing)
+                Text(String(format: "%.0f", d.tpsa)).font(.footnote.monospaced()).frame(width: 42, alignment: .trailing)
+                Text("\(d.rotatableBonds)").font(.footnote.monospaced()).frame(width: 30, alignment: .trailing)
                 Image(systemName: d.lipinski ? "checkmark" : "xmark")
-                    .font(.system(size: 10)).foregroundStyle(d.lipinski ? .green : .red.opacity(0.7)).frame(width: 26)
+                    .font(.footnote).foregroundStyle(d.lipinski ? .green : .red.opacity(0.7)).frame(width: 26)
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 52, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 42, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 30, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 30, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 42, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 30, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 26, alignment: .center)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 26, alignment: .center)
             }
 
             // Atom count
             Text(row.atoms.isEmpty ? "—" : "\(row.atoms.count)")
-                .font(.system(size: 9, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(row.atoms.isEmpty ? .tertiary : .primary)
                 .frame(width: 38, alignment: .trailing)
         }
@@ -661,7 +679,7 @@ struct LigandDatabaseWindow: View {
                     }
                 } label: {
                     Image(systemName: expandedEntryIDs.contains(entry.id) ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8, weight: .semibold))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
@@ -679,7 +697,7 @@ struct LigandDatabaseWindow: View {
                 }
             } label: {
                 Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 11))
+                    .font(.subheadline)
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.plain)
@@ -691,14 +709,14 @@ struct LigandDatabaseWindow: View {
                     Circle().fill(.green).frame(width: 5, height: 5)
                 }
                 Text(entry.name)
-                    .font(.system(size: 10, weight: isActive ? .semibold : .regular))
+                    .font(.footnote.weight(isActive ? .semibold : .regular))
                     .lineLimit(1)
             }
             .frame(width: 140, alignment: .leading)
 
             // SMILES
             Text(entry.smiles)
-                .font(.system(size: 9, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -707,78 +725,78 @@ struct LigandDatabaseWindow: View {
             // Descriptors
             if let d = entry.descriptors {
                 Text(String(format: "%.0f", d.molecularWeight))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 60, alignment: .trailing)
                 Text(String(format: "%.1f", d.logP))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 50, alignment: .trailing)
                 Text("\(d.hbd)")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 36, alignment: .trailing)
                 Text("\(d.hba)")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 36, alignment: .trailing)
                 Text(String(format: "%.0f", d.tpsa))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 50, alignment: .trailing)
                 Text("\(d.rotatableBonds)")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .frame(width: 36, alignment: .trailing)
                 Image(systemName: d.lipinski ? "checkmark" : "xmark")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(d.lipinski ? .green : .red.opacity(0.7))
                     .frame(width: 30)
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 60, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 50, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 36, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 36, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 50, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 36, alignment: .trailing)
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 30, alignment: .center)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 60, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 50, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 50, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .center)
             }
 
             // Affinity data (Ki, pKi, IC50)
             if let ki = entry.ki {
                 Text(String(format: "%.1f", ki))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.purple)
                     .frame(width: 55, alignment: .trailing)
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 55, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 55, alignment: .trailing)
             }
             if let pKi = entry.pKi ?? entry.effectivePKi {
                 Text(String(format: "%.2f", pKi))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(entry.pKi != nil ? .purple : .purple.opacity(0.5))
                     .frame(width: 45, alignment: .trailing)
                     .help(entry.pKi != nil ? "Stored pKi" : "Computed from \(entry.ki != nil ? "Ki" : "IC50")")
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 45, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 45, alignment: .trailing)
             }
             if let ic50 = entry.ic50 {
                 Text(String(format: "%.1f", ic50))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.purple)
                     .frame(width: 55, alignment: .trailing)
             } else {
-                Text("—").font(.system(size: 9)).foregroundStyle(.tertiary).frame(width: 55, alignment: .trailing)
+                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 55, alignment: .trailing)
             }
 
             // Prepared status
             Image(systemName: entry.isPrepared ? "checkmark.circle.fill" : "circle")
-                .font(.system(size: 9))
+                .font(.footnote)
                 .foregroundColor(entry.isPrepared ? .green : .gray)
                 .frame(width: 36)
 
             // Atom count
             Text(entry.atoms.isEmpty ? "—" : "\(entry.atoms.count)")
-                .font(.system(size: 9, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(entry.atoms.isEmpty ? .tertiary : .primary)
                 .frame(width: 44, alignment: .trailing)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.vertical, 4)
         .background(isInspected ? Color.accentColor.opacity(0.2) :
                      isSelected ? Color.accentColor.opacity(0.1) :
                      isActive ? Color.green.opacity(0.05) : Color.clear)
@@ -824,27 +842,27 @@ struct LigandDatabaseWindow: View {
 
             // Kind badge
             Text(form.kind.symbol)
-                .font(.system(size: 7, weight: .bold))
+                .font(.caption2.weight(.bold))
                 .foregroundStyle(.white)
                 .frame(width: 18, height: 16)
-                .background(RoundedRectangle(cornerRadius: 3).fill(kindColor))
+                .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
 
             // Form label
             Text(form.label)
-                .font(.system(size: 9, weight: isBest ? .semibold : .regular))
+                .font(.footnote.weight(isBest ? .semibold : .regular))
                 .frame(width: 120, alignment: .leading)
                 .lineLimit(1)
 
             // SMILES (shows difference from parent)
             Text(form.smiles)
-                .font(.system(size: 8, design: .monospaced))
+                .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             // Population %
             Text(form.populationString)
-                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                .font(.caption.monospaced().weight(.medium))
                 .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
                                  form.boltzmannWeight > 0.1 ? .yellow : .secondary)
                 .frame(width: 42, alignment: .trailing)
@@ -852,19 +870,19 @@ struct LigandDatabaseWindow: View {
             // Relative energy
             if form.relativeEnergy < 0.01 {
                 Text("best")
-                    .font(.system(size: 8, weight: .medium))
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(.green)
                     .frame(width: 50, alignment: .trailing)
             } else {
                 Text(String(format: "+%.1f kcal", form.relativeEnergy))
-                    .font(.system(size: 8, design: .monospaced))
+                    .font(.caption.monospaced())
                     .foregroundStyle(.orange)
                     .frame(width: 50, alignment: .trailing)
             }
 
             // Conformer count
             Text("\(form.conformerCount) conf")
-                .font(.system(size: 8, design: .monospaced))
+                .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 40, alignment: .trailing)
 
@@ -878,10 +896,10 @@ struct LigandDatabaseWindow: View {
                         title: form.smiles,
                         smiles: form.smiles
                     )
-                    viewModel.setLigandForDocking(mol, entryID: entry.id)
+                    viewModel.setLigandForDocking(mol, entryID: entry.id, forms: entry.forms)
                 } label: {
                     Image(systemName: "arrow.right.circle")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.accentColor)
@@ -917,14 +935,14 @@ struct LigandDatabaseWindow: View {
         VStack(spacing: 16) {
             Spacer()
             Image(systemName: "tray")
-                .font(.system(size: 48))
-                .foregroundStyle(.tertiary)
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
             Text("No ligands in database")
-                .font(.system(size: 16, weight: .medium))
+                .font(.title3.weight(.medium))
                 .foregroundStyle(.secondary)
             Text("Add SMILES, or import .smi / .csv / .sdf files")
-                .font(.system(size: 12))
-                .foregroundStyle(.tertiary)
+                .font(.callout)
+                .foregroundStyle(.secondary)
 
             Button(action: { showSMILESEntry = true }) {
                 Label("Add SMILES", systemImage: "plus")
@@ -950,38 +968,38 @@ struct LigandDatabaseWindow: View {
         HStack(spacing: 16) {
             HStack(spacing: 4) {
                 Text("\(nMolecules) molecules")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                 if nForms > nMolecules || nConformers > 0 {
-                    Image(systemName: "arrow.right").font(.system(size: 8)).foregroundStyle(.tertiary)
+                    Image(systemName: "arrow.right").font(.caption).foregroundStyle(.secondary)
                     Text("\(nForms) forms")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.green)
                     if nVariants > 0 {
                         Text("(\(nVariants) variants)")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    Image(systemName: "arrow.right").font(.system(size: 8)).foregroundStyle(.tertiary)
+                    Image(systemName: "arrow.right").font(.caption).foregroundStyle(.secondary)
                     Text("\(nConformers) conformers")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
             Text("Selected: \(nSelected)")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(Color.accentColor)
 
             Spacer()
 
             if isBatchProcessing {
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     ProgressView().controlSize(.mini)
                     Text("Processing \(batchProgress.current)/\(batchProgress.total)")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                     Button(action: { cancelPopulateAndPrepare() }) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10))
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
@@ -993,13 +1011,13 @@ struct LigandDatabaseWindow: View {
                 HStack(spacing: 4) {
                     Circle().fill(.green).frame(width: 5, height: 5)
                     Text("Active: \(lig.name)")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                 }
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+        .padding(.vertical, 8)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     // MARK: - Selection
@@ -1184,7 +1202,8 @@ struct LigandDatabaseWindow: View {
         }
         let mol = Molecule(name: row.name, atoms: row.atoms, bonds: row.bonds,
                            title: row.smiles, smiles: row.smiles)
-        viewModel.setLigandForDocking(mol, entryID: row.entryID)
+        let forms = db.entries.first(where: { $0.id == row.entryID })?.forms ?? []
+        viewModel.setLigandForDocking(mol, entryID: row.entryID, forms: forms)
     }
 
     func deleteFormRow(_ row: FormRow) {
@@ -1286,7 +1305,7 @@ struct LigandDatabaseWindow: View {
         }
         let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds,
                            title: entry.smiles, smiles: entry.smiles)
-        viewModel.setLigandForDocking(mol, entryID: entry.id)
+        viewModel.setLigandForDocking(mol, entryID: entry.id, forms: entry.forms)
     }
 
     private func addAndPrepare(smiles: String, name: String) {
@@ -1324,109 +1343,74 @@ struct LigandDatabaseWindow: View {
         let confsPerForm = prepNumConformers
         let pkaThreshold = variantPkaThreshold
         let minPop = variantMinPopulation / 100.0  // convert % to fraction
+        let useGFN2 = pkaMethod == .gfn2
 
         populateTask = Task {
             var totalForms = 0
             var totalConformers = 0
             var completedCount = 0
 
-            // Process molecules: pKa prediction (GFN2-xTB) → ensemble generation
-            // Each molecule: detect sites → GFN2 energy for each site → derive pKa → ensemble
+            // GFN2-xTB: limit to 2 (GPU-heavy per site); Table: scale with CPU cores
+            let maxConcurrency = useGFN2 ? 2 : max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
             await withTaskGroup(of: (LigandEntry, RDKitBridge.EnsembleResult, [LigandpKaPredictor.SitePKa])?.self) { group in
+                var enqueued = 0
                 for entry in toProcess {
+                    // Throttle: wait for a result before adding more tasks past the limit
+                    if enqueued >= maxConcurrency {
+                        if let item = await group.next() {
+                            if let (entry, result, pkaResults) = item {
+                                completedCount += 1
+                                batchProgress = (completedCount, toProcess.count)
+                                processingMessage = "Populating \(completedCount)/\(toProcess.count): \(entry.name)"
+                                processPopulateResult(entry: entry, result: result, pkaResults: pkaResults,
+                                                      minPop: minPop, totalForms: &totalForms,
+                                                      totalConformers: &totalConformers)
+                            }
+                        }
+                    }
+
+                    guard !Task.isCancelled else { break }
+
                     let smi = !entry.originalSMILES.isEmpty ? entry.originalSMILES : entry.name
                     let nm = entry.name
-                    group.addTask {
+                    group.addTask { [entry] in
                         guard !Task.isCancelled else { return nil }
 
-                        // Phase 1: Predict pKa for each ionizable site via GFN2-xTB
-                        let pkaResults = await LigandpKaPredictor.predictpKa(smiles: smi)
-                        let computedPKa = LigandpKaPredictor.pKaArray(from: pkaResults)
+                        // Run the heavy C++ work off the main actor
+                        let (result, pkaResults) = await Task.detached(priority: .userInitiated) {
+                            // Phase 1: pKa — either GFN2-xTB (slow, accurate) or table lookup (fast)
+                            var pkaResults: [LigandpKaPredictor.SitePKa] = []
+                            var computedPKa: [Double] = []
+                            if useGFN2 {
+                                pkaResults = await LigandpKaPredictor.predictpKa(smiles: smi)
+                                computedPKa = LigandpKaPredictor.pKaArray(from: pkaResults)
+                            }
 
-                        // Phase 2: Ensemble generation with computed pKa values
-                        let result = RDKitBridge.prepareEnsembleWithPKa(
-                            smiles: smi, name: nm,
-                            pH: ph, pkaThreshold: pkaThreshold,
-                            maxTautomers: maxTauto, maxProtomers: maxProto,
-                            energyCutoff: energyCutoff, conformersPerForm: confsPerForm,
-                            sitePKa: computedPKa
-                        )
+                            // Phase 2: Ensemble generation (C++ RDKit — CPU-heavy)
+                            let result = RDKitBridge.prepareEnsembleWithPKa(
+                                smiles: smi, name: nm,
+                                pH: ph, pkaThreshold: pkaThreshold,
+                                maxTautomers: maxTauto, maxProtomers: maxProto,
+                                energyCutoff: energyCutoff, conformersPerForm: confsPerForm,
+                                sitePKa: computedPKa
+                            )
+                            return (result, pkaResults)
+                        }.value
                         return (entry, result, pkaResults)
                     }
+                    enqueued += 1
                 }
 
+                // Drain remaining results
                 for await item in group {
                     guard !Task.isCancelled else { break }
                     guard let (entry, result, pkaResults) = item else { continue }
                     completedCount += 1
                     batchProgress = (completedCount, toProcess.count)
-
-                    // Log pKa predictions
-                    if !pkaResults.isEmpty {
-                        let pkaLog = pkaResults.map { p in
-                            "\(p.groupName)[\(p.atomIdx)]: \(p.converged ? String(format: "%.1f", p.computedPKa) : "fallback \(String(format: "%.1f", p.defaultPKa))")"
-                        }.joined(separator: ", ")
-                        viewModel.log.info("pKa(\(entry.name)): \(pkaLog)", category: .molecule)
-                    }
-
                     processingMessage = "Populating \(completedCount)/\(toProcess.count): \(entry.name)"
-
-                    guard result.success, !result.members.isEmpty else {
-                        viewModel.log.error("Failed to populate \(entry.name): \(result.errorMessage)", category: .molecule)
-                        continue
-                    }
-
-                    // Convert flat ensemble members → hierarchical ChemicalForm array
-                    var forms = RDKitBridge.ensembleResultToForms(result)
-                    guard !forms.isEmpty else { continue }
-
-                    // Filter forms by minimum Boltzmann population (always keep parent/best form)
-                    if minPop > 0 && forms.count > 1 {
-                        let preCount = forms.count
-                        forms = forms.enumerated().filter { idx, form in
-                            idx == 0 || form.boltzmannWeight >= minPop  // always keep best form
-                        }.map(\.element)
-
-                        // Re-normalize Boltzmann weights after filtering
-                        let weightSum = forms.reduce(0.0) { $0 + $1.boltzmannWeight }
-                        if weightSum > 0 {
-                            for i in forms.indices {
-                                forms[i].boltzmannWeight /= weightSum
-                            }
-                        }
-
-                        if forms.count < preCount {
-                            viewModel.log.info("\(entry.name): filtered \(preCount) → \(forms.count) forms (>\(String(format: "%.1f", minPop * 100))% population)", category: .molecule)
-                        }
-                    }
-
-                    // Update the entry with forms and best conformer
-                    var updated = entry
-                    updated.forms = forms
-                    updated.bestFormIndex = 0  // forms are sorted by energy, best first
-                    updated.atoms = forms[0].atoms
-                    updated.bonds = forms[0].bonds
-                    updated.originalSMILES = entry.originalSMILES
-                    updated.isPrepared = true
-                    updated.preparationDate = Date()
-                    updated.conformerCount = forms.reduce(0) { $0 + $1.conformerCount }
-
-                    // Recompute descriptors from the best form's SMILES
-                    if let desc = RDKitBridge.computeDescriptors(smiles: forms[0].smiles) {
-                        updated.descriptors = desc
-                    }
-
-                    // Remove any legacy children from old runs
-                    db.batchMutate { entries in
-                        entries.removeAll { $0.parentID == entry.id }
-                    }
-                    db.update(updated)
-
-                    totalForms += forms.count
-                    totalConformers += updated.conformerCount
-                    if forms.count > 1 {
-                        expandedEntryIDs.insert(entry.id)
-                    }
+                    processPopulateResult(entry: entry, result: result, pkaResults: pkaResults,
+                                          minPop: minPop, totalForms: &totalForms,
+                                          totalConformers: &totalConformers)
                 }
             }
 
@@ -1445,6 +1429,75 @@ struct LigandDatabaseWindow: View {
                     category: .molecule
                 )
             }
+        }
+    }
+
+    /// Process a single completed Populate & Prepare result — shared by throttle drain and final drain.
+    private func processPopulateResult(
+        entry: LigandEntry, result: RDKitBridge.EnsembleResult,
+        pkaResults: [LigandpKaPredictor.SitePKa],
+        minPop: Double, totalForms: inout Int, totalConformers: inout Int
+    ) {
+        // Log pKa predictions
+        if !pkaResults.isEmpty {
+            let pkaLog = pkaResults.map { p in
+                "\(p.groupName)[\(p.atomIdx)]: \(p.converged ? String(format: "%.1f", p.computedPKa) : "fallback \(String(format: "%.1f", p.defaultPKa))")"
+            }.joined(separator: ", ")
+            viewModel.log.info("pKa(\(entry.name)): \(pkaLog)", category: .molecule)
+        }
+
+        guard result.success, !result.members.isEmpty else {
+            viewModel.log.error("Failed to populate \(entry.name): \(result.errorMessage)", category: .molecule)
+            return
+        }
+
+        // Convert flat ensemble members → hierarchical ChemicalForm array
+        var forms = RDKitBridge.ensembleResultToForms(result)
+        guard !forms.isEmpty else { return }
+
+        // Filter forms by minimum Boltzmann population (always keep parent/best form)
+        if minPop > 0 && forms.count > 1 {
+            let preCount = forms.count
+            forms = forms.enumerated().filter { idx, form in
+                idx == 0 || form.boltzmannWeight >= minPop
+            }.map(\.element)
+
+            let weightSum = forms.reduce(0.0) { $0 + $1.boltzmannWeight }
+            if weightSum > 0 {
+                for i in forms.indices {
+                    forms[i].boltzmannWeight /= weightSum
+                }
+            }
+
+            if forms.count < preCount {
+                viewModel.log.info("\(entry.name): filtered \(preCount) → \(forms.count) forms (>\(String(format: "%.1f", minPop * 100))% population)", category: .molecule)
+            }
+        }
+
+        // Update the entry with forms and best conformer
+        var updated = entry
+        updated.forms = forms
+        updated.bestFormIndex = 0
+        updated.atoms = forms[0].atoms
+        updated.bonds = forms[0].bonds
+        updated.originalSMILES = entry.originalSMILES
+        updated.isPrepared = true
+        updated.preparationDate = Date()
+        updated.conformerCount = forms.reduce(0) { $0 + $1.conformerCount }
+
+        if let desc = RDKitBridge.computeDescriptors(smiles: forms[0].smiles) {
+            updated.descriptors = desc
+        }
+
+        db.batchMutate { entries in
+            entries.removeAll { $0.parentID == entry.id }
+        }
+        db.update(updated)
+
+        totalForms += forms.count
+        totalConformers += updated.conformerCount
+        if forms.count > 1 {
+            expandedEntryIDs.insert(entry.id)
         }
     }
 

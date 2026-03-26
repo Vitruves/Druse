@@ -287,6 +287,11 @@ final class LigandDatabase {
                                              minimize: minimize, computeCharges: charges)
                 }.value
 
+                // Build entries off the hot path, then batch-insert
+                let batchSize = 500
+                var batch: [LigandEntry] = []
+                batch.reserveCapacity(min(batchSize, results.count))
+
                 for (i, result) in results.enumerated() {
                     let line = lines[i]
                     var entry = LigandEntry(name: line.name, smiles: line.smiles)
@@ -297,16 +302,29 @@ final class LigandDatabase {
                         entry.preparationDate = Date()
                         entry.conformerCount = 1
                     }
-                    // Compute descriptors
                     if let desc = await Task.detached(operation: { RDKitBridge.computeDescriptors(smiles: line.smiles) }).value {
                         entry.descriptors = desc
                     }
-                    entries.append(entry)
+                    batch.append(entry)
+
+                    // Flush batch periodically to show progress without triggering didSet per-row
+                    if batch.count >= batchSize {
+                        let chunk = batch
+                        batchMutate { entries in entries.append(contentsOf: chunk) }
+                        batch.removeAll(keepingCapacity: true)
+                    }
                     processingProgress = Double(i + 1) / Double(results.count)
                 }
+                // Flush remaining
+                if !batch.isEmpty {
+                    let chunk = batch
+                    batchMutate { entries in entries.append(contentsOf: chunk) }
+                }
             } else {
-                for line in lines {
-                    entries.append(LigandEntry(name: line.name, smiles: line.smiles))
+                let newEntries = lines.map { LigandEntry(name: $0.name, smiles: $0.smiles) }
+                batchMutate { entries in
+                    entries.reserveCapacity(entries.count + newEntries.count)
+                    entries.append(contentsOf: newEntries)
                 }
             }
 

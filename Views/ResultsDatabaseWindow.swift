@@ -108,17 +108,17 @@ struct ResultsDatabaseWindow: View {
     private var toolbar: some View {
         HStack(spacing: 12) {
             Image(systemName: "chart.bar.xaxis")
-                .font(.system(size: 14))
+                .font(.body)
                 .foregroundStyle(.secondary)
 
             Text("Results Database")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.headline)
 
             if let ligandName = viewModel.molecules.ligand?.name, !ligandName.isEmpty {
                 Text(ligandName)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 2)
                     .background(Capsule().fill(Color.accentColor.opacity(0.1)))
             }
@@ -128,7 +128,7 @@ struct ResultsDatabaseWindow: View {
             // Sort controls
             HStack(spacing: 4) {
                 Text("Sort:")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                 Picker("", selection: $sortField) {
                     ForEach(SortField.allCases, id: \.self) { field in
@@ -141,7 +141,7 @@ struct ResultsDatabaseWindow: View {
 
                 Button(action: { sortAscending.toggle() }) {
                     Image(systemName: sortAscending ? "arrow.up" : "arrow.down")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                 }
                 .buttonStyle(.plain)
                 .help(sortAscending ? "Sort descending" : "Sort ascending")
@@ -153,7 +153,7 @@ struct ResultsDatabaseWindow: View {
             if !viewModel.docking.batchResults.isEmpty {
                 Button(action: { showCorrelation = true }) {
                     Label("Correlation", systemImage: "chart.line.uptrend.xyaxis")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -164,7 +164,7 @@ struct ResultsDatabaseWindow: View {
             HStack(spacing: 4) {
                 Button(action: { viewModel.exportDockingResultsSDF() }) {
                     Label("SDF", systemImage: "doc.text")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -172,7 +172,7 @@ struct ResultsDatabaseWindow: View {
 
                 Button(action: { viewModel.exportDockingResultsCSV() }) {
                     Label("CSV", systemImage: "tablecells")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -181,7 +181,7 @@ struct ResultsDatabaseWindow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     // MARK: - Batch Ligand List
@@ -190,11 +190,11 @@ struct ResultsDatabaseWindow: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Label("Ligands", systemImage: "tray.full")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                 Spacer()
                 Text("\(viewModel.docking.batchResults.count)")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
             }
             .padding(8)
 
@@ -207,26 +207,26 @@ struct ResultsDatabaseWindow: View {
                         let bestEnergy = entry.results.first?.energy ?? .infinity
                         let affinityData = ligandAffinityData(for: entry.ligandName)
 
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             Text("#\(rank + 1)")
-                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .font(.footnote.monospaced().weight(.bold))
                                 .foregroundStyle(rank == 0 ? .green : .secondary)
                                 .frame(width: 24, alignment: .trailing)
 
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(entry.ligandName)
-                                    .font(.system(size: 10, weight: .medium))
+                                    .font(.footnote.weight(.medium))
                                     .lineLimit(1)
-                                HStack(spacing: 6) {
+                                HStack(spacing: 8) {
                                     Text(String(format: "%.1f", bestEnergy))
-                                        .font(.system(size: 9, design: .monospaced))
+                                        .font(.footnote.monospaced())
                                         .foregroundStyle(energyColor(bestEnergy))
                                     Text("\(entry.results.count)p")
-                                        .font(.system(size: 9, design: .monospaced))
+                                        .font(.footnote.monospaced())
                                         .foregroundStyle(.secondary)
                                     if let ki = affinityData?.ki {
                                         Text(String(format: "Ki:%.1f", ki))
-                                            .font(.system(size: 9, design: .monospaced))
+                                            .font(.footnote.monospaced())
                                             .foregroundStyle(.purple)
                                     }
                                 }
@@ -253,7 +253,7 @@ struct ResultsDatabaseWindow: View {
                 }
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     // MARK: - Pose Table
@@ -264,7 +264,7 @@ struct ResultsDatabaseWindow: View {
             if viewModel.docking.selectedPoseIndices.count > 1 {
                 HStack {
                     Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button("View Selected Poses") {
@@ -299,7 +299,7 @@ struct ResultsDatabaseWindow: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+            .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
@@ -318,7 +318,7 @@ struct ResultsDatabaseWindow: View {
     @ViewBuilder
     private func tableHeader(_ title: String, width: CGFloat) -> some View {
         Text(title)
-            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .font(.footnote.monospaced().weight(.semibold))
             .foregroundStyle(.secondary)
             .frame(width: width, alignment: .leading)
     }
@@ -331,7 +331,7 @@ struct ResultsDatabaseWindow: View {
             Button(action: { viewModel.togglePoseSelection(at: index) }) {
                 Image(systemName: viewModel.docking.selectedPoseIndices.contains(index)
                       ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 10))
+                    .font(.footnote)
                     .foregroundStyle(viewModel.docking.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.3))
             }
             .buttonStyle(.plain)
@@ -339,57 +339,50 @@ struct ResultsDatabaseWindow: View {
             .help("Select for multi-pose overlay")
 
             Text("#\(index + 1)")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .font(.footnote.monospaced().weight(.bold))
                 .foregroundStyle(.secondary)
                 .frame(width: 40, alignment: .leading)
 
-            if viewModel.docking.scoringMethod == .druseAffinity, let pKd = result.mlPKd {
-                Text(viewModel.docking.affinityDisplayUnit.format(pKd))
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
-                    .frame(width: 80, alignment: .leading)
-            } else {
-                Text(String(format: "%.2f", result.energy))
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(energyColor(result.energy))
-                    .frame(width: 80, alignment: .leading)
-            }
+            Text(String(format: "%.2f", result.energy))
+                .font(.footnote.monospaced().weight(.semibold))
+                .foregroundStyle(energyColor(result.energy))
+                .frame(width: 80, alignment: .leading)
 
             Text(String(format: "%.1f", result.vdwEnergy))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 65, alignment: .leading)
 
             Text(String(format: "%.1f", result.elecEnergy))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 65, alignment: .leading)
 
             Text(String(format: "%.1f", result.hbondEnergy))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 65, alignment: .leading)
 
             Text(String(format: "%.1f", result.torsionPenalty))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 65, alignment: .leading)
 
             if result.clusterID >= 0 {
                 Text("C\(result.clusterID)")
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .font(.footnote.monospaced().weight(.medium))
                     .foregroundStyle(.cyan)
                     .frame(width: 60, alignment: .leading)
             } else {
                 Text("-")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
                     .frame(width: 60, alignment: .leading)
             }
 
             Text("\(result.generation)")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(.footnote.monospaced())
+                .foregroundStyle(.secondary)
                 .frame(width: 45, alignment: .leading)
 
             Spacer()
@@ -411,7 +404,7 @@ struct ResultsDatabaseWindow: View {
                     showInteractionDiagram = true
                 } label: {
                     Image(systemName: "circle.hexagongrid")
-                        .font(.system(size: 9))
+                        .font(.footnote)
                 }
                 .controlSize(.mini)
                 .buttonStyle(.bordered)
@@ -420,7 +413,7 @@ struct ResultsDatabaseWindow: View {
             .frame(width: 100, alignment: .trailing)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
         .background(isSelected ? Color.accentColor.opacity(0.12) : (displayIndex % 2 == 0 ? Color.clear : Color.primary.opacity(0.02)))
         .contentShape(Rectangle())
         .onTapGesture {
@@ -437,20 +430,14 @@ struct ResultsDatabaseWindow: View {
             // Header
             HStack {
                 Label("Pose #\(index + 1)", systemImage: "cube")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                 Spacer()
-                if viewModel.docking.scoringMethod == .druseAffinity, let pKd = result.mlPKd {
-                    Text("\(viewModel.docking.affinityDisplayUnit.format(pKd)) \(viewModel.docking.affinityDisplayUnit.unitLabel)")
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        .foregroundStyle(pKd > 8 ? Color.green : pKd > 5 ? .yellow : .red)
-                } else {
-                    Text(String(format: "%.2f kcal/mol", result.energy))
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        .foregroundStyle(energyColor(result.energy))
-                }
+                Text(String(format: "%.2f kcal/mol", result.energy))
+                    .font(.subheadline.monospaced().weight(.bold))
+                    .foregroundStyle(energyColor(result.energy))
             }
-            .padding(10)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+            .padding(12)
+            .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
@@ -472,7 +459,7 @@ struct ResultsDatabaseWindow: View {
                     Divider()
 
                     // Action buttons
-                    VStack(spacing: 6) {
+                    VStack(spacing: 8) {
                         Button(action: {
                             viewModel.showDockingPose(at: index)
                             viewModel.docking.interactionDiagramPoseIndex = index
@@ -496,54 +483,54 @@ struct ResultsDatabaseWindow: View {
                         .help("Display this pose in the 3D viewer")
                     }
                 }
-                .padding(10)
+                .padding(12)
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     @ViewBuilder
     private func energyBreakdownSection(result: DockingResult) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Energy Breakdown")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
 
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
                 GridRow {
-                    Text("Total").font(.system(size: 10, weight: .medium))
+                    Text("Total").font(.footnote.weight(.medium))
                     Text(String(format: "%.2f kcal/mol", result.energy))
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .font(.footnote.monospaced().weight(.bold))
                         .foregroundStyle(energyColor(result.energy))
                 }
                 GridRow {
-                    Text("Steric (vdW)").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Steric (vdW)").font(.footnote).foregroundStyle(.secondary)
                     Text(String(format: "%.2f", result.stericEnergy))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 GridRow {
-                    Text("Hydrophobic").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Hydrophobic").font(.footnote).foregroundStyle(.secondary)
                     Text(String(format: "%.2f", result.hydrophobicEnergy))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 GridRow {
-                    Text("H-bond").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("H-bond").font(.footnote).foregroundStyle(.secondary)
                     Text(String(format: "%.2f", result.hbondEnergy))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 GridRow {
-                    Text("Torsion penalty").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Torsion penalty").font(.footnote).foregroundStyle(.secondary)
                     Text(String(format: "%.2f", result.torsionPenalty))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 if let refine = result.refinementEnergy {
                     GridRow {
-                        Text("Refined (OpenMM)").font(.system(size: 10)).foregroundStyle(.purple)
+                        Text("Refined (OpenMM)").font(.footnote).foregroundStyle(.purple)
                         Text(String(format: "%.2f", refine))
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .font(.footnote.monospaced().weight(.medium))
                             .foregroundStyle(.purple)
                     }
                 }
@@ -553,10 +540,10 @@ struct ResultsDatabaseWindow: View {
             if result.clusterID >= 0 {
                 HStack(spacing: 4) {
                     Text("Cluster \(result.clusterID)")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.footnote.weight(.medium))
                     Text("(rank \(result.clusterRank) within cluster)")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(4)
                 .background(Capsule().fill(Color.cyan.opacity(0.1)))
@@ -567,27 +554,27 @@ struct ResultsDatabaseWindow: View {
     @ViewBuilder
     private var interactionsSummary: some View {
         let interactions = viewModel.docking.currentInteractions
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Interactions")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
 
             if interactions.isEmpty {
                 Text("Select a pose to see interactions")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             } else {
                 let grouped = Dictionary(grouping: interactions, by: \.type)
                 ForEach(MolecularInteraction.InteractionType.allCases, id: \.rawValue) { type in
                     if let group = grouped[type] {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             Circle()
                                 .fill(interactionColor(type))
                                 .frame(width: 6, height: 6)
                             Text(interactionLabel(type))
-                                .font(.system(size: 10))
+                                .font(.footnote)
                             Spacer()
                             Text("\(group.count)")
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .font(.footnote.monospaced().weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -604,7 +591,7 @@ struct ResultsDatabaseWindow: View {
         if let protein = viewModel.molecules.protein, !interactions.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Interaction Map")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
 
                 Canvas { context, size in
                     drawMiniDiagram(context: context, size: size,
@@ -710,7 +697,7 @@ struct ResultsDatabaseWindow: View {
         VStack(spacing: 0) {
             HStack {
                 Label("Docking vs. Experimental Affinity", systemImage: "chart.line.uptrend.xyaxis")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.headline)
                 Spacer()
                 Button("Done") { showCorrelation = false }
                     .buttonStyle(.bordered)
@@ -726,13 +713,13 @@ struct ResultsDatabaseWindow: View {
                 VStack(spacing: 12) {
                     Image(systemName: "chart.line.uptrend.xyaxis")
                         .font(.system(size: 36))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                     Text("No Affinity Data Available")
-                        .font(.system(size: 14, weight: .medium))
+                        .font(.body.weight(.medium))
                         .foregroundStyle(.secondary)
                     Text("Import Ki, pKi, or IC50 values in the Ligand Database\nto compute rank correlation with docking scores.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -778,35 +765,35 @@ struct ResultsDatabaseWindow: View {
 
         VStack(alignment: .leading, spacing: 8) {
             Text("Correlation Statistics (n=\(n))")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                 GridRow {
-                    Text("Spearman ρ").font(.system(size: 11))
+                    Text("Spearman ρ").font(.subheadline)
                     Text(String(format: "%.3f", spearman))
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .font(.subheadline.monospaced().weight(.bold))
                         .foregroundStyle(abs(spearman) > 0.7 ? .green : abs(spearman) > 0.4 ? .yellow : .red)
                 }
                 GridRow {
-                    Text("Pearson r").font(.system(size: 11))
+                    Text("Pearson r").font(.subheadline)
                     Text(String(format: "%.3f", pearson))
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .font(.subheadline.monospaced().weight(.bold))
                         .foregroundStyle(abs(pearson) > 0.7 ? .green : abs(pearson) > 0.4 ? .yellow : .red)
                 }
                 GridRow {
-                    Text("Kendall τ").font(.system(size: 11))
+                    Text("Kendall τ").font(.subheadline)
                     Text(String(format: "%.3f", kendall))
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .font(.subheadline.monospaced().weight(.bold))
                         .foregroundStyle(abs(kendall) > 0.6 ? .green : abs(kendall) > 0.3 ? .yellow : .red)
                 }
                 GridRow {
-                    Text("R²").font(.system(size: 11))
+                    Text("R²").font(.subheadline)
                     Text(String(format: "%.3f", pearson * pearson))
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.subheadline.monospaced())
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(10)
+            .padding(12)
             .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.05)))
         }
     }
@@ -818,16 +805,16 @@ struct ResultsDatabaseWindow: View {
 
         VStack(alignment: .leading, spacing: 8) {
             Text("Rank Comparison")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             // Header
             HStack(spacing: 0) {
-                Text("Dock Rank").font(.system(size: 9, weight: .semibold)).frame(width: 70, alignment: .leading)
-                Text("Ligand").font(.system(size: 9, weight: .semibold)).frame(width: 120, alignment: .leading)
-                Text("Energy").font(.system(size: 9, weight: .semibold)).frame(width: 70, alignment: .leading)
-                Text("pKi").font(.system(size: 9, weight: .semibold)).frame(width: 60, alignment: .leading)
-                Text("Aff Rank").font(.system(size: 9, weight: .semibold)).frame(width: 70, alignment: .leading)
-                Text("Δ Rank").font(.system(size: 9, weight: .semibold)).frame(width: 60, alignment: .leading)
+                Text("Dock Rank").font(.footnote.weight(.semibold)).frame(width: 70, alignment: .leading)
+                Text("Ligand").font(.footnote.weight(.semibold)).frame(width: 120, alignment: .leading)
+                Text("Energy").font(.footnote.weight(.semibold)).frame(width: 70, alignment: .leading)
+                Text("pKi").font(.footnote.weight(.semibold)).frame(width: 60, alignment: .leading)
+                Text("Aff Rank").font(.footnote.weight(.semibold)).frame(width: 70, alignment: .leading)
+                Text("Δ Rank").font(.footnote.weight(.semibold)).frame(width: 60, alignment: .leading)
             }
             .foregroundStyle(.secondary)
             .padding(.horizontal, 6)
@@ -838,30 +825,30 @@ struct ResultsDatabaseWindow: View {
 
                 HStack(spacing: 0) {
                     Text("#\(dockRank + 1)")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .font(.footnote.monospaced().weight(.bold))
                         .frame(width: 70, alignment: .leading)
 
                     Text(pair.ligand)
-                        .font(.system(size: 10))
+                        .font(.footnote)
                         .lineLimit(1)
                         .frame(width: 120, alignment: .leading)
 
                     Text(String(format: "%.1f", pair.dockingEnergy))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(energyColor(pair.dockingEnergy))
                         .frame(width: 70, alignment: .leading)
 
                     Text(String(format: "%.1f", pair.pKi))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.purple)
                         .frame(width: 60, alignment: .leading)
 
                     Text("#\(affRank)")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.footnote.monospaced())
                         .frame(width: 70, alignment: .leading)
 
                     Text(delta == 0 ? "=" : "±\(delta)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .font(.footnote.monospaced().weight(.medium))
                         .foregroundStyle(delta == 0 ? .green : delta <= 2 ? .yellow : .red)
                         .frame(width: 60, alignment: .leading)
                 }
@@ -876,29 +863,29 @@ struct ResultsDatabaseWindow: View {
     private var clusterConsensusSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Binding Site Consensus")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.callout.weight(.semibold))
 
             Text("Most populated cluster across all docked ligands identifies the consensus binding site.")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
 
             // Count ligands per cluster (using best pose of each ligand)
             let clusterCounts = computeClusterConsensus()
             if clusterCounts.isEmpty {
                 Text("No cluster data available")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             } else {
                 ForEach(clusterCounts.prefix(5), id: \.cluster) { entry in
                     HStack(spacing: 8) {
                         Text("Cluster \(entry.cluster)")
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.footnote.weight(.medium))
                             .foregroundStyle(.cyan)
                         ProgressView(value: Double(entry.count), total: Double(clusterCounts.first?.count ?? 1))
                             .progressViewStyle(.linear)
                             .tint(.cyan)
                         Text("\(entry.count) ligands")
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.footnote.monospaced())
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -912,13 +899,13 @@ struct ResultsDatabaseWindow: View {
         VStack(spacing: 12) {
             Image(systemName: "chart.bar.xaxis")
                 .font(.system(size: 36))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
             Text("No Docking Results")
-                .font(.system(size: 14, weight: .medium))
+                .font(.body.weight(.medium))
                 .foregroundStyle(.secondary)
             Text("Run docking from the Docking tab to see results here.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -928,22 +915,22 @@ struct ResultsDatabaseWindow: View {
     private var statusBar: some View {
         HStack {
             Text("\(displayedResults.count) poses")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
 
             if let best = displayedResults.first {
                 Text("•")
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                 Text(String(format: "Best: %.1f kcal/mol", best.energy))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
 
             if !viewModel.docking.batchResults.isEmpty {
                 Text("•")
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                 Text("\(viewModel.docking.batchResults.count) ligands in batch")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
 
@@ -952,12 +939,12 @@ struct ResultsDatabaseWindow: View {
             if let sel = selectedPoseIndex, sel < displayedResults.count {
                 Text(String(format: "Selected: Pose #%d (%.2f kcal/mol)",
                            sel + 1, displayedResults[sel].energy))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
     }
 
     // MARK: - Data Helpers

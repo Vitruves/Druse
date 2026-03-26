@@ -25,11 +25,35 @@ final class AppViewModel {
     /// Activity log
     let log = ActivityLog.shared
 
-    // ML models (scoring/detection)
-    let druseMLScoring = DruseMLScoringInference()
-    let druseRescoring = DruseRescoringInference()
+    // ML models (detection/ADMET)
     let pocketDetectorML = PocketDetectorInference()
     let admetPredictor = ADMETPredictor()
+
+    // MARK: - Guided Demo
+
+    enum DemoStep: String, CaseIterable {
+        case idle
+        case fetching        = "Fetching Trypsin from RCSB..."
+        case parsing         = "Building drug & parsing structure..."
+        case overview        = "Exploring the protein"
+        case ribbon          = "Ribbon view — secondary structure"
+        case pocketScan      = "Scanning surface for binding pockets..."
+        case pocketFound     = "S1 pocket found"
+        case gridSetup       = "Setting up docking search grid"
+        case dockingStart    = "Launching GPU genetic algorithm..."
+        case dockingRun      = "Nafamostat searching the pocket..."
+        case dockingConverge = "Converging on optimal binding pose..."
+        case scoring         = "Scoring & ranking poses"
+        case bestPose        = "Best pose — analyzing interactions"
+        case interactions    = "Molecular interactions mapped"
+        case complete        = "Demo complete — explore the results!"
+    }
+
+    var demoStep: DemoStep = .idle
+    var demoNarration: String = ""
+    var isDemoRunning: Bool {
+        demoStep != .idle && demoStep != .complete
+    }
 
     // MARK: - Context menu target
 
@@ -52,7 +76,7 @@ final class AppViewModel {
     /// - Parameters:
     ///   - molecule: The molecule to set as active ligand.
     ///   - entryID: Optional UUID of the `LigandEntry` this molecule came from.
-    func setLigandForDocking(_ molecule: Molecule, entryID: UUID? = nil) {
+    func setLigandForDocking(_ molecule: Molecule, entryID: UUID? = nil, forms: [ChemicalForm] = []) {
         let normalizedAtoms = molecule.atoms.enumerated().map { i, atom in
             Atom(id: i, element: atom.element, position: atom.position,
                  name: atom.name,
@@ -72,6 +96,7 @@ final class AppViewModel {
         molecules.ligand = normalizedLigand
         activeLigandEntryID = entryID
         docking.originalDockingLigand = nil
+        docking.ligandForms = forms
         docking.dockingResults = []
         docking.currentInteractions = []
         renderer?.updateInteractionLines([])
@@ -473,6 +498,22 @@ final class AppViewModel {
                     // side chains to the ribbon backbone)
                     let backboneExcludeNames: Set<String> = ["N", "C", "O", "OXT", "H", "HA"]
 
+                    // Collect positions of protein atoms involved in interactions so
+                    // backbone atoms at interaction endpoints are rendered as spheres
+                    // (otherwise H-bond lines to backbone N/O point to empty space)
+                    struct PosKey: Hashable {
+                        let x, y, z: Int32
+                        init(_ p: SIMD3<Float>) {
+                            x = Int32((p.x * 100).rounded())
+                            y = Int32((p.y * 100).rounded())
+                            z = Int32((p.z * 100).rounded())
+                        }
+                    }
+                    var interactingPositions = Set<PosKey>()
+                    for ixn in docking.currentInteractions {
+                        interactingPositions.insert(PosKey(ixn.proteinPosition))
+                    }
+
                     // First pass: collect all side chain atom indices including CA
                     var scPosToNew: [Int: Int] = [:]
                     for residueIdx in sideChainResidueIndices {
@@ -485,7 +526,9 @@ final class AppViewModel {
                             if !workspace.showHydrogens && atom.element == .H { continue }
                             let trimmedName = atom.name.trimmingCharacters(in: .whitespaces)
                             // Keep CA (alpha carbon) — it's the attachment point to the ribbon
-                            if backboneExcludeNames.contains(trimmedName) { continue }
+                            // Also keep backbone atoms involved in interactions (e.g. H-bonds to N/O)
+                            if backboneExcludeNames.contains(trimmedName)
+                                && !interactingPositions.contains(PosKey(atom.position)) { continue }
                             scPosToNew[atomIdx] = allAtoms.count
                             allAtoms.append(Atom(
                                 id: allAtoms.count, element: atom.element, position: atom.position,
@@ -495,6 +538,25 @@ final class AppViewModel {
                             ))
                         }
                     }
+                    // Also add protein atoms from interactions whose residues aren't in
+                    // the sidechain set (e.g. contacts just outside the 5 Å cutoff)
+                    if !interactingPositions.isEmpty {
+                        for (atomIdx, atom) in prot.atoms.enumerated() {
+                            guard scPosToNew[atomIdx] == nil else { continue }
+                            if workspace.hiddenChainIDs.contains(atom.chainID) { continue }
+                            if atom.element == .H { continue }
+                            if interactingPositions.contains(PosKey(atom.position)) {
+                                scPosToNew[atomIdx] = allAtoms.count
+                                allAtoms.append(Atom(
+                                    id: allAtoms.count, element: atom.element, position: atom.position,
+                                    name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                                    chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                                    isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
+                                ))
+                            }
+                        }
+                    }
+
                     // Second pass: remap bonds where at least both endpoints are in the side chain set
                     for bond in prot.bonds {
                         if let a = scPosToNew[bond.atomIndex1], let b = scPosToNew[bond.atomIndex2] {
@@ -507,6 +569,7 @@ final class AppViewModel {
             renderer.selectedAtomIndex = workspace.selectedAtomIndex ?? -1
             renderer.selectedResidueAtomIndices = []
             renderer.renderMode = .ballAndStick
+            renderer.ligandRenderMode = workspace.ligandRenderMode
             renderer.ligandVisible = workspace.showLigand && !docking.isDocking && molecules.ligand != nil
             renderer.updateMoleculeData(atoms: allAtoms, bonds: allBonds)
             return
@@ -569,6 +632,7 @@ final class AppViewModel {
             }
         )
         renderer.renderMode = workspace.renderMode
+        renderer.ligandRenderMode = workspace.ligandRenderMode
 
         renderer.enableClipping = workspace.enableClipping
         renderer.clipNearZ = workspace.clipNearZ
@@ -583,8 +647,12 @@ final class AppViewModel {
         if let prot = molecules.protein {
             var colorMap: [String: SIMD3<Float>] = [:]
             let palette = WorkspaceState.MoleculeColorScheme.chainPalette
+            // Default per-chain mode depends on the global color scheme:
+            // - .chainColored → chains get palette colors by default
+            // - .element / .ligandFocus → chains get element (CPK) colors by default
+            let defaultMode: WorkspaceState.ChainColorMode = workspace.colorScheme == .chainColored ? .chainDefault : .cpk
             for (i, chain) in prot.chains.enumerated() {
-                let mode = workspace.chainColorModes[chain.id] ?? .chainDefault
+                let mode = workspace.chainColorModes[chain.id] ?? defaultMode
                 switch mode {
                 case .cpk:
                     break // omit from map → renderer falls through to element colors
@@ -789,8 +857,25 @@ final class ContextMenuTarget: NSObject {
         viewModel?.selectChain(chainID)
     }
 
-    @objc func selectNearbyResiduesAction() {
-        viewModel?.selectResiduesWithinDistance(5.0)
+    @objc func selectNearbyAction(_ sender: NSMenuItem) {
+        guard let distance = sender.representedObject as? Float else { return }
+        viewModel?.selectResiduesWithinDistance(distance)
+    }
+
+    @objc func extendByOneResidueAction() {
+        viewModel?.extendSelectionByOneResidue()
+    }
+
+    @objc func shrinkByOneResidueAction() {
+        viewModel?.shrinkSelectionByOneResidue()
+    }
+
+    @objc func invertSelectionAction() {
+        viewModel?.invertSelection()
+    }
+
+    @objc func createSubsetAction() {
+        viewModel?.createSubsetFromSelection()
     }
 
     @objc func definePocketAction() {

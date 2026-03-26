@@ -207,6 +207,46 @@ enum GemmiBridge {
         return indices.prefix(Int(count)).map(Int.init)
     }
 
+    // MARK: - Entity Sequence Extraction (SEQRES)
+
+    struct ChainSequence: Sendable {
+        let chainID: String
+        let residueNames: [String]  // 3-letter codes from SEQRES / entity_poly_seq
+    }
+
+    static func entitySequences(content: String) throws -> [ChainSequence] {
+        guard let result = content.withCString({ druse_get_entity_sequences($0) }) else {
+            throw GemmiError.parseFailed("druse_get_entity_sequences returned nil")
+        }
+        defer { druse_free_entity_sequence_result(result) }
+
+        let parsed = result.pointee
+        guard parsed.success else {
+            throw GemmiError.parseFailed(fixedCString(parsed.errorMessage))
+        }
+
+        var sequences: [ChainSequence] = []
+        sequences.reserveCapacity(Int(parsed.chainCount))
+
+        for i in 0..<Int(parsed.chainCount) {
+            let chain = parsed.chains[i]
+            let chainID = fixedCString(chain.chainID)
+
+            var residueNames: [String] = []
+            residueNames.reserveCapacity(Int(chain.residueCount))
+            for j in 0..<Int(chain.residueCount) {
+                let name = withUnsafePointer(to: chain.residueNames[j]) { ptr in
+                    ptr.withMemoryRebound(to: CChar.self, capacity: 8) { String(cString: $0) }
+                }
+                residueNames.append(name)
+            }
+
+            sequences.append(ChainSequence(chainID: chainID, residueNames: residueNames))
+        }
+
+        return sequences
+    }
+
     private static func fixedCString<T>(_ value: T) -> String {
         withUnsafePointer(to: value) { pointer in
             pointer.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) { cString in

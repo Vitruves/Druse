@@ -80,7 +80,7 @@ extension DockingEngine {
         return positions
     }
 
-    func extractBestPose(from buffer: MTLBuffer? = nil, ligandAtoms: [Atom], centroid: SIMD3<Float>, maxPoses: Int? = nil) -> DockingResult? {
+    func extractBestPose(from buffer: MTLBuffer? = nil, ligandAtoms: [Atom], centroid: SIMD3<Float>, maxPoses: Int? = nil, scoringMethod: ScoringMethod = .vina) -> DockingResult? {
         guard let buffer = buffer ?? populationBuffer else { return nil }
         let poseCount = min(maxPoses ?? Int.max, buffer.length / MemoryLayout<DockPose>.stride)
         guard poseCount > 0 else { return nil }
@@ -114,6 +114,7 @@ extension DockingEngine {
         )
         result.drusinaCorrection = p.drusinaCorrection
         result.constraintPenalty = p.constraintPenalty
+
         return result
     }
 
@@ -123,7 +124,8 @@ extension DockingEngine {
         centroid: SIMD3<Float>,
         idOffset: Int = 0,
         sortByEnergy: Bool = true,
-        maxPoses: Int? = nil
+        maxPoses: Int? = nil,
+        scoringMethod: ScoringMethod = .vina
     ) -> [DockingResult] {
         guard let buffer = buffer ?? populationBuffer else { return [] }
         let poseCount = min(maxPoses ?? Int.max, buffer.length / MemoryLayout<DockPose>.stride)
@@ -156,6 +158,7 @@ extension DockingEngine {
             )
             r.drusinaCorrection = p.drusinaCorrection
             r.constraintPenalty = p.constraintPenalty
+
             results.append(r)
         }
         return sortByEnergy ? results.sorted { $0.energy < $1.energy } : results
@@ -260,22 +263,25 @@ extension DockingEngine {
         var matrix = [Float](repeating: 0, count: matrixSize)
         // Parallel computation for large result sets
         if n > 50 {
-            matrix.withUnsafeMutableBufferPointer { buf in
-                nonisolated(unsafe) let base = buf.baseAddress!
-                DispatchQueue.concurrentPerform(iterations: n) { i in
-                    for j in (i+1)..<n {
-                        let idx = i * n - i * (i + 1) / 2 + j - i - 1
-                        let posA = results[i].transformedAtomPositions
-                        let posB = results[j].transformedAtomPositions
-                        guard posA.count == posB.count, !posA.isEmpty else {
-                            base[idx] = .infinity
-                            continue
-                        }
-                        let s = zip(posA, posB).reduce(Float(0)) { $0 + simd_distance_squared($1.0, $1.1) }
-                        base[idx] = sqrt(s / Float(posA.count))
+            // Parallel RMSD computation using raw pointer to avoid inout capture issues
+            let storage = UnsafeMutablePointer<Float>.allocate(capacity: matrixSize)
+            storage.initialize(repeating: 0, count: matrixSize)
+            nonisolated(unsafe) let base = storage
+            DispatchQueue.concurrentPerform(iterations: n) { i in
+                for j in (i+1)..<n {
+                    let idx = i * n - i * (i + 1) / 2 + j - i - 1
+                    let posA = results[i].transformedAtomPositions
+                    let posB = results[j].transformedAtomPositions
+                    guard posA.count == posB.count, !posA.isEmpty else {
+                        base[idx] = .infinity
+                        continue
                     }
+                    let s = zip(posA, posB).reduce(Float(0)) { $0 + simd_distance_squared($1.0, $1.1) }
+                    base[idx] = sqrt(s / Float(posA.count))
                 }
             }
+            for i in 0..<matrixSize { matrix[i] = storage[i] }
+            storage.deallocate()
         } else {
             for i in 0..<n {
                 for j in (i+1)..<n {

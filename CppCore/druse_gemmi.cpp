@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <gemmi/chemcomp.hpp>
+#include <gemmi/metadata.hpp>
 #include <gemmi/mmcif.hpp>
 #include <gemmi/mmread.hpp>
 #include <gemmi/neighbor.hpp>
@@ -449,4 +450,107 @@ int32_t druse_find_structure_neighbors(
     } catch (...) {
         return -1;
     }
+}
+
+// ============================================================================
+// Entity Sequence Extraction (SEQRES / entity_poly_seq)
+// ============================================================================
+
+DruseEntitySequenceResult* druse_get_entity_sequences(const char* content) {
+    auto* result = new DruseEntitySequenceResult();
+    std::memset(result, 0, sizeof(DruseEntitySequenceResult));
+
+    if (!content || !content[0]) {
+        result->success = false;
+        std::strncpy(result->errorMessage, "Empty structure content", sizeof(result->errorMessage) - 1);
+        return result;
+    }
+
+    try {
+        gemmi::Structure structure = read_structure_from_text(content);
+        if (structure.models.empty()) {
+            result->success = false;
+            std::strncpy(result->errorMessage, "No coordinate model found", sizeof(result->errorMessage) - 1);
+            return result;
+        }
+
+        gemmi::setup_entities(structure);
+
+        // Collect per-chain sequences: map author chain ID → sequence of 3-letter codes
+        struct ChainSeq {
+            std::string chainID;
+            std::vector<std::string> residues;
+        };
+        std::vector<ChainSeq> chainSeqs;
+
+        gemmi::Model& model = structure.models.front();
+        for (const gemmi::Chain& chain : model.chains) {
+            // Get the polymer subchain for this chain
+            auto polymer = chain.get_polymer();
+            if (polymer.size() == 0) continue;
+
+            // Find the entity for this polymer's subchain
+            std::string subchain = polymer.subchain_id();
+            const gemmi::Entity* entity = gemmi::find_entity_of_subchain(subchain, structure.entities);
+            if (!entity || entity->full_sequence.empty()) continue;
+            if (entity->entity_type != gemmi::EntityType::Polymer) continue;
+
+            ChainSeq cs;
+            cs.chainID = chain.name.empty() ? "A" : chain.name;
+            cs.residues.reserve(entity->full_sequence.size());
+            for (const std::string& mon : entity->full_sequence) {
+                cs.residues.push_back(gemmi::Entity::first_mon(mon));
+            }
+            chainSeqs.push_back(std::move(cs));
+        }
+
+        if (chainSeqs.empty()) {
+            result->success = true;
+            result->chainCount = 0;
+            result->chains = nullptr;
+            return result;
+        }
+
+        result->chainCount = static_cast<int32_t>(chainSeqs.size());
+        result->chains = new DruseChainSequence[result->chainCount];
+
+        for (int32_t i = 0; i < result->chainCount; ++i) {
+            const auto& cs = chainSeqs[i];
+            DruseChainSequence& out = result->chains[i];
+            std::memset(&out, 0, sizeof(DruseChainSequence));
+            copy_fixed(out.chainID, cs.chainID);
+            out.residueCount = static_cast<int32_t>(cs.residues.size());
+
+            if (out.residueCount > 0) {
+                out.residueNames = new char[out.residueCount][8];
+                for (int32_t j = 0; j < out.residueCount; ++j) {
+                    std::memset(out.residueNames[j], 0, 8);
+                    std::strncpy(out.residueNames[j], cs.residues[j].c_str(), 7);
+                }
+            }
+        }
+
+        result->success = true;
+        return result;
+
+    } catch (const std::exception& error) {
+        result->success = false;
+        std::strncpy(result->errorMessage, error.what(), sizeof(result->errorMessage) - 1);
+        return result;
+    } catch (...) {
+        result->success = false;
+        std::strncpy(result->errorMessage, "Unknown error extracting entity sequences", sizeof(result->errorMessage) - 1);
+        return result;
+    }
+}
+
+void druse_free_entity_sequence_result(DruseEntitySequenceResult* result) {
+    if (!result) return;
+    if (result->chains) {
+        for (int32_t i = 0; i < result->chainCount; ++i) {
+            delete[] result->chains[i].residueNames;
+        }
+        delete[] result->chains;
+    }
+    delete result;
 }

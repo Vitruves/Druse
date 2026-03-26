@@ -228,7 +228,124 @@ extension AppViewModel {
         }
     }
 
-    // MARK: - Fix Missing Residues (Detection)
+    // MARK: - Fix Missing Residues (Detection + Loop Building + Atom Reconstruction)
+
+    /// Combined action: detect gaps, build missing loops, and reconstruct missing atoms.
+    func detectAndFixMissingResidues() {
+        guard let prot = molecules.protein else {
+            log.info("[Prep] fixMissingResidues skipped: no protein loaded", category: .prep)
+            return
+        }
+
+        let gaps = ProteinPreparation.detectMissingResidues(in: prot.atoms)
+        if gaps.isEmpty {
+            log.success("No missing residues detected -- sequence is contiguous", category: .prep)
+        } else {
+            log.warn("Detected \(gaps.count) gap(s) in residue numbering:", category: .prep)
+            for gap in gaps {
+                let count = gap.gapEnd - gap.gapStart + 1
+                log.warn("  Chain \(gap.chainID): residues \(gap.gapStart)-\(gap.gapEnd) missing (\(count) residue\(count == 1 ? "" : "s"))", category: .prep)
+            }
+        }
+
+        if molecules.preparationReport != nil {
+            molecules.preparationReport?.missingResidues = gaps
+        }
+
+        molecules.isMinimizing = true
+        workspace.statusMessage = "Fixing missing residues..."
+
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let name = prot.name
+        let title = prot.title
+        let secondaryStructure = prot.secondaryStructureAssignments
+        let rawContent = molecules.rawPDBContent
+        let pH = molecules.protonationPH
+        let buildableGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
+
+        Task.detached(priority: .userInitiated) {
+            var workAtoms = atoms
+            var workBonds = bonds
+            var loopsBuilt = 0
+            var residuesAdded = 0
+
+            // Phase 1: Build missing loop residues (if gaps exist)
+            if !buildableGaps.isEmpty {
+                var chainSequences: [GemmiBridge.ChainSequence] = []
+                if let content = rawContent {
+                    do {
+                        chainSequences = try GemmiBridge.entitySequences(content: content)
+                    } catch { /* fall back to polyalanine */ }
+                }
+
+                let loopResult = LoopBuilder.buildMissingLoops(
+                    atoms: workAtoms, bonds: workBonds,
+                    gaps: buildableGaps, chainSequences: chainSequences
+                )
+                if loopResult.gapsBuilt > 0 {
+                    // GPU refine loop regions
+                    let metalDevice = await MainActor.run { self.renderer?.device }
+                    var finalAtoms = loopResult.atoms
+                    if let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) {
+                        var isLoopAtom = [Bool](repeating: false, count: loopResult.atoms.count)
+                        for i in workAtoms.count..<loopResult.atoms.count { isLoopAtom[i] = true }
+                        let loopAngles = AppViewModel.extractLoopBackboneAngles(
+                            atoms: loopResult.atoms, bonds: loopResult.bonds, isLoopAtom: isLoopAtom)
+                        let loopTorsions = AppViewModel.extractLoopOmegaTorsions(
+                            atoms: loopResult.atoms, bonds: loopResult.bonds, isLoopAtom: isLoopAtom)
+                        let refineInput = LoopMetalAccelerator.LoopRefineInput(
+                            atoms: loopResult.atoms, bonds: loopResult.bonds,
+                            isLoopAtom: isLoopAtom, angles: loopAngles, torsions: loopTorsions)
+                        let output = accelerator.refine(input: refineInput, maxIterations: 500, tolerance: 0.05)
+                        for i in 0..<loopResult.atoms.count where isLoopAtom[i] {
+                            finalAtoms[i] = Atom(
+                                id: finalAtoms[i].id, element: finalAtoms[i].element,
+                                position: output.positions[i], name: finalAtoms[i].name,
+                                residueName: finalAtoms[i].residueName, residueSeq: finalAtoms[i].residueSeq,
+                                chainID: finalAtoms[i].chainID, charge: finalAtoms[i].charge,
+                                formalCharge: finalAtoms[i].formalCharge, isHetAtom: finalAtoms[i].isHetAtom,
+                                occupancy: finalAtoms[i].occupancy, tempFactor: finalAtoms[i].tempFactor)
+                        }
+                    }
+                    workAtoms = finalAtoms
+                    workBonds = loopResult.bonds
+                    loopsBuilt = loopResult.gapsBuilt
+                    residuesAdded = loopResult.residuesAdded
+                }
+            }
+
+            // Phase 2: Reconstruct missing heavy atoms in existing residues
+            let completed = ProteinPreparation.completePhase23(
+                atoms: workAtoms, bonds: workBonds, pH: pH, polarOnly: true
+            )
+            let atomsRebuilt = completed.atoms.count - workAtoms.count
+            let capturedLoopsBuilt = loopsBuilt
+            let capturedResiduesAdded = residuesAdded
+
+            await MainActor.run {
+                let mol = Molecule(name: name, atoms: completed.atoms, bonds: completed.bonds, title: title)
+                mol.secondaryStructureAssignments = secondaryStructure
+                self.molecules.protein = mol
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
+                self.pushToRenderer()
+                self.renderer?.fitToContent()
+
+                var messages: [String] = []
+                if capturedLoopsBuilt > 0 { messages.append("\(capturedLoopsBuilt) loop(s) built (\(capturedResiduesAdded) residues)") }
+                if atomsRebuilt > 0 { messages.append("\(atomsRebuilt) atoms rebuilt") }
+                if messages.isEmpty {
+                    self.log.success("Protein structure is complete -- no missing residues or atoms", category: .prep)
+                    self.workspace.statusMessage = "Structure complete"
+                } else {
+                    self.log.success("Fixed: \(messages.joined(separator: ", "))", category: .prep)
+                    self.workspace.statusMessage = messages.joined(separator: ", ")
+                }
+                self.molecules.isMinimizing = false
+                self.molecules.proteinPrepared = true
+            }
+        }
+    }
 
     func detectAndReportMissingResidues() {
         guard let prot = molecules.protein else {
@@ -246,13 +363,380 @@ extension AppViewModel {
                 let count = gap.gapEnd - gap.gapStart + 1
                 log.warn("  Chain \(gap.chainID): residues \(gap.gapStart)-\(gap.gapEnd) missing (\(count) residue\(count == 1 ? "" : "s"))", category: .prep)
             }
-            log.info("Actual modeling of missing residues requires homology tools (not yet available)", category: .prep)
+            let buildableGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
+            if !buildableGaps.isEmpty {
+                let totalResidues = buildableGaps.reduce(0) { $0 + ($1.gapEnd - $1.gapStart + 1) }
+                log.info("Use 'Build Missing Loops' to model \(buildableGaps.count) gap(s) (\(totalResidues) residues, max 15 per loop)", category: .prep)
+            }
+            let longGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) > 15 }
+            for gap in longGaps {
+                let count = gap.gapEnd - gap.gapStart + 1
+                log.warn("  Chain \(gap.chainID): gap of \(count) residues too long for ab initio loop building (max 15)", category: .prep)
+            }
             workspace.statusMessage = "\(gaps.count) gap(s) detected"
         }
 
         if molecules.preparationReport != nil {
             molecules.preparationReport?.missingResidues = gaps
         }
+
+        // Reconstruct missing heavy atoms from residue templates
+        let atomsBefore = prot.atoms
+        let pH = molecules.protonationPH
+        molecules.isMinimizing = true
+        log.info("Reconstructing missing heavy atoms from templates...", category: .prep)
+
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let name = prot.name
+        let title = prot.title
+        let secondaryStructure = prot.secondaryStructureAssignments
+
+        Task.detached(priority: .userInitiated) {
+            let completed = ProteinPreparation.completePhase23(
+                atoms: atoms, bonds: bonds, pH: pH, polarOnly: true
+            )
+            let rebuilt = completed.atoms.count - atomsBefore.count
+
+            await MainActor.run {
+                let mol = Molecule(name: name, atoms: completed.atoms, bonds: completed.bonds, title: title)
+                mol.secondaryStructureAssignments = secondaryStructure
+                self.molecules.protein = mol
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
+                self.pushToRenderer()
+                if rebuilt > 0 {
+                    self.log.success("Rebuilt \(rebuilt) missing atoms from residue templates", category: .prep)
+                    self.workspace.statusMessage = "\(rebuilt) atoms rebuilt"
+                } else {
+                    self.log.info("No missing heavy atoms found to rebuild", category: .prep)
+                }
+                self.molecules.isMinimizing = false
+            }
+        }
+    }
+
+    // MARK: - Build Missing Loops
+
+    func buildMissingLoops() {
+        guard let prot = molecules.protein else {
+            log.info("[Prep] buildMissingLoops skipped: no protein loaded", category: .prep)
+            return
+        }
+
+        let gaps = ProteinPreparation.detectMissingResidues(in: prot.atoms)
+        guard !gaps.isEmpty else {
+            log.success("No missing residues detected -- nothing to build", category: .prep)
+            workspace.statusMessage = "No gaps to build"
+            return
+        }
+
+        molecules.isMinimizing = true
+        log.info("Building missing residue loops...", category: .prep)
+        workspace.statusMessage = "Building loops..."
+
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let name = prot.name
+        let title = prot.title
+        let secondaryStructure = prot.secondaryStructureAssignments
+        let rawContent = molecules.rawPDBContent
+
+        Task.detached(priority: .userInitiated) {
+            // 1. Extract SEQRES sequences
+            var chainSequences: [GemmiBridge.ChainSequence] = []
+            if let content = rawContent {
+                do {
+                    chainSequences = try GemmiBridge.entitySequences(content: content)
+                } catch {
+                    // Fall back to polyalanine
+                }
+            }
+
+            // 2. Build loops (backbone + sidechains)
+            let result = LoopBuilder.buildMissingLoops(
+                atoms: atoms,
+                bonds: bonds,
+                gaps: gaps,
+                chainSequences: chainSequences
+            )
+
+            guard result.gapsBuilt > 0 else {
+                await MainActor.run {
+                    self.log.warn("No gaps could be built (anchors missing or gaps too long)", category: .prep)
+                    self.workspace.statusMessage = "No loops built"
+                    self.molecules.isMinimizing = false
+                }
+                return
+            }
+
+            // 3. Metal GPU refinement of loop regions
+            let metalDevice = await MainActor.run { self.renderer?.device }
+            var finalAtoms = result.atoms
+            var wasRefined = false
+            if let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) {
+                var isLoopAtom = [Bool](repeating: false, count: result.atoms.count)
+                for i in atoms.count..<result.atoms.count { isLoopAtom[i] = true }
+
+                let loopAngles = AppViewModel.extractLoopBackboneAngles(
+                    atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom
+                )
+                let loopTorsions = AppViewModel.extractLoopOmegaTorsions(
+                    atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom
+                )
+
+                let refineInput = LoopMetalAccelerator.LoopRefineInput(
+                    atoms: result.atoms,
+                    bonds: result.bonds,
+                    isLoopAtom: isLoopAtom,
+                    angles: loopAngles,
+                    torsions: loopTorsions
+                )
+                let output = accelerator.refine(input: refineInput, maxIterations: 500, tolerance: 0.05)
+                for i in 0..<result.atoms.count where isLoopAtom[i] {
+                    finalAtoms[i] = Atom(
+                        id: finalAtoms[i].id,
+                        element: finalAtoms[i].element,
+                        position: output.positions[i],
+                        name: finalAtoms[i].name,
+                        residueName: finalAtoms[i].residueName,
+                        residueSeq: finalAtoms[i].residueSeq,
+                        chainID: finalAtoms[i].chainID,
+                        charge: finalAtoms[i].charge,
+                        formalCharge: finalAtoms[i].formalCharge,
+                        isHetAtom: finalAtoms[i].isHetAtom,
+                        occupancy: finalAtoms[i].occupancy,
+                        tempFactor: finalAtoms[i].tempFactor
+                    )
+                }
+                wasRefined = true
+            }
+
+            let capturedAtoms = finalAtoms
+            let capturedChainSequences = chainSequences
+            let capturedWasRefined = wasRefined
+            await MainActor.run {
+                let mol = Molecule(name: name, atoms: capturedAtoms, bonds: result.bonds, title: title)
+                mol.secondaryStructureAssignments = secondaryStructure
+                self.molecules.protein = mol
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: capturedAtoms, bonds: result.bonds)
+                self.pushToRenderer()
+                self.renderer?.fitToContent()
+
+                let seqSource = capturedChainSequences.isEmpty ? "polyalanine" : "SEQRES"
+                let refinedStr = capturedWasRefined ? ", Metal GPU-refined" : ""
+                self.log.success(
+                    "Built \(result.gapsBuilt) loop(s) with \(result.residuesAdded) residues " +
+                    "(from \(seqSource)\(refinedStr))",
+                    category: .prep
+                )
+                self.workspace.statusMessage = "\(result.residuesAdded) loop residues built"
+                self.molecules.isMinimizing = false
+                self.molecules.proteinPrepared = true
+            }
+        }
+    }
+
+    // MARK: - OpenMM Loop Refinement
+
+    nonisolated static func refineLoopsWithOpenMM(
+        atoms: [Atom],
+        bonds: [Bond],
+        originalAtomCount: Int
+    ) -> [Atom] {
+        // Identify loop atoms (those added by LoopBuilder)
+        var isLoopAtom = [Bool](repeating: false, count: atoms.count)
+        for i in originalAtomCount..<atoms.count {
+            isLoopAtom[i] = true
+        }
+
+        // Build OpenMM atom array (heavy atoms only for loop refinement)
+        var ommAtoms: [DruseOpenMMAtom] = []
+        ommAtoms.reserveCapacity(atoms.count)
+        for atom in atoms {
+            var ommAtom = DruseOpenMMAtom()
+            ommAtom.x = atom.position.x
+            ommAtom.y = atom.position.y
+            ommAtom.z = atom.position.z
+            ommAtom.charge = atom.charge
+            ommAtom.sigmaNm = Float(atom.element.vdwRadius) * 2.0 / 10.0 * 0.8909  // approx sigma
+            ommAtom.epsilonKJ = 0.36  // generic LJ epsilon
+            ommAtom.mass = atom.element.mass
+            ommAtom.atomicNum = Int32(atom.element.rawValue)
+            ommAtom.isPocket = false
+            ommAtoms.append(ommAtom)
+        }
+
+        // Build OpenMM bond array
+        var ommBonds: [DruseOpenMMBond] = []
+        for bond in bonds {
+            let a1 = bond.atomIndex1
+            let a2 = bond.atomIndex2
+            guard a1 >= 0, a1 < atoms.count, a2 >= 0, a2 < atoms.count else { continue }
+            let dist = simd_distance(atoms[a1].position, atoms[a2].position) / 10.0  // Å → nm
+            var ommBond = DruseOpenMMBond()
+            ommBond.atom1 = Int32(a1)
+            ommBond.atom2 = Int32(a2)
+            ommBond.lengthNm = dist
+            ommBonds.append(ommBond)
+        }
+
+        // Build backbone angle restraints for loop residues
+        var ommAngles: [DruseOpenMMAngle] = []
+        // Find triplets N-CA-C, CA-C-N(next), C-N(next)-CA(next) in loop region
+        let loopBackboneAngles = extractLoopBackboneAngles(atoms: atoms, bonds: bonds, isLoopAtom: isLoopAtom)
+        for (a1, a2, a3, angleDeg) in loopBackboneAngles {
+            var angle = DruseOpenMMAngle()
+            angle.atom1 = Int32(a1)
+            angle.atom2 = Int32(a2)
+            angle.atom3 = Int32(a3)
+            angle.angleDegrees = angleDeg
+            angle.forceConstant = 460.0  // kJ/mol/rad^2
+            ommAngles.append(angle)
+        }
+
+        // Build omega torsion restraints (trans peptide bond: 180°)
+        var ommTorsions: [DruseOpenMMTorsion] = []
+        let loopOmegaTorsions = extractLoopOmegaTorsions(atoms: atoms, bonds: bonds, isLoopAtom: isLoopAtom)
+        for (a1, a2, a3, a4) in loopOmegaTorsions {
+            var torsion = DruseOpenMMTorsion()
+            torsion.atom1 = Int32(a1)
+            torsion.atom2 = Int32(a2)
+            torsion.atom3 = Int32(a3)
+            torsion.atom4 = Int32(a4)
+            torsion.periodicity = 2
+            torsion.phaseDegrees = 180.0
+            torsion.forceConstant = 40.0  // kJ/mol
+            ommTorsions.append(torsion)
+        }
+
+        // Call OpenMM
+        let resultPtr = ommAtoms.withUnsafeBufferPointer { atomsBuf in
+            ommBonds.withUnsafeBufferPointer { bondsBuf in
+                ommAngles.withUnsafeBufferPointer { anglesBuf in
+                    ommTorsions.withUnsafeBufferPointer { torsionsBuf in
+                        isLoopAtom.withUnsafeBufferPointer { loopBuf in
+                            druse_openmm_refine_loop(
+                                atomsBuf.baseAddress,
+                                Int32(ommAtoms.count),
+                                bondsBuf.baseAddress,
+                                Int32(ommBonds.count),
+                                anglesBuf.baseAddress,
+                                Int32(ommAngles.count),
+                                torsionsBuf.baseAddress,
+                                Int32(ommTorsions.count),
+                                loopBuf.baseAddress,
+                                1000
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        guard let ptr = resultPtr else { return atoms }
+        defer { druse_free_openmm_loop_result(ptr) }
+
+        guard ptr.pointee.success, ptr.pointee.atomCount == Int32(atoms.count) else {
+            return atoms
+        }
+
+        // Apply refined positions
+        var refinedAtoms = atoms
+        for i in 0..<atoms.count {
+            refinedAtoms[i].position = SIMD3<Float>(
+                ptr.pointee.refinedPositionsX[i],
+                ptr.pointee.refinedPositionsY[i],
+                ptr.pointee.refinedPositionsZ[i]
+            )
+        }
+
+        return refinedAtoms
+    }
+
+    nonisolated private static func extractLoopBackboneAngles(
+        atoms: [Atom],
+        bonds: [Bond],
+        isLoopAtom: [Bool]
+    ) -> [(Int, Int, Int, Float)] {
+        // Find backbone triplets in loop residues
+        var angles: [(Int, Int, Int, Float)] = []
+
+        // Group loop atoms by residue
+        var residueAtoms: [String: [Int]] = [:]  // "chainID_seq" → [atomIndex]
+        for i in 0..<atoms.count where isLoopAtom[i] {
+            let key = "\(atoms[i].chainID)_\(atoms[i].residueSeq)"
+            residueAtoms[key, default: []].append(i)
+        }
+
+        for (_, indices) in residueAtoms {
+            var nIdx: Int?, caIdx: Int?, cIdx: Int?
+            for idx in indices {
+                let name = atoms[idx].name.trimmingCharacters(in: .whitespaces)
+                switch name {
+                case "N": nIdx = idx
+                case "CA": caIdx = idx
+                case "C": cIdx = idx
+                default: break
+                }
+            }
+            // N-CA-C angle
+            if let n = nIdx, let ca = caIdx, let c = cIdx {
+                angles.append((n, ca, c, 111.2))
+            }
+        }
+
+        return angles
+    }
+
+    nonisolated static func extractLoopOmegaTorsions(
+        atoms: [Atom],
+        bonds: [Bond],
+        isLoopAtom: [Bool]
+    ) -> [(Int, Int, Int, Int)] {
+        // Find CA-C-N-CA torsions across peptide bonds in loop
+        var torsions: [(Int, Int, Int, Int)] = []
+
+        // Build adjacency for bond lookup
+        var adj: [Int: Set<Int>] = [:]
+        for bond in bonds {
+            adj[bond.atomIndex1, default: []].insert(bond.atomIndex2)
+            adj[bond.atomIndex2, default: []].insert(bond.atomIndex1)
+        }
+
+        // For each C atom in loop region, find bonded N in next residue
+        for i in 0..<atoms.count where isLoopAtom[i] {
+            let name = atoms[i].name.trimmingCharacters(in: .whitespaces)
+            guard name == "C" else { continue }
+
+            let cIdx = i
+            let cResSeq = atoms[i].residueSeq
+            let cChain = atoms[i].chainID
+
+            // Find CA in same residue
+            guard let caIdx = (0..<atoms.count).first(where: {
+                atoms[$0].name.trimmingCharacters(in: .whitespaces) == "CA" &&
+                atoms[$0].residueSeq == cResSeq &&
+                atoms[$0].chainID == cChain
+            }) else { continue }
+
+            // Find bonded N (next residue)
+            guard let nIdx = adj[cIdx]?.first(where: {
+                atoms[$0].name.trimmingCharacters(in: .whitespaces) == "N" &&
+                atoms[$0].residueSeq == cResSeq + 1 &&
+                atoms[$0].chainID == cChain
+            }) else { continue }
+
+            // Find CA in next residue
+            guard let nextCAIdx = (0..<atoms.count).first(where: {
+                atoms[$0].name.trimmingCharacters(in: .whitespaces) == "CA" &&
+                atoms[$0].residueSeq == cResSeq + 1 &&
+                atoms[$0].chainID == cChain
+            }) else { continue }
+
+            torsions.append((caIdx, cIdx, nIdx, nextCAIdx))
+        }
+
+        return torsions
     }
 
     func analyzeMissingAtoms() {

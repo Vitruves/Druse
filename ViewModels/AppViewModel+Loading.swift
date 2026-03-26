@@ -269,4 +269,25 @@ extension AppViewModel {
             workspace.isSearching = false
         }
     }
+
+    // MARK: - Open Project (for welcome screen)
+
+    func openProject() {
+        let panel = NSOpenPanel()
+        panel.title = "Open Druse Project"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowedContentTypes = [.folder]
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await DruseProjectIO.load(from: url, into: self)
+                } catch {
+                    self.log.error("Load failed: \(error.localizedDescription)", category: .system)
+                }
+            }
+        }
+    }
 }

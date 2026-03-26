@@ -315,6 +315,11 @@ extension DockingEngine {
             category: .dock
         )
 
+        guard gpuLigAtoms.count > 0 else {
+            ActivityLog.shared.error("[Engine] Ligand has no valid heavy atoms — cannot dock", category: .dock)
+            isRunning = false
+            return []
+        }
         guard gpuLigAtoms.count <= 128 else {
             ActivityLog.shared.error("[Engine] Ligand has \(gpuLigAtoms.count) heavy atoms, exceeding the 128-atom GPU limit", category: .dock)
             isRunning = false
@@ -447,7 +452,7 @@ extension DockingEngine {
             prepareDrusinaBuffers(
                 ligandAtoms: heavyAtoms,
                 ligandBonds: heavyBonds,
-                gpuLigAtoms: gpuLigAtoms,
+                gpuLigAtoms: &gpuLigAtoms,
                 centroid: centroid)
         }
 
@@ -458,11 +463,25 @@ extension DockingEngine {
         if useDruseAF {
             prepareDruseAFBuffers(
                 ligandAtoms: heavyAtoms,
+                ligandBonds: heavyBonds,
                 gpuLigAtoms: gpuLigAtoms,
                 pocket: pocket,
                 popSize: config.populationSize)
         }
-        ActivityLog.shared.info("[Engine] Scoring method: \(scoringMethod.rawValue), Drusina: \(useDrusina), DruseAF: \(useDruseAF)", category: .dock)
+
+        // Prepare PIGNet2 physics-informed GNN scoring buffers
+        let usePIGNet2 = scoringMethod == .pignet2
+            && pignet2SetupPipeline != nil && pignet2EncodePipeline != nil
+            && pignet2ScorePipeline != nil && pignet2Weights != nil
+        if usePIGNet2 {
+            preparePIGNet2Buffers(
+                ligandAtoms: heavyAtoms,
+                ligandBonds: heavyBonds,
+                gpuLigAtoms: gpuLigAtoms,
+                pocket: pocket,
+                popSize: config.populationSize)
+        }
+        ActivityLog.shared.info("[Engine] Scoring method: \(scoringMethod.rawValue), Drusina: \(useDrusina), DruseAF: \(useDruseAF), PIGNet2: \(usePIGNet2)", category: .dock)
 
         let popSize = config.populationSize
         let poseSize = popSize * MemoryLayout<DockPose>.stride
@@ -593,7 +612,7 @@ extension DockingEngine {
         }
         let affinityBuf = vinaAffinityGridBuffer
         let typeIdxBuf = vinaTypeIndexBuffer
-        if !useDruseAF && (affinityBuf == nil || typeIdxBuf == nil) {
+        if !useDruseAF && !usePIGNet2 && (affinityBuf == nil || typeIdxBuf == nil) {
             ActivityLog.shared.error("[Engine] Vina affinity grids nil — cannot score (affinity=\(affinityBuf != nil) typeIdx=\(typeIdxBuf != nil))", category: .dock)
             isRunning = false
             return []
@@ -687,11 +706,17 @@ extension DockingEngine {
                     repGAParams.translationStep = config.explorationTranslationStep
                     repGAParams.rotationStep = config.explorationRotationStep
                     repGAParams.mutationRate = config.explorationMutationRate
+                    repGAParams.localSearchSteps = UInt32(max(config.localSearchSteps / 2, 5))
                 } else if step == explorationCutoff {
                     repGAParams.translationStep = config.translationStep
                     repGAParams.rotationStep = config.rotationStep
                     repGAParams.mutationRate = config.mutationRate
+                    repGAParams.localSearchSteps = UInt32(max(config.localSearchSteps, 1))
                 }
+
+                let effectiveLSFreq = step < explorationCutoff
+                    ? max(config.explorationLocalSearchFrequency, 1)
+                    : localSearchFrequency
 
                 repParams.swapGeneration = UInt32(step)
                 replicaParamsBuffer?.contents().copyMemory(from: &repParams, byteCount: MemoryLayout<ReplicaParams>.stride)
@@ -717,7 +742,7 @@ extension DockingEngine {
                     (replicaBestBuf, 2), (ringBuf, 3), (repParamsBuf, 4)
                 ]
 
-                let doLS = step % localSearchFrequency == 0 && !useDruseAF
+                let doLS = step % effectiveLSFreq == 0 && !useDruseAF
 
                 var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
                     (pipeline: perturbPipe, buffers: perturbBuffers),
@@ -789,7 +814,8 @@ extension DockingEngine {
                 ligandAtoms: heavyAtoms,
                 centroid: centroid,
                 idOffset: 0,
-                maxPoses: totalPoses
+                maxPoses: totalPoses,
+                scoringMethod: scoringMethod
             )
 
             ActivityLog.shared.info("[Engine] REMC completed: \(aggregatedResults.count) poses extracted from \(K) replicas", category: .dock)
@@ -805,11 +831,13 @@ extension DockingEngine {
             dispatchCompute(pipeline: initPopPipeline, buffers: [
                 (popBuf, 0), (gpBuf, 1), (gaBuf, 2)
             ], threadGroups: tgCount, threadGroupSize: tgSize)
-            if !useDruseAF {
+            if !useDruseAF && !usePIGNet2 {
                 localOptimize(buffer: popBuf, tg: tgCount, tgs: tgSize)
             }
             if useDruseAF {
                 scoreDruseAF(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
+            } else if usePIGNet2 {
+                scorePIGNet2(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
             } else if useDrusina {
                 scoreDrusina(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
             } else {
@@ -833,7 +861,8 @@ extension DockingEngine {
                         from: bestBuf,
                         ligandAtoms: heavyAtoms,
                         centroid: centroid,
-                        idOffset: aggregatedResults.count
+                        idOffset: aggregatedResults.count,
+                        scoringMethod: scoringMethod
                     ))
                     break runLoop
                 }
@@ -845,11 +874,17 @@ extension DockingEngine {
                     gaParams.translationStep = config.explorationTranslationStep
                     gaParams.rotationStep = config.explorationRotationStep
                     gaParams.mutationRate = config.explorationMutationRate
+                    gaParams.localSearchSteps = UInt32(max(config.localSearchSteps / 2, 5))
                 } else if step == explorationCutoff {
                     gaParams.translationStep = config.translationStep
                     gaParams.rotationStep = config.rotationStep
                     gaParams.mutationRate = config.mutationRate
+                    gaParams.localSearchSteps = UInt32(max(config.localSearchSteps, 1))
                 }
+
+                let effectiveLSFreq = step < explorationCutoff
+                    ? max(config.explorationLocalSearchFrequency, 1)
+                    : localSearchFrequency
 
                 let ringBuf = gaParamsRing[step % 3]
                 ringBuf.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
@@ -880,7 +915,7 @@ extension DockingEngine {
                 var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
                     (pipeline: mcPerturbPipeline, buffers: perturbBuffers)
                 ]
-                let doLocalSearch = step % localSearchFrequency == 0 && !useDruseAF
+                let doLocalSearch = step % effectiveLSFreq == 0 && !useDruseAF && !usePIGNet2
                 if doLocalSearch && !localSearchIsSIMD {
                     dispatches.append((pipeline: activeLocalSearchPipeline, buffers: vinaScoreBuffers))
                 }
@@ -893,20 +928,38 @@ extension DockingEngine {
                         (afParamsBuf, 5), (afIntermed, 6), (gpBuf, 7)
                     ]
                     dispatches.append((pipeline: encodePipe, buffers: encodeBuffers))
-                } else if useDrusina, let drusinaPipe = drusinaScorePipeline {
+                } else if usePIGNet2, let encodePipe = pignet2EncodePipeline,
+                          let pigParamsBuf = pignet2ParamsBuffer,
+                          let pigIntermed = pignet2IntermediateBuffer {
+                    let encodeBuffers: [(MTLBuffer, Int)] = [
+                        (offBuf, 0), (ligBuf, 1), (ringBuf, 2),
+                        (teBuf, 3), (miBuf, 4),
+                        (pigParamsBuf, 5), (pigIntermed, 6), (gpBuf, 7)
+                    ]
+                    dispatches.append((pipeline: encodePipe, buffers: encodeBuffers))
+                } else if useDrusina, let drusinaPipe = drusinaScorePipeline,
+                          let prb = proteinRingBuffer, let lrb = ligandRingBuffer,
+                          let pcb = proteinCationBuffer, let dpb = drusinaParamsBuffer,
+                          let pab = proteinAtomBuffer, let hib = halogenInfoBuffer,
+                          let pamb = proteinAmideBuffer, let cib = chalcogenInfoBuffer,
+                          let sbgb = saltBridgeGroupBuffer,
+                          let elecBuf = electrostaticGridBuffer,
+                          let pchBuf = proteinChalcogenBuffer,
+                          let tsBuf = torsionStrainBuffer {
                     var drusinaBuffers = vinaScoreBuffers
                     drusinaBuffers.append(contentsOf: [
-                        (proteinRingBuffer!, 9), (ligandRingBuffer!, 10),
-                        (proteinCationBuffer!, 11), (drusinaParamsBuffer!, 12),
-                        (proteinAtomBuffer!, 13), (halogenInfoBuffer!, 14),
-                        (proteinAmideBuffer!, 15), (chalcogenInfoBuffer!, 16),
-                        (saltBridgeGroupBuffer!, 17)
+                        (prb, 9), (lrb, 10),
+                        (pcb, 11), (dpb, 12),
+                        (pab, 13), (hib, 14),
+                        (pamb, 15), (cib, 16),
+                        (sbgb, 17),
+                        (elecBuf, 18), (pchBuf, 19), (tsBuf, 20)
                     ])
                     dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
                 } else {
                     dispatches.append((pipeline: scorePipeline, buffers: vinaScoreBuffers))
                 }
-                if !useDruseAF, let fe = flexEngine, fe.isEnabled {
+                if !useDruseAF && !usePIGNet2, let fe = flexEngine, fe.isEnabled {
                     lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
                     if doLocalSearch && localSearchIsSIMD {
                         let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
@@ -923,7 +976,7 @@ extension DockingEngine {
                         gaParamsBuffer: ringBuf, torsionEdgeBuffer: teBuf,
                         movingIndicesBuffer: miBuf, populationSize: popSize
                     )
-                    if step % localSearchFrequency == 0,
+                    if step % effectiveLSFreq == 0,
                        let ab = affinityBuf, let tb = typeIdxBuf {
                         fe.dispatchFlexLocalSearch(
                             populationBuffer: offBuf, ligandAtomBuffer: ligBuf,
@@ -951,6 +1004,30 @@ extension DockingEngine {
                     let afTgCount = MTLSize(width: popSize, height: 1, depth: 1)
                     lastCmdBuf = dispatchComputeAsync(pipeline: scorePipe, buffers: afScoreBuffers,
                                                        threadGroups: afTgCount, threadGroupSize: afTgSize)
+                    lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
+                                                       threadGroups: tgCount, threadGroupSize: tgSize)
+                } else if usePIGNet2, let scorePipe = pignet2ScorePipeline,
+                          let pig2Weights = pignet2Weights,
+                          let pigParamsBuf = pignet2ParamsBuffer,
+                          let pigProtPos = pignet2ProtPosBuffer,
+                          let pigSetup = pignet2SetupBuffer,
+                          let pigIntermed = pignet2IntermediateBuffer,
+                          let pigLigFeat = pignet2LigFeatBuffer,
+                          let pigProtAux = pignet2ProtAuxBuffer,
+                          let pigLigAux = pignet2LigAuxBuffer,
+                          let pigLigEdgeBuf = pignet2LigEdgeBuffer {
+                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
+                    let pigScoreBuffers: [(MTLBuffer, Int)] = [
+                        (offBuf, 0), (pigProtPos, 1),
+                        (pig2Weights.weightBuffer, 2), (pig2Weights.entryBuffer, 3),
+                        (pigParamsBuf, 4), (pigIntermed, 5), (pigSetup, 6),
+                        (pigLigFeat, 7), (pigProtAux, 8), (pigLigAux, 9),
+                        (pigLigEdgeBuf, 10), (ringBuf, 11)
+                    ]
+                    let pigTgSize = MTLSize(width: 1, height: 1, depth: 1)
+                    let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+                    lastCmdBuf = dispatchComputeAsync(pipeline: scorePipe, buffers: pigScoreBuffers,
+                                                       threadGroups: pigTgCount, threadGroupSize: pigTgSize)
                     lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
                                                        threadGroups: tgCount, threadGroupSize: tgSize)
                 } else {
@@ -991,7 +1068,8 @@ extension DockingEngine {
                 from: bestPopulationBuffer,
                 ligandAtoms: heavyAtoms,
                 centroid: centroid,
-                idOffset: aggregatedResults.count
+                idOffset: aggregatedResults.count,
+                scoringMethod: scoringMethod
             ))
         }
 
@@ -1064,7 +1142,7 @@ extension DockingEngine {
         let centroid = preparedLigand.centroid
         var gpuLigAtoms = preparedLigand.gpuAtoms
 
-        guard gpuLigAtoms.count <= 128 else { return nil }
+        guard gpuLigAtoms.count > 0, gpuLigAtoms.count <= 128 else { return nil }
 
         ligandAtomBuffer = device.makeBuffer(
             bytes: &gpuLigAtoms,
@@ -1223,8 +1301,19 @@ extension DockingEngine {
         if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
             buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
         }
+        // SIMD local search kernel expects 32 threads per threadgroup (one pose per threadgroup)
+        let effectiveTg: MTLSize
+        let effectiveTgs: MTLSize
+        if localSearchIsSIMD {
+            let popSize = tg.width * tgs.width
+            effectiveTgs = MTLSize(width: 32, height: 1, depth: 1)
+            effectiveTg = MTLSize(width: popSize, height: 1, depth: 1)
+        } else {
+            effectiveTg = tg
+            effectiveTgs = tgs
+        }
         dispatchCompute(pipeline: activeLocalSearchPipeline, buffers: buffers,
-                        threadGroups: tg, threadGroupSize: tgs)
+                        threadGroups: effectiveTg, threadGroupSize: effectiveTgs)
     }
 
     func scorePopulation(buffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
@@ -1261,6 +1350,9 @@ extension DockingEngine {
               let paBuf = proteinAtomBuffer, let hiBuf = halogenInfoBuffer,
               let amBuf = proteinAmideBuffer, let chBuf = chalcogenInfoBuffer,
               let sbBuf = saltBridgeGroupBuffer,
+              let elecBuf = electrostaticGridBuffer,
+              let pchBuf = proteinChalcogenBuffer,
+              let tsBuf = torsionStrainBuffer,
               let ligBuf = ligandAtomBuffer,
               let affBuf = vinaAffinityGridBuffer,
               let typBuf = vinaTypeIndexBuffer,
@@ -1278,17 +1370,15 @@ extension DockingEngine {
             (teBuf, 6), (miBuf, 7),
             (ipBuf, 8),
             (prBuf, 9), (lrBuf, 10), (pcBuf, 11), (dpBuf, 12), (paBuf, 13), (hiBuf, 14),
-            (amBuf, 15), (chBuf, 16), (sbBuf, 17)
+            (amBuf, 15), (chBuf, 16), (sbBuf, 17),
+            (elecBuf, 18), (pchBuf, 19), (tsBuf, 20)
         ], threadGroups: tg, threadGroupSize: tgs)
     }
 
     func scoreDruseAF(buffer: MTLBuffer, gaParamsBuffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
         guard let encodePipe = druseAFEncodePipeline,
-              let scorePipe = druseAFScorePipeline,
               let afWeights = druseAFWeights,
-              let afParams = druseAFParamsBuffer,
               let afProtPos = druseAFProtPosBuffer,
-              let afSetup = druseAFSetupBuffer,
               let afIntermed = druseAFIntermediateBuffer,
               let ligBuf = ligandAtomBuffer,
               let gpBuf = gridParamsBuffer,
@@ -1297,19 +1387,92 @@ extension DockingEngine {
             ActivityLog.shared.error("[DruseAF] scoreDruseAF: missing buffers", category: .dock)
             return
         }
+
+        if useAFv4 {
+            // === v4 PGN scoring ===
+            guard let v4Score = afv4ScorePipeline,
+                  let v4Params = afv4ParamsBuffer,
+                  let compatParams = afv4EncodeCompatParamsBuffer,
+                  let protPP = afv4ProtPairProjBuffer,
+                  let ligPP = afv4LigPairProjBuffer,
+                  let ligHidden = afv4LigHiddenBuffer else { return }
+
+            // Transform ligand positions (reuse v3 druseAFEncode kernel with compat params)
+            dispatchCompute(pipeline: encodePipe, buffers: [
+                (buffer, 0), (ligBuf, 1), (gaParamsBuffer, 2),
+                (teBuf, 3), (miBuf, 4),
+                (compatParams, 5), (afIntermed, 6), (gpBuf, 7)
+            ], threadGroups: tg, threadGroupSize: tgs)
+
+            // v4 Score: 1 threadgroup per pose, 64 threads per group (one per ligand atom)
+            let popSize = Int(tg.width * tgs.width)
+            let scoreTgSize = MTLSize(width: 64, height: 1, depth: 1)
+            let scoreTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+            dispatchCompute(pipeline: v4Score, buffers: [
+                (buffer, 0), (afProtPos, 1),
+                (protPP, 2), (ligPP, 3), (ligHidden, 4),
+                (afWeights.weightBuffer, 5), (afWeights.entryBuffer, 6),
+                (v4Params, 7), (afIntermed, 8), (gpBuf, 9)
+            ], threadGroups: scoreTgCount, threadGroupSize: scoreTgSize)
+        } else {
+            // === v3 cross-attention scoring (legacy) ===
+            guard let scorePipe = druseAFScorePipeline,
+                  let afParams = druseAFParamsBuffer,
+                  let afSetup = druseAFSetupBuffer else { return }
+
+            dispatchCompute(pipeline: encodePipe, buffers: [
+                (buffer, 0), (ligBuf, 1), (gaParamsBuffer, 2),
+                (teBuf, 3), (miBuf, 4),
+                (afParams, 5), (afIntermed, 6), (gpBuf, 7)
+            ], threadGroups: tg, threadGroupSize: tgs)
+            let popSize = Int(tg.width * tgs.width)
+            let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
+            let simdTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+            dispatchCompute(pipeline: scorePipe, buffers: [
+                (buffer, 0), (afProtPos, 1),
+                (afWeights.weightBuffer, 2), (afWeights.entryBuffer, 3),
+                (afParams, 4), (afIntermed, 5), (afSetup, 6)
+            ], threadGroups: simdTgCount, threadGroupSize: simdTgSize)
+        }
+    }
+
+    func scorePIGNet2(buffer: MTLBuffer, gaParamsBuffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
+        guard let encodePipe = pignet2EncodePipeline,
+              let scorePipe = pignet2ScorePipeline,
+              let pig2Weights = pignet2Weights,
+              let pigParams = pignet2ParamsBuffer,
+              let pigProtPos = pignet2ProtPosBuffer,
+              let pigSetup = pignet2SetupBuffer,
+              let pigIntermed = pignet2IntermediateBuffer,
+              let pigLigFeat = pignet2LigFeatBuffer,
+              let pigProtAux = pignet2ProtAuxBuffer,
+              let pigLigAux = pignet2LigAuxBuffer,
+              let pigLigEdgeBuf = pignet2LigEdgeBuffer,
+              let ligBuf = ligandAtomBuffer,
+              let gpBuf = gridParamsBuffer,
+              let teBuf = torsionEdgeBuffer,
+              let miBuf = movingIndicesBuffer else {
+            ActivityLog.shared.error("[PIGNet2] scorePIGNet2: missing buffers", category: .dock)
+            return
+        }
+        // Encode: transform ligand positions
         dispatchCompute(pipeline: encodePipe, buffers: [
             (buffer, 0), (ligBuf, 1), (gaParamsBuffer, 2),
             (teBuf, 3), (miBuf, 4),
-            (afParams, 5), (afIntermed, 6), (gpBuf, 7)
+            (pigParams, 5), (pigIntermed, 6), (gpBuf, 7)
         ], threadGroups: tg, threadGroupSize: tgs)
+
+        // Score: GNN + physics (1 thread per pose)
         let popSize = Int(tg.width * tgs.width)
-        let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
-        let simdTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+        let pigTgSize = MTLSize(width: 1, height: 1, depth: 1)
+        let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
         dispatchCompute(pipeline: scorePipe, buffers: [
-            (buffer, 0), (afProtPos, 1),
-            (afWeights.weightBuffer, 2), (afWeights.entryBuffer, 3),
-            (afParams, 4), (afIntermed, 5), (afSetup, 6)
-        ], threadGroups: simdTgCount, threadGroupSize: simdTgSize)
+            (buffer, 0), (pigProtPos, 1),
+            (pig2Weights.weightBuffer, 2), (pig2Weights.entryBuffer, 3),
+            (pigParams, 4), (pigIntermed, 5), (pigSetup, 6),
+            (pigLigFeat, 7), (pigProtAux, 8), (pigLigAux, 9),
+            (pigLigEdgeBuf, 10), (gaParamsBuffer, 11)
+        ], threadGroups: pigTgCount, threadGroupSize: pigTgSize)
     }
 
     func dispatchCompute(
@@ -1362,7 +1525,12 @@ extension DockingEngine {
     func dispatchBatch(_ dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])],
                                 threadGroups: MTLSize, threadGroupSize: MTLSize) {
         guard isRunning else { return }
-        guard threadGroups.width > 0, threadGroupSize.width > 0 else { return }
+        guard threadGroups.width > 0, threadGroups.height > 0, threadGroups.depth > 0,
+              threadGroupSize.width > 0, threadGroupSize.height > 0, threadGroupSize.depth > 0
+        else {
+            ActivityLog.shared.warn("[Engine] Skipped batch dispatch: zero threadGroups=\(threadGroups.width)×\(threadGroups.height)×\(threadGroups.depth) or threadGroupSize=\(threadGroupSize.width)×\(threadGroupSize.height)×\(threadGroupSize.depth)", category: .dock)
+            return
+        }
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
         for d in dispatches {
@@ -1384,7 +1552,12 @@ extension DockingEngine {
     func dispatchBatchAsync(_ dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])],
                                      threadGroups: MTLSize, threadGroupSize: MTLSize) -> MTLCommandBuffer? {
         guard isRunning else { return nil }
-        guard threadGroups.width > 0, threadGroupSize.width > 0 else { return nil }
+        guard threadGroups.width > 0, threadGroups.height > 0, threadGroups.depth > 0,
+              threadGroupSize.width > 0, threadGroupSize.height > 0, threadGroupSize.depth > 0
+        else {
+            ActivityLog.shared.warn("[Engine] Skipped batch async dispatch: zero threadGroups=\(threadGroups.width)×\(threadGroups.height)×\(threadGroups.depth) or threadGroupSize=\(threadGroupSize.width)×\(threadGroupSize.height)×\(threadGroupSize.depth)", category: .dock)
+            return nil
+        }
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return nil }
         for d in dispatches {

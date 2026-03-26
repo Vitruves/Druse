@@ -43,7 +43,12 @@ struct DruseScoreFeatureExtractor {
     /// Returns a dictionary mapping atom ID → Hybridization.
     enum Hybridization { case sp, sp2, sp3 }
 
-    static func buildHybridizationMap(atoms: [Atom], bonds: [Bond]) -> [Int: Hybridization] {
+    struct AtomChemInfo {
+        var hybridization: Hybridization
+        var isAromatic: Bool
+    }
+
+    static func buildHybridizationMap(atoms: [Atom], bonds: [Bond]) -> [Int: AtomChemInfo] {
         // Build adjacency: atom index → list of bond orders
         var atomBonds: [Int: [BondOrder]] = [:]
         for bond in bonds {
@@ -51,20 +56,22 @@ struct DruseScoreFeatureExtractor {
             atomBonds[bond.atomIndex2, default: []].append(bond.order)
         }
 
-        var result: [Int: Hybridization] = [:]
+        var result: [Int: AtomChemInfo] = [:]
         for atom in atoms {
             let orders = atomBonds[atom.id] ?? []
             let hasAromatic = orders.contains(.aromatic)
             let hasDouble = orders.contains(.double)
             let hasTriple = orders.contains(.triple)
 
+            let hyb: Hybridization
             if hasTriple {
-                result[atom.id] = .sp
+                hyb = .sp
             } else if hasAromatic || hasDouble {
-                result[atom.id] = .sp2
+                hyb = .sp2
             } else {
-                result[atom.id] = .sp3
+                hyb = .sp3
             }
+            result[atom.id] = AtomChemInfo(hybridization: hyb, isAromatic: hasAromatic)
         }
         return result
     }
@@ -89,8 +96,8 @@ struct DruseScoreFeatureExtractor {
         let protPositions = pocketAtoms.map(\.position)
         let ligPositions = ligandAtoms.map(\.position)
 
-        let protFeats = pocketAtoms.map { atomFeatures($0, isProtein: true, hybridization: protHybrid[$0.id]) }
-        let ligFeats = ligandAtoms.map { atomFeatures($0, isProtein: false, hybridization: ligHybrid[$0.id]) }
+        let protFeats = pocketAtoms.map { atomFeatures($0, isProtein: true, chemInfo: protHybrid[$0.id]) }
+        let ligFeats = ligandAtoms.map { atomFeatures($0, isProtein: false, chemInfo: ligHybrid[$0.id]) }
 
         // Compute pairwise distance matrix + RBF encoding
         let nProt = protPositions.count
@@ -191,7 +198,7 @@ struct DruseScoreFeatureExtractor {
 
     /// Encode atom as 20-dimensional feature vector (v2).
     /// Must exactly match pdb_atom_features() / mol2_atom_features() in train_druse_pKi_v2.py.
-    static func atomFeatures(_ atom: Atom, isProtein: Bool, hybridization: Hybridization? = nil) -> [Float] {
+    static func atomFeatures(_ atom: Atom, isProtein: Bool, chemInfo: AtomChemInfo? = nil) -> [Float] {
         var features = [Float](repeating: 0, count: atomFeatureSize)
 
         // [0-9] One-hot encode element (H, C, N, O, F, P, S, Cl, Br, other)
@@ -255,8 +262,10 @@ struct DruseScoreFeatureExtractor {
 
         } else {
             // ── Ligand features: element/hybridization based (match mol2_atom_features) ──
-            let hyb = hybridization ?? .sp3
-            let isAromatic = hyb == .sp2 && (atom.element == .C || atom.element == .N)
+            let info = chemInfo ?? AtomChemInfo(hybridization: .sp3, isAromatic: false)
+            let hyb = info.hybridization
+            // Aromatic only when atom has aromatic bonds (matches SYBYL "ar" subtype)
+            let isAromatic = info.isAromatic
 
             // [10] Aromatic
             features[10] = isAromatic ? 1.0 : 0.0
@@ -264,9 +273,11 @@ struct DruseScoreFeatureExtractor {
             // [11] Partial charge (Gasteiger — same as MOL2 training data)
             features[11] = atom.charge
 
-            // [12] H-bond donor — element + hybridization based
+            // [12] H-bond donor — matches SYBYL subtype logic:
+            //   N: sp3 ("3"), sp3-positive ("4"), amide ("am"), planar ("pl3")
+            //   O: sp3 only; S: sp3 only
             var isHBD = false
-            if atom.element == .N && (hyb == .sp3 || hyb == .sp2) { isHBD = true }
+            if atom.element == .N && (hyb == .sp3 || (hyb == .sp2 && !isAromatic)) { isHBD = true }
             if atom.element == .O && hyb == .sp3 { isHBD = true }
             if atom.element == .S && hyb == .sp3 { isHBD = true }
             features[12] = isHBD ? 1.0 : 0.0
@@ -305,549 +316,6 @@ struct DruseScoreFeatureExtractor {
         rbfCenters.map { center in
             exp(-rbfGamma * (distance - center) * (distance - center))
         }
-    }
-}
-
-// MARK: - Druse ML Scoring (Primary Scorer)
-
-/// DruseScorePKi v2: primary ML scoring function that replaces Vina-style empirical scores.
-/// Outputs docking_score = pKd * pose_confidence for pose ranking.
-/// Trained on 13K+ co-crystallized structures × 8 RMSD perturbations (~152K samples).
-@MainActor
-final class DruseMLScoringInference {
-
-    private var model: MLModel?
-    private var isLoaded = false
-
-    /// Fixed dimensions matching the exported CoreML model.
-    nonisolated static let maxProteinAtoms = 256
-    nonisolated static let maxLigandAtoms = 64
-
-    struct Prediction: Sendable {
-        var dockingScore: Float      // pKd * confidence — primary ranking value
-        var pKd: Float               // predicted -log10(Kd), range ~2-12
-        var poseConfidence: Float    // 0-1, how close to native geometry
-        var interactionMap: [DruseRescoringInference.Prediction.InteractionPred]
-        var attentionWeights: [Float]
-    }
-
-    /// Load the DruseScorePKi CoreML model from the app bundle.
-    func loadModel() {
-        guard let modelURL = Bundle.main.url(forResource: "DruseScorePKi", withExtension: "mlmodelc") else {
-            ActivityLog.shared.warn("[DruseMLScoring] Model not found in bundle — Vina scoring only", category: .system)
-            return
-        }
-
-        do {
-            let config = MLModelConfiguration()
-            config.computeUnits = .all
-            model = try MLModel(contentsOf: modelURL, configuration: config)
-            isLoaded = true
-            ActivityLog.shared.info("[DruseMLScoring] Model loaded — compute units: all (ANE preferred)", category: .system)
-        } catch {
-            ActivityLog.shared.error("[DruseMLScoring] Failed to load model: \(error)", category: .system)
-        }
-    }
-
-    var isAvailable: Bool { isLoaded && model != nil }
-
-    /// Score a single protein-ligand complex using DruseScorePKi.
-    func score(features: DruseScoreFeatureExtractor.ComplexFeatures) async -> Prediction? {
-        guard let model else { return nil }
-
-        let maxP = Self.maxProteinAtoms
-        let maxL = Self.maxLigandAtoms
-        let featSize = DruseScoreFeatureExtractor.atomFeatureSize
-
-        let nProt = min(features.proteinPositions.count, maxP)
-        let nLig = min(features.ligandPositions.count, maxL)
-        guard nProt > 0 && nLig > 0 else {
-            ActivityLog.shared.warn("[DruseMLScoring] score skipped: empty atoms (prot=\(features.proteinPositions.count), lig=\(features.ligandPositions.count))", category: .dock)
-            return nil
-        }
-
-        do {
-            func makeMLArray(shape: [Int], fill: (UnsafeMutablePointer<Float>) -> Void) throws -> MLMultiArray {
-                let totalCount = shape.reduce(1, *)
-                let byteCount = totalCount * MemoryLayout<Float>.stride
-                let raw = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: MemoryLayout<Float>.alignment)
-                let floatPtr = raw.bindMemory(to: Float.self, capacity: totalCount)
-                // Zero-initialize for padding
-                floatPtr.initialize(repeating: 0, count: totalCount)
-                fill(floatPtr)
-                let strides = shape.indices.map { i in
-                    NSNumber(value: shape[(i+1)...].reduce(1, *))
-                }
-                return try MLMultiArray(
-                    dataPointer: raw,
-                    shape: shape.map { NSNumber(value: $0) },
-                    dataType: .float32,
-                    strides: strides,
-                    deallocator: { ptr in ptr.deallocate() }
-                )
-            }
-
-            // Protein features: [1, maxP, 18] — zero-padded
-            let protArray = try makeMLArray(shape: [1, maxP, featSize]) { ptr in
-                for i in 0..<nProt {
-                    let base = i * featSize
-                    for j in 0..<featSize {
-                        ptr[base + j] = features.proteinFeatures[i][j]
-                    }
-                }
-            }
-
-            // Ligand features: [1, maxL, 18]
-            let ligArray = try makeMLArray(shape: [1, maxL, featSize]) { ptr in
-                for i in 0..<nLig {
-                    let base = i * featSize
-                    for j in 0..<featSize {
-                        ptr[base + j] = features.ligandFeatures[i][j]
-                    }
-                }
-            }
-
-            // Protein positions: [1, maxP, 3]
-            let protPos = try makeMLArray(shape: [1, maxP, 3]) { ptr in
-                for i in 0..<nProt {
-                    let base = i * 3
-                    ptr[base] = features.proteinPositions[i].x
-                    ptr[base + 1] = features.proteinPositions[i].y
-                    ptr[base + 2] = features.proteinPositions[i].z
-                }
-            }
-
-            // Ligand positions: [1, maxL, 3]
-            let ligPos = try makeMLArray(shape: [1, maxL, 3]) { ptr in
-                for i in 0..<nLig {
-                    let base = i * 3
-                    ptr[base] = features.ligandPositions[i].x
-                    ptr[base + 1] = features.ligandPositions[i].y
-                    ptr[base + 2] = features.ligandPositions[i].z
-                }
-            }
-
-            // Pair RBF: [1, maxL, maxP, 50] — note: ligand-first dimension order
-            // Source RBF was computed with actual atom counts, not capped — use actual stride
-            let actualNLig = features.ligandPositions.count
-            let actualNProt = features.proteinPositions.count
-            let rbfArray = try makeMLArray(shape: [1, maxL, maxP, 50]) { ptr in
-                for li in 0..<nLig {
-                    for pi in 0..<nProt {
-                        // Source is [actualNProt, actualNLig, 50] (prot-first), remap to [maxL, maxP, 50]
-                        let srcBase = (pi * actualNLig + li) * 50
-                        let dstBase = (li * maxP + pi) * 50
-                        for k in 0..<50 {
-                            if srcBase + k < features.pairRBF.count {
-                                ptr[dstBase + k] = features.pairRBF[srcBase + k]
-                            }
-                        }
-                    }
-                }
-            }
-            _ = actualNProt // used for documentation; actual capping happens via nProt
-
-            let provider = try MLDictionaryFeatureProvider(dictionary: [
-                "protein_features": protArray,
-                "ligand_features": ligArray,
-                "protein_positions": protPos,
-                "ligand_positions": ligPos,
-                "pair_rbf": rbfArray
-            ])
-
-            let result = try await model.prediction(from: provider)
-            return parsePrediction(result, nProt: nProt, nLig: nLig)
-        } catch {
-            ActivityLog.shared.warn("[DruseMLScoring] Inference failed: \(error)", category: .dock)
-            return nil
-        }
-    }
-
-    /// Score poses from docking results using DruseScorePKi, returning results sorted by ML score.
-    func scorePoses(
-        results: [DockingResult],
-        proteinAtoms: [Atom],
-        ligandAtoms: [Atom],
-        pocketCenter: SIMD3<Float>,
-        proteinBonds: [Bond] = [],
-        ligandBonds: [Bond] = []
-    ) async -> [DockingResult] {
-        guard isAvailable else { return results }
-
-        let pocketProteinAtoms = proteinAtoms.filter {
-            simd_distance($0.position, pocketCenter) <= 10.0
-        }
-
-        var scored = results
-        for i in 0..<scored.count {
-            var poseAtoms = ligandAtoms
-            for j in 0..<poseAtoms.count {
-                if j < scored[i].transformedAtomPositions.count {
-                    poseAtoms[j].position = scored[i].transformedAtomPositions[j]
-                }
-            }
-
-            let features = DruseScoreFeatureExtractor.extract(
-                proteinAtoms: pocketProteinAtoms,
-                ligandAtoms: poseAtoms,
-                pocketCenter: pocketCenter,
-                proteinBonds: proteinBonds,
-                ligandBonds: ligandBonds
-            )
-
-            if let pred = await score(features: features) {
-                scored[i].mlDockingScore = pred.dockingScore
-                scored[i].mlPKd = pred.pKd
-                scored[i].mlPoseConfidence = pred.poseConfidence
-            }
-        }
-
-        // Sort by ML docking score descending (higher = better)
-        return scored.sorted { ($0.mlDockingScore ?? -.infinity) > ($1.mlDockingScore ?? -.infinity) }
-    }
-
-    private func parsePrediction(_ output: MLFeatureProvider, nProt: Int, nLig: Int) -> Prediction? {
-        guard let dockingScoreVal = output.featureValue(for: "docking_score")?.multiArrayValue,
-              let pkdVal = output.featureValue(for: "pKd")?.multiArrayValue,
-              let confVal = output.featureValue(for: "pose_confidence")?.multiArrayValue
-        else {
-            ActivityLog.shared.warn("[DruseMLScoring] parsePrediction: missing required output features (docking_score/pKd/pose_confidence)", category: .dock)
-            return nil
-        }
-
-        let dockingScore = dockingScoreVal[0].floatValue
-        let pKd = pkdVal[0].floatValue
-        let confidence = confVal[0].floatValue
-
-        // Use direct pointer access to avoid NSNumber allocation storm in hot loop.
-        // The NSNumber subscript ([NSNumber]) allocates 4 objects per access;
-        // for 256×64×5 = 81,920 accesses per prediction this causes Jetsam OOM kills.
-        var interactions: [DruseRescoringInference.Prediction.InteractionPred] = []
-        if let interMap = output.featureValue(for: "interaction_map")?.multiArrayValue {
-            let strides = interMap.strides.map(\.intValue)
-            let ptr = interMap.dataPointer.bindMemory(to: Float.self, capacity: interMap.count)
-            let s0 = strides.count > 0 ? strides[0] : 0
-            let s1 = strides.count > 1 ? strides[1] : 0
-            let s2 = strides.count > 2 ? strides[2] : 0
-            let s3 = strides.count > 3 ? strides[3] : 0
-            let totalCount = interMap.count
-
-            for li in 0..<nLig {
-                for pi in 0..<nProt {
-                    let base = 0 * s0 + li * s1 + pi * s2
-                    let i0 = base + 0 * s3
-                    let i4 = base + 4 * s3
-                    guard i0 >= 0, i4 < totalCount else { continue }
-                    let hb = ptr[i0]
-                    let hp = ptr[base + 1 * s3]
-                    let ion = ptr[base + 2 * s3]
-                    let pi_s = ptr[base + 3 * s3]
-                    let hal = ptr[i4]
-
-                    if max(hb, hp, ion, pi_s, hal) > 0.3 {
-                        interactions.append(.init(
-                            proteinAtomIndex: pi, ligandAtomIndex: li,
-                            hbondProb: hb, hydrophobicProb: hp,
-                            ionicProb: ion, piStackProb: pi_s, halogenProb: hal
-                        ))
-                    }
-                }
-            }
-        }
-
-        var attention: [Float] = []
-        if let attnWeights = output.featureValue(for: "attention_weights")?.multiArrayValue {
-            let ptr = attnWeights.dataPointer.bindMemory(to: Float.self, capacity: attnWeights.count)
-            attention.reserveCapacity(attnWeights.count)
-            for i in 0..<attnWeights.count {
-                attention.append(ptr[i])
-            }
-        }
-
-        return Prediction(
-            dockingScore: dockingScore,
-            pKd: pKd,
-            poseConfidence: confidence,
-            interactionMap: interactions,
-            attentionWeights: attention
-        )
-    }
-}
-
-// MARK: - Druse Rescoring (Post-Docking Re-Ranker)
-
-/// Manages CoreML model loading and inference for the DruseRescoring function.
-/// SE(3)-equivariant geometric cross-attention network for binding affinity prediction.
-/// Secondary opinion — trained on crystal poses only.
-@MainActor
-final class DruseRescoringInference {
-
-    private var model: MLModel?
-    private var isLoaded = false
-
-    /// Predicted output from DruseScore
-    struct Prediction: Sendable {
-        var pKd: Float                          // predicted binding affinity (-log10 Kd)
-        var poseConfidence: Float               // 0-1, is this a correct pose?
-        var interactionMap: [InteractionPred]    // per-atom-pair interaction types
-        var attentionWeights: [Float]           // cross-attention weights for visualization
-
-        struct InteractionPred: Sendable {
-            var proteinAtomIndex: Int
-            var ligandAtomIndex: Int
-            var hbondProb: Float
-            var hydrophobicProb: Float
-            var ionicProb: Float
-            var piStackProb: Float
-            var halogenProb: Float
-        }
-    }
-
-    /// Load the DruseRescoring CoreML model from the app bundle.
-    func loadModel() {
-        guard let modelURL = Bundle.main.url(forResource: "DruseRescoring", withExtension: "mlmodelc") else {
-            ActivityLog.shared.warn("[DruseRescoring] Model not found in bundle — re-ranking unavailable", category: .system)
-            return
-        }
-
-        do {
-            let config = MLModelConfiguration()
-            config.computeUnits = .all // Use Neural Engine + GPU + CPU
-            model = try MLModel(contentsOf: modelURL, configuration: config)
-            isLoaded = true
-            ActivityLog.shared.info("[DruseRescoring] Model loaded — compute units: all (ANE preferred)", category: .system)
-        } catch {
-            ActivityLog.shared.error("[DruseRescoring] Failed to load model: \(error)", category: .system)
-        }
-    }
-
-    /// Whether the ML model is available.
-    var isAvailable: Bool { isLoaded && model != nil }
-
-    /// Score a single protein-ligand complex.
-    func score(features: DruseScoreFeatureExtractor.ComplexFeatures) async -> Prediction? {
-        guard let model else { return nil }
-
-        // Prepare MLMultiArray inputs
-        let nProt = min(features.proteinPositions.count, DruseScoreFeatureExtractor.maxAtoms)
-        let nLig = min(features.ligandPositions.count, DruseScoreFeatureExtractor.maxAtoms)
-        let featSize = DruseScoreFeatureExtractor.atomFeatureSize
-
-        guard nProt > 0 && nLig > 0 else {
-            ActivityLog.shared.warn("[DruseRescoring] score skipped: empty atoms (prot=\(features.proteinPositions.count), lig=\(features.ligandPositions.count))", category: .dock)
-            return nil
-        }
-
-        do {
-            // Zero-copy MLMultiArray: allocate contiguous Float buffer and wrap directly.
-            // Avoids per-element NSNumber boxing which dominates inference prep time.
-            func makeMLArray(shape: [Int], fill: (UnsafeMutablePointer<Float>) -> Void) throws -> MLMultiArray {
-                let totalCount = shape.reduce(1, *)
-                let byteCount = totalCount * MemoryLayout<Float>.stride
-                let raw = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: MemoryLayout<Float>.alignment)
-                let floatPtr = raw.bindMemory(to: Float.self, capacity: totalCount)
-                fill(floatPtr)
-                let strides = shape.indices.map { i in
-                    NSNumber(value: shape[(i+1)...].reduce(1, *))
-                }
-                return try MLMultiArray(
-                    dataPointer: raw,
-                    shape: shape.map { NSNumber(value: $0) },
-                    dataType: .float32,
-                    strides: strides,
-                    deallocator: { ptr in ptr.deallocate() }
-                )
-            }
-
-            // Protein features: [1, nProt, featSize]
-            let protArray = try makeMLArray(shape: [1, nProt, featSize]) { ptr in
-                for i in 0..<nProt {
-                    let base = i * featSize
-                    for j in 0..<featSize {
-                        ptr[base + j] = features.proteinFeatures[i][j]
-                    }
-                }
-            }
-
-            // Ligand features: [1, nLig, featSize]
-            let ligArray = try makeMLArray(shape: [1, nLig, featSize]) { ptr in
-                for i in 0..<nLig {
-                    let base = i * featSize
-                    for j in 0..<featSize {
-                        ptr[base + j] = features.ligandFeatures[i][j]
-                    }
-                }
-            }
-
-            // Protein positions: [1, nProt, 3]
-            let protPos = try makeMLArray(shape: [1, nProt, 3]) { ptr in
-                for i in 0..<nProt {
-                    let base = i * 3
-                    ptr[base] = features.proteinPositions[i].x
-                    ptr[base + 1] = features.proteinPositions[i].y
-                    ptr[base + 2] = features.proteinPositions[i].z
-                }
-            }
-
-            // Ligand positions: [1, nLig, 3]
-            let ligPos = try makeMLArray(shape: [1, nLig, 3]) { ptr in
-                for i in 0..<nLig {
-                    let base = i * 3
-                    ptr[base] = features.ligandPositions[i].x
-                    ptr[base + 1] = features.ligandPositions[i].y
-                    ptr[base + 2] = features.ligandPositions[i].z
-                }
-            }
-
-            // RBF-encoded pairwise distances: [1, nProt, nLig, 50]
-            // Source was computed with actual (uncapped) atom counts — only copy the valid region
-            let actualNLigR = features.ligandPositions.count
-            let rbfArray = try makeMLArray(shape: [1, nProt, nLig, 50]) { ptr in
-                if actualNLigR == nLig {
-                    // No capping needed — direct memcpy
-                    let count = min(features.pairRBF.count, nProt * nLig * 50)
-                    features.pairRBF.withUnsafeBufferPointer { src in
-                        ptr.update(from: src.baseAddress!, count: count)
-                    }
-                } else {
-                    // Source stride differs from dest stride — copy row by row
-                    for pi in 0..<nProt {
-                        for li in 0..<nLig {
-                            let srcBase = (pi * actualNLigR + li) * 50
-                            let dstBase = (pi * nLig + li) * 50
-                            for k in 0..<50 {
-                                if srcBase + k < features.pairRBF.count {
-                                    ptr[dstBase + k] = features.pairRBF[srcBase + k]
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Create feature provider
-            let provider = try MLDictionaryFeatureProvider(dictionary: [
-                "protein_features": protArray,
-                "ligand_features": ligArray,
-                "protein_positions": protPos,
-                "ligand_positions": ligPos,
-                "pair_rbf": rbfArray
-            ])
-
-            // Run inference on main actor (CoreML handles dispatch internally)
-            let result = try await model.prediction(from: provider)
-            return parsePrediction(result, nProt: nProt, nLig: nLig)
-        } catch {
-            ActivityLog.shared.warn("[DruseRescoring] Inference failed: \(error)", category: .dock)
-            return nil
-        }
-    }
-
-    /// Re-rank a batch of docking results using DruseScore.
-    func rerankPoses(
-        results: [DockingResult],
-        proteinAtoms: [Atom],
-        ligandAtoms: [Atom],
-        pocketCenter: SIMD3<Float>,
-        proteinBonds: [Bond] = [],
-        ligandBonds: [Bond] = []
-    ) async -> [DockingResult] {
-        guard isAvailable else { return results }
-
-        var scored = results
-        let pocketProteinAtoms = proteinAtoms.filter {
-            simd_distance($0.position, pocketCenter) <= 10.0
-        }
-
-        for i in 0..<scored.count {
-            // Create virtual ligand atoms at pose position
-            var poseAtoms = ligandAtoms
-            for j in 0..<poseAtoms.count {
-                if j < scored[i].transformedAtomPositions.count {
-                    poseAtoms[j].position = scored[i].transformedAtomPositions[j]
-                }
-            }
-
-            let features = DruseScoreFeatureExtractor.extract(
-                proteinAtoms: pocketProteinAtoms,
-                ligandAtoms: poseAtoms,
-                pocketCenter: pocketCenter,
-                proteinBonds: proteinBonds,
-                ligandBonds: ligandBonds
-            )
-
-            if let pred = await score(features: features) {
-                // Combine physics score with ML score (weighted)
-                let physicsScore = scored[i].energy
-                let mlScore = -pred.pKd * 1.364 // Convert pKd to approx kcal/mol
-                scored[i].energy = 0.3 * physicsScore + 0.7 * mlScore
-            }
-        }
-
-        return scored.sorted { $0.energy < $1.energy }
-    }
-
-    /// Parse CoreML output tensors into our Prediction struct.
-    /// Uses direct pointer access to avoid NSNumber allocation storm.
-    private func parsePrediction(_ output: MLFeatureProvider, nProt: Int, nLig: Int) -> Prediction? {
-        guard let pkdValue = output.featureValue(for: "pKd")?.multiArrayValue,
-              let poseConf = output.featureValue(for: "pose_confidence")?.multiArrayValue
-        else {
-            ActivityLog.shared.warn("[DruseRescoring] parsePrediction: missing required output features (pKd/pose_confidence)", category: .dock)
-            return nil
-        }
-
-        let pKd = pkdValue[0].floatValue
-        let confidence = poseConf[0].floatValue
-
-        var interactions: [Prediction.InteractionPred] = []
-        if let interMap = output.featureValue(for: "interaction_map")?.multiArrayValue {
-            let strides = interMap.strides.map(\.intValue)
-            let ptr = interMap.dataPointer.bindMemory(to: Float.self, capacity: interMap.count)
-            let s0 = strides.count > 0 ? strides[0] : 0
-            let s1 = strides.count > 1 ? strides[1] : 0
-            let s2 = strides.count > 2 ? strides[2] : 0
-            let s3 = strides.count > 3 ? strides[3] : 0
-            let totalCount = interMap.count
-
-            for i in 0..<nProt {
-                for j in 0..<nLig {
-                    let base = 0 * s0 + i * s1 + j * s2
-                    let i0 = base + 0 * s3
-                    let i4 = base + 4 * s3
-                    guard i0 >= 0, i4 < totalCount else { continue }
-                    let hb = ptr[i0]
-                    let hp = ptr[base + 1 * s3]
-                    let ion = ptr[base + 2 * s3]
-                    let piS = ptr[base + 3 * s3]
-                    let hal = ptr[i4]
-
-                    if max(hb, hp, ion, piS, hal) > 0.3 {
-                        interactions.append(.init(
-                            proteinAtomIndex: i, ligandAtomIndex: j,
-                            hbondProb: hb, hydrophobicProb: hp,
-                            ionicProb: ion, piStackProb: piS, halogenProb: hal
-                        ))
-                    }
-                }
-            }
-        }
-
-        var attention: [Float] = []
-        if let attnWeights = output.featureValue(for: "attention_weights")?.multiArrayValue {
-            let ptr = attnWeights.dataPointer.bindMemory(to: Float.self, capacity: attnWeights.count)
-            attention.reserveCapacity(attnWeights.count)
-            for i in 0..<attnWeights.count {
-                attention.append(ptr[i])
-            }
-        }
-
-        return Prediction(
-            pKd: pKd,
-            poseConfidence: confidence,
-            interactionMap: interactions,
-            attentionWeights: attention
-        )
     }
 }
 
@@ -1645,8 +1113,9 @@ private final class FeatureComputeAccelerator {
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
 
-        // Read valid count
-        let validCount = Int(countBuf.contents().load(as: UInt32.self))
+        // Read valid count — clamp to buffer capacity (GPU atomic counter can exceed allocation)
+        let rawCount = Int(countBuf.contents().load(as: UInt32.self))
+        let validCount = min(rawCount, maxOutput)
         guard validCount > 0 else { return nil }
 
         // Subsample to maxPoints if needed

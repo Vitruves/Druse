@@ -578,16 +578,26 @@ enum ProteinPreparation {
         pH: Float = 7.4,
         chargeMethod: ChargeMethod = .gasteiger
     ) -> (atoms: [Atom], bonds: [Bond], report: DockingPreparationReport) {
+        let totalStart = CFAbsoluteTimeGetCurrent()
         var report = DockingPreparationReport()
 
+        let logT = { (phase: String, start: CFAbsoluteTime) in
+            let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            Task { @MainActor in ActivityLog.shared.info("[Prep] \(phase) — \(String(format: "%.0f", ms))ms", category: .prep) }
+        }
+
+        var t = CFAbsoluteTimeGetCurrent()
         let cleanup = cleanupStructure(atoms: atoms, bonds: bonds)
+        logT("Phase 1 cleanup (\(atoms.count) → \(cleanup.atoms.count) atoms)", t)
         report.altConformerAtomsRemoved = cleanup.report.removedAltConformerAtoms
         report.heterogenResiduesRemoved = cleanup.report.removedHeterogenResidues
         report.cappingResiduesAdded = cleanup.report.addedCappingResidues
         report.chainBreaksDetected = cleanup.report.chainBreaks.count
         report.chainBreaksCapped = cleanup.report.chainBreaks.filter(\.isCapped).count
 
+        t = CFAbsoluteTimeGetCurrent()
         let phase23 = completePhase23(atoms: cleanup.atoms, bonds: cleanup.bonds, pH: pH)
+        logT("Phase 2-4 reconstruct+H+network (\(cleanup.atoms.count) → \(phase23.atoms.count) atoms)", t)
         var workingAtoms = phase23.atoms
         var workingBonds = phase23.bonds
 
@@ -602,27 +612,12 @@ enum ProteinPreparation {
             report.hydrogenMethod = "existing"
         }
 
-        // Phase 4: H-bond network optimization (enumerate, score, optimize, apply)
-        let network = HBondNetworkOptimizer.optimizeNetwork(
-            atoms: workingAtoms,
-            bonds: workingBonds,
-            predictions: phase23.protonation
-        )
-        workingAtoms = network.atoms
-        workingBonds = network.bonds
-        report.hbondNetworkReport = network.report
+        report.hbondNetworkReport = phase23.report.networkReport
 
         // Phase 5: Charge assignment — dispatch based on selected method
+        t = CFAbsoluteTimeGetCurrent()
         switch chargeMethod {
         case .gasteiger:
-            // RDKit's PDB parser can crash on very large proteins (>8000 atoms).
-            // For large structures, skip RDKit Gasteiger and rely on the
-            // electrostatic fallback table (residue-based partial charges).
-            // RDKit's PDB-based Gasteiger charges can crash on large structures.
-            // The fragment-based approach in RDKit parses each residue independently
-            // which is O(n_residues) but the internal graph operations are expensive
-            // for large molecules. Above this threshold, we use the residue-based
-            // fallback charge table instead (accurate for standard amino acids).
             let maxAtomsForRDKitCharges = 6000
             if let pdbContent = rawPDBContent, workingAtoms.count <= maxAtomsForRDKitCharges,
                let chargeData = RDKitBridge.computeChargesPDB(pdbContent: pdbContent) {
@@ -636,7 +631,6 @@ enum ProteinPreparation {
             }
 
         case .eem, .qeq, .xtb:
-            // Use the new charge calculators (EEM/QEq run on GPU, xTB on CPU)
             let calculator: ChargeCalculator
             switch chargeMethod {
             case .eem: calculator = EEMChargeCalculator(device: nil)
@@ -644,7 +638,6 @@ enum ProteinPreparation {
             case .xtb: calculator = XTBChargeCalculator()
             default:   calculator = GasteigerChargeCalculator()
             }
-            // Synchronous wrapper — prepareForDocking is called from a Task context
             let semaphore = DispatchSemaphore(value: 0)
             nonisolated(unsafe) var computedCharges: [Float]?
             let calcAtoms = workingAtoms
@@ -663,6 +656,7 @@ enum ProteinPreparation {
                 }
             }
         }
+        logT("Phase 5 charges (\(chargeMethod), \(workingAtoms.count) atoms)", t)
 
         let beforeFallback = workingAtoms
         workingAtoms = applyElectrostaticFallback(to: workingAtoms)
@@ -671,10 +665,11 @@ enum ProteinPreparation {
         }.count
         report.nonZeroChargeAtoms = workingAtoms.filter { abs($0.charge) > 0.001 }.count
 
+        let totalMs = (CFAbsoluteTimeGetCurrent() - totalStart) * 1000
         let finalAtomCount = workingAtoms.count
         let finalHAdded = report.hydrogensAdded
         let finalChargedAtoms = report.nonZeroChargeAtoms
-        Task { @MainActor in ActivityLog.shared.info("[Prep] Docking prep done: \(finalAtomCount) atoms, \(finalHAdded) H added, \(finalChargedAtoms) charged atoms (\(chargeMethod))", category: .prep) }
+        Task { @MainActor in ActivityLog.shared.info("[Prep] Docking prep done in \(String(format: "%.0f", totalMs))ms: \(finalAtomCount) atoms, \(finalHAdded) H added, \(finalChargedAtoms) charged atoms (\(chargeMethod))", category: .prep) }
         return (workingAtoms, workingBonds, report)
     }
 

@@ -22,6 +22,9 @@
 #include "openmm/VerletIntegrator.h"
 #include "openmm/LocalEnergyMinimizer.h"
 #include "openmm/HarmonicBondForce.h"
+#include "openmm/HarmonicAngleForce.h"
+#include "openmm/PeriodicTorsionForce.h"
+#include "openmm/CustomBondForce.h"
 #include "openmm/CustomExternalForce.h"
 #include "openmm/CustomNonbondedForce.h"
 #include "openmm/Vec3.h"
@@ -304,6 +307,220 @@ bool druse_openmm_available(void) {
     return true;
 }
 
+// ============================================================================
+// Loop Refinement
+// ============================================================================
+
+DruseOpenMMLoopResult* druse_openmm_refine_loop(
+    const DruseOpenMMAtom *atoms,
+    int32_t atomCount,
+    const DruseOpenMMBond *bonds,
+    int32_t bondCount,
+    const DruseOpenMMAngle *angles,
+    int32_t angleCount,
+    const DruseOpenMMTorsion *torsions,
+    int32_t torsionCount,
+    const bool *isLoopAtom,
+    int32_t maxIterations
+) {
+    auto *result = new DruseOpenMMLoopResult();
+    result->success = false;
+    result->finalEnergyKcal = 0;
+    result->refinedPositionsX = nullptr;
+    result->refinedPositionsY = nullptr;
+    result->refinedPositionsZ = nullptr;
+    result->atomCount = 0;
+    result->errorMessage[0] = '\0';
+
+    if (!atoms || atomCount <= 0 || !isLoopAtom) {
+        std::strncpy(result->errorMessage, "Invalid input: no atoms or missing isLoopAtom flags", 255);
+        return result;
+    }
+
+    try {
+        Platform::loadPluginsFromDirectory(Platform::getDefaultPluginsDirectory());
+
+        System system;
+        for (int i = 0; i < atomCount; i++) {
+            system.addParticle(atoms[i].mass);
+        }
+
+        // ---------------------------------------------------------------
+        // 1. HarmonicBondForce — maintain all bond geometry
+        // ---------------------------------------------------------------
+        auto *bondForce = new HarmonicBondForce();
+        bondForce->setForceGroup(0);
+        for (int i = 0; i < bondCount; i++) {
+            int a1 = bonds[i].atom1;
+            int a2 = bonds[i].atom2;
+            if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount) continue;
+            double lengthNm = bonds[i].lengthNm;
+            double k = estimateBondForceConstant(atoms[a1].atomicNum, atoms[a2].atomicNum);
+            bondForce->addBond(a1, a2, lengthNm, k);
+        }
+        system.addForce(bondForce);
+
+        // ---------------------------------------------------------------
+        // 2. HarmonicAngleForce — backbone angle constraints
+        // ---------------------------------------------------------------
+        if (angleCount > 0 && angles) {
+            auto *angleForce = new HarmonicAngleForce();
+            angleForce->setForceGroup(1);
+            constexpr double degToRad = 3.14159265358979323846 / 180.0;
+            for (int i = 0; i < angleCount; i++) {
+                int a1 = angles[i].atom1;
+                int a2 = angles[i].atom2;
+                int a3 = angles[i].atom3;
+                if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount || a3 < 0 || a3 >= atomCount) continue;
+                double angleRad = angles[i].angleDegrees * degToRad;
+                double k = angles[i].forceConstant;
+                angleForce->addAngle(a1, a2, a3, angleRad, k);
+            }
+            system.addForce(angleForce);
+        }
+
+        // ---------------------------------------------------------------
+        // 3. PeriodicTorsionForce — omega and phi/psi constraints
+        // ---------------------------------------------------------------
+        if (torsionCount > 0 && torsions) {
+            auto *torsionForce = new PeriodicTorsionForce();
+            torsionForce->setForceGroup(2);
+            constexpr double degToRad = 3.14159265358979323846 / 180.0;
+            for (int i = 0; i < torsionCount; i++) {
+                int a1 = torsions[i].atom1;
+                int a2 = torsions[i].atom2;
+                int a3 = torsions[i].atom3;
+                int a4 = torsions[i].atom4;
+                if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount ||
+                    a3 < 0 || a3 >= atomCount || a4 < 0 || a4 >= atomCount) continue;
+                double phaseRad = torsions[i].phaseDegrees * degToRad;
+                torsionForce->addTorsion(a1, a2, a3, a4,
+                                         torsions[i].periodicity, phaseRad, torsions[i].forceConstant);
+            }
+            system.addForce(torsionForce);
+        }
+
+        // ---------------------------------------------------------------
+        // 4. CustomExternalForce — positional restraints
+        //    Loop atoms: free (k=0), non-loop atoms: frozen (k=10000)
+        // ---------------------------------------------------------------
+        auto *restraint = new CustomExternalForce(
+            "0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)"
+        );
+        restraint->addPerParticleParameter("k");
+        restraint->addPerParticleParameter("x0");
+        restraint->addPerParticleParameter("y0");
+        restraint->addPerParticleParameter("z0");
+        restraint->setForceGroup(3);
+
+        for (int i = 0; i < atomCount; i++) {
+            double posNmX = atoms[i].x / 10.0;
+            double posNmY = atoms[i].y / 10.0;
+            double posNmZ = atoms[i].z / 10.0;
+            double k = isLoopAtom[i] ? 0.0 : 10000.0;
+            std::vector<double> params = {k, posNmX, posNmY, posNmZ};
+            restraint->addParticle(i, params);
+        }
+        system.addForce(restraint);
+
+        // ---------------------------------------------------------------
+        // 5. Steric repulsion — loop vs. non-loop atoms
+        // ---------------------------------------------------------------
+        auto *steric = new CustomNonbondedForce(
+            "4*epsilon*(sigma/r)^12; "
+            "sigma=0.5*(sigma1+sigma2); "
+            "epsilon=sqrt(epsilon1*epsilon2)"
+        );
+        steric->addPerParticleParameter("sigma");
+        steric->addPerParticleParameter("epsilon");
+        steric->setNonbondedMethod(CustomNonbondedForce::NoCutoff);
+        steric->setForceGroup(4);
+
+        std::set<int> loopGroup, nonLoopGroup;
+        for (int i = 0; i < atomCount; i++) {
+            double sigma = atoms[i].sigmaNm > 0 ? atoms[i].sigmaNm : 0.34;
+            double epsilon = atoms[i].epsilonKJ > 0 ? atoms[i].epsilonKJ : 0.36;
+            std::vector<double> params = {sigma, epsilon};
+            steric->addParticle(params);
+            if (isLoopAtom[i]) {
+                loopGroup.insert(i);
+            } else {
+                nonLoopGroup.insert(i);
+            }
+        }
+        if (!loopGroup.empty() && !nonLoopGroup.empty()) {
+            steric->addInteractionGroup(loopGroup, nonLoopGroup);
+        }
+        system.addForce(steric);
+
+        // ---------------------------------------------------------------
+        // 6. Context setup + minimize
+        // ---------------------------------------------------------------
+        VerletIntegrator integrator(0.001);
+
+        Platform *platform = nullptr;
+        try { platform = &Platform::getPlatformByName("CPU"); }
+        catch (...) {
+            try { platform = &Platform::getPlatformByName("Reference"); }
+            catch (...) {}
+        }
+
+        Context *context;
+        if (platform) {
+            context = new Context(system, integrator, *platform);
+        } else {
+            context = new Context(system, integrator);
+        }
+
+        std::vector<Vec3> positions(atomCount);
+        for (int i = 0; i < atomCount; i++) {
+            positions[i] = Vec3(atoms[i].x / 10.0, atoms[i].y / 10.0, atoms[i].z / 10.0);
+        }
+        context->setPositions(positions);
+
+        LocalEnergyMinimizer::minimize(*context, 1.0, maxIterations);
+
+        // ---------------------------------------------------------------
+        // 7. Extract results
+        // ---------------------------------------------------------------
+        State energyState = context->getState(State::Energy);
+        result->finalEnergyKcal = (float)(energyState.getPotentialEnergy() * 0.239005736);
+
+        State posState = context->getState(State::Positions);
+        const std::vector<Vec3> &finalPositions = posState.getPositions();
+
+        result->refinedPositionsX = new float[atomCount];
+        result->refinedPositionsY = new float[atomCount];
+        result->refinedPositionsZ = new float[atomCount];
+        result->atomCount = atomCount;
+
+        for (int i = 0; i < atomCount; i++) {
+            result->refinedPositionsX[i] = (float)(finalPositions[i][0] * 10.0);
+            result->refinedPositionsY[i] = (float)(finalPositions[i][1] * 10.0);
+            result->refinedPositionsZ[i] = (float)(finalPositions[i][2] * 10.0);
+        }
+
+        result->success = true;
+        delete context;
+
+    } catch (const std::exception &e) {
+        std::strncpy(result->errorMessage, e.what(), 255);
+        result->errorMessage[255] = '\0';
+    } catch (...) {
+        std::strncpy(result->errorMessage, "Unknown OpenMM loop refinement error", 255);
+    }
+
+    return result;
+}
+
+void druse_free_openmm_loop_result(DruseOpenMMLoopResult *result) {
+    if (!result) return;
+    delete[] result->refinedPositionsX;
+    delete[] result->refinedPositionsY;
+    delete[] result->refinedPositionsZ;
+    delete result;
+}
+
 #else // DRUSE_HAS_OPENMM not defined
 
 #include "druse_openmm.h"
@@ -336,6 +553,32 @@ void druse_free_openmm_result(DruseOpenMMResult *result) {
 
 bool druse_openmm_available(void) {
     return false;
+}
+
+DruseOpenMMLoopResult* druse_openmm_refine_loop(
+    const DruseOpenMMAtom *, int32_t,
+    const DruseOpenMMBond *, int32_t,
+    const DruseOpenMMAngle *, int32_t,
+    const DruseOpenMMTorsion *, int32_t,
+    const bool *, int32_t
+) {
+    auto *result = new DruseOpenMMLoopResult();
+    result->success = false;
+    result->finalEnergyKcal = 0;
+    result->refinedPositionsX = nullptr;
+    result->refinedPositionsY = nullptr;
+    result->refinedPositionsZ = nullptr;
+    result->atomCount = 0;
+    std::strncpy(result->errorMessage, "OpenMM not available (not compiled with DRUSE_HAS_OPENMM)", 255);
+    return result;
+}
+
+void druse_free_openmm_loop_result(DruseOpenMMLoopResult *result) {
+    if (!result) return;
+    delete[] result->refinedPositionsX;
+    delete[] result->refinedPositionsY;
+    delete[] result->refinedPositionsZ;
+    delete result;
 }
 
 #endif // DRUSE_HAS_OPENMM

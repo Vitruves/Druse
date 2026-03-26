@@ -98,13 +98,7 @@ struct StatusStripView: View {
             return "Ready to dock — configure and run"
         }
         if !viewModel.docking.dockingResults.isEmpty {
-            let best = viewModel.docking.dockingResults.first
-            if viewModel.docking.scoringMethod == .druseAffinity, let pKd = best?.mlPKd {
-                let display = viewModel.docking.affinityDisplayUnit.format(pKd)
-                let unit = viewModel.docking.affinityDisplayUnit.unitLabel
-                return "Best pose: \(display) \(unit) — check Results"
-            }
-            let energy = best?.energy ?? 0
+            let energy = viewModel.docking.dockingResults.first?.energy ?? 0
             return String(format: "Best pose: %.2f kcal/mol — check Results", energy)
         }
         return nil
@@ -136,38 +130,43 @@ struct StatusStripView: View {
                             .fill(Color.secondary.opacity(0.4))
                             .frame(width: 36, height: 3)
                     )
-                    .background(.ultraThinMaterial)
+                    .background(Color(nsColor: .windowBackgroundColor))
             }
 
             Divider()
 
             // Status strip — always visible
-            HStack(spacing: 6) {
+            HStack(alignment: .center, spacing: 6) {
                 // Expand/collapse console
                 Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showConsole.toggle() } }) {
                     Image(systemName: showConsole ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 9, weight: .bold))
-                        .frame(width: 16, height: 16)
+                        .font(.caption2.weight(.bold))
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
+                .help(showConsole ? "Collapse console" : "Expand console")
+                .plainButtonAccessibility(AccessibilityID.statusToggleConsole)
 
                 // Status indicator
                 let status = statusInfo
-                HStack(spacing: 5) {
+                HStack(spacing: 4) {
                     if isActive {
                         ProgressView()
                             .controlSize(.mini)
                             .scaleEffect(0.7)
+                            .frame(width: 14, height: 14)
                     } else {
                         Image(systemName: status.icon)
-                            .font(.system(size: 10))
+                            .font(.caption2)
                             .foregroundStyle(status.color)
+                            .frame(width: 14, height: 14)
                     }
 
                     Text(status.message)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(isActive ? .primary : .secondary)
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
                 }
 
@@ -185,58 +184,47 @@ struct StatusStripView: View {
                             }
                         }
                         .frame(width: 80, height: 4)
+
                     }
 
                     Button(action: stopCurrentOperation) {
                         Image(systemName: "stop.fill")
-                            .font(.system(size: 8))
+                            .font(.caption2)
                             .foregroundStyle(.red)
-                            .frame(width: 16, height: 16)
+                            .frame(width: 20, height: 20)
                             .background(Color.red.opacity(0.12))
-                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                     }
                     .buttonStyle(.plain)
                     .help(stopButtonHint)
+                    .plainButtonAccessibility(AccessibilityID.statusStop)
                 }
 
                 // Contextual hint (when not actively working)
                 if !isActive, let hint = contextualHint {
-                    Divider().frame(height: 14)
-                    HStack(spacing: 3) {
+                    Divider().frame(height: 12)
+                    HStack(spacing: 4) {
                         Image(systemName: "lightbulb.fill")
-                            .font(.system(size: 8))
+                            .font(.caption2)
                             .foregroundStyle(.yellow.opacity(0.7))
+                            .frame(width: 14, height: 14)
                         Text(hint)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
 
-                Spacer()
+                Spacer(minLength: 4)
 
                 // Project save/load
-                Button(action: { saveProject() }) {
-                    Image(systemName: "square.and.arrow.down")
-                        .font(.system(size: 10))
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Save Project (Cmd+S)")
+                statusBarButton(icon: "square.and.arrow.down", help: "Save Project (Cmd+S)",
+                                accessibilityID: AccessibilityID.statusSaveProject) { saveProject() }
 
-                Button(action: { openProject() }) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 10))
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Open Project (Cmd+Shift+O)")
+                statusBarButton(icon: "folder", help: "Open Project (Cmd+Shift+O)",
+                                accessibilityID: AccessibilityID.statusOpenProject) { openProject() }
 
-                Divider().frame(height: 14)
+                Divider().frame(height: 12)
 
                 if showConsole {
                     Picker("", selection: $filterLevel) {
@@ -247,56 +235,38 @@ struct StatusStripView: View {
                     }
                     .pickerStyle(.menu)
                     .frame(width: 60)
+                    .help("Filter console by log level")
 
                     if !selectedEntryIDs.isEmpty {
                         Button(action: copySelected) {
-                            HStack(spacing: 3) {
+                            HStack(spacing: 4) {
                                 Image(systemName: "doc.on.doc")
-                                    .font(.system(size: 9))
+                                    .font(.caption2)
                                 Text("\(selectedEntryIDs.count)")
-                                    .font(.system(size: 9, design: .monospaced))
+                                    .font(.footnote.monospaced())
                             }
-                            .frame(height: 22)
+                            .frame(height: 20)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
                         .help("Copy selected lines")
+                        .plainButtonAccessibility(AccessibilityID.statusCopySelected)
                     }
 
-                    Button(action: copyAll) {
-                        Image(systemName: "doc.on.clipboard")
-                            .font(.system(size: 10))
-                            .frame(width: 22, height: 22)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help("Copy all console output")
+                    statusBarButton(icon: "doc.on.clipboard", help: "Copy all console output",
+                                    accessibilityID: AccessibilityID.statusCopyAll) { copyAll() }
 
-                    Button(action: {
+                    statusBarButton(icon: "trash", help: "Clear all log entries",
+                                    accessibilityID: AccessibilityID.statusClearLog) {
                         log.clear()
                         selectedEntryIDs.removeAll()
                         lastClickedID = nil
-                    }) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 10))
-                            .frame(width: 22, height: 22)
-                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
 
                     if log.currentLogFileURL != nil {
-                        Button(action: { log.revealLogInFinder() }) {
-                            Image(systemName: "doc.text.magnifyingglass")
-                                .font(.system(size: 10))
-                                .frame(width: 22, height: 22)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Reveal log file in Finder")
+                        statusBarButton(icon: "doc.text.magnifyingglass", help: "Reveal log file in Finder",
+                                        accessibilityID: AccessibilityID.statusRevealLog) { log.revealLogInFinder() }
                     }
                 }
 
@@ -305,11 +275,11 @@ struct StatusStripView: View {
                     if errorCount > 0 {
                         HStack(spacing: 3) {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 9))
+                                .font(.caption2)
                             Text("\(errorCount)")
-                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .font(.caption2.weight(.medium).monospaced())
                         }
-                        .padding(.horizontal, 5)
+                        .padding(.horizontal, 4)
                         .padding(.vertical, 2)
                         .background(Color.red.opacity(0.15))
                         .foregroundStyle(.red)
@@ -317,21 +287,21 @@ struct StatusStripView: View {
                     }
                 }
 
-                Divider().frame(height: 14)
+                Divider().frame(height: 12)
 
                 // Console toggle
                 Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showConsole.toggle() } }) {
                     HStack(spacing: 4) {
                         Image(systemName: "terminal")
-                            .font(.system(size: 10))
+                            .font(.caption2)
                         if !showConsole {
                             Text("Console")
-                                .font(.system(size: 10))
+                                .font(.footnote)
                         }
                     }
-                    .foregroundStyle(showConsole ? .primary : .tertiary)
+                    .foregroundStyle(showConsole ? .primary : .secondary)
                     .padding(.horizontal, 6)
-                    .frame(height: 22)
+                    .frame(height: 20)
                     .background(showConsole ? Color.accentColor.opacity(0.12) : Color.clear)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
                     .contentShape(Rectangle())
@@ -340,9 +310,8 @@ struct StatusStripView: View {
                 .help(showConsole ? "Hide console" : "Show console")
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 4)
             .frame(height: 26)
-            .background(.ultraThinMaterial)
+            .background(Color(nsColor: .windowBackgroundColor))
 
             // Expanded console
             if showConsole {
@@ -370,10 +339,25 @@ struct StatusStripView: View {
                     }
                 }
                 .frame(height: consoleHeight)
-                .background(Color(nsColor: .controlBackgroundColor).opacity(0.3))
+                .background(Color(nsColor: .controlBackgroundColor))
                 .copyable(formatEntries(selectedEntryIDs.isEmpty ? filteredEntries : selectedEntries))
             }
         }
+    }
+
+    // MARK: - Status Bar Button
+
+    private func statusBarButton(icon: String, help: String, accessibilityID: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.caption2)
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help(help)
+        .plainButtonAccessibility(accessibilityID)
     }
 
     // MARK: - Log Entry Row
@@ -381,23 +365,23 @@ struct StatusStripView: View {
     @ViewBuilder
     private func logEntryRow(_ entry: LogEntry) -> some View {
         let isSelected = selectedEntryIDs.contains(entry.id)
-        HStack(alignment: .top, spacing: 6) {
+        HStack(alignment: .top, spacing: 8) {
             Text(entry.formattedTime)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
+                .font(.footnote.monospaced())
+                .foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
             Image(systemName: entry.level.icon)
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(entry.level.color)
                 .frame(width: 14)
             Text(entry.category.rawValue)
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(.footnote.weight(.medium).monospaced())
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
                 .background(Color.accentColor.opacity(0.15))
-                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
             Text(entry.message)
-                .font(.system(size: 11, design: .monospaced))
+                .font(.subheadline.monospaced())
                 .foregroundStyle(.primary)
                 .lineLimit(2)
                 .textSelection(.enabled)
@@ -406,7 +390,7 @@ struct StatusStripView: View {
         .padding(.vertical, 2)
         .padding(.horizontal, 4)
         .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 3))
+        .clipShape(RoundedRectangle(cornerRadius: 4))
         .contentShape(Rectangle())
         .onTapGesture {
             handleEntryClick(entry, shiftKey: NSEvent.modifierFlags.contains(.shift))

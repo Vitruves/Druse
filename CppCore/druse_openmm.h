@@ -72,6 +72,60 @@ void druse_free_openmm_result(DruseOpenMMResult *result);
 /// Check if OpenMM is available (compiled in).
 bool druse_openmm_available(void);
 
+// ============================================================================
+// MARK: - OpenMM Loop Refinement (C API)
+// ============================================================================
+
+/// An angle restraint for backbone geometry.
+typedef struct {
+    int32_t atom1;
+    int32_t atom2;            // central atom
+    int32_t atom3;
+    float angleDegrees;       // equilibrium angle (degrees)
+    float forceConstant;      // kJ/mol/rad^2
+} DruseOpenMMAngle;
+
+/// A torsion (dihedral) restraint for backbone geometry.
+typedef struct {
+    int32_t atom1;
+    int32_t atom2;
+    int32_t atom3;
+    int32_t atom4;
+    int32_t periodicity;
+    float phaseDegrees;       // equilibrium phase (degrees)
+    float forceConstant;      // kJ/mol
+} DruseOpenMMTorsion;
+
+/// Result of loop refinement.
+typedef struct {
+    bool success;
+    float finalEnergyKcal;
+    float *refinedPositionsX;     // all atom positions (Å)
+    float *refinedPositionsY;
+    float *refinedPositionsZ;
+    int32_t atomCount;
+    char errorMessage[256];
+} DruseOpenMMLoopResult;
+
+/// Run OpenMM loop refinement.
+/// Strong restraints on non-loop atoms, free movement for loop atoms.
+/// Includes angle/torsion forces for proper backbone geometry and gap closure.
+DruseOpenMMLoopResult* druse_openmm_refine_loop(
+    const DruseOpenMMAtom *atoms,
+    int32_t atomCount,
+    const DruseOpenMMBond *bonds,
+    int32_t bondCount,
+    const DruseOpenMMAngle *angles,
+    int32_t angleCount,
+    const DruseOpenMMTorsion *torsions,
+    int32_t torsionCount,
+    const bool *isLoopAtom,            // per-atom flag: true for loop atoms
+    int32_t maxIterations              // minimization iterations (default 1000)
+);
+
+/// Free a result from druse_openmm_refine_loop.
+void druse_free_openmm_loop_result(DruseOpenMMLoopResult *result);
+
 #ifdef __cplusplus
 }
 #endif

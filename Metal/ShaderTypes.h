@@ -147,6 +147,9 @@ struct GridProteinAtom {
     float       _pad1;
 };
 
+// Ligand atom flags
+#define LIGATOM_FLAG_AROMATIC 1u
+
 // Ligand atom for scoring
 struct DockLigandAtom {
     simd_float3 position;     // will be transformed by pose (centroid-subtracted)
@@ -155,7 +158,7 @@ struct DockLigandAtom {
     int32_t     vinaType;     // VinaAtomType enum
     int32_t     formalCharge;  // formal charge (for π-cation / salt bridge detection)
     float       _pad1;
-    float       _pad2;
+    uint32_t    flags;        // bit 0 = LIGATOM_FLAG_AROMATIC (member of aromatic ring)
 };
 
 // A single docking pose (chromosome in GA / ILS state)
@@ -320,6 +323,8 @@ struct LigandRingGPU {
 struct HalogenBondInfo {
     int32_t     halogenAtomIndex;
     int32_t     carbonAtomIndex;
+    int32_t     elementType;  // 0=F, 1=Cl, 2=Br, 3=I (for element-specific distances)
+    int32_t     _pad;
 };
 
 // Chalcogen bond info (maps ligand sulfur to its bonded carbon for σ-hole angle check)
@@ -347,6 +352,23 @@ struct SaltBridgeGroupGPU {
     float       _pad2;
 };
 
+// Protein chalcogen for bidirectional chalcogen bond scoring (Met SD, Cys SG)
+struct ProteinChalcogenGPU {
+    simd_float3 position;     // S atom position
+    float       _pad0;
+    simd_float3 bondedCDir;   // normalize(C - S): direction from S to bonded C (σ-hole is opposite)
+    float       _pad1;
+};
+
+// Torsion strain info for amide/conjugated planarity penalty
+struct TorsionStrainInfo {
+    int32_t     atom0, atom1, atom2, atom3; // dihedral quad (i-j-k-l)
+    int32_t     strainType;    // 0=none, 1=amide, 2=conjugated_sp2
+    float       forceConstant; // penalty stiffness (default 5.0 for amide)
+    float       _pad0;
+    float       _pad1;
+};
+
 // Drusina scoring parameters
 struct DrusinaParams {
     uint32_t    numProteinRings;
@@ -364,6 +386,15 @@ struct DrusinaParams {
     float       wAmideStack;     // amide-π stacking weight
     float       wChalcogenBond;  // chalcogen bond weight
     uint32_t    numSaltBridgeGroups; // number of protein charged groups
+    // New scoring terms
+    float       wCoulomb;        // screened Coulomb weight (ε=4r dielectric)
+    float       wCHPi;           // CH-π interaction weight
+    float       wCooperativity;  // cooperativity bonus per extra interaction
+    float       wTorsionStrain;  // torsion planarity penalty (positive = penalty)
+    uint32_t    numProteinChalcogens; // protein S atoms (Met/Cys) for bidirectional scoring
+    uint32_t    numTorsionStrains;    // amide/conjugated torsion count
+    uint32_t    _padDP0;
+    uint32_t    _padDP1;
 };
 
 // ============================================================================
@@ -374,14 +405,14 @@ struct DrusinaParams {
 struct DruseAFParams {
     uint32_t    numProteinAtoms;   // actual P (<=256)
     uint32_t    numLigandAtoms;    // actual L (<=64)
-    uint32_t    hiddenDim;         // 128
+    uint32_t    hiddenDim;         // 256
     uint32_t    numHeads;          // 4
-    uint32_t    headDim;           // 32 (hiddenDim / numHeads)
+    uint32_t    headDim;           // 64 (hiddenDim / numHeads)
     uint32_t    rbfBins;           // 50
     float       rbfGamma;          // 10.0
     float       rbfSpacing;        // 10.0 / 49.0 (matches torch.linspace(0, 10, 50))
-    uint32_t    numCrossAttnLayers; // 2
-    uint32_t    numWeightTensors;  // 48
+    uint32_t    numCrossAttnLayers; // 3
+    uint32_t    numWeightTensors;  // 56
     uint32_t    _pad0;
     uint32_t    _pad1;
 };
@@ -390,6 +421,76 @@ struct DruseAFParams {
 struct DruseAFWeightEntry {
     uint32_t    offset;    // float offset into weight buffer
     uint32_t    count;     // number of float elements
+};
+
+// ============================================================================
+// PIGNet2 — Physics-Informed GNN scoring
+// ============================================================================
+
+#define PIG_DIM            128u   // hidden dimension
+#define PIG_FEAT_DIM        47u   // input feature dimension (atom_to_features)
+#define PIG_MAX_PROT       256u   // max protein heavy atoms in pocket
+#define PIG_MAX_LIG         64u   // max ligand heavy atoms
+#define PIG_MAX_TOTAL      320u   // PIG_MAX_PROT + PIG_MAX_LIG
+#define PIG_MAX_INTRA_PROT 2048u  // max intramolecular edges (protein, bidirectional)
+#define PIG_MAX_INTRA_LIG   512u  // max intramolecular edges (ligand, bidirectional)
+#define PIG_MAX_INTER      8192u  // max intermolecular edges per pose (bidirectional)
+#define PIG_N_GNN            3u   // GatedGAT / InteractionNet layers
+#define PIG_INTER_CUTOFF   5.0f   // intermolecular edge distance cutoff (Angstroms)
+#define PIG_INTERACT_MIN   0.5f   // min distance for pairwise interactions
+#define PIG_VDW_EPS_LO     0.0178f
+#define PIG_VDW_EPS_HI     0.0356f
+#define PIG_DEV_VDW_COEFF  0.2f
+#define PIG_VDW_CLAMP     100.0f
+#define PIG_VDW_WIDTH_LO    1.0f   // Morse width scale range
+#define PIG_VDW_WIDTH_HI    2.0f
+#define PIG_SHORT_RANGE_A   2.1f   // Morse short-range width
+#define PIG_HBOND_C1      (-0.7f)
+#define PIG_HBOND_C2        0.0f
+#define PIG_METAL_C1      (-0.7f)
+#define PIG_METAL_C2        0.0f
+#define PIG_HYDRO_C1        0.5f
+#define PIG_HYDRO_C2        1.5f
+
+struct PIGNet2Params {
+    uint32_t    numProteinAtoms;      // P (<=256)
+    uint32_t    numLigandAtoms;       // L (<=64)
+    uint32_t    numProtIntraEdges;    // protein covalent edge pairs (bidirectional)
+    uint32_t    numLigIntraEdges;     // ligand covalent edge pairs (bidirectional)
+    uint32_t    numRotatableBonds;    // for rotor penalty
+    uint32_t    numWeightTensors;     // 61 (PIGNet2-Morse)
+    uint32_t    _pad0;
+    uint32_t    _pad1;
+};
+
+// Per-atom auxiliary data for PIGNet2 physics layer
+struct PIGNet2AtomAux {
+    float       vdwRadius;
+    uint32_t    flags;         // bit0: is_metal, bit1: h_donor, bit2: h_acceptor, bit3: hydrophobic
+    float       formalCharge;
+    float       _pad;
+};
+
+// PIGNet2 edge in CSR-like format: packed (source, target) uint16 pairs
+struct PIGNet2Edge {
+    uint16_t    src;
+    uint16_t    dst;
+};
+
+// PIGNet2 setup buffer layout offsets (in floats, relative to buffer start)
+// After setup kernel: stores protein embeddings + cached InteractionNet projections
+// PROT_EMBED:      [P × PIG_DIM]       — protein features after 3× intra-GatedGAT
+// INTER_W2X[0-2]:  [P × PIG_DIM] × 3   — cached W2*x_prot for each InteractionNet layer
+// Total: 4 × P × PIG_DIM floats
+#define PIG_SETUP_PROT_EMBED    0u
+// Offsets computed at runtime based on actual P
+
+// Parameters for the DruseAF v4 Pairwise Geometric Network (PGN)
+struct DruseAFv4Params {
+    uint32_t    numProteinAtoms;   // actual P (<=256)
+    uint32_t    numLigandAtoms;    // actual L (<=64)
+    uint32_t    numWeightTensors;  // 56
+    uint32_t    numPoses;          // population size (for score kernel dispatch)
 };
 
 // ============================================================================
@@ -823,6 +924,64 @@ struct GFN2CNGradAtom {
     float       _pad0;
     float       _pad1;
     float       _pad2;
+};
+
+// ============================================================================
+// MARK: - Loop Refinement GPU Types
+// ============================================================================
+
+/// Per-atom data for loop refinement kernels.
+struct LoopRefineAtom {
+    simd_float3 position;        // Angstrom
+    float       mass;            // Da (0 = frozen)
+    float       sigma;           // LJ sigma (Angstrom)
+    float       epsilon;         // LJ epsilon (kcal/mol)
+    uint32_t    isLoop;          // 1 = loop atom (free), 0 = fixed
+    float       _pad0;
+};
+
+/// Bond definition for harmonic bond force.
+struct LoopRefineBond {
+    uint32_t    atom1;
+    uint32_t    atom2;
+    float       length;          // equilibrium length (Angstrom)
+    float       k;               // force constant (kcal/mol/A^2)
+};
+
+/// Angle definition for harmonic angle force.
+struct LoopRefineAngle {
+    uint32_t    atom1;
+    uint32_t    atom2;           // central atom
+    uint32_t    atom3;
+    float       angle;           // equilibrium angle (radians)
+    float       k;               // force constant (kcal/mol/rad^2)
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
+};
+
+/// Torsion definition for periodic torsion force.
+struct LoopRefineTorsion {
+    uint32_t    atom1;
+    uint32_t    atom2;
+    uint32_t    atom3;
+    uint32_t    atom4;
+    float       phase;           // phase (radians)
+    float       k;               // force constant (kcal/mol)
+    uint32_t    periodicity;
+    float       _pad0;
+};
+
+/// Parameters for loop refinement kernels.
+struct LoopRefineParams {
+    uint32_t    atomCount;
+    uint32_t    bondCount;
+    uint32_t    angleCount;
+    uint32_t    torsionCount;
+    float       restraintK;      // positional restraint (kcal/mol/A^2) for non-loop atoms
+    float       stericCutoff;    // cutoff for steric evaluation (Angstrom)
+    uint32_t    computeGrad;     // 0 = energy only, 1 = energy + gradient
+    uint32_t    _pad0;
 };
 
 #endif /* ShaderTypes_h */

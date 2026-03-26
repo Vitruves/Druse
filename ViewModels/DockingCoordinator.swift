@@ -44,12 +44,29 @@ struct DockingCoordinator {
     /// Original ligand preserved before docking mutates the active ligand with pose transforms.
     var originalDockingLigand: Molecule?
 
+    /// Chemical forms from the active ligand's ensemble (populated from LigandEntry.forms).
+    /// Used for multi-start docking across tautomers/protomers/conformers.
+    var ligandForms: [ChemicalForm] = []
+
+    /// Multi-start docking progress: (current start index, total starts).
+    var ensembleProgress: (current: Int, total: Int) = (0, 0)
+
     // Batch docking state
     var batchResults: [(ligandName: String, results: [DockingResult])] = []
     var isBatchDocking: Bool = false
     var batchProgress: (current: Int, total: Int) = (0, 0)
     var batchQueue: [LigandEntry] = []
     var batchDockingTask: Task<Void, Never>?
+
+    /// Cached prepared protein for docking scoring. Avoids re-running the full
+    /// preparation pipeline (H-bond network, charges) on every docking invocation.
+    struct PreparedProteinCache {
+        let protein: Molecule
+        let report: ProteinPreparation.DockingPreparationReport
+        /// Hash of source atoms + pH — invalidated when protein or pH changes.
+        let key: Int
+    }
+    var preparedProteinCache: PreparedProteinCache?
 
     // Virtual screening state
     var screeningPipeline: VirtualScreeningPipeline?
@@ -63,8 +80,6 @@ struct DockingCoordinator {
     var resultsEnergyCutoff: Float = 0
     var resultsMLScoreCutoff: Float = 0
     var resultsHasInitializedCutoffs: Bool = false
-
-    var usePostDockingRefinement: Bool = false
 
     // Scaffold enforcement UI
     var showScaffoldInput: Bool = false
