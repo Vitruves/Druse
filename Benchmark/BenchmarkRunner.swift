@@ -12,6 +12,7 @@ import MetalKit
 //   xcodebuild test ... -only-testing:DruseTests/BenchmarkRunner/testCASF_Vina
 //   xcodebuild test ... -only-testing:DruseTests/BenchmarkRunner/testCASF_Drusina
 //   xcodebuild test ... -only-testing:DruseTests/BenchmarkRunner/testCASF_DruseAF
+//   xcodebuild test ... -only-testing:DruseTests/BenchmarkRunner/testCASF_PIGNet2
 //
 // Each writes its own results JSON. The Python analyzer compares all three.
 //
@@ -441,6 +442,23 @@ final class BenchmarkRunner: XCTestCase {
         (loadFileConfig()["gfn2Scoring"] as? Bool) ?? false
     }
 
+    /// Read outputFile from .bench_config.json (set by run_benchmark.py per scoring method).
+    /// Falls back to a versioned+timestamped name if not set.
+    private static func cfgOutputFile(fallbackMethod: String) -> String {
+        if let f = loadFileConfig()["outputFile"] as? String, !f.isEmpty {
+            return f
+        }
+        // Fallback: version_timestamp format
+        let version = (try? String(contentsOfFile: URL(fileURLWithPath: #file)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("VERSION").path, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+        let ts = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        return "casf_\(fallbackMethod)_\(version)_\(ts).json"
+    }
+
     // ==========================================================================
     // MARK: - Test Methods (one per scoring method)
     // ==========================================================================
@@ -452,7 +470,7 @@ final class BenchmarkRunner: XCTestCase {
         try await runBenchmark(
             scoringMethod: .vina,
             label: "Vina",
-            outputFile: "casf_vina.json",
+            outputFile: Self.cfgOutputFile(fallbackMethod: "vina"),
             maxComplexes: Self.cfgMaxComplexes,
             enableGFN2Scoring: Self.cfgGFN2Scoring
         )
@@ -464,7 +482,7 @@ final class BenchmarkRunner: XCTestCase {
         try await runBenchmark(
             scoringMethod: .drusina,
             label: "Drusina",
-            outputFile: "casf_drusina.json",
+            outputFile: Self.cfgOutputFile(fallbackMethod: "drusina"),
             maxComplexes: Self.cfgMaxComplexes,
             enableGFN2Scoring: Self.cfgGFN2Scoring
         )
@@ -476,7 +494,19 @@ final class BenchmarkRunner: XCTestCase {
         try await runBenchmark(
             scoringMethod: .druseAffinity,
             label: "DruseAF",
-            outputFile: "casf_druseaf.json",
+            outputFile: Self.cfgOutputFile(fallbackMethod: "druseaf"),
+            maxComplexes: Self.cfgMaxComplexes,
+            enableGFN2Scoring: Self.cfgGFN2Scoring
+        )
+    }
+
+    /// Dock with PIGNet2 physics-informed GNN scoring (native Metal).
+    @MainActor
+    func testCASF_PIGNet2() async throws {
+        try await runBenchmark(
+            scoringMethod: .pignet2,
+            label: "PIGNet2",
+            outputFile: Self.cfgOutputFile(fallbackMethod: "pignet2"),
             maxComplexes: Self.cfgMaxComplexes,
             enableGFN2Scoring: Self.cfgGFN2Scoring
         )
@@ -488,7 +518,7 @@ final class BenchmarkRunner: XCTestCase {
         try await runBenchmark(
             scoringMethod: .drusina,
             label: "Drusina+GFN2",
-            outputFile: "casf_drusina_gfn2.json",
+            outputFile: Self.cfgOutputFile(fallbackMethod: "drusina_gfn2"),
             maxComplexes: Self.cfgMaxComplexes,
             enableGFN2Scoring: true
         )
@@ -502,13 +532,15 @@ final class BenchmarkRunner: XCTestCase {
         print("=== Full CASF-2016 Benchmark (all scoring methods)\(suffix) ===\n")
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: "casf_vina.json", maxComplexes: n)
+        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: Self.cfgOutputFile(fallbackMethod: "vina"), maxComplexes: n)
         print("\n" + String(repeating: "=", count: 60) + "\n")
-        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: "casf_drusina.json", maxComplexes: n)
+        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: Self.cfgOutputFile(fallbackMethod: "drusina"), maxComplexes: n)
         print("\n" + String(repeating: "=", count: 60) + "\n")
-        try await runBenchmark(scoringMethod: .druseAffinity, label: "DruseAF", outputFile: "casf_druseaf.json", maxComplexes: n)
+        try await runBenchmark(scoringMethod: .druseAffinity, label: "DruseAF", outputFile: Self.cfgOutputFile(fallbackMethod: "druseaf"), maxComplexes: n)
         print("\n" + String(repeating: "=", count: 60) + "\n")
-        try await runBenchmark(scoringMethod: .drusina, label: "Drusina+GFN2", outputFile: "casf_drusina_gfn2.json", maxComplexes: n, enableGFN2Scoring: true)
+        try await runBenchmark(scoringMethod: .pignet2, label: "PIGNet2", outputFile: Self.cfgOutputFile(fallbackMethod: "pignet2"), maxComplexes: n)
+        print("\n" + String(repeating: "=", count: 60) + "\n")
+        try await runBenchmark(scoringMethod: .drusina, label: "Drusina+GFN2", outputFile: Self.cfgOutputFile(fallbackMethod: "drusina_gfn2"), maxComplexes: n, enableGFN2Scoring: true)
 
         let total = CFAbsoluteTimeGetCurrent() - t0
         print("\n=== Full benchmark completed in \(String(format: "%.1f", total / 60)) minutes ===")
@@ -524,9 +556,9 @@ final class BenchmarkRunner: XCTestCase {
         print("=== Quick Validation: Vina vs Drusina (first \(n)) ===\n")
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: "casf_vina_quick.json", maxComplexes: n)
+        try await runBenchmark(scoringMethod: .vina, label: "Vina", outputFile: Self.cfgOutputFile(fallbackMethod: "vina_quick"), maxComplexes: n)
         print("\n" + String(repeating: "-", count: 50) + "\n")
-        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: "casf_drusina_quick.json", maxComplexes: n)
+        try await runBenchmark(scoringMethod: .drusina, label: "Drusina", outputFile: Self.cfgOutputFile(fallbackMethod: "drusina_quick"), maxComplexes: n)
 
         let total = CFAbsoluteTimeGetCurrent() - t0
         print("\n=== Quick validation completed in \(String(format: "%.1f", total / 60)) minutes ===")

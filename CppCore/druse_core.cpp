@@ -1441,7 +1441,36 @@ DruseVariantSet* druse_enumerate_protomers(
         // Each site can be in state 0 (as-drawn) or state 1 (toggled)
         int nSites = std::min((int)ambiguousSites.size(), 10); // cap to avoid explosion
         int nCombinations = 1 << nSites;
-        nCombinations = std::min(nCombinations, (int)maxProtomers);
+
+        // Precompute Henderson-Hasselbalch populations for ALL combos (cheap math only),
+        // then sort by population so we try the most probable combos first.
+        // This avoids the bug where capping nCombinations to maxProtomers would only
+        // explore combos 0..maxProtomers-1, ignoring higher-indexed ionizable sites.
+        struct ComboPopulation { int combo; double population; };
+        std::vector<ComboPopulation> combosByPop;
+        combosByPop.reserve(nCombinations);
+        for (int combo = 0; combo < nCombinations; combo++) {
+            double pop = 1.0;
+            for (int s = 0; s < nSites; s++) {
+                bool toggle = (combo >> s) & 1;
+                const auto &grp = kIonizableGroups[ambiguousSites[s].groupIdx];
+                double fracProt = 1.0 / (1.0 + std::pow(10.0, pH - grp.pKa));
+                double fracDeprot = 1.0 - fracProt;
+                if (toggle) {
+                    // Toggled: acid → deprotonated, base → protonated
+                    pop *= grp.isAcid ? fracDeprot : fracProt;
+                } else {
+                    // As-drawn: acid → protonated, base → deprotonated
+                    pop *= grp.isAcid ? fracProt : fracDeprot;
+                }
+            }
+            combosByPop.push_back({combo, pop});
+        }
+        std::sort(combosByPop.begin(), combosByPop.end(),
+            [](const ComboPopulation &a, const ComboPopulation &b) {
+                return a.population > b.population;
+            });
+        int nToTry = std::min((int)combosByPop.size(), (int)maxProtomers);
 
         struct ProtomerEntry {
             std::string smi;
@@ -1452,7 +1481,8 @@ DruseVariantSet* druse_enumerate_protomers(
         std::vector<ProtomerEntry> entries;
         std::set<std::string> seen;
 
-        for (int combo = 0; combo < nCombinations; combo++) {
+        for (int ci = 0; ci < nToTry; ci++) {
+            int combo = combosByPop[ci].combo;
             auto rw = std::make_unique<RWMol>(*mol);
 
             std::string comboLabel;
@@ -1652,7 +1682,35 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         }
 
         int nAmbSites = std::min((int)ambSites.size(), 10);
-        int nCombos = std::min(1 << nAmbSites, (int)maxProtomers);
+        int nTotalCombos = 1 << nAmbSites;
+
+        // Precompute Henderson-Hasselbalch populations for ALL combos (cheap math only),
+        // then sort by population so we try the most probable combos first.
+        // This avoids the bug where capping nCombos to maxProtomers would only
+        // explore combos 0..maxProtomers-1, ignoring higher-indexed ionizable sites.
+        struct ComboPopulation { int combo; double population; };
+        std::vector<ComboPopulation> combosByPop;
+        combosByPop.reserve(nTotalCombos);
+        for (int combo = 0; combo < nTotalCombos; combo++) {
+            double pop = 1.0;
+            for (int s = 0; s < nAmbSites; s++) {
+                const auto &site = ambSites[s];
+                double fracProt = 1.0 / (1.0 + std::pow(10.0, pH - site.groupPKa));
+                double fracDeprot = 1.0 - fracProt;
+                bool toggle = (combo >> s) & 1;
+                if (!toggle) {
+                    pop *= site.isAcid ? fracProt : fracDeprot;
+                } else {
+                    pop *= site.isAcid ? fracDeprot : fracProt;
+                }
+            }
+            combosByPop.push_back({combo, pop});
+        }
+        std::sort(combosByPop.begin(), combosByPop.end(),
+            [](const ComboPopulation &a, const ComboPopulation &b) {
+                return a.population > b.population;
+            });
+        int nCombos = std::min((int)combosByPop.size(), (int)maxProtomers);
 
         struct ProtomerForm {
             std::string smi;
@@ -1662,13 +1720,9 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         };
         std::vector<ProtomerForm> protomers;
 
-        // combo=0 = washed molecule with no additional protonation changes
-        // For each combo, compute combined Henderson-Hasselbalch population:
-        //   For each ambiguous site:
-        //     fraction_protonated = 1 / (1 + 10^(pH - pKa))
-        //     fraction_deprotonated = 1 - fraction_protonated
-        //   The combo population = product of per-site fractions
-        for (int combo = 0; combo < nCombos; combo++) {
+        // Iterate combos in order of decreasing HH population
+        for (int ci = 0; ci < nCombos; ci++) {
+            int combo = combosByPop[ci].combo;
             auto rw = std::make_unique<RWMol>(*washedMol);
             std::string comboLabel;
             double hhPop = 1.0;

@@ -349,6 +349,7 @@ kernel void druseAFv4Score(
     float energy_sum = 0.0f;
     float ctx[PD];
     float gate_sum = 0.0f;
+    float max_g = -INFINITY;  // online log-sum-exp for numerical stability
     for (uint d = 0; d < PD; d++) ctx[d] = 0.0f;
 
     if (valid) {
@@ -389,10 +390,17 @@ kernel void druseAFv4Score(
             energy_sum += e;
 
             // Context gate: pair → Linear(PD→1) (no GELU)
+            // Online log-sum-exp: when a new max appears, rescale running sums
             float g = cg_b[0];
             for (uint d = 0; d < PD; d++)
                 g += pair[d] * cg_w[d];
-            float w = exp(g);
+            if (g > max_g) {
+                float scale = exp(max_g - g);
+                gate_sum *= scale;
+                for (uint d = 0; d < PD; d++) ctx[d] *= scale;
+                max_g = g;
+            }
+            float w = exp(g - max_g);
             gate_sum += w;
 
             // Accumulate weighted protein projection for context
@@ -576,6 +584,7 @@ kernel void druseAFv4Rescore(
     float energy_sum = 0.0f;
     float ctx[PD];
     float gate_sum = 0.0f;
+    float max_g = -INFINITY;  // online log-sum-exp for numerical stability
     for (uint d = 0; d < PD; d++) ctx[d] = 0.0f;
 
     if (valid) {
@@ -605,9 +614,16 @@ kernel void druseAFv4Rescore(
             for (uint d = 0; d < PD; d++) e += gelu_tanh(pair[d]) * pe_w[d];
             energy_sum += e;
 
+            // Online log-sum-exp: when a new max appears, rescale running sums
             float g = cg_b[0];
             for (uint d = 0; d < PD; d++) g += pair[d] * cg_w[d];
-            float w = exp(g);
+            if (g > max_g) {
+                float scale = exp(max_g - g);
+                gate_sum *= scale;
+                for (uint d = 0; d < PD; d++) ctx[d] *= scale;
+                max_g = g;
+            }
+            float w = exp(g - max_g);
             gate_sum += w;
             for (uint d = 0; d < PD; d++) ctx[d] += w * protPairProj[p * PD + d];
         }

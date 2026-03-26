@@ -1526,6 +1526,10 @@ inline float computeDrusinaCorrections(
         drusinaE += params.wCooperativity * float(interactionCount - 1);
     }
 
+    // Safety cap: Drusina corrections should complement Vina, not overwhelm it.
+    // Typical Vina scores are -5 to -15 kcal/mol; cap Drusina at -6 kcal/mol.
+    drusinaE = max(drusinaE, -6.0f);
+
     return drusinaE;
 }
 
