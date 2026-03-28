@@ -423,9 +423,10 @@ struct ResultsDatabaseWindow: View {
                 Label("Pose #\(index + 1)", systemImage: "cube")
                     .font(.callout.weight(.semibold))
                 Spacer()
-                Text(String(format: "%.2f kcal/mol", result.energy))
+                let sm = viewModel.docking.scoringMethod
+                Text(String(format: "%.2f %@", result.displayScore(method: sm), sm.unitLabel))
                     .font(.subheadline.monospaced().weight(.bold))
-                    .foregroundStyle(energyColor(result.energy))
+                    .foregroundStyle(scoreColor(result.displayScore(method: sm), method: sm))
             }
             .padding(12)
             .background(Color(nsColor: .controlBackgroundColor))
@@ -488,10 +489,11 @@ struct ResultsDatabaseWindow: View {
 
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
                 GridRow {
-                    Text("Total").font(.footnote.weight(.medium))
-                    Text(String(format: "%.2f kcal/mol", result.energy))
+                    let sm2 = viewModel.docking.scoringMethod
+                    Text(sm2.isAffinityScore ? "pKi" : "Total").font(.footnote.weight(.medium))
+                    Text(String(format: "%.2f %@", result.displayScore(method: sm2), sm2.unitLabel))
                         .font(.footnote.monospaced().weight(.bold))
-                        .foregroundStyle(energyColor(result.energy))
+                        .foregroundStyle(scoreColor(result.displayScore(method: sm2), method: sm2))
                 }
                 GridRow {
                     Text("Steric (vdW)").font(.footnote).foregroundStyle(.secondary)
@@ -910,9 +912,10 @@ struct ResultsDatabaseWindow: View {
                 .foregroundStyle(.secondary)
 
             if let best = displayedResults.first {
+                let sm = viewModel.docking.scoringMethod
                 Text("•")
                     .foregroundStyle(.secondary)
-                Text(String(format: "Best: %.1f kcal/mol", best.energy))
+                Text(String(format: "Best: %.1f %@", best.displayScore(method: sm), sm.unitLabel))
                     .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -928,8 +931,9 @@ struct ResultsDatabaseWindow: View {
             Spacer()
 
             if let sel = selectedPoseIndex, sel < displayedResults.count {
-                Text(String(format: "Selected: Pose #%d (%.2f kcal/mol)",
-                           sel + 1, displayedResults[sel].energy))
+                let sm = viewModel.docking.scoringMethod
+                Text(String(format: "Selected: Pose #%d (%.2f %@)",
+                           sel + 1, displayedResults[sel].displayScore(method: sm), sm.unitLabel))
                     .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -1058,6 +1062,16 @@ struct ResultsDatabaseWindow: View {
         if energy < -4 { return .yellow }
         if energy < 0 { return .orange }
         return .red
+    }
+
+    private func scoreColor(_ value: Float, method: ScoringMethod) -> Color {
+        if method.isAffinityScore {
+            if value > 8 { return .green }
+            if value > 5 { return .yellow }
+            if value > 3 { return .orange }
+            return .red
+        }
+        return energyColor(value)
     }
 
     private func interactionColor(_ type: MolecularInteraction.InteractionType) -> Color {

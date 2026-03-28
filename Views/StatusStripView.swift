@@ -98,8 +98,9 @@ struct StatusStripView: View {
             return "Ready to dock — configure and run"
         }
         if !viewModel.docking.dockingResults.isEmpty {
-            let energy = viewModel.docking.dockingResults.first?.energy ?? 0
-            return String(format: "Best pose: %.2f kcal/mol — check Results", energy)
+            let method = viewModel.docking.scoringMethod
+            let score = viewModel.docking.dockingResults.first?.displayScore(method: method) ?? 0
+            return String(format: "Best pose: %.2f %@ — check Results", score, method.unitLabel)
         }
         return nil
     }

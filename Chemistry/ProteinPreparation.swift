@@ -70,6 +70,10 @@ enum ProteinPreparation {
         "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
     ]
     private static let cappingResidueNames: Set<String> = ["ACE", "NME"]
+    private static let metalIonResidueNames: Set<String> = [
+        "ZN", "MG", "CA", "FE", "MN", "CO", "NI", "CU",
+        "FE2", "MG2", "CA2", "ZN2", "MN2", "CO2", "NI2", "CU2", "CU1",
+    ]
 
     private struct ResidueKey: Hashable {
         let chainID: String
@@ -266,6 +270,8 @@ enum ProteinPreparation {
                 shouldKeep = keepingWaters
             } else if cappingResidueNames.contains(residueName) {
                 shouldKeep = keepingExistingCaps
+            } else if metalIonResidueNames.contains(residueName) {
+                shouldKeep = true
             } else {
                 shouldKeep = false
             }

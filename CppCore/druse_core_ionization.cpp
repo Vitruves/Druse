@@ -7,11 +7,16 @@
 #include <tuple>
 
 // Shared ionizable group table (used by protomer enumeration, site detection, ensemble)
+//
+// CRITICAL ORDERING RULE: most specific patterns MUST come before generic ones
+// within each functional group class, because first-match-wins by atom index.
+// A generic "Phenol" before "2-Hydroxypyridine" would shadow the latter.
+//
+// Sources: Williams pKa tables, Evans/Ripin DMSO→H2O, Jencks/Westheimer,
+//          FLogD acidbase.csv (2445 entries), cchem acidbase.c
 const IonizableGroupDef kIonizableGroups[] = {
     // =====================================================================
-    // ACIDS — ordered most specific first (first atom-match wins)
-    // Sources: Williams pKa tables, Evans/Ripin DMSO→H2O, Jencks/Westheimer,
-    //          FLogD acidbase.csv (2445 entries), cchem acidbase.c
+    // ACIDS — ordered most specific first within each class
     // =====================================================================
 
     // ---- Sulfonic acids (pKa < 0, always deprotonated at physiological pH) ----
@@ -23,7 +28,7 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"Phosphonate",      "[OX2H1]P(=O)([CX4])",        2.4,  true},
     {"Phosphoric ester", "[OX2H1]P(=O)",               1.5,  true},
 
-    // ---- Carboxylic acids — specific subtypes first ----
+    // ---- Carboxylic acids — ALL specific subtypes before generic ----
     {"Trifluoroacetic",  "[CX3](=O)([OX2H1])C(F)(F)F", 0.5,  true},
     {"Trichloroacetic",  "[CX3](=O)([OX2H1])C(Cl)(Cl)Cl", 0.65, true},
     {"Difluoroacetic",   "[CX3](=O)([OX2H1])C([F,Cl])F", 1.35, true},
@@ -47,6 +52,20 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"ArCOOH p-NH2",     "[CX3](=O)([OX2H1])c1ccc(N)cc1",  4.92, true},
     {"ArCOOH p-NMe2",    "[CX3](=O)([OX2H1])c1ccc(N(C)C)cc1", 5.03, true},
     {"ArCOOH p-Me",      "[CX3](=O)([OX2H1])c1ccc(C)cc1",  4.34, true},
+    // --- Additional COOH from Williams tables (MOVED here before generic) ---
+    {"Salicylic acid",   "[CX3](=O)([OX2H1])c1ccccc1O",  2.97, true},
+    {"Glycine COOH",     "[CX3](=O)([OX2H1])[CX4]([NX3H2,NX4H3+])", 2.35, true},
+    {"Proline COOH",     "[CX3](=O)([OX2H1])C1CCCN1",   1.99, true},
+    {"Cinnamic acid",    "[CX3](=O)([OX2H1])/C=C/c",    4.44, true},
+    {"Crotonic acid",    "[CX3](=O)([OX2H1])/C=C/C",    4.69, true},
+    {"Pyruvic acid",     "[CX3](=O)([OX2H1])C(=O)C",    2.50, true},
+    {"Lactic acid",      "[CX3](=O)([OX2H1])C(O)C",     3.86, true},
+    {"Mandelic acid",    "[CX3](=O)([OX2H1])C(O)c",     3.41, true},
+    {"Glycolic acid",    "[CX3](=O)([OX2H1])CO",        3.82, true},
+    {"Picolinic acid",   "[CX3](=O)([OX2H1])c1ccccn1",  5.25, true},
+    {"Oxalacetic acid",  "[CX3](=O)([OX2H1])CC(=O)C(=O)[OX2H1]", 2.56, true},
+    {"Malonic acid",     "[CX3](=O)([OX2H1])CC(=O)[OX2H1]", 2.83, true},
+    {"Adipic acid",      "[CX3](=O)([OX2H1])CCCCC(=O)[OX2H1]", 4.42, true},
     {"Benzoic acid",     "[CX3](=O)([OX2H1])c",       4.20,  true},
     {"Succinic acid",    "[CX3](=O)([OX2H1])CCC(=O)[OX2H1]", 4.19, true},
     {"Glutaric acid",    "[CX3](=O)([OX2H1])CCCC(=O)[OX2H1]", 4.34, true},
@@ -66,24 +85,65 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"ArSO2NH2",         "[NX3H2]S(=O)(=O)c",          10.0, true},
     {"Sulfonamide NH",   "[NX3H1]S(=O)(=O)",           10.0, true},
 
-    // ---- Phenols — specific subtypes first ----
+    // ---- Phenols — ALL specific subtypes before generic phenol ----
+    // ---- Highly substituted phenols first ----
     {"2,4,6-Trinitro-phenol", "[OX2H1]c1c([NX3+](=O)[O-])cc([NX3+](=O)[O-])cc1[NX3+](=O)[O-]", 0.3, true},
+    {"Pentachlorophenol","[OX2H1]c1c(Cl)c(Cl)c(Cl)c(Cl)c1Cl", 4.7, true},
+    {"2,4,6-triCl-phenol","[OX2H1]c1c(Cl)cc(Cl)cc1Cl",  6.15, true},
+    {"2,4-diCl-phenol",  "[OX2H1]c1ccc(Cl)cc1Cl",       7.85, true},
     {"2,4-Dinitrophenol","[OX2H1]c1ccc([NX3+](=O)[O-])cc1[NX3+](=O)[O-]", 4.1, true},
+    {"2,6-di-tBu-phenol","[OX2H1]c1c(C(C)(C)C)cccc1C(C)(C)C", 11.70, true},
+    // ---- Hydroxypyridines / Pyridinones (tautomeric, act as acids) ----
+    // MUST come before generic phenol — these are ArOH with very different pKa
+    // Hydroxypyrimidines/pyrazines exist predominantly as lactam tautomers.
+    // The measured pKa (~9-11) is for N-H deprotonation, not O-H loss.
+    {"2-Hydroxypyrimidine","[OX2H1]c1ncccn1",           9.5,  true},
+    {"4-Hydroxypyrimidine","[OX2H1]c1ccncn1",           9.5,  true},
+    {"2-Hydroxypyrazine","[OX2H1]c1cnccn1",             9.0,  true},
+    {"Hydroxypyrazine v2","[OX2H1]c1nccnc1",            9.0,  true},
+    {"2-Hydroxy-4-aminopyrimidine","[OX2H1]c1nc(N)ccn1", 9.5, true},
+    {"Hydroxypurine",    "[OX2H1]c1ncnc2[nH]cnc12",     8.5,  true},
+    {"2-Hydroxypyridine","[OH]c1ccccn1",                0.75, true},
+    {"3-Hydroxypyridine","[OH]c1cccnc1",               8.72, true},
+    {"4-Hydroxypyridine","[OH]c1ccncc1",               11.09, true},
+    {"8-Hydroxyquinoline","[OH]c1ccc2ncccc2c1",         9.81, true},
+    {"Hydroxyquinazoline","[OX2H1]c1nc2ccccc2nc1",      2.0,  true},
+    {"Hydroxyquinoxaline","[OX2H1]c1nc2ccccc2nc1",      2.0,  true},
+    // ---- para-substituted phenols ----
     {"p-Nitrophenol",    "[OX2H1]c1ccc([NX3+](=O)[O-])cc1", 7.14, true},
     {"m-Nitrophenol",    "[OX2H1]c1cccc([NX3+](=O)[O-])c1", 8.35, true},
     {"o-Nitrophenol",    "[OX2H1]c1ccccc1[NX3+](=O)[O-]",   7.23, true},
+    {"p-Cyanophenol",    "[OX2H1]c1ccc(C#N)cc1",       7.95, true},
+    {"p-CF3-phenol",     "[OX2H1]c1ccc(C(F)(F)F)cc1",  8.68, true},
     {"p-Fluorophenol",   "[OX2H1]c1ccc(F)cc1",         9.95, true},
     {"p-Chlorophenol",   "[OX2H1]c1ccc(Cl)cc1",        9.38, true},
     {"p-Bromophenol",    "[OX2H1]c1ccc(Br)cc1",        9.34, true},
-    {"p-Cyanophenol",    "[OX2H1]c1ccc(C#N)cc1",       7.95, true},
-    {"p-CF3-phenol",     "[OX2H1]c1ccc(C(F)(F)F)cc1",  8.68, true},
     {"p-Methoxyphenol",  "[OX2H1]c1ccc(OC)cc1",       10.20, true},
     {"p-Aminophenol",    "[OX2H1]c1ccc(N)cc1",        10.30, true},
+    {"p-SO2Me-phenol",   "[OX2H1]c1ccc(S(=O)(=O)C)cc1", 8.47, true},
+    {"p-Acetylphenol",   "[OX2H1]c1ccc(C(=O)C)cc1",     8.05, true},
+    {"p-tBu-phenol",     "[OX2H1]c1ccc(C(C)(C)C)cc1",  10.23, true},
+    {"p-Hydroxyphenol",  "[OX2H1]c1ccc([OX2H1])cc1",    9.85, true},
+    {"p-Hydroxybenz OH", "[OX2H1]c1ccc(C(=O))cc1",      8.0,  true},
+    // ---- ortho-substituted phenols ----
+    {"o-Chlorophenol",   "[OX2H1]c1ccccc1Cl",           8.48, true},
+    {"o-Bromophenol",    "[OX2H1]c1ccccc1Br",           8.42, true},
+    {"o-Fluorophenol",   "[OX2H1]c1ccccc1F",            8.81, true},
+    {"Salicylaldehyde OH","[OX2H1]c1ccccc1C=O",         8.34, true},
+    {"Salicylic acid OH","[OX2H1]c1ccccc1C(=O)[OH]",   13.0, true},
+    // ---- meta-substituted phenols ----
+    {"m-Chlorophenol",   "[OX2H1]c1cccc(Cl)c1",         9.02, true},
+    {"m-Bromophenol",    "[OX2H1]c1cccc(Br)c1",         9.03, true},
+    {"m-Fluorophenol",   "[OX2H1]c1cccc(F)c1",          9.28, true},
+    {"m-Cyanophenol",    "[OX2H1]c1cccc(C#N)c1",        8.61, true},
+    {"m-Methoxyphenol",  "[OX2H1]c1cccc(OC)c1",         9.65, true},
+    // ---- polycyclic / disubstituted phenols ----
     {"1-Naphthol",       "[OX2H1]c1cccc2ccccc12",      9.34, true},
     {"2-Naphthol",       "[OX2H1]c1ccc2ccccc2c1",      9.51, true},
     {"Catechol",         "[OX2H1]c1ccccc1[OX2H1]",     9.45, true},
     {"Resorcinol",       "[OX2H1]c1cccc([OX2H1])c1",   9.15, true},
     {"Hydroquinone",     "[OX2H1]c1ccc([OX2H1])cc1",   9.85, true},
+    // ---- Generic phenol LAST in this class ----
     {"Phenol",           "[OX2H1]c",                   10.0,  true},
 
     // ---- Hydroxamic acids ----
@@ -128,30 +188,53 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"Sulfonylcarboxamide","[NH1](S(=O)(=O))C(=O)c",    3.0,  true},
 
     // ---- Carbon acids (C-H acidity, drug-relevant enolizable systems) ----
+    // --- 1,3-Dicarbonyl CH — CH2 and CH1 variants ---
     {"Acetylacetone CH", "[CH2](C(=O)C)C(=O)C",         8.95, true},
     {"ArCO-CH2-COAr",   "[CH2](C(=O)c)C(=O)c",         8.5,  true},
     {"ArCO-CH2-COCH3",  "[CH2](C(=O)c)C(=O)C",         9.0,  true},
+    // NEW: CH1 (substituted) variants of 1,3-dicarbonyls
+    {"Subst diketone CH","[CH1](C(=O))C(=O)",           10.5, true},
+    // NEW: CH2 between ketone and amide (beta-keto amides)
+    {"BetaKetoAmide CH2","[CH2](C(=O)[CX4,c])C(=O)N",  10.5, true},
+    {"BetaKetoAmide CH2 v2","[CH2](C(=O)N)C(=O)[CX4,c]", 10.5, true},
+    // NEW: Cyclic beta-diketone (1,3-cyclohexanedione, dimedone)
+    {"Cyclic diketone CH2","[CH2;R](C(=O))C(=O)",       5.3,  true},
+    // --- Nitrile-containing carbon acids ---
     {"Malononitrile CH", "[CH2](C#N)C#N",              11.2,  true},
     {"Cyanoacetate CH",  "[CH2](C#N)C(=O)O",           10.7,  true},
     {"Cyanoacetamide CH","[CH2](C#N)C(=O)N",           11.5,  true},
+    // NEW: CH1 variants of cyano acids
+    {"Subst cyanoacetate","[CH1](C#N)C(=O)O",          11.5, true},
+    {"Subst malononitrile","[CH1](C#N)C#N",            11.5, true},
+    // --- Malonate / ester C-H acids ---
     {"Malonate diester", "[CH2](C(=O)OC)C(=O)OC",     12.9,  true},
     {"Malonic acid CH",  "[CH2](C(=O)[OH])C(=O)[OH]",  2.83, true},
-    {"Nitromethane",     "[CH3][NX3+](=O)[O-]",        10.2,  true},
-    {"Nitroethane",      "[CH2]([CX4])[NX3+](=O)[O-]", 8.6,  true},
+    // --- Nitroalkane C-H acids ---
     {"Dinitromethane",   "[CH1]([NX3+](=O)[O-])[NX3+](=O)[O-]", 3.6, true},
     {"Phenylnitromethane","[CH2](c)[NX3+](=O)[O-]",    7.1,  true},
+    {"Nitromethane",     "[CH3][NX3+](=O)[O-]",        10.2,  true},
+    {"Nitroethane",      "[CH2]([CX4])[NX3+](=O)[O-]", 8.6,  true},
+    // NEW: branched nitroalkanes (CH1)
+    {"2-Nitropropane",   "[CH1]([CX4])([CX4])[NX3+](=O)[O-]", 7.68, true},
+    // --- Sulfonyl C-H acids ---
     {"Bis-sulfonylmethane","[CH2](S(=O)(=O))S(=O)(=O)", 12.3, true},
+    // NEW: alpha-sulfonyl carbon acids
+    {"Sulfonyl-CH2-CN", "[CH2](S(=O)(=O))C#N",         12.0, true},
+    {"Sulfonyl-CH2-CO", "[CH2](S(=O)(=O))C(=O)",       11.5, true},
+    // NEW: alpha-NO2 / alpha-CN single activating group on CH2/CH3
+    {"ArCH2NO2",         "[CH2](c)[NX3+](=O)[O-]",     7.1, true},
+    // NEW: ketone alpha-CH2 (simple, high pKa but detected in dataset)
+    {"Alpha-CO-CH2-Ar",  "[CH2](C(=O)c)c",             10.0, true},
 
     // ---- Enols (drug-relevant) ----
     {"Ascorbic acid",    "OC1OC(=O)C(O)=C1O",          4.1,  true},
     {"Squaric acid",     "[OH]C1=C([OH])C(=O)C1=O",    1.5,  true},
     {"Tropolone",        "[OH]c1cccccc1=O",             6.95, true},
-
-    // ---- Hydroxypyridines / Pyridinones (tautomeric, act as acids) ----
-    {"2-Hydroxypyridine","[OH]c1ccccn1",                0.75, true},
-    {"3-Hydroxypyridine","[OH]c1cccnc1",               8.72, true},
-    {"4-Hydroxypyridine","[OH]c1ccncc1",               11.09, true},
-    {"8-Hydroxyquinoline","[OH]c1ccc2ncccc2c1",         9.81, true},
+    // NEW: enol patterns — halogenated enols are much more acidic
+    {"Enol polyhal",     "[OX2H1]C(=C([F,Cl,Br]))C(=O)",  1.5, true},
+    {"Enol halogenated", "[OX2H1]C(=C[F,Cl,Br])C=O",      3.0, true},
+    {"Enol 1,3-diketone","[OX2H1]C(=CC(=O))C(=O)",        4.0, true},
+    {"Enol",             "[OX2H1]C=C",                    10.5, true},
 
     // ---- Nucleobase acids (NH) ----
     {"Uracil NH",        "[NH1]1C(=O)[NH1]C(=O)C=C1",  9.5,  true},
@@ -162,49 +245,18 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"Thioamide NH",     "[NX3H1]C(=S)",               13.0,  true},
     {"Thiourea NH",      "[NX3H1]C(=S)N",              21.0, true},
 
-    // ---- Additional phenols (ortho/meta substituents from Williams tables) ----
-    {"o-Chlorophenol",   "[OX2H1]c1ccccc1Cl",           8.48, true},
-    {"o-Bromophenol",    "[OX2H1]c1ccccc1Br",           8.42, true},
-    {"m-Chlorophenol",   "[OX2H1]c1cccc(Cl)c1",         9.02, true},
-    {"m-Bromophenol",    "[OX2H1]c1cccc(Br)c1",         9.03, true},
-    {"m-Fluorophenol",   "[OX2H1]c1cccc(F)c1",          9.28, true},
-    {"o-Fluorophenol",   "[OX2H1]c1ccccc1F",            8.81, true},
-    {"m-Cyanophenol",    "[OX2H1]c1cccc(C#N)c1",        8.61, true},
-    {"p-SO2Me-phenol",   "[OX2H1]c1ccc(S(=O)(=O)C)cc1", 8.47, true},
-    {"p-Acetylphenol",   "[OX2H1]c1ccc(C(=O)C)cc1",     8.05, true},
-    {"2,4-diCl-phenol",  "[OX2H1]c1ccc(Cl)cc1Cl",       7.85, true},
-    {"2,4,6-triCl-phenol","[OX2H1]c1c(Cl)cc(Cl)cc1Cl",  6.15, true},
-    {"Pentachlorophenol","[OX2H1]c1c(Cl)c(Cl)c(Cl)c(Cl)c1Cl", 4.7, true},
-    {"p-Hydroxyphenol",  "[OX2H1]c1ccc([OX2H1])cc1",    9.85, true},
-    {"Salicylaldehyde OH","[OX2H1]c1ccccc1C=O",         8.34, true},
-    {"Salicylic acid OH","[OX2H1]c1ccccc1C(=O)[OH]",   13.0, true},
-    {"p-Hydroxybenz OH", "[OX2H1]c1ccc(C(=O))cc1",      8.0,  true},
-    {"m-Methoxyphenol",  "[OX2H1]c1cccc(OC)c1",         9.65, true},
-    {"p-tBu-phenol",     "[OX2H1]c1ccc(C(C)(C)C)cc1",  10.23, true},
-    {"2,6-di-tBu-phenol","[OX2H1]c1c(C(C)(C)C)cccc1C(C)(C)C", 11.70, true},
-
-    // ---- Salicylic acid (COOH) ----
-    {"Salicylic acid",   "[CX3](=O)([OX2H1])c1ccccc1O",  2.97, true},
-
-    // ---- Additional carboxylic acids from Williams ----
-    {"Glycine COOH",     "[CX3](=O)([OX2H1])[CX4]([NX3H2,NX4H3+])", 2.35, true},
-    {"Proline COOH",     "[CX3](=O)([OX2H1])C1CCCN1",   1.99, true},
-    {"Cinnamic acid",    "[CX3](=O)([OX2H1])/C=C/c",    4.44, true},
-    {"Crotonic acid",    "[CX3](=O)([OX2H1])/C=C/C",    4.69, true},
-    {"Pyruvic acid",     "[CX3](=O)([OX2H1])C(=O)C",    2.50, true},
-    {"Lactic acid",      "[CX3](=O)([OX2H1])C(O)C",     3.86, true},
-    {"Mandelic acid",    "[CX3](=O)([OX2H1])C(O)c",     3.41, true},
-    {"Glycolic acid",    "[CX3](=O)([OX2H1])CO",        3.82, true},
-    {"Picolinic acid",   "[CX3](=O)([OX2H1])c1ccccn1",  5.25, true},
-    {"Oxalacetic acid",  "[CX3](=O)([OX2H1])CC(=O)C(=O)[OX2H1]", 2.56, true},
-    {"Malonic acid",     "[CX3](=O)([OX2H1])CC(=O)[OX2H1]", 2.83, true},
-    {"Adipic acid",      "[CX3](=O)([OX2H1])CCCCC(=O)[OX2H1]", 4.42, true},
-
     // ---- Phosphonamides ----
     {"Phosphonamidate",  "[OX2H1]P(=O)(N)",             3.0,  true},
 
     // ---- Selenol ----
     {"Selenol",          "[SeX2H1]",                     5.2,  true},
+
+    // NEW: ---- Alcohols (high pKa, rarely relevant but needed for detection) ----
+    // Only match simple aliphatic alcohols — exclude those alpha to C=O, C=C, or heteroatoms
+    // which are better handled as enols or special cases
+    {"Alcohol gem-diol", "[OX2H1][CX4]([OX2H1])",       10.0, true},
+    {"Alcohol alpha-EWG","[OX2H1][CX4]([F,Cl,Br,NX3+])", 13.0, true},
+    {"Alcohol",          "[OX2H1][CX4;!$([CX4]([OX2])[CX3]=[OX1]);!$([CX4]=C)]", 16.0, true},
 
     // =====================================================================
     // BASES — conjugate acid pKa (pH where 50% protonated)
@@ -306,6 +358,12 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"2-Aminobenzoxazole","[nH0;X2]1c2ccccc2oc1N",        3.73, false},
     {"Oxazole =N",       "[nH0;X2]1cocc1",               0.8,  false},
     {"Oxazoline =N",     "N=1CCOC1",                       4.8,  false},
+    // NEW: Thiazolines (common in dataset, 5-membered with S and C=N)
+    {"Thiazoline =N",    "N=1CCSC1",                       5.2,  false},
+    {"4-Me-thiazoline",  "N=1CC(C)SC1",                    5.2,  false},
+    {"2-Me-thiazoline",  "N=1CCSC1C",                      5.3,  false},
+    {"2-iPr-thiazoline", "N=1CCSC1C(C)C",                  5.1,  false},
+    {"2-tBu-thiazoline", "N=1CCSC1C(C)(C)C",               5.1,  false},
     {"Isoxazole =N",     "[nH0;X2]1oncc1",               -2.0,  false},
     {"Isothiazole =N",   "[nH0;X2]1sncc1",                0.5,  false},
     {"1,2,4-Thiadiazole","[nH0;X2]1ncs[nH0]1",           -1.0,  false},
@@ -433,6 +491,11 @@ const IonizableGroupDef kIonizableGroups[] = {
 
     // ---- Pyridine N-oxide (as base, less basic than pyridine) ----
     {"Pyridine N-oxide", "[nX3;R1]([O-])1ccccc1",         0.8,  false},
+
+    // NEW: ---- Amide basicity (very weak base, protonation on O) ----
+    {"Amide base ArCO",  "[NX3H2]C(=O)c",                -1.0,  false},
+    {"Amide base",       "[NX3H2]C(=O)[CX4]",            -0.5,  false},
+    {"Amide base generic","[NX3H2]C(=O)",                 -0.5,  false},
 
     // =====================================================================
     // GENERIC FALLBACK PATTERNS — catch anything the specific patterns above miss

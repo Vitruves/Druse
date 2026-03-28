@@ -160,7 +160,8 @@ struct DemoOverlay: View {
                     .foregroundStyle(.cyan)
 
                 if energy < .infinity {
-                    Text(String(format: "%.1f kcal/mol", energy))
+                    let sm = viewModel.docking.scoringMethod
+                    Text(String(format: "%.1f %@", energy, sm.unitLabel))
                         .font(.footnote.bold().monospaced())
                         .foregroundStyle(energy < -6 ? .green : energy < -3 ? .yellow : .orange)
                 }

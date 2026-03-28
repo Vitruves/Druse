@@ -255,19 +255,54 @@ DruseSiteProtomerPair* druse_generate_site_protomers(
     const char *smiles, int32_t atomIdx, bool isAcid);
 void druse_free_site_protomer_pair(DruseSiteProtomerPair *result);
 
-/// Unified ligand preparation with per-site pKa overrides.
-/// Same as druse_prepare_ligand_ensemble but uses the provided pKa values
-/// instead of the hardcoded lookup table. If sitePKa is NULL, falls back to defaults.
-/// @param sitePKa     Array of computed pKa values (one per detected ionizable site, or NULL)
-/// @param nSitePKa    Length of sitePKa array (0 = use defaults)
-DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
+/// Ionizable site definition for GNN-driven ensemble preparation.
+typedef struct {
+    int32_t atomIdx;    // heavy-atom index in the canonical SMILES molecule
+    double pKa;         // predicted pKa
+    bool isAcid;        // true = deprotonates (loses H), false = protonates (gains H)
+} DruseIonSiteDef;
+
+/// Unified ligand ensemble preparation.
+/// If sites/nSites are provided, uses those directly (GNN path — recommended).
+/// If sites is NULL or nSites <= 0, falls back to SMARTS detection + lookup table.
+/// @param sites    Array of ionizable sites with pKa (from GNN or other source), or NULL
+/// @param nSites   Number of sites (0 = fall back to SMARTS table)
+DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
     const char *smiles, const char *name,
     double pH, double pkaThreshold,
     int32_t maxTautomers, int32_t maxProtomers,
     double energyCutoff, int32_t conformersPerForm,
     double temperature,
-    const double *sitePKa, int32_t nSitePKa
+    const DruseIonSiteDef *sites, int32_t nSites
 );
+
+// ============================================================================
+// MARK: - pKa GNN Featurization
+// ============================================================================
+
+#define PKA_MAX_ATOMS  128
+#define PKA_MAX_EDGES  512
+#define PKA_ATOM_FEAT   25
+#define PKA_BOND_FEAT   10
+
+/// Molecular graph featurized for the pKa GNN Metal shader.
+/// Arrays are heap-allocated to avoid Swift C-import tuple size limits.
+typedef struct {
+    float *atomFeatures;         // [numAtoms * 25] row-major (caller must not free)
+    float *bondFeatures;         // [numEdges * 10] row-major
+    int32_t *edgeSrc;            // [numEdges] source atom indices
+    int32_t *edgeDst;            // [numEdges] dest atom indices
+    int32_t numAtoms;
+    int32_t numEdges;
+    bool success;
+    char errorMessage[256];
+} DrusePKaGraphResult;
+
+/// Featurize a SMILES string into a molecular graph for pKa GNN inference.
+/// Features match the Python training script (train_pka.py) exactly.
+/// Caller must free with druse_free_pka_graph().
+DrusePKaGraphResult* druse_featurize_pka_graph(const char *smiles);
+void druse_free_pka_graph(DrusePKaGraphResult *result);
 
 // ============================================================================
 // MARK: - Protein Preparation (fragment-based)

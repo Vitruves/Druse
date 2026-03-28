@@ -129,6 +129,7 @@ add_library(druse_core STATIC
     druse_core_geometry.cpp
     druse_core_analysis.cpp
     druse_core_protonation_tools.cpp
+    druse_core_pka_featurize.cpp
     druse_2d.cpp
     druse_gemmi.cpp
     druse_openmm.cpp

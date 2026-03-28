@@ -13,6 +13,7 @@ struct InteractionDiagramView: View {
     let ligandSmiles: String?
     let poseEnergy: Float
     let poseIndex: Int
+    var scoringMethod: ScoringMethod = .vina
 
     @State private var coords2D: RDKitBridge.Coords2D?
     @State private var isLoading = true
@@ -167,7 +168,7 @@ struct InteractionDiagramView: View {
             Text("Pose #\(poseIndex + 1)")
                 .font(.callout.monospaced().weight(.medium))
                 .foregroundStyle(.secondary)
-            Text(String(format: "%.2f kcal/mol", poseEnergy))
+            Text(String(format: "%.2f %@", poseEnergy, scoringMethod.unitLabel))
                 .font(.callout.monospaced().weight(.semibold))
                 .foregroundStyle(poseEnergy < -6 ? .green : poseEnergy < 0 ? .orange : .red)
 

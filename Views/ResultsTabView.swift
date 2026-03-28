@@ -98,11 +98,12 @@ struct ResultsTabView: View {
 
             // Summary card
             if let best = viewModel.docking.dockingResults.first {
-                let bestValue = best.energy
-                let color: Color = bestValue < -6 ? .green : bestValue < 0 ? .yellow : .red
+                let method = viewModel.docking.scoringMethod
+                let bestValue = best.displayScore(method: method)
+                let color: Color = scoreColor(bestValue, method: method)
                 summaryCard(
                     bestDisplay: String(format: "%.1f", bestValue),
-                    bestUnit: "kcal/mol",
+                    bestUnit: method.unitLabel,
                     bestColor: color,
                     poseCount: viewModel.docking.dockingResults.count,
                     clusterCount: Set(viewModel.docking.dockingResults.map(\.clusterID)).count
@@ -195,10 +196,11 @@ struct ResultsTabView: View {
     @ViewBuilder
     private var energyLandscapeChart: some View {
         let results = viewModel.docking.dockingResults
-        let scores: [Float] = results.map(\.energy)
+        let method = viewModel.docking.scoringMethod
+        let scores: [Float] = results.map { $0.displayScore(method: method) }
         let selectedIdx = viewModel.docking.selectedPoseIndices.count == 1 ? viewModel.docking.selectedPoseIndices.first : nil
-        let chartTitle = "Energy Landscape"
-        let unitLabel = "kcal/mol"
+        let chartTitle = method.isAffinityScore ? "Affinity Landscape" : "Energy Landscape"
+        let unitLabel = method.unitLabel
 
         // Clamp outliers: use interquartile range to determine useful display range
         let sorted = scores.sorted()
@@ -313,10 +315,10 @@ struct ResultsTabView: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 24, alignment: .trailing)
 
-                Text(String(format: "%.2f", result.energy))
+                Text(String(format: "%.2f", result.displayScore(method: viewModel.docking.scoringMethod)))
                     .font(.callout.monospaced().weight(.semibold))
-                    .foregroundStyle(energyColor(result.energy))
-                Text("kcal/mol")
+                    .foregroundStyle(scoreColor(result.displayScore(method: viewModel.docking.scoringMethod), method: viewModel.docking.scoringMethod))
+                Text(viewModel.docking.scoringMethod.unitLabel)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 
@@ -469,8 +471,9 @@ struct ResultsTabView: View {
                 statBadge("Hits", "\(filteredScreeningHits.count)")
                 statBadge("Screened", "\(totalScreened)", color: .secondary)
                 if let best = filteredScreeningHits.first {
-                    statBadge("Best", String(format: "%.1f", best.compositeScore), unit: "kcal/mol",
-                               color: best.compositeScore < -6 ? .green : .yellow)
+                    let sm = viewModel.docking.scoringMethod
+                    statBadge("Best", String(format: "%.1f", best.compositeScore), unit: sm.unitLabel,
+                               color: scoreColor(best.compositeScore, method: sm))
                 }
             }
             .padding(8)
@@ -522,7 +525,7 @@ struct ResultsTabView: View {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(String(format: "%.1f", hit.compositeScore))
                         .font(.subheadline.monospaced().weight(.semibold))
-                        .foregroundStyle(energyColor(hit.compositeScore))
+                        .foregroundStyle(scoreColor(hit.compositeScore, method: viewModel.docking.scoringMethod))
                     if let ml = hit.mlScore {
                         Text(String(format: "ML:%.1f", ml))
                             .font(.footnote.monospaced().weight(.medium))
@@ -582,7 +585,7 @@ struct ResultsTabView: View {
                     Text("Energy cutoff")
                         .font(.subheadline)
                     Spacer()
-                    Text(String(format: "%.1f kcal/mol", vm.docking.resultsEnergyCutoff))
+                    Text(String(format: "%.1f %@", vm.docking.resultsEnergyCutoff, vm.docking.scoringMethod.unitLabel))
                         .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                 }
@@ -676,8 +679,10 @@ struct ResultsTabView: View {
             if let best = viewModel.docking.batchResults.first, let bestPose = best.results.first {
                 HStack(spacing: 12) {
                     statBadge("Best", best.ligandName, color: .green)
-                    statBadge("Energy", String(format: "%.1f", bestPose.energy), unit: "kcal/mol",
-                               color: bestPose.energy < -6 ? .green : bestPose.energy < 0 ? .yellow : .red)
+                    let sm = viewModel.docking.scoringMethod
+                    let bpScore = bestPose.displayScore(method: sm)
+                    statBadge("Energy", String(format: "%.1f", bpScore), unit: sm.unitLabel,
+                               color: scoreColor(bpScore, method: sm))
                     statBadge("Ligands", "\(viewModel.docking.batchResults.count)")
                 }
                 .padding(8)
@@ -808,6 +813,17 @@ struct ResultsTabView: View {
         if energy < -4 { return .yellow }
         if energy < 0 { return .orange }
         return .red
+    }
+
+    private func scoreColor(_ value: Float, method: ScoringMethod) -> Color {
+        if method.isAffinityScore {
+            // pKi: higher is better (>8 great, >5 good, >3 moderate)
+            if value > 8 { return .green }
+            if value > 5 { return .yellow }
+            if value > 3 { return .orange }
+            return .red
+        }
+        return energyColor(value)
     }
 
     private var filteredScreeningHits: [VirtualScreeningPipeline.ScreeningHit] {

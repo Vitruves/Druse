@@ -298,7 +298,8 @@ struct ContentView: View {
 
             // Best score (kcal/mol or pKi)
             HStack(spacing: 4) {
-                if let pKi = bestPKi {
+                let method = viewModel.docking.scoringMethod
+                if method.isAffinityScore, let pKi = bestPKi {
                     Text("pKi")
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
@@ -309,7 +310,7 @@ struct ContentView: View {
                     Text(String(format: "%.1f", bestE))
                         .font(.body.weight(.bold).monospaced())
                         .foregroundStyle(bestE < -6 ? .green : bestE < -3 ? .yellow : .orange)
-                    Text("kcal/mol")
+                    Text(method.unitLabel)
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
                 }

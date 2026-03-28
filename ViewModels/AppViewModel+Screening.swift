@@ -160,7 +160,8 @@ extension AppViewModel {
                 docking.batchResults.append((ligandName: entry.name, results: entryResults))
 
                 if let best = entryResults.first {
-                    log.info(String(format: "  %@ best: %.1f kcal/mol", entry.name, best.energy), category: .dock)
+                    let sm = docking.scoringMethod
+                    log.info(String(format: "  %@ best: %.1f %@", entry.name, best.displayScore(method: sm), sm.unitLabel), category: .dock)
                     applyDockingPose(best, originalLigand: mol)
                 }
             }
@@ -189,7 +190,9 @@ extension AppViewModel {
                 showGridBoxForPocket(pocket)
             }
 
-            log.success("Batch complete: \(docking.batchResults.count) ligands, best: \(docking.batchResults.first?.ligandName ?? "?") (\(String(format: "%.1f", docking.batchResults.first?.results.first?.energy ?? 0)) kcal/mol)", category: .dock)
+            let sm = docking.scoringMethod
+            let bestScore = docking.batchResults.first?.results.first.map { $0.displayScore(method: sm) } ?? 0
+            log.success("Batch complete: \(docking.batchResults.count) ligands, best: \(docking.batchResults.first?.ligandName ?? "?") (\(String(format: "%.1f", bestScore)) \(sm.unitLabel))", category: .dock)
             workspace.statusMessage = "Batch complete — \(docking.batchResults.count) ligands ranked"
         }
     }
@@ -243,7 +246,8 @@ extension AppViewModel {
                 docking.batchResults.append((ligandName: entry.name, results: results))
 
                 if let best = results.first {
-                    log.info(String(format: "  %@ best: %.1f kcal/mol", entry.name, best.energy), category: .dock)
+                    let sm = docking.scoringMethod
+                    log.info(String(format: "  %@ best: %.1f %@", entry.name, best.displayScore(method: sm), sm.unitLabel), category: .dock)
                 }
             }
 

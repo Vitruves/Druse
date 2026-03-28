@@ -457,25 +457,18 @@ final class ADMETPredictor {
 // MARK: - Pocket Detector CoreML Inference
 
 /// GNN-based binding site prediction using surface point features.
-/// Alternative to geometric alpha-sphere + DBSCAN detection.
-///
-/// Model inputs (matching train_pocket_detector.py features):
-///   - surface_features: [1, N, 11] — per-point: normal(3) + dist + hydrophobicity + charge +
-///                                     aromatic + donor + acceptor + buriedness + curvature
-///   - neighbor_features: [1, N, 11] — mean of k-nearest neighbor features (pre-aggregated GCN)
-///
-/// Model outputs:
-///   - pocket_probability: [1, N, 1] — per-point probability of being in a binding pocket
+/// 3D U-Net pocket detector: voxelizes protein into a 64³ grid with 10 feature channels,
+/// runs CoreML inference, thresholds per-voxel probabilities, and clusters into binding sites.
 @MainActor
 final class PocketDetectorInference {
 
     private var model: MLModel?
     private var isLoaded = false
+    private var pocketThreshold: Float = 0.01  // overridden from model metadata
 
-    private nonisolated let maxPoints = 4096
-    private nonisolated let kNeighbors = 16
-    private nonisolated let featureSize = 11  // matches training SURFACE_FEAT_DIM
-    private nonisolated let pocketThreshold: Float = 0.49  // optimal threshold from training
+    private nonisolated static let gridSize = 64
+    private nonisolated static let nChannels = 10
+    private nonisolated static let resolution: Float = 1.0  // Angstroms per voxel
 
     // Kyte-Doolittle hydrophobicity scale (normalized by /4.5, matching training)
     private nonisolated static let hydrophobicity: [String: Float] = [
@@ -484,6 +477,32 @@ final class PocketDetectorInference {
         "HIS": -3.2 / 4.5, "ILE":  4.5 / 4.5, "LEU":  3.8 / 4.5, "LYS": -3.9 / 4.5,
         "MET":  1.9 / 4.5, "PHE":  2.8 / 4.5, "PRO": -1.6 / 4.5, "SER": -0.8 / 4.5,
         "THR": -0.7 / 4.5, "TRP": -0.9 / 4.5, "TYR": -1.3 / 4.5, "VAL":  4.2 / 4.5,
+    ]
+
+    // Partial charges at pH 7.4 (matching training)
+    private nonisolated static let partialCharges: [String: [String: Float]] = [
+        "ASP": ["OD1": -0.5, "OD2": -0.5],
+        "GLU": ["OE1": -0.5, "OE2": -0.5],
+        "LYS": ["NZ": 1.0],
+        "ARG": ["NH1": 0.33, "NH2": 0.33, "NE": 0.33],
+        "HIS": ["ND1": 0.25, "NE2": 0.25],
+    ]
+
+    // Aromatic ring atoms in standard residues
+    private nonisolated static let aromaticResidueAtoms: Set<String> = ["PHE", "TYR", "TRP", "HIS"]
+
+    // H-bond donor atoms (backbone N except PRO, plus side-chain donors)
+    private nonisolated static let hbondDonorAtoms: [String: Set<String>] = [
+        "SER": ["OG"], "THR": ["OG1"], "TYR": ["OH"], "CYS": ["SG"],
+        "ASN": ["ND2"], "GLN": ["NE2"], "TRP": ["NE1"],
+        "LYS": ["NZ"], "ARG": ["NH1", "NH2", "NE"], "HIS": ["ND1", "NE2"],
+    ]
+
+    // H-bond acceptor atoms (backbone O, plus side-chain acceptors)
+    private nonisolated static let hbondAcceptorAtoms: [String: Set<String>] = [
+        "SER": ["OG"], "THR": ["OG1"], "TYR": ["OH"],
+        "ASN": ["OD1"], "ASP": ["OD1", "OD2"], "GLN": ["OE1"], "GLU": ["OE1", "OE2"],
+        "HIS": ["ND1", "NE2"], "MET": ["SD"],
     ]
 
     /// Load the PocketDetector CoreML model from the app bundle.
@@ -498,7 +517,14 @@ final class PocketDetectorInference {
             config.computeUnits = .all
             model = try MLModel(contentsOf: modelURL, configuration: config)
             isLoaded = true
-            ActivityLog.shared.info("[PocketDetector] Model loaded — compute units: all", category: .system)
+
+            // Read threshold from model metadata
+            if let threshStr = model?.modelDescription.metadata[MLModelMetadataKey(rawValue: "pocket_threshold")] as? String,
+               let thresh = Float(threshStr) {
+                pocketThreshold = thresh
+            }
+
+            ActivityLog.shared.info("[PocketDetector] v3 loaded (3D U-Net, threshold=\(String(format: "%.6f", pocketThreshold)))", category: .system)
         } catch {
             ActivityLog.shared.error("[PocketDetector] Failed to load model: \(error)", category: .system)
         }
@@ -507,7 +533,7 @@ final class PocketDetectorInference {
     /// Whether the ML model is available.
     var isAvailable: Bool { isLoaded && model != nil }
 
-    /// Detect binding pockets using the ML model.
+    /// Detect binding pockets using the 3D U-Net model.
     /// Returns BindingPocket array sorted by druggability, compatible with geometric detection results.
     func detectPockets(protein: Molecule) async -> [BindingPocket] {
         guard let model else {
@@ -522,129 +548,29 @@ final class PocketDetectorInference {
         }
         let residueSnapshot = protein.residues
         let allAtoms = protein.atoms
+        let threshold = pocketThreshold
 
-        // Try GPU-accelerated path first
-        if let gpu = FeatureComputeAccelerator.shared, gpu.hasPocketPipelines {
-            return await detectPocketsGPU(model: model, heavyAtoms: heavyAtoms,
-                                          residues: residueSnapshot, allAtoms: allAtoms, gpu: gpu)
-        }
-
-        // CPU fallback
-        return await detectPocketsCPU(model: model, heavyAtoms: heavyAtoms,
-                                      residues: residueSnapshot, allAtoms: allAtoms)
-    }
-
-    // MARK: - GPU-Accelerated Path
-
-    private func detectPocketsGPU(
-        model: MLModel, heavyAtoms: [Atom],
-        residues: [Residue], allAtoms: [Atom],
-        gpu: FeatureComputeAccelerator
-    ) async -> [BindingPocket] {
-        let (gpuAtoms, gridPoints) = await Task.detached(priority: .userInitiated) { () -> ([PocketMLAtom], [SIMD3<Float>]) in
-            // Build GPU atom data
-            var atoms = [PocketMLAtom]()
-            for a in heavyAtoms {
-                let vdw: Float
-                switch a.element {
-                case .C: vdw = 1.7; case .N: vdw = 1.55; case .O: vdw = 1.52
-                case .S: vdw = 1.8; case .P: vdw = 1.8; default: vdw = 1.7
-                }
-                let hydro = Self.hydrophobicity[a.residueName] ?? 0.0
-                var flags: UInt32 = 0
-                if a.element == .N || a.element == .O { flags |= 1 }  // donor/acceptor
-                if a.element == .C { flags |= 2 }  // aromatic proxy
-                atoms.append(PocketMLAtom(position: a.position, vdwRadius: vdw, charge: a.charge,
-                                          hydrophobicity: hydro, flags: flags, _pad0: 0))
-            }
-
-            // Generate grid points
-            var bboxMin = SIMD3<Float>(repeating: .infinity)
-            var bboxMax = SIMD3<Float>(repeating: -.infinity)
-            for a in heavyAtoms {
-                bboxMin = simd_min(bboxMin, a.position)
-                bboxMax = simd_max(bboxMax, a.position)
-            }
-            bboxMin -= SIMD3<Float>(repeating: 6.0)
-            bboxMax += SIMD3<Float>(repeating: 6.0)
-
-            var grid: [SIMD3<Float>] = []
-            let spacing: Float = 1.0
-            var x = bboxMin.x
-            while x < bboxMax.x {
-                var y = bboxMin.y
-                while y < bboxMax.y {
-                    var z = bboxMin.z
-                    while z < bboxMax.z {
-                        grid.append(SIMD3<Float>(x, y, z))
-                        z += spacing
-                    }
-                    y += spacing
-                }
-                x += spacing
-            }
-            return (atoms, grid)
+        // Voxelize protein on background thread
+        let (voxelGrid, center) = await Task.detached(priority: .userInitiated) {
+            Self.voxelizeProtein(heavyAtoms: heavyAtoms, residues: residueSnapshot)
         }.value
 
-        guard !gridPoints.isEmpty else {
-            ActivityLog.shared.warn("[PocketDetector] GPU path: no grid points generated", category: .dock)
-            return []
-        }
-
-        // GPU: surface features + KNN in one call
-        guard let gpuResult = gpu.computePocketFeatures(
-            gridPoints: gridPoints, atoms: gpuAtoms,
-            maxPoints: maxPoints, kNeighbors: kNeighbors
-        ) else {
-            // Fallback to CPU
-            return await detectPocketsCPU(model: model, heavyAtoms: heavyAtoms,
-                                          residues: residues, allAtoms: allAtoms)
-        }
-
-        let nPoints = gpuResult.surfaceFeats.count
-        guard nPoints >= 10 else {
-            ActivityLog.shared.warn("[PocketDetector] GPU path: too few surface points (\(nPoints))", category: .dock)
-            return []
-        }
-
         do {
-            let (features, neighborFeatures) = try await Task.detached(priority: .userInitiated) { [featureSize] in
-                let n = NSNumber(value: nPoints)
-                let features = try MLMultiArray(shape: [1, n, NSNumber(value: featureSize)], dataType: .float32)
-                let neighborFeatures = try MLMultiArray(shape: [1, n, NSNumber(value: featureSize)], dataType: .float32)
-
-                for i in 0..<nPoints {
-                    for j in 0..<featureSize {
-                        features[[0, i, j] as [NSNumber]] = NSNumber(value: gpuResult.surfaceFeats[i][j])
-                        neighborFeatures[[0, i, j] as [NSNumber]] = NSNumber(value: gpuResult.neighborFeats[i][j])
-                    }
-                }
-                return (features, neighborFeatures)
-            }.value
-
             let provider = try MLDictionaryFeatureProvider(dictionary: [
-                "surface_features": features,
-                "neighbor_features": neighborFeatures,
+                "voxel_grid": voxelGrid,
             ])
-
             let result = try await model.prediction(from: provider)
-            guard let probArray = result.featureValue(for: "pocket_probability")?.multiArrayValue else {
+
+            guard let probGrid = result.featureValue(for: "pocket_probability")?.multiArrayValue else {
                 ActivityLog.shared.error("[PocketDetector] Missing 'pocket_probability' in model output", category: .dock)
                 return []
             }
 
-            let threshold = pocketThreshold
-            let positions = gpuResult.positions
+            // Extract pocket voxels and cluster on background thread
             return await Task.detached(priority: .userInitiated) {
-                var pocketPoints: [(position: SIMD3<Float>, probability: Float)] = []
-                for i in 0..<nPoints {
-                    let prob = probArray[[0, i, 0] as [NSNumber]].floatValue
-                    if prob >= threshold {
-                        pocketPoints.append((positions[i], prob))
-                    }
-                }
+                let pocketPoints = Self.extractPocketPoints(probGrid: probGrid, center: center, threshold: threshold)
                 guard !pocketPoints.isEmpty else { return [] }
-                return Self.clusterIntoPockets(pocketPoints, residues: residues, atoms: allAtoms)
+                return Self.clusterIntoPockets(pocketPoints, residues: residueSnapshot, atoms: allAtoms)
             }.value
         } catch {
             ActivityLog.shared.warn("[PocketDetector] Inference failed: \(error)", category: .dock)
@@ -652,238 +578,158 @@ final class PocketDetectorInference {
         }
     }
 
-    // MARK: - CPU Fallback Path
+    // MARK: - Voxelization
 
-    private func detectPocketsCPU(
-        model: MLModel, heavyAtoms: [Atom],
-        residues: [Residue], allAtoms: [Atom]
-    ) async -> [BindingPocket] {
-        let (surfaceData, nPoints): ([SurfacePoint], Int) = await Task.detached(priority: .userInitiated) { [maxPoints, featureSize] in
-            let sd = Self.computeSurfaceFeatures(atoms: heavyAtoms, maxPoints: maxPoints, featureSize: featureSize)
-            return (sd, sd.count)
-        }.value
+    /// Voxelize protein atoms into a 10-channel 64³ grid for the 3D U-Net.
+    /// Returns the MLMultiArray grid and the centroid used for coordinate conversion.
+    private nonisolated static func voxelizeProtein(
+        heavyAtoms: [Atom], residues: [Residue]
+    ) -> (MLMultiArray, SIMD3<Float>) {
+        let gs = gridSize
+        let res = resolution
+        let half = Float(gs) * res / 2.0
 
-        guard nPoints >= 10 else {
-            ActivityLog.shared.warn("[PocketDetector] CPU path: too few surface points (\(nPoints))", category: .dock)
-            return []
+        // Compute protein centroid (center of the grid)
+        var sum = SIMD3<Float>.zero
+        for a in heavyAtoms { sum += a.position }
+        let center = sum / Float(heavyAtoms.count)
+
+        // Build residue lookup for atoms
+        var atomResidueMap: [Int: Int] = [:]
+        for (ri, residue) in residues.enumerated() {
+            for ai in residue.atomIndices {
+                atomResidueMap[ai] = ri
+            }
         }
 
+        // Create grid [1, 10, 64, 64, 64]
+        let grid: MLMultiArray
         do {
-            let (features, neighborFeatures) = try await Task.detached(priority: .userInitiated) { [featureSize, kNeighbors] in
-                let n = NSNumber(value: nPoints)
-
-                let features = try MLMultiArray(
-                    shape: [1, n, NSNumber(value: featureSize)],
-                    dataType: .float32
-                )
-                for i in 0..<nPoints {
-                    let feat = surfaceData[i].features
-                    for j in 0..<featureSize {
-                        features[[0, i, j] as [NSNumber]] = NSNumber(value: feat[j])
-                    }
-                }
-
-                let neighborFeatures = try MLMultiArray(
-                    shape: [1, n, NSNumber(value: featureSize)],
-                    dataType: .float32
-                )
-                let positions = surfaceData.map(\.position)
-                for i in 0..<nPoints {
-                    let neighbors = Self.findKNN(positions: positions, queryIdx: i, k: kNeighbors, n: nPoints)
-                    var meanFeat = [Float](repeating: 0, count: featureSize)
-                    for ni in neighbors {
-                        let nFeat = surfaceData[Int(ni)].features
-                        for j in 0..<featureSize { meanFeat[j] += nFeat[j] }
-                    }
-                    let scale = 1.0 / Float(neighbors.count)
-                    for j in 0..<featureSize {
-                        neighborFeatures[[0, i, j] as [NSNumber]] = NSNumber(value: meanFeat[j] * scale)
-                    }
-                }
-
-                return (features, neighborFeatures)
-            }.value
-
-            let provider = try MLDictionaryFeatureProvider(dictionary: [
-                "surface_features": features,
-                "neighbor_features": neighborFeatures,
-            ])
-
-            let result = try await model.prediction(from: provider)
-
-            guard let probArray = result.featureValue(for: "pocket_probability")?.multiArrayValue else {
-                ActivityLog.shared.error("[PocketDetector] Missing 'pocket_probability' in model output", category: .dock)
-                return []
-            }
-
-            let threshold = pocketThreshold
-            return await Task.detached(priority: .userInitiated) {
-                var pocketPoints: [(position: SIMD3<Float>, probability: Float)] = []
-                for i in 0..<nPoints {
-                    let prob = probArray[[0, i, 0] as [NSNumber]].floatValue
-                    if prob >= threshold {
-                        pocketPoints.append((surfaceData[i].position, prob))
-                    }
-                }
-
-                guard !pocketPoints.isEmpty else { return [] }
-
-                return Self.clusterIntoPockets(pocketPoints, residues: residues, atoms: allAtoms)
-            }.value
-
+            grid = try MLMultiArray(
+                shape: [1, NSNumber(value: nChannels), NSNumber(value: gs), NSNumber(value: gs), NSNumber(value: gs)],
+                dataType: .float16
+            )
         } catch {
-            ActivityLog.shared.warn("[PocketDetector] Inference failed: \(error)", category: .dock)
-            return []
+            // Fallback — should never fail
+            return (try! MLMultiArray(shape: [1, 10, 64, 64, 64], dataType: .float16), center)
         }
-    }
 
-    // MARK: - Surface Feature Computation (matches training pipeline)
+        // Zero-fill (MLMultiArray is not guaranteed to be zeroed)
+        let totalElements = 1 * nChannels * gs * gs * gs
+        let ptr = grid.dataPointer.bindMemory(to: Float16.self, capacity: totalElements)
+        for i in 0..<totalElements { ptr[i] = 0 }
 
-    private struct SurfacePoint: Sendable {
-        let position: SIMD3<Float>
-        let features: [Float]  // 11-dim matching SURFACE_FEAT_DIM
-    }
+        // Strides for [1, C, X, Y, Z] layout
+        let strideC = gs * gs * gs
+        let strideX = gs * gs
+        let strideY = gs
 
-    /// Compute surface points and 11-dim features matching train_pocket_detector.py.
-    ///
-    /// Features: normal(3) + dist_to_atom + hydrophobicity + charge +
-    ///           aromatic_nearby + donor_nearby + acceptor_nearby + buriedness + curvature
-    private nonisolated static func computeSurfaceFeatures(atoms: [Atom], maxPoints: Int, featureSize: Int) -> [SurfacePoint] {
-        let atomPositions = atoms.map(\.position)
+        for atom in heavyAtoms {
+            let vxf = (atom.position.x - center.x + half) / res
+            let vyf = (atom.position.y - center.y + half) / res
+            let vzf = (atom.position.z - center.z + half) / res
 
-        // Compute bounding box for grid generation
-        var bboxMin = SIMD3<Float>(repeating: .infinity)
-        var bboxMax = SIMD3<Float>(repeating: -.infinity)
-        for pos in atomPositions {
-            bboxMin = simd_min(bboxMin, pos)
-            bboxMax = simd_max(bboxMax, pos)
-        }
-        bboxMin -= SIMD3<Float>(repeating: 6.0)
-        bboxMax += SIMD3<Float>(repeating: 6.0)
+            let vx = Int(vxf)
+            let vy = Int(vyf)
+            let vz = Int(vzf)
 
-        // Generate grid points (spacing = 1.0 A, matching training)
-        let spacing: Float = 1.0
-        var gridPoints: [SIMD3<Float>] = []
-        var x = bboxMin.x
-        while x < bboxMax.x {
-            var y = bboxMin.y
-            while y < bboxMax.y {
-                var z = bboxMin.z
-                while z < bboxMax.z {
-                    gridPoints.append(SIMD3<Float>(x, y, z))
-                    z += spacing
-                }
-                y += spacing
+            guard vx >= 0, vx < gs, vy >= 0, vy < gs, vz >= 0, vz < gs else { continue }
+
+            let spatialIdx = vx * strideX + vy * strideY + vz
+
+            // Channel 0: all-atom density
+            ptr[0 * strideC + spatialIdx] += 1.0
+
+            // Channels 1-4: element type
+            switch atom.element {
+            case .C: ptr[1 * strideC + spatialIdx] += 1.0
+            case .N: ptr[2 * strideC + spatialIdx] += 1.0
+            case .O: ptr[3 * strideC + spatialIdx] += 1.0
+            default: ptr[4 * strideC + spatialIdx] += 1.0  // S, P, etc.
             }
-            x += spacing
-        }
 
-        // VdW radii matching training
-        func vdwRadius(for element: Element) -> Float {
-            switch element {
-            case .C: return 1.7
-            case .N: return 1.55
-            case .O: return 1.52
-            case .S: return 1.8
-            case .P: return 1.8
-            default: return 1.7
-            }
-        }
+            // Channel 5: hydrophobicity (from residue)
+            let hydro = hydrophobicity[atom.residueName] ?? 0.0
+            ptr[5 * strideC + spatialIdx] += Float16(hydro)
 
-        // Filter to surface region: distance to nearest atom surface ~ probe_radius
-        let probeRadius: Float = 1.4
-        var surfacePoints: [SurfacePoint] = []
+            // Channel 6: partial charge
+            let charge = partialCharges[atom.residueName]?[atom.name] ?? 0.0
+            ptr[6 * strideC + spatialIdx] += Float16(charge)
 
-        for gridPt in gridPoints {
-            // Find nearest atom
-            var minDist: Float = .infinity
-            var nearestIdx = 0
-            for (ai, aPos) in atomPositions.enumerated() {
-                let d = simd_distance(gridPt, aPos)
-                if d < minDist {
-                    minDist = d
-                    nearestIdx = ai
+            // Channel 7: aromatic
+            if aromaticResidueAtoms.contains(atom.residueName) {
+                let aroNames: Set<String> = [
+                    "CG", "CD1", "CD2", "CE1", "CE2", "CZ",  // PHE/TYR
+                    "NE1", "CE3", "CZ2", "CZ3", "CH2",       // TRP
+                    "ND1", "NE2",                              // HIS
+                ]
+                if aroNames.contains(atom.name) {
+                    ptr[7 * strideC + spatialIdx] += 1.0
                 }
             }
 
-            let surfaceDist = minDist - vdwRadius(for: atoms[nearestIdx].element)
-            guard surfaceDist >= -0.5 && surfaceDist <= probeRadius + 0.5 else { continue }
+            // Channel 8: H-bond donor
+            let isDonor: Bool = {
+                // Backbone N (except PRO)
+                if atom.name == "N" && atom.residueName != "PRO" { return true }
+                // Side-chain donors
+                if let donors = hbondDonorAtoms[atom.residueName], donors.contains(atom.name) { return true }
+                return false
+            }()
+            if isDonor { ptr[8 * strideC + spatialIdx] += 1.0 }
 
-            let atom = atoms[nearestIdx]
-            let atomPos = atomPositions[nearestIdx]
+            // Channel 9: H-bond acceptor
+            let isAcceptor: Bool = {
+                // Backbone O
+                if atom.name == "O" { return true }
+                // Side-chain acceptors
+                if let acceptors = hbondAcceptorAtoms[atom.residueName], acceptors.contains(atom.name) { return true }
+                return false
+            }()
+            if isAcceptor { ptr[9 * strideC + spatialIdx] += 1.0 }
+        }
 
-            // Feature [0-2]: surface normal (point - nearest atom, normalized)
-            var normal = gridPt - atomPos
-            let normLen = simd_length(normal)
-            if normLen > 0 { normal /= normLen }
+        return (grid, center)
+    }
 
-            // Feature [3]: distance to nearest atom
-            let distFeat = normLen
+    // MARK: - Pocket Extraction
 
-            // Feature [4]: hydrophobicity of nearest residue (normalized)
-            let resName = atom.residueName
-            let hydro = Self.hydrophobicity[resName] ?? 0.0
+    /// Extract above-threshold voxels from the probability grid and convert to world coordinates.
+    private nonisolated static func extractPocketPoints(
+        probGrid: MLMultiArray, center: SIMD3<Float>, threshold: Float
+    ) -> [(position: SIMD3<Float>, probability: Float)] {
+        let gs = gridSize
+        let res = resolution
+        let half = Float(gs) * res / 2.0
 
-            // Feature [5]: charge
-            let charge = atom.charge
+        let ptr = probGrid.dataPointer.bindMemory(to: Float16.self, capacity: gs * gs * gs)
+        var points: [(position: SIMD3<Float>, probability: Float)] = []
 
-            // Feature [6]: aromatic proxy (is carbon)
-            let aromatic: Float = atom.element == .C ? 1.0 : 0.0
+        let strideX = gs * gs
+        let strideY = gs
 
-            // Feature [7]: H-bond donor nearby
-            let donor: Float = (atom.element == .N || atom.element == .O) ? 1.0 : 0.0
-
-            // Feature [8]: H-bond acceptor nearby
-            let acceptor: Float = (atom.element == .N || atom.element == .O || atom.element == .F) ? 1.0 : 0.0
-
-            // Feature [9]: buriedness (count atoms within 6A, normalized)
-            var nearbyCount = 0
-            for aPos in atomPositions {
-                if simd_distance(gridPt, aPos) <= 6.0 { nearbyCount += 1 }
+        for x in 0..<gs {
+            for y in 0..<gs {
+                for z in 0..<gs {
+                    let prob = Float(ptr[x * strideX + y * strideY + z])
+                    if prob > threshold {
+                        let worldPos = SIMD3<Float>(
+                            Float(x) * res - half + center.x,
+                            Float(y) * res - half + center.y,
+                            Float(z) * res - half + center.z
+                        )
+                        points.append((worldPos, prob))
+                    }
+                }
             }
-            let buriedness = min(Float(nearbyCount) / 20.0, 1.0)
-
-            // Feature [10]: curvature placeholder (matching training)
-            let curvature: Float = 0.5
-
-            surfacePoints.append(SurfacePoint(
-                position: gridPt,
-                features: [normal.x, normal.y, normal.z, distFeat, hydro, charge,
-                           aromatic, donor, acceptor, buriedness, curvature]
-            ))
         }
 
-        // Subsample to maxPoints (matching training's 5000 cap, but we use maxPoints)
-        if surfacePoints.count > maxPoints {
-            // Stride-sample to fit
-            let stride = max(1, surfacePoints.count / maxPoints)
-            surfacePoints = (0..<surfacePoints.count)
-                .filter { $0 % stride == 0 }
-                .prefix(maxPoints)
-                .map { surfacePoints[$0] }
-        }
-
-        return surfacePoints
+        return points
     }
 
-    /// Find k-nearest neighbors by brute force.
-    private nonisolated static func findKNN(positions: [SIMD3<Float>], queryIdx: Int, k: Int, n: Int) -> [Int32] {
-        let query = positions[queryIdx]
-        var dists: [(Int, Float)] = []
-        for i in 0..<n {
-            if i == queryIdx { continue }
-            let d = simd_distance_squared(query, positions[i])
-            dists.append((i, d))
-        }
-        dists.sort { $0.1 < $1.1 }
-        var result = [Int32](repeating: 0, count: k)
-        for i in 0..<k {
-            result[i] = i < dists.count ? Int32(dists[i].0) : Int32(queryIdx)
-        }
-        return result
-    }
+    // MARK: - Clustering
 
-    /// Cluster pocket points into BindingPocket objects using simple single-linkage.
+    /// Cluster pocket points into BindingPocket objects using connected-component flood fill.
     private nonisolated static func clusterIntoPockets(
         _ points: [(position: SIMD3<Float>, probability: Float)],
         residues: [Residue],
@@ -983,30 +829,11 @@ private final class FeatureComputeAccelerator {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let rbfPipeline: MTLComputePipelineState
-    private let pocketSurfacePipeline: MTLComputePipelineState?
-    private let pocketKNNPipeline: MTLComputePipelineState?
-    private let spatialHashCountPipeline: MTLComputePipelineState?
-    private let spatialHashScatterPipeline: MTLComputePipelineState?
 
     private init(device: MTLDevice, commandQueue: MTLCommandQueue, rbfPipeline: MTLComputePipelineState) {
         self.device = device
         self.commandQueue = commandQueue
         self.rbfPipeline = rbfPipeline
-
-        // Try to load pocket detection pipelines (optional — falls back to CPU)
-        let library = device.makeDefaultLibrary()
-        self.pocketSurfacePipeline = library.flatMap { lib in
-            lib.makeFunction(name: "pocketSurfaceFeatures").flatMap { try? device.makeComputePipelineState(function: $0) }
-        }
-        self.pocketKNNPipeline = library.flatMap { lib in
-            lib.makeFunction(name: "pocketKNNAggregate").flatMap { try? device.makeComputePipelineState(function: $0) }
-        }
-        self.spatialHashCountPipeline = library.flatMap { lib in
-            lib.makeFunction(name: "buildSpatialHashCount").flatMap { try? device.makeComputePipelineState(function: $0) }
-        }
-        self.spatialHashScatterPipeline = library.flatMap { lib in
-            lib.makeFunction(name: "buildSpatialHashScatter").flatMap { try? device.makeComputePipelineState(function: $0) }
-        }
     }
 
     /// Compute pairwise distances and RBF-encoded features on GPU.
@@ -1059,247 +886,4 @@ private final class FeatureComputeAccelerator {
         )
     }
 
-    var hasPocketPipelines: Bool { pocketSurfacePipeline != nil && pocketKNNPipeline != nil }
-
-    /// GPU-accelerated surface feature computation + KNN neighbor aggregation.
-    /// Returns (surfaceFeatures, neighborFeatures, positions, count) ready for CoreML.
-    func computePocketFeatures(
-        gridPoints: [SIMD3<Float>],
-        atoms: [PocketMLAtom],
-        maxPoints: Int,
-        kNeighbors: Int
-    ) -> (surfaceFeats: [[Float]], neighborFeats: [[Float]], positions: [SIMD3<Float>])? {
-        guard let surfacePipeline = pocketSurfacePipeline,
-              let knnPipeline = pocketKNNPipeline,
-              !gridPoints.isEmpty, !atoms.isEmpty
-        else { return nil }
-
-        var gridPts = gridPoints
-        var atomData = atoms
-        var params = PocketDetectParams(
-            numGridPoints: UInt32(gridPoints.count),
-            numAtoms: UInt32(atoms.count),
-            probeRadius: 1.4,
-            buriednessCutoff: 6.0
-        )
-
-        // Allocate buffers
-        let maxOutput = min(gridPoints.count, maxPoints * 4) // overallocate, will trim
-        guard let gridBuf = device.makeBuffer(bytes: &gridPts, length: gridPoints.count * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared),
-              let atomBuf = device.makeBuffer(bytes: &atomData, length: atoms.count * MemoryLayout<PocketMLAtom>.stride, options: .storageModeShared),
-              let outputBuf = device.makeBuffer(length: maxOutput * MemoryLayout<PocketSurfacePoint>.stride, options: .storageModeShared),
-              let countBuf = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
-              let paramsBuf = device.makeBuffer(bytes: &params, length: MemoryLayout<PocketDetectParams>.stride, options: .storageModeShared),
-              let cmdBuf = commandQueue.makeCommandBuffer(),
-              let enc = cmdBuf.makeComputeCommandEncoder()
-        else { return nil }
-
-        // Zero the counter
-        countBuf.contents().storeBytes(of: UInt32(0), as: UInt32.self)
-
-        // Pass 1: Surface feature computation
-        enc.setComputePipelineState(surfacePipeline)
-        enc.setBuffer(gridBuf, offset: 0, index: 0)
-        enc.setBuffer(atomBuf, offset: 0, index: 1)
-        enc.setBuffer(outputBuf, offset: 0, index: 2)
-        enc.setBuffer(countBuf, offset: 0, index: 3)
-        enc.setBuffer(paramsBuf, offset: 0, index: 4)
-
-        let w = surfacePipeline.maxTotalThreadsPerThreadgroup
-        let tg = MTLSize(width: min(Int(params.numGridPoints), w), height: 1, depth: 1)
-        let gc = MTLSize(width: (Int(params.numGridPoints) + tg.width - 1) / tg.width, height: 1, depth: 1)
-        enc.dispatchThreadgroups(gc, threadsPerThreadgroup: tg)
-        enc.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
-
-        // Read valid count — clamp to buffer capacity (GPU atomic counter can exceed allocation)
-        let rawCount = Int(countBuf.contents().load(as: UInt32.self))
-        let validCount = min(rawCount, maxOutput)
-        guard validCount > 0 else { return nil }
-
-        // Subsample to maxPoints if needed
-        let surfacePtr = outputBuf.contents().bindMemory(to: PocketSurfacePoint.self, capacity: validCount)
-        let allSurfacePoints = Array(UnsafeBufferPointer(start: surfacePtr, count: validCount))
-
-        // Stride-sample
-        let sampledPoints: [PocketSurfacePoint]
-        if validCount > maxPoints {
-            let stride = max(1, validCount / maxPoints)
-            sampledPoints = (0..<validCount).filter { $0 % stride == 0 }.prefix(maxPoints).map { allSurfacePoints[$0] }
-        } else {
-            sampledPoints = allSurfacePoints
-        }
-        let n = sampledPoints.count
-
-        // Pass 2: Build spatial hash grid for accelerated KNN
-        var sampledData = sampledPoints
-        let useSpatialHash: Bool = spatialHashCountPipeline != nil
-            && spatialHashScatterPipeline != nil && n >= 64
-
-        guard let sampledBuf = device.makeBuffer(bytes: &sampledData, length: n * MemoryLayout<PocketSurfacePoint>.stride, options: .storageModeShared)
-        else { return nil }
-
-        // Spatial hash buffers (optional — will be nil if hash not used)
-        var sortedIndicesBuf: MTLBuffer?
-        var cellOffsetsBuf: MTLBuffer?
-        var hashParamsBuf: MTLBuffer?
-
-        if useSpatialHash {
-            // Compute bounding box of sampled points
-            var bboxMin = SIMD3<Float>(Float.infinity, Float.infinity, Float.infinity)
-            var bboxMax = SIMD3<Float>(-Float.infinity, -Float.infinity, -Float.infinity)
-            for pt in sampledPoints {
-                bboxMin = min(bboxMin, pt.position)
-                bboxMax = max(bboxMax, pt.position)
-            }
-            // Add small padding to avoid edge cases
-            bboxMin -= SIMD3<Float>(repeating: 0.01)
-            bboxMax += SIMD3<Float>(repeating: 0.01)
-
-            let cellSize: Float = 4.0  // 2x typical KNN radius in Angstroms
-            let extent = bboxMax - bboxMin
-            let gx = max(UInt32(ceilf(extent.x / cellSize)), 1)
-            let gy = max(UInt32(ceilf(extent.y / cellSize)), 1)
-            let gz = max(UInt32(ceilf(extent.z / cellSize)), 1)
-            let totalCells = Int(gx * gy * gz)
-
-            var hashParams = SpatialHashParams(
-                gridOrigin: bboxMin,
-                cellSize: cellSize,
-                gridDims: SIMD3<UInt32>(gx, gy, gz),
-                numPoints: UInt32(n),
-                totalCells: UInt32(totalCells),
-                _pad0: 0, _pad1: 0, _pad2: 0
-            )
-
-            // Allocate hash buffers
-            guard let cellCountsBuf = device.makeBuffer(length: totalCells * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                  let sortedBuf = device.makeBuffer(length: n * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                  // cellOffsets has totalCells+1 entries (prefix sum)
-                  let offsBuf = device.makeBuffer(length: (totalCells + 1) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                  let hpBuf = device.makeBuffer(bytes: &hashParams, length: MemoryLayout<SpatialHashParams>.stride, options: .storageModeShared)
-            else { return nil }
-
-            // Zero cell counts
-            memset(cellCountsBuf.contents(), 0, totalCells * MemoryLayout<UInt32>.stride)
-
-            // Pass 2a: Count points per cell
-            guard let countPipeline = spatialHashCountPipeline,
-                  let cmdBufHash1 = commandQueue.makeCommandBuffer(),
-                  let encHash1 = cmdBufHash1.makeComputeCommandEncoder()
-            else { return nil }
-
-            encHash1.setComputePipelineState(countPipeline)
-            encHash1.setBuffer(sampledBuf, offset: 0, index: 0)
-            encHash1.setBuffer(cellCountsBuf, offset: 0, index: 1)
-            encHash1.setBuffer(hpBuf, offset: 0, index: 2)
-
-            let wh = countPipeline.maxTotalThreadsPerThreadgroup
-            let tgh = MTLSize(width: min(n, wh), height: 1, depth: 1)
-            let gch = MTLSize(width: (n + tgh.width - 1) / tgh.width, height: 1, depth: 1)
-            encHash1.dispatchThreadgroups(gch, threadsPerThreadgroup: tgh)
-            encHash1.endEncoding()
-            cmdBufHash1.commit()
-            cmdBufHash1.waitUntilCompleted()
-
-            // CPU prefix sum: cellOffsets[i] = sum of cellCounts[0..i-1]
-            let countsPtr = cellCountsBuf.contents().bindMemory(to: UInt32.self, capacity: totalCells)
-            let offsetsPtr = offsBuf.contents().bindMemory(to: UInt32.self, capacity: totalCells + 1)
-            var running: UInt32 = 0
-            for i in 0..<totalCells {
-                offsetsPtr[i] = running
-                running += countsPtr[i]
-            }
-            offsetsPtr[totalCells] = running
-
-            // Reset cell counts for scatter pass (reused as atomic write cursor)
-            memset(cellCountsBuf.contents(), 0, totalCells * MemoryLayout<UInt32>.stride)
-
-            // Pass 2b: Scatter point indices into sorted buffer
-            guard let scatterPipeline = spatialHashScatterPipeline,
-                  let cmdBufHash2 = commandQueue.makeCommandBuffer(),
-                  let encHash2 = cmdBufHash2.makeComputeCommandEncoder()
-            else { return nil }
-
-            encHash2.setComputePipelineState(scatterPipeline)
-            encHash2.setBuffer(sampledBuf, offset: 0, index: 0)
-            encHash2.setBuffer(sortedBuf, offset: 0, index: 1)
-            encHash2.setBuffer(offsBuf, offset: 0, index: 2)
-            encHash2.setBuffer(cellCountsBuf, offset: 0, index: 3)
-            encHash2.setBuffer(hpBuf, offset: 0, index: 4)
-
-            let ws = scatterPipeline.maxTotalThreadsPerThreadgroup
-            let tgs = MTLSize(width: min(n, ws), height: 1, depth: 1)
-            let gcs = MTLSize(width: (n + tgs.width - 1) / tgs.width, height: 1, depth: 1)
-            encHash2.dispatchThreadgroups(gcs, threadsPerThreadgroup: tgs)
-            encHash2.endEncoding()
-            cmdBufHash2.commit()
-            cmdBufHash2.waitUntilCompleted()
-
-            sortedIndicesBuf = sortedBuf
-            cellOffsetsBuf = offsBuf
-            hashParamsBuf = hpBuf
-        }
-
-        // Pass 3: KNN aggregation on sampled points (using spatial hash when available)
-        var knnParams = PocketKNNParams(
-            numPoints: UInt32(n),
-            k: UInt32(kNeighbors),
-            featureSize: 11,
-            useSpatialHash: useSpatialHash ? 1 : 0
-        )
-
-        guard let neighborBuf = device.makeBuffer(length: n * 11 * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let knnParamsBuf = device.makeBuffer(bytes: &knnParams, length: MemoryLayout<PocketKNNParams>.stride, options: .storageModeShared),
-              let cmdBuf2 = commandQueue.makeCommandBuffer(),
-              let enc2 = cmdBuf2.makeComputeCommandEncoder()
-        else { return nil }
-
-        enc2.setComputePipelineState(knnPipeline)
-        enc2.setBuffer(sampledBuf, offset: 0, index: 0)
-        enc2.setBuffer(neighborBuf, offset: 0, index: 1)
-        enc2.setBuffer(knnParamsBuf, offset: 0, index: 2)
-
-        if useSpatialHash, let sib = sortedIndicesBuf, let cob = cellOffsetsBuf, let hpb = hashParamsBuf {
-            enc2.setBuffer(sib, offset: 0, index: 3)
-            enc2.setBuffer(cob, offset: 0, index: 4)
-            enc2.setBuffer(hpb, offset: 0, index: 5)
-        } else {
-            // Bind dummy zero-length buffers so Metal doesn't complain about missing bindings
-            let dummyBuf = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
-            let dummyHashParams = device.makeBuffer(length: MemoryLayout<SpatialHashParams>.stride, options: .storageModeShared)
-            enc2.setBuffer(dummyBuf, offset: 0, index: 3)
-            enc2.setBuffer(dummyBuf, offset: 0, index: 4)
-            enc2.setBuffer(dummyHashParams, offset: 0, index: 5)
-        }
-
-        let w2 = knnPipeline.maxTotalThreadsPerThreadgroup
-        let tg2 = MTLSize(width: min(n, w2), height: 1, depth: 1)
-        let gc2 = MTLSize(width: (n + tg2.width - 1) / tg2.width, height: 1, depth: 1)
-        enc2.dispatchThreadgroups(gc2, threadsPerThreadgroup: tg2)
-        enc2.endEncoding()
-        cmdBuf2.commit()
-        cmdBuf2.waitUntilCompleted()
-
-        // Read results
-        let neighborPtr = neighborBuf.contents().bindMemory(to: Float.self, capacity: n * 11)
-        var surfaceFeats: [[Float]] = []
-        var neighborFeats: [[Float]] = []
-        var positions: [SIMD3<Float>] = []
-
-        for i in 0..<n {
-            let pt = sampledPoints[i]
-            surfaceFeats.append([pt.normal.x, pt.normal.y, pt.normal.z, pt.nearestDist,
-                                 pt.hydrophobicity, pt.charge, pt.aromatic, pt.donor,
-                                 pt.acceptor, pt.buriedness, pt.curvature])
-            positions.append(pt.position)
-
-            var nf = [Float](repeating: 0, count: 11)
-            for j in 0..<11 { nf[j] = neighborPtr[i * 11 + j] }
-            neighborFeats.append(nf)
-        }
-
-        return (surfaceFeats, neighborFeats, positions)
-    }
 }

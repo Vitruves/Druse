@@ -59,10 +59,13 @@ struct LeadOptComparisonView: View {
 
             if let refE = reference.referenceResult?.energy, let analogE = analog.bestEnergy {
                 let delta = analogE - refE
+                let sm = viewModel.docking.scoringMethod
+                let label = sm.isAffinityScore ? "ΔpKi" : "ΔE"
+                let betterColor: Color = sm.isAffinityScore ? (delta > 0 ? .green : .red) : (delta < 0 ? .green : delta > 1 ? .red : .secondary)
                 HStack {
-                    Text("ΔE = \(String(format: "%+.2f", delta)) kcal/mol")
+                    Text("\(label) = \(String(format: "%+.2f", delta)) \(sm.unitLabel)")
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(delta < 0 ? .green : delta > 1 ? .red : .secondary)
+                        .foregroundStyle(betterColor)
                     if let rmsd = analog.rmsdToReference {
                         Spacer()
                         Text("RMSD = \(String(format: "%.2f", rmsd)) Å")
@@ -84,10 +87,14 @@ struct LeadOptComparisonView: View {
                 .font(.system(size: 10, weight: .semibold))
                 .lineLimit(1)
             if let e = energy {
+                let sm = viewModel.docking.scoringMethod
+                let isBetter = sm.isAffinityScore
+                    ? e > (reference.referenceResult?.energy ?? 0)
+                    : e < (reference.referenceResult?.energy ?? 0)
                 Text(String(format: "%.2f", e))
                     .font(.system(size: 16, weight: .bold, design: .monospaced))
-                    .foregroundColor(isReference ? .primary : (e < (reference.referenceResult?.energy ?? 0) ? .green : .orange))
-                Text("kcal/mol")
+                    .foregroundColor(isReference ? .primary : (isBetter ? .green : .orange))
+                Text(sm.unitLabel)
                     .font(.system(size: 8))
                     .foregroundStyle(.tertiary)
             }

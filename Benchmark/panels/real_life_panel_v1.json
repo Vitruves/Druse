@@ -1,0 +1,104 @@
+{
+  "id": "real_life_panel_v1",
+  "name": "Real-Life Docking Panel v1",
+  "description": "Sixteen CASF complexes curated for fast product-facing docking checks. The panel is grouped by common failure modes rather than by aggregate leaderboard value alone.",
+  "source_manifest": "Benchmark/manifests/casf_manifest.json",
+  "cases": [
+    {
+      "pdb_id": "1bcu",
+      "group": "rigid_fragments",
+      "title": "Flat rigid aromatic fragment",
+      "reason": "Low-flexibility fragment-like ligand. Good for checking basic pose placement and aromatic packing."
+    },
+    {
+      "pdb_id": "2weg",
+      "group": "rigid_fragments",
+      "title": "Small Zn-pocket fragment",
+      "reason": "Tiny ligand in a metal-containing site. Exposes overfitting to ligand size and brittle pocket centering."
+    },
+    {
+      "pdb_id": "3d4z",
+      "group": "rigid_fragments",
+      "title": "Compact bicyclic fragment",
+      "reason": "Rigid fragment with little torsional freedom. Useful for separating search failures from scoring failures."
+    },
+    {
+      "pdb_id": "3udh",
+      "group": "rigid_fragments",
+      "title": "Charged fused-ring fragment",
+      "reason": "Small cationic fragment. Keeps the search space simple while still probing charge handling."
+    },
+    {
+      "pdb_id": "3ejr",
+      "group": "metal_coordination",
+      "title": "Zn-aware medium ligand",
+      "reason": "Coordination-sensitive site where generic hydrophobic scoring often looks better than it should."
+    },
+    {
+      "pdb_id": "2zcq",
+      "group": "metal_coordination",
+      "title": "Mg-bound aromatic binder",
+      "reason": "Mixed aromatic and metal-mediated recognition. Good stress case for explicit interaction terms."
+    },
+    {
+      "pdb_id": "3oe5",
+      "group": "metal_coordination",
+      "title": "Mg-assisted larger pocket",
+      "reason": "Bigger ligand in a metal-containing site. Helps catch missed coordination in otherwise plausible poses."
+    },
+    {
+      "pdb_id": "1k1i",
+      "group": "metal_coordination",
+      "title": "Ca-containing aromatic binder",
+      "reason": "Tests whether non-Zn metals are treated consistently during search and ranking."
+    },
+    {
+      "pdb_id": "1a30",
+      "group": "charged_flexible",
+      "title": "Peptidic charged ligand",
+      "reason": "High torsional freedom plus formal charge. A good quick readout for protonation and conformational search."
+    },
+    {
+      "pdb_id": "1h22",
+      "group": "charged_flexible",
+      "title": "Long dicationic binder",
+      "reason": "Flexible, highly charged ligand that punishes weak electrostatics and weak exploration."
+    },
+    {
+      "pdb_id": "1h23",
+      "group": "charged_flexible",
+      "title": "Even longer dicationic analogue",
+      "reason": "Near-neighbor to 1h22 with more flexibility. Good for stability and ranking consistency checks."
+    },
+    {
+      "pdb_id": "4cig",
+      "group": "charged_flexible",
+      "title": "Charged aromatic medium ligand",
+      "reason": "Balanced charge plus aromaticity. Useful when rigid fragments pass but realistic ligands still drift."
+    },
+    {
+      "pdb_id": "4gid",
+      "group": "bulky_hydrophobic",
+      "title": "Bulky aromatic high-affinity ligand",
+      "reason": "Large, lipophilic ligand with many torsions. A practical stress test for exploration versus collapse."
+    },
+    {
+      "pdb_id": "3prs",
+      "group": "bulky_hydrophobic",
+      "title": "Very large aromatic scaffold",
+      "reason": "High-MW, ring-rich ligand. Good for runtime, clustering, and large-ligand ranking behavior."
+    },
+    {
+      "pdb_id": "1eby",
+      "group": "bulky_hydrophobic",
+      "title": "Bulky heteroatom-rich ligand",
+      "reason": "Large ligand with more polar functionality than the purely lipophilic cases."
+    },
+    {
+      "pdb_id": "2vkm",
+      "group": "bulky_hydrophobic",
+      "title": "Large charged aromatic binder",
+      "reason": "Large aromatic ligand with formal charge. Useful for checking whether heavy hydrophobics swamp electrostatics."
+    }
+  ]
+}

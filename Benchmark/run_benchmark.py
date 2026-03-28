@@ -84,6 +84,16 @@ def parse_args():
     ds = p.add_argument_group("Dataset")
     ds.add_argument("--casf", action="store_true",
                     help="Run CASF-2016 benchmark (225 complexes)")
+    ds.add_argument("--manifest", type=str, default="",
+                    help="Run a custom manifest JSON instead of the default CASF manifest")
+    ds.add_argument("--benchmark-name", type=str, default="",
+                    help="Override benchmark label stored in results JSON")
+    ds.add_argument("--pipeline-mode", type=str, default="redock",
+                    choices=["redock", "full"],
+                    help="Benchmark mode: classic redocking or full end-to-end Druse pipeline")
+    ds.add_argument("--pocket-mode", type=str, default="hybrid",
+                    choices=["ligand-guided", "geometric", "ml", "hybrid"],
+                    help="Pocket selection mode. In full mode, 'hybrid' means ML first then geometric fallback")
     ds.add_argument("--quick", type=int, metavar="N", default=0,
                     help="Limit to first N complexes (fast validation)")
 
@@ -195,6 +205,8 @@ def parse_args():
                      help="Run analyze.py after benchmark completes")
     out.add_argument("--verbose", action="store_true",
                      help="Show full xcodebuild output")
+    out.add_argument("--debug", action="store_true",
+                     help="Enable debug diagnostics in results JSON (pocket center, distances, etc.)")
     out.add_argument("--druse-logs", nargs="?", const="-", default=None,
                      metavar="FILE",
                      help="Stream Druse app logs in real time. "
@@ -209,14 +221,14 @@ def parse_args():
 
     args = p.parse_args()
 
-    if not args.casf:
-        p.error("No dataset specified. Use --casf (more datasets coming soon)")
+    if not args.casf and not args.manifest:
+        p.error("No dataset specified. Use --casf or --manifest PATH")
 
     return args
 
 
 def apply_preset(args):
-    """Apply parameter preset, overriding individual settings."""
+    """Apply parameter preset as defaults — explicit CLI flags take precedence."""
     if not args.preset:
         return
 
@@ -227,7 +239,7 @@ def apply_preset(args):
             "local_search_steps": 15, "gfn2_opt": False,
         },
         "standard": {
-            "population": 200, "generations": 200, "runs": 1,
+            "population": 200, "generations": 200, "runs": 3,
             "grid_spacing": 0.375, "local_search_freq": 1,
             "local_search_steps": 30, "gfn2_opt": False,
         },
@@ -246,10 +258,33 @@ def apply_preset(args):
         },
     }
 
+    # Detect which flags the user explicitly set on the command line
+    import sys
+    cli_flags = set()
+    # Map argparse dest names to their CLI flag names
+    flag_to_dest = {
+        "--population": "population", "--generations": "generations",
+        "--runs": "runs", "--grid-spacing": "grid_spacing",
+        "--local-search-freq": "local_search_freq",
+        "--local-search-steps": "local_search_steps",
+        "--gfn2-opt": "gfn2_opt", "--gfn2-opt-level": "gfn2_opt_level",
+        "--gfn2-top-poses": "gfn2_top_poses", "--flex-residues": "flex_residues",
+    }
+    for flag, dest in flag_to_dest.items():
+        if flag in sys.argv:
+            cli_flags.add(dest)
+
     p = presets[args.preset]
+    overrides = []
     for k, v in p.items():
-        setattr(args, k, v)
-    print(f"Applied preset: {args.preset}")
+        if k not in cli_flags:
+            setattr(args, k, v)
+        else:
+            overrides.append(f"{k}={getattr(args, k)}")
+    msg = f"Applied preset: {args.preset}"
+    if overrides:
+        msg += f" (CLI overrides: {', '.join(overrides)})"
+    print(msg)
 
 
 CONFIG_FILE = BENCHMARK_DIR / ".bench_config.json"
@@ -313,8 +348,17 @@ def build_config(args) -> dict:
         # Quick mode
         "maxComplexes": args.quick if args.quick > 0 else 0,
 
+        # Dataset
+        "manifestPath": args.manifest,
+        "benchmarkName": args.benchmark_name,
+        "pipelineMode": args.pipeline_mode,
+        "pocketMode": args.pocket_mode,
+
         # Stdout log mirroring
         "stdoutLogs": args.druse_logs is not None,
+
+        # Debug diagnostics
+        "debug": args.debug,
 
         # Output
         "outputDir": args.output_dir,
@@ -383,10 +427,10 @@ def _format_time(ms: float) -> str:
 
 
 import re
-# Vina/Drusina format — tolerates optional fields (e.g. GFN2=xxx) between RMSD and ms:
+# Vina/Drusina format — tolerates optional fields (e.g. GFN2=xxx, debug fields) between RMSD and ms:
 #   [1/10] 1a30  E=-11.04  RMSD=3.49A  5912ms
 #   [1/10] 1a30  E=-11.04  RMSD=3.49A  GFN2=-123  5912ms
-#   [1/10] 1a30  E=-11.04  RMSD=N/AA  5912ms
+#   [1/10] 1a30  E=-11.04  RMSD=N/AA  pocket=ml dist=12.3A vol=456A3  5912ms
 _RESULT_RE = re.compile(
     r"\[(\d+)/(\d+)\]\s+(\S+)\s+E=([\-\d.]+)\s+RMSD=([\d.]+|N/A)A.*?(\d+)ms"
 )
@@ -536,14 +580,19 @@ def run_xcodebuild(test_method: str, env: dict, verbose: bool,
 def print_config_summary(args, methods):
     """Print human-readable configuration summary."""
     scoring_str = ", ".join(SCORING_LABELS.get(m, m) for m, _, _ in methods)
-    dataset_str = f"CASF-2016 (first {args.quick})" if args.quick else "CASF-2016 (225 complexes)"
+    if args.manifest:
+        dataset_name = args.benchmark_name or Path(args.manifest).stem
+        dataset_str = f"{dataset_name} (first {args.quick})" if args.quick else dataset_name
+    else:
+        dataset_str = f"CASF-2016 (first {args.quick})" if args.quick else "CASF-2016 (225 complexes)"
     strain_on = args.strain_penalty and not args.no_strain_penalty
     grad_str = "numerical (FD)" if args.no_analytical_gradients else "analytical"
+    pipeline_str = f"{args.pipeline_mode}/{args.pocket_mode}"
 
     print()
     print(f"\033[1mDruse Benchmark\033[0m  v{VERSION}")
     print()
-    print(f"  {dataset_str}  |  {scoring_str}  |  {args.preset or 'custom'} preset")
+    print(f"  {dataset_str}  |  {scoring_str}  |  {args.preset or 'custom'} preset  |  {pipeline_str}")
     print(f"  pop={args.population} gen={args.generations} runs={args.runs}  "
           f"grid={args.grid_spacing}A  LS every {args.local_search_freq} gen x{args.local_search_steps}  "
           f"{grad_str}")

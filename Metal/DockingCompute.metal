@@ -1183,6 +1183,15 @@ inline float computeDrusinaCorrections(
     float drusinaE = 0.0f;
     int interactionCount = 0;
 
+    // Pre-compute ligand centroid for spatial gating of protein partners.
+    // Protein features beyond ligandCutoff from centroid cannot interact with any
+    // ligand atom (max ligand radius ~8Å + max interaction range ~6Å = 14Å).
+    float3 ligCentroid = float3(0);
+    for (uint a = 0; a < nAtoms; a++) ligCentroid += positions[a];
+    ligCentroid /= float(max(nAtoms, 1u));
+    const float ligandCutoff = 14.0f;
+    const float ligandCutoffSq = ligandCutoff * ligandCutoff;
+
     // Pre-compute ligand ring centroids and normals for reuse (π-π + amide-π)
     const uint MAX_LIG_RINGS = 8u;
     float3 ligRingCentroid[MAX_LIG_RINGS];
@@ -1229,6 +1238,7 @@ inline float computeDrusinaCorrections(
         float3 norm = ligRingNormal[lr];
 
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
+            if (distance_squared(ligCentroid, proteinRings[pr].centroid) > ligandCutoffSq) continue;
             float d = distance(centroid, proteinRings[pr].centroid);
             if (d < 3.2f || d > 5.8f) continue;
             float dotN = abs(dot(norm, proteinRings[pr].normal));
@@ -1259,6 +1269,7 @@ inline float computeDrusinaCorrections(
 
         for (uint pc = 0; pc < params.numProteinCations; pc++) {
             float3 cPos = proteinCations[pc].xyz;
+            if (distance_squared(ligCentroid, cPos) > ligandCutoffSq) continue;
             float d = distance(centroid, cPos);
             if (d > 5.5f) continue;
             float3 toAtom = normalize(cPos - centroid);
@@ -1276,6 +1287,7 @@ inline float computeDrusinaCorrections(
     for (uint a = 0; a < nAtoms; a++) {
         if (ligandAtoms[a].formalCharge <= 0) continue;
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
+            if (distance_squared(ligCentroid, proteinRings[pr].centroid) > ligandCutoffSq) continue;
             float d = distance(positions[a], proteinRings[pr].centroid);
             if (d > 5.5f) continue;
             float3 toAtom = normalize(positions[a] - proteinRings[pr].centroid);
@@ -1298,6 +1310,7 @@ inline float computeDrusinaCorrections(
         if (ligCharge == 0) continue;
 
         for (uint g = 0; g < params.numSaltBridgeGroups; g++) {
+            if (distance_squared(ligCentroid, saltBridgeGroups[g].centroid) > ligandCutoffSq) continue;
             // Require opposite charges
             bool isSB = (ligCharge > 0 && saltBridgeGroups[g].chargeSign < 0) ||
                         (ligCharge < 0 && saltBridgeGroups[g].chargeSign > 0);
@@ -1326,6 +1339,7 @@ inline float computeDrusinaCorrections(
         float3 norm = ligRingNormal[lr];
 
         for (uint am = 0; am < params.numProteinAmides; am++) {
+            if (distance_squared(ligCentroid, proteinAmides[am].centroid) > ligandCutoffSq) continue;
             float d = distance(centroid, proteinAmides[am].centroid);
             if (d < 3.0f || d > 5.2f) continue;
 
@@ -1449,18 +1463,19 @@ inline float computeDrusinaCorrections(
 
     // ---- Enhanced metal coordination ----
     // Verdonk 2003: optimal distance loosened from 2.2 to 2.6 Å for raw PDB structures.
-    // We use 2.4 Å optimal with cutoff at 3.2 Å for robustness.
+    // We use 2.4 Å optimal with cutoff at 3.5 Å (widened for prepared structure tolerance).
+    // Also accept N_D (donor-only nitrogen, e.g. imidazole) as coordinating atom.
     for (uint p = 0; p < numProteinAtoms; p++) {
         if (proteinAtoms[p].vinaType != VINA_MET_D) continue;
         for (uint a = 0; a < nAtoms; a++) {
             int lt = ligandAtoms[a].vinaType;
-            bool isCoord = (lt == VINA_N_A || lt == VINA_N_DA ||
+            bool isCoord = (lt == VINA_N_A || lt == VINA_N_DA || lt == VINA_N_D ||
                             lt == VINA_O_A || lt == VINA_O_DA || lt == VINA_S_P);
             if (!isCoord) continue;
             float d = distance(positions[a], proteinAtoms[p].position);
-            if (d > 3.2f) continue;
+            if (d > 3.5f) continue;
             float dd = d - 2.4f;
-            drusinaE += params.wMetalCoord * drusinaRamp(dd, 0.2f, 0.8f);
+            drusinaE += params.wMetalCoord * drusinaRamp(dd, 0.3f, 1.1f);
             interactionCount++;
         }
     }
@@ -1486,6 +1501,7 @@ inline float computeDrusinaCorrections(
         if (ligandAtoms[a].flags & LIGATOM_FLAG_AROMATIC) continue;
         float3 cPos = positions[a];
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
+            if (distance_squared(ligCentroid, proteinRings[pr].centroid) > ligandCutoffSq) continue;
             float d = distance(cPos, proteinRings[pr].centroid);
             if (d < 3.5f || d > 5.0f) continue;
             float3 toC = normalize(cPos - proteinRings[pr].centroid);
@@ -1527,8 +1543,9 @@ inline float computeDrusinaCorrections(
     }
 
     // Safety cap: Drusina corrections should complement Vina, not overwhelm it.
-    // Typical Vina scores are -5 to -15 kcal/mol; cap Drusina at -6 kcal/mol.
-    drusinaE = max(drusinaE, -6.0f);
+    // Typical Vina scores are -5 to -15 kcal/mol; cap Drusina at -10 kcal/mol
+    // to allow strong metal coordination + salt bridge contributions.
+    drusinaE = max(drusinaE, -10.0f);
 
     return drusinaE;
 }
@@ -1789,8 +1806,13 @@ kernel void scoreBatchRigidPoses(
     pose.energy = totalSteric + totalHydrophobic + totalHBond + pose.clashPenalty;
 }
 
-/// Initialize random poses within the pocket-centered search box.
-/// 70% focused near the pocket center, 30% exploratory across the search box.
+/// Initialize population with conformer-aware seeding.
+/// Three tiers to balance exploitation of the RDKit conformer with exploration:
+///   Tier 1 (30%): Reference conformer (torsions=0) with positional + rotational diversity
+///                  — these poses START from the chemically reasonable RDKit geometry
+///   Tier 2 (30%): Reference torsions + small Gaussian noise (±30°) with random placement
+///                  — conformational variants near the reference
+///   Tier 3 (40%): Fully random torsions for exploration of alternative binding modes
 kernel void initializePopulation(
     device DockPose            *poses        [[buffer(0)]],
     constant GridParams        &gridParams   [[buffer(1)]],
@@ -1800,18 +1822,17 @@ kernel void initializePopulation(
     if (tid >= gaParams.populationSize) return;
 
     uint seed = tid * 747796405u + gaParams.generation * 2891336453u + 67890u;
+    uint popSize = gaParams.populationSize;
     float3 center = gridParams.searchCenter;
     float3 halfExtent = gridParams.searchHalfExtent;
 
-    // Balanced exploration/exploitation:
-    // - 50% focused near pocket center
-    // - 50% spread across the full search box
-    float3 spread;
     float3 searchSize = halfExtent * 2.0f;
     float minDim = min(searchSize.x, min(searchSize.y, searchSize.z));
     float focusSpread = min(minDim * 0.5f, 12.0f);
 
-    if (tid < gaParams.populationSize * 7 / 10) {
+    // --- Translation: focused near pocket center for all tiers ---
+    float3 spread;
+    if (tid < popSize * 8 / 10) {
         spread = float3(focusSpread);
     } else {
         spread = halfExtent;
@@ -1823,7 +1844,7 @@ kernel void initializePopulation(
         (gpuRandom(seed, 2) * 2.0f - 1.0f) * spread.z
     );
 
-    // Uniform random quaternion (Shoemake method)
+    // --- Rotation: uniform random quaternion (Shoemake method) for all tiers ---
     float u1 = gpuRandom(seed, 3);
     float u2 = gpuRandom(seed, 4) * 2.0f * M_PI_F;
     float u3 = gpuRandom(seed, 5) * 2.0f * M_PI_F;
@@ -1831,8 +1852,31 @@ kernel void initializePopulation(
     float sq2 = sqrt(u1);
     poses[tid].rotation = float4(sq1 * sin(u2), sq1 * cos(u2), sq2 * sin(u3), sq2 * cos(u3));
 
-    for (uint t = 0; t < gaParams.numTorsions; t++) {
-        poses[tid].torsions[t] = gpuRandom(seed, 6 + t) * 2.0f * M_PI_F - M_PI_F;
+    // --- Torsions: three-tier seeding strategy ---
+    uint tier1End = popSize * 3 / 10;   // 30% reference conformer (torsions=0)
+    uint tier2End = popSize * 6 / 10;   // 30% near-reference (small noise)
+
+    if (tid < tier1End) {
+        // Tier 1: Exact RDKit reference conformer — torsions = 0
+        for (uint t = 0; t < gaParams.numTorsions; t++) {
+            poses[tid].torsions[t] = 0.0f;
+        }
+    } else if (tid < tier2End) {
+        // Tier 2: Reference torsions + Gaussian noise (σ ≈ 30° = 0.52 rad)
+        // Box-Muller for approximate Gaussian from uniform random
+        for (uint t = 0; t < gaParams.numTorsions; t++) {
+            float u = max(gpuRandom(seed, 40 + t * 2), 1e-6f);
+            float v = gpuRandom(seed, 41 + t * 2) * 2.0f * M_PI_F;
+            float noise = sqrt(-2.0f * log(u)) * cos(v) * 0.52f;
+            poses[tid].torsions[t] = noise;
+            if (poses[tid].torsions[t] > M_PI_F) poses[tid].torsions[t] -= 2.0f * M_PI_F;
+            if (poses[tid].torsions[t] < -M_PI_F) poses[tid].torsions[t] += 2.0f * M_PI_F;
+        }
+    } else {
+        // Tier 3: Fully random torsions for exploration
+        for (uint t = 0; t < gaParams.numTorsions; t++) {
+            poses[tid].torsions[t] = gpuRandom(seed, 6 + t) * 2.0f * M_PI_F - M_PI_F;
+        }
     }
 
     poses[tid].numTorsions = int(gaParams.numTorsions);
@@ -2387,8 +2431,8 @@ kernel void localSearch(
         gradMag = sqrt(gradMag);
         if (gradMag < 1e-6f) break;  // converged
 
-        // Normalize and clamp
-        float scale = min(stepSize / gradMag, stepSize);
+        // Normalize gradient to step in consistent direction
+        float scale = stepSize / gradMag;
 
         // ---- Apply gradient step ----
         float3 newT = pose.translation;
@@ -2434,7 +2478,7 @@ kernel void localSearch(
 
         if (newE < baseE) {
             pose.energy = newE;
-            stepSize = min(stepSize * 1.2f, 0.5f);
+            stepSize = min(stepSize * 1.2f, 1.0f);
         } else {
             // Rollback
             pose.translation = oldT;
@@ -2443,7 +2487,7 @@ kernel void localSearch(
             pose.energy = baseE;
             stepSize *= 0.5f;
         }
-        if (stepSize < 0.001f) break;
+        if (stepSize < 0.0005f) break;
     }
 }
 
@@ -2692,7 +2736,9 @@ kernel void localSearchAnalytical(
         gradMag = sqrt(gradMag);
         if (gradMag < 1e-6f) break;
 
-        float scale = min(stepSize / gradMag, stepSize);
+        // Gradient-normalized step: always step proportional to gradient direction,
+        // scaled by stepSize. This avoids overshooting when gradient is small.
+        float scale = stepSize / gradMag;
 
         // Apply gradient step
         float3 newT = pose.translation;
@@ -2739,7 +2785,7 @@ kernel void localSearchAnalytical(
 
         if (newE < baseE) {
             pose.energy = newE;
-            stepSize = min(stepSize * 1.2f, 0.5f);
+            stepSize = min(stepSize * 1.2f, 1.0f);
         } else {
             pose.translation = oldT;
             pose.rotation = oldRot;
@@ -2747,7 +2793,7 @@ kernel void localSearchAnalytical(
             pose.energy = baseE;
             stepSize *= 0.5f;
         }
-        if (stepSize < 0.001f) break;
+        if (stepSize < 0.0005f) break;
     }
 }
 
@@ -2797,8 +2843,20 @@ kernel void localSearchAnalyticalSIMD(
     threadgroup float4 tg_oldRot;
     threadgroup float  tg_oldTor[32];
 
-    float stepSize = 0.08f;
     int maxSteps = max(int(gaParams.localSearchSteps), 1);
+
+    // L-BFGS history (m=5): store position and gradient differences
+    const uint LBFGS_M = 5;
+    const uint NDIM = 6 + nTor;  // 3 translation + 3 rotation + nTorsions
+    float lbfgs_s[LBFGS_M][38];  // s_k = x_{k+1} - x_k  (position diff)
+    float lbfgs_y[LBFGS_M][38];  // y_k = g_{k+1} - g_k  (gradient diff)
+    float lbfgs_rho[LBFGS_M];    // 1 / dot(y_k, s_k)
+    uint lbfgs_count = 0;         // how many history pairs stored
+    uint lbfgs_newest = 0;        // circular buffer index
+
+    float prevGrad[38];           // previous gradient for L-BFGS update
+    float prevX[38];              // previous position for L-BFGS update
+    bool hasPrev = false;
 
     for (int step = 0; step < maxSteps; step++) {
         // === Transform atoms: rigid body parallel, torsions sequential ===
@@ -2905,13 +2963,99 @@ kernel void localSearchAnalyticalSIMD(
         totalEnergy = simd_broadcast_first(totalEnergy);
         for (int i = 0; i < 3; i++) { gradT[i] = simd_broadcast_first(gradT[i]); gradR[i] = simd_broadcast_first(gradR[i]); }
 
+        // Pack current gradient and position into flat vectors
+        float curGrad[38], curX[38];
+        curGrad[0] = gradT[0]; curGrad[1] = gradT[1]; curGrad[2] = gradT[2];
+        curGrad[3] = gradR[0]; curGrad[4] = gradR[1]; curGrad[5] = gradR[2];
+        for (uint t = 0; t < nTor; t++) curGrad[6+t] = gradTor[t];
+
+        curX[0] = pose.translation.x; curX[1] = pose.translation.y; curX[2] = pose.translation.z;
+        // Pack rotation as axis-angle (for L-BFGS position diffs)
+        curX[3] = pose.rotation.x; curX[4] = pose.rotation.y; curX[5] = pose.rotation.z;
+        for (uint t = 0; t < nTor; t++) curX[6+t] = pose.torsions[t];
+
         float gradMag = 0;
-        for (int i = 0; i < 3; i++) gradMag += gradT[i] * gradT[i] + gradR[i] * gradR[i];
-        for (uint t = 0; t < nTor; t++) gradMag += gradTor[t] * gradTor[t];
+        for (uint d = 0; d < NDIM; d++) gradMag += curGrad[d] * curGrad[d];
         gradMag = sqrt(gradMag);
         if (gradMag < 1e-6f) break;
 
-        float scale = min(stepSize / gradMag, stepSize);
+        // === Update L-BFGS history from previous step ===
+        if (hasPrev) {
+            float s_vec[38], y_vec[38];
+            float sy = 0.0f;
+            for (uint d = 0; d < NDIM; d++) {
+                s_vec[d] = curX[d] - prevX[d];
+                y_vec[d] = curGrad[d] - prevGrad[d];
+                sy += s_vec[d] * y_vec[d];
+            }
+            if (sy > 1e-10f) {
+                uint idx = lbfgs_newest;
+                for (uint d = 0; d < NDIM; d++) {
+                    lbfgs_s[idx][d] = s_vec[d];
+                    lbfgs_y[idx][d] = y_vec[d];
+                }
+                lbfgs_rho[idx] = 1.0f / sy;
+                lbfgs_newest = (lbfgs_newest + 1) % LBFGS_M;
+                if (lbfgs_count < LBFGS_M) lbfgs_count++;
+            }
+        }
+
+        // Save current for next iteration
+        for (uint d = 0; d < NDIM; d++) { prevGrad[d] = curGrad[d]; prevX[d] = curX[d]; }
+        hasPrev = true;
+
+        // === L-BFGS two-loop recursion to compute search direction ===
+        float q[38];
+        for (uint d = 0; d < NDIM; d++) q[d] = curGrad[d];
+
+        float alpha[LBFGS_M];
+        // First loop: newest to oldest
+        for (uint k = 0; k < lbfgs_count; k++) {
+            uint idx = (lbfgs_newest + LBFGS_M - 1 - k) % LBFGS_M;
+            float dotSQ = 0.0f;
+            for (uint d = 0; d < NDIM; d++) dotSQ += lbfgs_s[idx][d] * q[d];
+            alpha[k] = lbfgs_rho[idx] * dotSQ;
+            for (uint d = 0; d < NDIM; d++) q[d] -= alpha[k] * lbfgs_y[idx][d];
+        }
+
+        // Initial Hessian estimate: H0 = (s'y / y'y) * I
+        float H0 = 1.0f;
+        if (lbfgs_count > 0) {
+            uint lastIdx = (lbfgs_newest + LBFGS_M - 1) % LBFGS_M;
+            float yy = 0.0f, sy2 = 0.0f;
+            for (uint d = 0; d < NDIM; d++) {
+                yy += lbfgs_y[lastIdx][d] * lbfgs_y[lastIdx][d];
+                sy2 += lbfgs_s[lastIdx][d] * lbfgs_y[lastIdx][d];
+            }
+            if (yy > 1e-10f) H0 = sy2 / yy;
+        }
+
+        float r_dir[38];
+        for (uint d = 0; d < NDIM; d++) r_dir[d] = H0 * q[d];
+
+        // Second loop: oldest to newest
+        for (uint k = lbfgs_count; k > 0; k--) {
+            uint idx = (lbfgs_newest + LBFGS_M - k) % LBFGS_M;
+            float dotYR = 0.0f;
+            for (uint d = 0; d < NDIM; d++) dotYR += lbfgs_y[idx][d] * r_dir[d];
+            float beta = lbfgs_rho[idx] * dotYR;
+            for (uint d = 0; d < NDIM; d++) r_dir[d] += (alpha[lbfgs_count - k] - beta) * lbfgs_s[idx][d];
+        }
+
+        // r_dir is now the L-BFGS search direction (descent: -H*g)
+        // Apply with a fixed step size of 1.0 (L-BFGS direction is already scaled)
+        // but cap to prevent overshooting
+        float dirMag = 0.0f;
+        for (uint d = 0; d < NDIM; d++) dirMag += r_dir[d] * r_dir[d];
+        dirMag = sqrt(dirMag);
+        float maxStep = 0.5f;  // max displacement per step
+        float scale = (dirMag > maxStep) ? (maxStep / dirMag) : 1.0f;
+
+        // Unpack search direction
+        float dirT[3] = {r_dir[0], r_dir[1], r_dir[2]};
+        float dirR[3] = {r_dir[3], r_dir[4], r_dir[5]};
+        float dirTor[32];
+        for (uint t = 0; t < nTor; t++) dirTor[t] = r_dir[6+t];
 
         // === Apply step (lane 0 saves old pose, applies trial pose) ===
         if (lane == 0) {
@@ -2920,10 +3064,10 @@ kernel void localSearchAnalyticalSIMD(
             for (uint t = 0; t < nTor; t++) tg_oldTor[t] = pose.torsions[t];
 
             float3 newT = pose.translation;
-            for (int i = 0; i < 3; i++) newT[i] -= scale * gradT[i];
+            for (int i = 0; i < 3; i++) newT[i] -= scale * dirT[i];
             newT = clamp(newT, gMin, gMax);
 
-            float3 rs = float3(-scale * gradR[0], -scale * gradR[1], -scale * gradR[2]);
+            float3 rs = float3(-scale * dirR[0], -scale * dirR[1], -scale * dirR[2]);
             float ra = length(rs);
             float4 newRot = pose.rotation;
             if (ra > 1e-6f) {
@@ -2937,7 +3081,7 @@ kernel void localSearchAnalyticalSIMD(
             }
             pose.translation = newT; pose.rotation = newRot;
             for (uint t = 0; t < nTor; t++) {
-                pose.torsions[t] -= scale * gradTor[t];
+                pose.torsions[t] -= scale * dirTor[t];
                 if (pose.torsions[t] > M_PI_F) pose.torsions[t] -= 2.0f * M_PI_F;
                 if (pose.torsions[t] < -M_PI_F) pose.torsions[t] += 2.0f * M_PI_F;
             }
@@ -3009,17 +3153,23 @@ kernel void localSearchAnalyticalSIMD(
         newE = simd_broadcast_first(newE);
 
         // === Accept/reject ===
+        bool accepted = (newE < totalEnergy);
         if (lane == 0) {
-            if (newE < totalEnergy) {
-                pose.energy = newE; stepSize = min(stepSize * 1.2f, 0.5f);
+            if (accepted) {
+                pose.energy = newE;
             } else {
                 pose.translation = tg_oldT; pose.rotation = tg_oldRot;
                 for (uint t = 0; t < nTor; t++) pose.torsions[t] = tg_oldTor[t];
-                pose.energy = totalEnergy; stepSize *= 0.5f;
+                pose.energy = totalEnergy;
             }
         }
-        stepSize = simd_broadcast_first(stepSize);
-        if (stepSize < 0.001f) break;
+        // On rejection, invalidate L-BFGS history (position didn't change,
+        // so s_k would be zero). Reset and fall back to steepest descent next step.
+        if (!accepted) {
+            lbfgs_count = 0;
+            lbfgs_newest = 0;
+            hasPrev = false;
+        }
     }
 }
 

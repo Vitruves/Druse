@@ -49,7 +49,7 @@ struct DockingConfig: Sendable {
     var explorationTranslationStep: Float = 5.0  // wider initial translation (vs 2.0 during refinement)
     var explorationRotationStep: Float = 0.8     // wider initial rotation (vs 0.3)
     var explorationMutationRate: Float = 0.25    // higher mutation during exploration
-    var explorationLocalSearchFrequency: Int = 8  // during exploration, LS only every 8th gen
+    var explorationLocalSearchFrequency: Int = 3  // during exploration, LS every 3rd gen (Lamarckian evolution needs frequent LS)
 
     // Post-docking refinement
     var gfn2Refinement: GFN2RefinementConfig = GFN2RefinementConfig()
@@ -88,24 +88,24 @@ struct DockingConfig: Sendable {
         var config = DockingConfig()
         config.autoMode = true
 
-        // --- Population scales with ligand flexibility ---
-        // More torsions = larger conformational space = need more population diversity
-        let torsionFactor = max(1.0, Float(ligandRotatableBonds) / 5.0) // 1.0 for ≤5 torsions, up to ~6 for 30
-        let basePop = 150
-        config.populationSize = min(500, max(100, Int(Float(basePop) * sqrt(torsionFactor))))
+        // --- Population scales with ligand size and flexibility ---
+        // More atoms + torsions = larger conformational space = need more population diversity
+        let torsionFactor = max(1.0, Float(ligandRotatableBonds) / 5.0)
+        let sizeFactor = max(1.0, Float(ligandHeavyAtoms) / 20.0)
+        let basePop = 200
+        config.populationSize = min(600, max(150, Int(Float(basePop) * sqrt(torsionFactor * sizeFactor))))
 
-        // --- Generations scale with pocket size and buriedness ---
-        // Large/shallow pockets need more exploration; buried pockets converge faster
-        let buriednessFactor = max(0.6, 1.5 - pocketBuriedness) // 0.6 for fully buried, 1.5 for exposed
-        let volumeFactor = max(0.8, min(2.0, pocketVolume / 800.0)) // normalize around 800 A³
-        let baseGen = 150
-        config.generationsPerRun = min(400, max(80, Int(Float(baseGen) * buriednessFactor * volumeFactor)))
+        // --- Generations scale with pocket size, buriedness, and ligand complexity ---
+        let buriednessFactor = max(0.6, 1.5 - pocketBuriedness)
+        let volumeFactor = max(0.8, min(2.0, pocketVolume / 800.0))
+        let baseGen = 200
+        config.generationsPerRun = min(500, max(120, Int(Float(baseGen) * buriednessFactor * volumeFactor * sqrt(sizeFactor))))
 
         // --- Runs scale with overall difficulty ---
-        // Large proteins + flexible ligands benefit from independent restarts
+        // Independent restarts are the most effective way to escape local minima
         let proteinSizeFactor: Float = proteinAtomCount > 5000 ? 1.5 : (proteinAtomCount > 3000 ? 1.2 : 1.0)
-        let difficultyScore = torsionFactor * buriednessFactor * proteinSizeFactor
-        config.numRuns = min(8, max(1, Int(difficultyScore)))
+        let difficultyScore = torsionFactor * buriednessFactor * proteinSizeFactor * sqrt(sizeFactor)
+        config.numRuns = min(10, max(2, Int(difficultyScore)))
 
         // --- Grid spacing: coarsen for very large proteins to stay in memory ---
         if proteinAtomCount > 10000 {
@@ -241,7 +241,7 @@ struct VRAMEstimate: Sendable {
 struct DockingResult: Identifiable, Sendable {
     let id: Int
     var pose: DockPoseSwift
-    var energy: Float           // total Vina score (kcal/mol)
+    var energy: Float           // total score (kcal/mol for Vina/Drusina/PIGNet2; -pKd*conf for DruseAF)
     var stericEnergy: Float     // gauss1 + gauss2 + repulsion
     var hydrophobicEnergy: Float
     var hbondEnergy: Float
@@ -277,10 +277,13 @@ struct DockingResult: Identifiable, Sendable {
         switch method {
         case .vina:          return energy
         case .drusina:       return energy  // energy already includes Drusina corrections
-        case .druseAffinity: return energy
+        case .druseAffinity: return stericEnergy  // pKd stored in stericEnergy by DruseAF shader
         case .pignet2:       return energy  // physics-decomposed kcal/mol
         }
     }
+
+    /// Confidence score from DruseAF (0–1), stored in hydrophobicEnergy field.
+    var afConfidence: Float { hydrophobicEnergy }
 
     // Backward-compatible aliases
     var vdwEnergy: Float { stericEnergy }

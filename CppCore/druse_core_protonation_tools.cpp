@@ -125,15 +125,16 @@ void druse_free_site_protomer_pair(DruseSiteProtomerPair *result) {
     delete result;
 }
 
-DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
+DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
     const char *smiles, const char *name,
     double pH, double pkaThreshold,
     int32_t maxTautomers, int32_t maxProtomers,
     double energyCutoff, int32_t conformersPerForm,
     double temperature,
-    const double *sitePKa, int32_t nSitePKa
+    const DruseIonSiteDef *sites, int32_t nSites
 ) {
-    if (!sitePKa || nSitePKa <= 0) {
+    // No explicit sites → fall back to SMARTS detection
+    if (!sites || nSites <= 0) {
         return druse_prepare_ligand_ensemble(smiles, name, pH, pkaThreshold,
             maxTautomers, maxProtomers, energyCutoff, conformersPerForm, temperature);
     }
@@ -156,55 +157,23 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
             return result;
         }
 
-        auto allSites = detectIonSitesInternal(*parentMol);
-        std::vector<double> effectivePKa(allSites.size());
-        for (size_t i = 0; i < allSites.size(); i++) {
-            effectivePKa[i] = ((int)i < nSitePKa) ? sitePKa[i] : std::get<3>(allSites[i]);
-        }
-
-        {
-            auto *ringInfo = parentMol->getRingInfo();
-            auto distMatrix = MolOps::getDistanceMat(*parentMol);
-            int nAt = parentMol->getNumAtoms();
-            for (size_t i = 0; i < allSites.size(); i++) {
-                if (std::get<2>(allSites[i])) continue;
-                for (size_t j = i + 1; j < allSites.size(); j++) {
-                    if (std::get<2>(allSites[j])) continue;
-                    int ai = std::get<0>(allSites[i]);
-                    int aj = std::get<0>(allSites[j]);
-                    int topoDist = (int)distMatrix[ai * nAt + aj];
-                    if (topoDist > 6) continue;
-                    bool sameRing = false;
-                    if (ringInfo) {
-                        for (const auto &ring : ringInfo->atomRings()) {
-                            bool hasI = false, hasJ = false;
-                            for (int idx : ring) {
-                                if (idx == ai) hasI = true;
-                                if (idx == aj) hasJ = true;
-                            }
-                            if (hasI && hasJ) { sameRing = true; break; }
-                        }
-                    }
-                    double depression = sameRing ? 4.5 : (topoDist <= 3 ? 3.0 : (topoDist <= 5 ? 1.5 : 0.5));
-                    if (effectivePKa[i] >= effectivePKa[j]) {
-                        effectivePKa[j] -= depression;
-                    } else {
-                        effectivePKa[i] -= depression;
-                    }
-                }
-            }
-        }
-
+        // Use GNN-provided sites directly — no SMARTS re-detection needed.
+        // GNN pKa values already account for electronic environment, so no
+        // proximity depression is applied (would double-count).
         auto washedMol = std::make_unique<RWMol>(*parentMol);
-        struct AmbSite { int groupIdx; int atomIdx; bool isAcid; double pKa; };
+
+        struct AmbSite { int atomIdx; bool isAcid; double pKa; };
         std::vector<AmbSite> ambSites;
 
-        for (size_t i = 0; i < allSites.size(); i++) {
-            auto &[atomIdx, groupIdx, isAcid, _] = allSites[i];
-            double computedPKa = effectivePKa[i];
-            double deltaPH = pH - computedPKa;
+        for (int32_t i = 0; i < nSites; i++) {
+            int atomIdx = sites[i].atomIdx;
+            if (atomIdx < 0 || atomIdx >= (int)parentMol->getNumAtoms()) continue;
+            bool isAcid = sites[i].isAcid;
+            double pKa = sites[i].pKa;
+            double deltaPH = pH - pKa;
 
             if (isAcid && deltaPH > pkaThreshold) {
+                // Clearly deprotonated at this pH
                 Atom *atom = washedMol->getAtomWithIdx(atomIdx);
                 int nH = atom->getTotalNumHs();
                 if (nH > 0) {
@@ -212,12 +181,14 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
                     atom->setFormalCharge(atom->getFormalCharge() - 1);
                 }
             } else if (!isAcid && deltaPH < -pkaThreshold) {
+                // Clearly protonated at this pH
                 Atom *atom = washedMol->getAtomWithIdx(atomIdx);
                 int nH = atom->getTotalNumHs();
                 atom->setNumExplicitHs(nH + 1);
                 atom->setFormalCharge(atom->getFormalCharge() + 1);
             } else if (std::abs(deltaPH) <= pkaThreshold) {
-                ambSites.push_back({groupIdx, atomIdx, isAcid, computedPKa});
+                // Ambiguous — enumerate both states
+                ambSites.push_back({atomIdx, isAcid, pKa});
             }
         }
         try { MolOps::sanitizeMol(*washedMol); } catch (...) {
@@ -234,15 +205,15 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
         std::vector<ChemicalForm> allForms;
         std::set<std::string> seenSMILES;
 
-        int nSites = std::min((int)ambSites.size(), 10);
-        int nTotalCombos = 1 << nSites;
+        int nAmb = std::min((int)ambSites.size(), 10);
+        int nTotalCombos = 1 << nAmb;
 
-        struct ComboPopV2 { int combo; double population; };
-        std::vector<ComboPopV2> combosByPop;
+        struct ComboPop { int combo; double population; };
+        std::vector<ComboPop> combosByPop;
         combosByPop.reserve(nTotalCombos);
         for (int combo = 0; combo < nTotalCombos; combo++) {
             double pop = 1.0;
-            for (int s = 0; s < nSites; s++) {
+            for (int s = 0; s < nAmb; s++) {
                 const auto &site = ambSites[s];
                 double fracProt = 1.0 / (1.0 + std::pow(10.0, pH - site.pKa));
                 double fracDeprot = 1.0 - fracProt;
@@ -253,7 +224,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
             combosByPop.push_back({combo, pop});
         }
         std::sort(combosByPop.begin(), combosByPop.end(),
-            [](const ComboPopV2 &a, const ComboPopV2 &b) { return a.population > b.population; });
+            [](const ComboPop &a, const ComboPop &b) { return a.population > b.population; });
         int nCombos = std::min((int)combosByPop.size(), (int)maxProtomers);
 
         struct ProtomerForm {
@@ -270,7 +241,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
             std::string comboLabel;
             double hhPop = 1.0;
 
-            for (int s = 0; s < nSites; s++) {
+            for (int s = 0; s < nAmb; s++) {
                 const auto &site = ambSites[s];
                 double fracProt = 1.0 / (1.0 + std::pow(10.0, pH - site.pKa));
                 double fracDeprot = 1.0 - fracProt;
@@ -296,8 +267,8 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_v2(
                     hhPop *= fracProt;
                 }
                 if (!comboLabel.empty()) comboLabel += "+";
-                comboLabel += std::string(site.isAcid ? "deprot_" : "prot_") +
-                    kIonizableGroups[site.groupIdx].name;
+                comboLabel += site.isAcid ? "deprot" : "prot";
+                comboLabel += "_atom" + std::to_string(site.atomIdx);
             }
 
             try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }

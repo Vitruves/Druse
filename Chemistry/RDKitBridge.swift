@@ -569,30 +569,33 @@ enum RDKitBridge {
         )
     }
 
-    /// Prepare ensemble with per-site pKa overrides (from GFN2-xTB prediction).
-    /// If sitePKa is empty, falls back to the default hardcoded pKa table.
-    static func prepareEnsembleWithPKa(
+    /// Prepare ensemble with GNN-predicted ionizable sites.
+    /// If sites is empty, falls back to SMARTS detection + lookup table.
+    static func prepareEnsembleWithSites(
         smiles: String, name: String = "",
         pH: Double = 7.4, pkaThreshold: Double = 2.0,
         maxTautomers: Int = 10, maxProtomers: Int = 8,
         energyCutoff: Double = 15.0, conformersPerForm: Int = 5,
         temperature: Double = 298.15,
-        sitePKa: [Double] = []
+        sites: [PKaGNNPredictor.SitePrediction] = []
     ) -> EnsembleResult {
         let cResult: UnsafeMutablePointer<DruseEnsembleResult>?
-        if sitePKa.isEmpty {
+        if sites.isEmpty {
             cResult = druse_prepare_ligand_ensemble(
                 smiles, name, pH, pkaThreshold,
                 Int32(maxTautomers), Int32(maxProtomers),
                 energyCutoff, Int32(conformersPerForm), temperature
             )
         } else {
-            cResult = sitePKa.withUnsafeBufferPointer { buf in
-                druse_prepare_ligand_ensemble_v2(
+            var cSites = sites.map { s in
+                DruseIonSiteDef(atomIdx: Int32(s.atomIdx), pKa: s.pKa, isAcid: s.isAcid)
+            }
+            cResult = cSites.withUnsafeMutableBufferPointer { buf in
+                druse_prepare_ligand_ensemble_ex(
                     smiles, name, pH, pkaThreshold,
                     Int32(maxTautomers), Int32(maxProtomers),
                     energyCutoff, Int32(conformersPerForm), temperature,
-                    buf.baseAddress, Int32(sitePKa.count)
+                    buf.baseAddress, Int32(sites.count)
                 )
             }
         }

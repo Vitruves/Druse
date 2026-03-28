@@ -12,14 +12,16 @@ struct InteractionDiagramWindow: View {
                viewModel.docking.interactionDiagramPoseIndex < viewModel.docking.dockingResults.count {
                 let idx = viewModel.docking.interactionDiagramPoseIndex
                 let result = viewModel.docking.dockingResults[idx]
+                let sm = viewModel.docking.scoringMethod
                 InteractionDiagramView(
                     interactions: viewModel.docking.currentInteractions,
                     ligandAtoms: ligand.atoms.filter { $0.element != .H },
                     ligandBonds: ligand.bonds,
                     proteinAtoms: protein.atoms.filter { $0.element != .H },
                     ligandSmiles: ligand.smiles ?? ligand.title,
-                    poseEnergy: result.energy,
-                    poseIndex: idx
+                    poseEnergy: result.displayScore(method: sm),
+                    poseIndex: idx,
+                    scoringMethod: sm
                 )
             } else {
                 VStack(spacing: 8) {

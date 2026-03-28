@@ -995,11 +995,14 @@ extension LigandDatabaseWindow {
             let cutoff = variantEnergyCutoff
             let nConf = prepNumConformers
 
+            let useGNN = pkaMethod == .gnn
             let result = await Task.detached { @Sendable in
-                RDKitBridge.prepareEnsemble(
+                let predictions = useGNN ? PKaGNNPredictor.predict(smiles: smi) : []
+                return RDKitBridge.prepareEnsembleWithSites(
                     smiles: smi, name: nm, pH: pH, pkaThreshold: pkaT,
                     maxTautomers: maxT, maxProtomers: maxP,
-                    energyCutoff: cutoff, conformersPerForm: nConf
+                    energyCutoff: cutoff, conformersPerForm: nConf,
+                    sites: predictions
                 )
             }.value
 

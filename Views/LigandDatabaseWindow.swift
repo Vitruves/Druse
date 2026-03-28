@@ -6,15 +6,15 @@ import UniformTypeIdentifiers
 
 /// Controls how ionizable-site pKa values are determined during Populate & Prepare.
 enum PKaMethod: String, CaseIterable {
+    /// GNN-predicted pKa via Metal GPU (fast + accurate, ~0.1ms per molecule).
+    case gnn = "GNN"
     /// Use the built-in SMARTS lookup table (fast, ~ms per molecule).
     case table = "Table"
-    /// Compute pKa via GFN2-xTB single-point energies on protonated/deprotonated forms (slow, ~seconds per site).
-    case gfn2 = "GFN2-xTB"
 
     var description: String {
         switch self {
-        case .table: return "Fast lookup table (~345 SMARTS rules)"
-        case .gfn2: return "GFN2-xTB quantum chemistry (accurate but slow)"
+        case .gnn: return "GNN-predicted pKa (Metal GPU, MAE ~1.0)"
+        case .table: return "SMARTS lookup table (~230 rules)"
         }
     }
 }
@@ -80,7 +80,7 @@ struct LigandDatabaseWindow: View {
     @State var variantEnergyCutoff: Double = 10.0
     @State var variantPkaThreshold: Double = 2.0
     @State var variantMinPopulation: Double = 1.0
-    @State var pkaMethod: PKaMethod = .table
+    @State var pkaMethod: PKaMethod = .gnn
 
     // 2D/3D preview toggle
     @State var show3DPreview: Bool = false
@@ -965,14 +965,14 @@ struct LigandDatabaseWindow: View {
         let confsPerForm = prepNumConformers
         let pkaThreshold = variantPkaThreshold
         let energyCutoff = variantEnergyCutoff
-        let useGFN2 = pkaMethod == .gfn2
+        let useGNN = pkaMethod == .gnn
 
         populateTask = Task {
             var successCount = 0
             var totalConformers = 0
             var completedCount = 0
 
-            let maxConcurrency = useGFN2 ? 2 : max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
+            let maxConcurrency = max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
             await withTaskGroup(of: (LigandEntry, RDKitBridge.EnsembleResult)?.self) { group in
                 var enqueued = 0
                 for entry in toProcess {
@@ -992,14 +992,13 @@ struct LigandDatabaseWindow: View {
                     group.addTask { [entry] in
                         guard !Task.isCancelled else { return nil }
                         let result = await Task.detached(priority: .userInitiated) {
-                            // maxTautomers=1 → no tautomer enumeration, but protomers at pH are generated
-                            // maxProtomers=1 → keep only dominant protomer
-                            RDKitBridge.prepareEnsembleWithPKa(
+                            let predictions = useGNN ? PKaGNNPredictor.predict(smiles: smi) : []
+                            return RDKitBridge.prepareEnsembleWithSites(
                                 smiles: smi, name: nm,
                                 pH: ph, pkaThreshold: pkaThreshold,
                                 maxTautomers: 1, maxProtomers: 1,
                                 energyCutoff: energyCutoff, conformersPerForm: confsPerForm,
-                                sitePKa: []
+                                sites: predictions
                             )
                         }.value
                         return (entry, result)
@@ -1081,15 +1080,15 @@ struct LigandDatabaseWindow: View {
         let confsPerForm = prepNumConformers
         let pkaThreshold = variantPkaThreshold
         let minPop = variantMinPopulation / 100.0
-        let useGFN2 = pkaMethod == .gfn2
+        let useGNN = pkaMethod == .gnn
 
         populateTask = Task {
             var totalNewEntries = 0
             var totalConformers = 0
             var completedCount = 0
 
-            let maxConcurrency = useGFN2 ? 2 : max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
-            await withTaskGroup(of: (LigandEntry, RDKitBridge.EnsembleResult, [LigandpKaPredictor.SitePKa])?.self) { group in
+            let maxConcurrency = max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
+            await withTaskGroup(of: (LigandEntry, RDKitBridge.EnsembleResult, [PKaGNNPredictor.SitePrediction])?.self) { group in
                 var enqueued = 0
                 for entry in toProcess {
                     if enqueued >= maxConcurrency {
@@ -1113,20 +1112,15 @@ struct LigandDatabaseWindow: View {
                     group.addTask { [entry] in
                         guard !Task.isCancelled else { return nil }
                         let (result, pkaResults) = await Task.detached(priority: .userInitiated) {
-                            var pkaResults: [LigandpKaPredictor.SitePKa] = []
-                            var computedPKa: [Double] = []
-                            if useGFN2 {
-                                pkaResults = await LigandpKaPredictor.predictpKa(smiles: smi)
-                                computedPKa = LigandpKaPredictor.pKaArray(from: pkaResults)
-                            }
-                            let result = RDKitBridge.prepareEnsembleWithPKa(
+                            let predictions = useGNN ? PKaGNNPredictor.predict(smiles: smi) : []
+                            let result = RDKitBridge.prepareEnsembleWithSites(
                                 smiles: smi, name: nm,
                                 pH: ph, pkaThreshold: pkaThreshold,
                                 maxTautomers: maxTauto, maxProtomers: maxProto,
                                 energyCutoff: energyCutoff, conformersPerForm: confsPerForm,
-                                sitePKa: computedPKa
+                                sites: predictions
                             )
-                            return (result, pkaResults)
+                            return (result, predictions)
                         }.value
                         return (entry, result, pkaResults)
                     }
@@ -1167,13 +1161,13 @@ struct LigandDatabaseWindow: View {
     /// Process a single enumerate result: insert N new entries after the original (which is kept).
     private func processEnumerateResult(
         entry: LigandEntry, result: RDKitBridge.EnsembleResult,
-        pkaResults: [LigandpKaPredictor.SitePKa],
+        pkaResults: [PKaGNNPredictor.SitePrediction],
         minPop: Double,
         totalNewEntries: inout Int, totalConformers: inout Int
     ) {
         if !pkaResults.isEmpty {
             let pkaLog = pkaResults.map { p in
-                "\(p.groupName)[\(p.atomIdx)]: \(p.converged ? String(format: "%.1f", p.computedPKa) : "fallback \(String(format: "%.1f", p.defaultPKa))")"
+                "\(p.isAcid ? "acid" : "base")[\(p.atomIdx)]: \(String(format: "%.1f", p.pKa)) (p=\(String(format: "%.2f", p.ionizableProbability)))"
             }.joined(separator: ", ")
             viewModel.log.info("pKa(\(entry.name)): \(pkaLog)", category: .molecule)
         }

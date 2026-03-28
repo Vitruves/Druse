@@ -65,6 +65,32 @@ xcodegen generate
 
 ## Running the Benchmark
 
+### Fast Curated Panel
+
+For day-to-day docking work, use the curated real-life panel instead of the full CASF sweep.
+It runs a fixed subset of 16 CASF complexes grouped by practical failure mode:
+rigid fragments, metal coordination, charged/flexible ligands, and bulky hydrophobics.
+Unlike the classic redocking benchmark, the panel defaults to the full Druse path:
+ligand regeneration from SMILES, automatic pocket detection (ML first, geometric fallback),
+then docking plus app-style post-processing.
+
+```bash
+# Quick two-method smoke benchmark
+python Benchmark/run_real_life_panel.py --scoring vina,drusina --preset fast
+
+# Focus on metal and charged cases only
+python Benchmark/run_real_life_panel.py \
+  --groups metal_coordination,charged_flexible \
+  --scoring drusina --preset fast
+
+# Inspect the panel without running it
+python Benchmark/run_real_life_panel.py --list
+```
+
+Outputs:
+- `Benchmark/manifests/real_life_panel_v1_manifest.json` — generated subset manifest
+- `Benchmark/reports/real_life_panel_v1_report.md` — grouped quick report
+
 ### Step 1: Prepare Manifest
 
 Parses the CASF-2016 index + PDBbind ligand SDF files to extract SMILES, crystal positions, and pKd values.
@@ -129,9 +155,11 @@ Benchmark/
   README.md              — This file
   prepare.py             — Parse datasets → JSON manifest
   analyze.py             — Compute metrics, generate report
+  run_real_life_panel.py — Curated quick benchmark grouped by failure mode
   requirements.txt       — Python dependencies
   BenchmarkRunner.swift  — XCTest headless docking runner
   BenchmarkTypes.swift   — Codable JSON manifest/result structs
+  panels/                — Curated panel definitions
   data/                  — CASF-2016 extracted here (gitignored)
   manifests/             — Generated JSON manifests (gitignored)
   results/               — Docking output JSON (gitignored)

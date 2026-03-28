@@ -46,9 +46,12 @@ def analyze_one(results_path: Path) -> dict:
 
     df = pd.DataFrame(entries)
 
+    # Use display score (pKi for DruseAF, best_energy for others) for scoring power
+    score_col = "best_display_score" if "best_display_score" in df.columns and df["best_display_score"].notna().any() else "best_energy"
+
     # Scoring power
-    scored = df.dropna(subset=["experimental_pKd", "best_energy"])
-    r_val, p_val = stats.pearsonr(scored["experimental_pKd"], scored["best_energy"]) if len(scored) > 5 else (0, 1)
+    scored = df.dropna(subset=["experimental_pKd", score_col])
+    r_val, p_val = stats.pearsonr(scored["experimental_pKd"], scored[score_col]) if len(scored) > 5 else (0, 1)
 
     # Docking power
     rmsd_df = df.dropna(subset=["best_rmsd"])
@@ -72,7 +75,8 @@ def analyze_one(results_path: Path) -> dict:
         "n_rmsd": len(rmsds),
         "mean_rmsd": round(float(np.mean(rmsds)), 2) if len(rmsds) > 0 else None,
         "median_rmsd": round(float(np.median(rmsds)), 2) if len(rmsds) > 0 else None,
-        "mean_energy": round(float(df["best_energy"].mean()), 2),
+        "score_col": score_col,
+        "mean_energy": round(float(df[score_col].mean()), 2),
         "mean_time_ms": round(float(df["docking_time_ms"].mean()), 0),
         "total_time_s": round(float(df["docking_time_ms"].sum() / 1000), 1),
         "config": data.get("config", {}),
@@ -162,9 +166,10 @@ def generate_plots(all_metrics: list[dict]):
     ax = axes[0]
     for m in all_metrics:
         df = m["df"]
-        scored = df.dropna(subset=["experimental_pKd", "best_energy"])
+        sc = m.get("score_col", "best_energy")
+        scored = df.dropna(subset=["experimental_pKd", sc])
         c = colors.get(m["label"], "gray")
-        ax.scatter(scored["experimental_pKd"], scored["best_energy"],
+        ax.scatter(scored["experimental_pKd"], scored[sc],
                    alpha=0.3, s=8, c=c, label=f"{m['label']} (r={m['pearson_r']:.3f})", edgecolors="none")
     ax.set_xlabel("Experimental pKd")
     ax.set_ylabel("Predicted Score")

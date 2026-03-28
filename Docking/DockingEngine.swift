@@ -499,11 +499,14 @@ final class DockingEngine {
 
         let gridMapCount: UInt64 = activeVinaTypes.isEmpty ? 3 : UInt64(3 + activeVinaTypes.count)
 
-        let searchPadding: Float = 0.0
+        let searchPadding: Float = 4.0
         let gridPadding: Float = 3.0
         let ligandMargin = ligandExtent ?? SIMD3<Float>(repeating: 4.0)
         let searchCenter = pocket.center
-        let searchHalfExtent = pocket.size + SIMD3<Float>(repeating: searchPadding)
+        // Ensure search box half-extent is at least ligandMargin + padding (so the ligand fits)
+        let minHalfExtent = ligandMargin + SIMD3<Float>(repeating: 2.0)
+        let rawSearchHalfExtent = pocket.size + SIMD3<Float>(repeating: searchPadding)
+        let searchHalfExtent = max(rawSearchHalfExtent, minHalfExtent)
         let gridHalfExtent = searchHalfExtent + ligandMargin + SIMD3<Float>(repeating: gridPadding)
         let boxMin = searchCenter - gridHalfExtent
         let boxMax = searchCenter + gridHalfExtent
@@ -1183,7 +1186,7 @@ final class DockingEngine {
             wPiPi: -0.35,
             wPiCation: -0.65,
             wHalogenBond: -0.40,
-            wMetalCoord: -0.80,
+            wMetalCoord: -0.95,
             numProteinAmides: UInt32(amides.first?.centroid == .zero && amides.count == 1 ? 0 : amides.count),
             numChalcogens: UInt32(chalcogens.first?.sulfurAtomIndex == -1 ? 0 : chalcogens.count),
             wSaltBridge: -0.35,

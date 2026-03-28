@@ -717,59 +717,6 @@ struct RMSDParams {
     uint32_t _pad1;
 };
 
-// ============================================================================
-// ML Pocket Detection GPU types
-// ============================================================================
-
-struct PocketMLAtom {
-    simd_float3 position;
-    float       vdwRadius;
-    float       charge;
-    float       hydrophobicity;  // normalized Kyte-Doolittle
-    uint32_t    flags;           // bit 0: is_N/O (donor/acceptor), bit 1: is_C (aromatic proxy)
-    uint32_t    _pad0;
-};
-
-struct PocketSurfacePoint {
-    simd_float3 position;
-    float       nearestDist;      // distance to nearest atom
-    simd_float3 normal;           // direction to nearest atom (normalized)
-    float       hydrophobicity;
-    float       charge;
-    float       aromatic;
-    float       donor;
-    float       acceptor;
-    float       buriedness;
-    float       curvature;
-    uint32_t    nearestAtomIdx;
-    uint32_t    _pad0;
-};
-
-struct PocketDetectParams {
-    uint32_t numGridPoints;
-    uint32_t numAtoms;
-    float    probeRadius;
-    float    buriednessCutoff;    // 6.0 A
-};
-
-struct PocketKNNParams {
-    uint32_t numPoints;
-    uint32_t k;
-    uint32_t featureSize;        // 11
-    uint32_t useSpatialHash;     // 1 = spatial hash available, 0 = brute-force fallback
-};
-
-// Spatial hash grid parameters for accelerated KNN in pocket detection
-struct SpatialHashParams {
-    simd_float3 gridOrigin;      // bounding box min corner
-    float       cellSize;        // cell edge length (e.g., 4.0 Angstroms)
-    simd_uint3  gridDims;        // number of cells in each dimension
-    uint32_t    numPoints;       // total number of surface points
-    uint32_t    totalCells;      // gridDims.x * gridDims.y * gridDims.z
-    uint32_t    _pad0;
-    uint32_t    _pad1;
-    uint32_t    _pad2;
-};
 
 // ============================================================================
 // H-Bond Network Scoring types (Phase 4)

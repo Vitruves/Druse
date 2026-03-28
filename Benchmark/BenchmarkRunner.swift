@@ -25,6 +25,7 @@ final class BenchmarkRunner: XCTestCase {
     // MARK: - Shared Engine & DruseAF Scorer
 
     @MainActor private static var _engine: DockingEngine?
+    @MainActor private static var _pocketDetector: PocketDetectorInference?
 
     @MainActor
     private func engine() throws -> DockingEngine {
@@ -46,6 +47,28 @@ final class BenchmarkRunner: XCTestCase {
 
     private func resolve(_ rel: String) -> String {
         projectRoot.appendingPathComponent(rel).path
+    }
+
+    private func resolveConfiguredPath(_ path: String) -> String {
+        if path.hasPrefix("/") {
+            return path
+        }
+        return projectRoot.appendingPathComponent(path).path
+    }
+
+    private func resolveOutputPath(_ outputFile: String) -> String {
+        let configured = Self.cfgOutputDirectory
+        let baseURL: URL
+        if let configured, !configured.isEmpty {
+            if configured.hasPrefix("/") {
+                baseURL = URL(fileURLWithPath: configured, isDirectory: true)
+            } else {
+                baseURL = projectRoot.appendingPathComponent(configured, isDirectory: true)
+            }
+        } else {
+            baseURL = projectRoot.appendingPathComponent("Benchmark/results", isDirectory: true)
+        }
+        return baseURL.appendingPathComponent(outputFile).path
     }
 
     // MARK: - Helpers
@@ -102,11 +125,255 @@ final class BenchmarkRunner: XCTestCase {
     }
 
     private func loadManifest() throws -> CASFManifest {
-        let path = resolve("Benchmark/manifests/casf_manifest.json")
+        let path = Self.cfgManifestPath.map(resolveConfiguredPath(_:))
+            ?? resolve("Benchmark/manifests/casf_manifest.json")
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
-            throw XCTSkip("Manifest not found. Run:\n  python Benchmark/download.py --setup\n  python Benchmark/prepare.py")
+            throw XCTSkip("Manifest not found at \(path). Run:\n  python Benchmark/prepare.py")
         }
         return try JSONDecoder().decode(CASFManifest.self, from: data)
+    }
+
+    @MainActor
+    private func pocketDetector() -> PocketDetectorInference {
+        if let detector = Self._pocketDetector { return detector }
+        let detector = PocketDetectorInference()
+        detector.loadModel()
+        Self._pocketDetector = detector
+        return detector
+    }
+
+    @MainActor
+    private func prepareBenchmarkLigand(from complex: CASFComplex) throws -> Molecule {
+        let (prepared, _, error) = RDKitBridge.prepareLigand(
+            smiles: complex.smiles,
+            name: complex.pdbId,
+            numConformers: 1,
+            addHydrogens: false,
+            minimize: true,
+            computeCharges: true
+        )
+        if let error {
+            throw BenchmarkError.step("ligand prep: \(error)")
+        }
+        guard let prepared else {
+            throw BenchmarkError.step("ligand prep returned nil")
+        }
+        return Molecule(
+            name: prepared.name,
+            atoms: prepared.atoms,
+            bonds: prepared.bonds,
+            title: complex.smiles,
+            smiles: complex.smiles
+        )
+    }
+
+    @MainActor
+    private func detectBenchmarkPocket(
+        protein: Molecule,
+        crystalLigand: Molecule?
+    ) async throws -> (pocket: BindingPocket, method: String) {
+        switch Self.cfgPocketMode {
+        case "ligand-guided":
+            guard let crystalLigand,
+                  let pocket = BindingSiteDetector.ligandGuidedPocket(
+                    protein: protein,
+                    ligand: crystalLigand,
+                    distance: 6.0
+                  ) else {
+                throw BenchmarkError.step("ligand-guided pocket detection")
+            }
+            return (pocket, "ligand-guided")
+
+        case "ml":
+            let detector = pocketDetector()
+            let pockets = await detector.detectPockets(protein: protein)
+            guard let pocket = pockets.first else {
+                throw BenchmarkError.step("ml pocket detection")
+            }
+            return (pocket, "ml")
+
+        case "hybrid":
+            let detector = pocketDetector()
+            let mlPockets = await detector.detectPockets(protein: protein)
+            if let pocket = mlPockets.first {
+                return (pocket, "ml")
+            }
+            fallthrough
+
+        default:
+            guard let pocket = BindingSiteDetector.detectPockets(protein: protein).first else {
+                throw BenchmarkError.step("geometric pocket detection")
+            }
+            return (pocket, "geometric")
+        }
+    }
+
+    @MainActor
+    private func configureFlexibleResiduesIfNeeded(
+        engine: DockingEngine,
+        protein: Molecule,
+        pocket: BindingPocket
+    ) {
+        guard Self.cfgFlexResidues else {
+            engine.flexEngine = nil
+            return
+        }
+
+        let selectedResidues = FlexibleResidueConfig.autoSelectResidues(
+            protein: protein.atoms,
+            pocket: (center: pocket.center, residueIndices: pocket.residueIndices)
+        )
+        guard !selectedResidues.isEmpty else {
+            engine.flexEngine = nil
+            return
+        }
+
+        let flexConfig = FlexibleResidueConfig(
+            flexibleResidueIndices: selectedResidues,
+            rotamerResolution: 10.0,
+            autoFlex: true
+        )
+        let flexEngine = FlexDockingEngine(device: engine.device, commandQueue: engine.commandQueue)
+        let vinaTypes = engine.vinaTypesForProtein(protein)
+        let exclusion = flexEngine.excludeFlexAtoms(
+            proteinAtoms: protein.atoms,
+            proteinBonds: protein.bonds,
+            flexConfig: flexConfig,
+            vinaTypes: vinaTypes
+        )
+        let flexWeight = FlexibleResidueConfig.softFlexWeight
+        let chiStep = FlexibleResidueConfig.softChiStep
+        flexEngine.prepareFlexBuffers(exclusion: exclusion, flexWeight: flexWeight, chiStep: chiStep)
+        engine.flexEngine = flexEngine
+    }
+
+    private func applyStrainPenalties(
+        results: [DockingResult],
+        smiles: String,
+        config: DockingConfig
+    ) async -> [DockingResult] {
+        let topN = min(results.count, 50)
+        guard topN > 0 else { return results }
+
+        let threshold = config.strainPenaltyThreshold
+        let weight = config.strainPenaltyWeight
+        let refEnergy = await Task.detached(priority: .userInitiated) {
+            RDKitBridge.mmffReferenceEnergy(smiles: smiles)
+        }.value
+        guard let refEnergy else { return results }
+
+        var updated = results
+        let positionsSlice = results.prefix(topN).map(\.transformedAtomPositions)
+        let strainResults: [(Int, Float?)] = await Task.detached(priority: .userInitiated) {
+            positionsSlice.enumerated().map { (i, positions) in
+                guard !positions.isEmpty else { return (i, nil as Float?) }
+                if let dockedEnergy = RDKitBridge.mmffStrainEnergy(smiles: smiles, heavyPositions: positions) {
+                    return (i, Float(dockedEnergy - refEnergy))
+                }
+                return (i, nil)
+            }
+        }.value
+
+        var changed = false
+        for (i, strain) in strainResults {
+            guard let strain else { continue }
+            updated[i].strainEnergy = strain
+            if strain > threshold {
+                updated[i].energy += weight * (strain - threshold)
+                changed = true
+            }
+        }
+        if changed {
+            updated.sort { $0.energy < $1.energy }
+        }
+        return updated
+    }
+
+    @MainActor
+    private func refineWithGFN2(
+        results: [DockingResult],
+        originalLigand: Molecule,
+        config: GFN2RefinementConfig
+    ) async -> [DockingResult] {
+        let topN = min(results.count, config.topPosesToRefine)
+        guard topN > 0 else { return results }
+
+        let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
+        guard heavyAtoms.count >= 2 else { return results }
+
+        let formalCharge = originalLigand.atoms.reduce(0) { $0 + $1.formalCharge }
+        var updated = results
+
+        let refinements: [(Int, GFN2RefinementResult?)] = await withTaskGroup(
+            of: (Int, GFN2RefinementResult?).self
+        ) { group in
+            for i in 0..<topN {
+                let positions = results[i].transformedAtomPositions
+                guard positions.count == heavyAtoms.count else { continue }
+                group.addTask {
+                    var dockedAtoms = heavyAtoms
+                    for j in 0..<dockedAtoms.count {
+                        dockedAtoms[j].position = positions[j]
+                    }
+                    do {
+                        let result = try await GFN2Refiner.optimizeGeometry(
+                            atoms: dockedAtoms,
+                            totalCharge: formalCharge,
+                            solvation: config.solvation,
+                            optLevel: config.optLevel,
+                            maxSteps: config.maxSteps,
+                            referencePositions: config.restraintStrength > 0 ? positions : nil,
+                            restraintStrength: config.restraintStrength
+                        )
+                        return (i, result)
+                    } catch {
+                        return (i, nil)
+                    }
+                }
+            }
+
+            var collected = [(Int, GFN2RefinementResult?)]()
+            for await result in group {
+                collected.append(result)
+            }
+            return collected
+        }
+
+        var gfn2Energies = [Float]()
+        for (i, gfn2Result) in refinements {
+            guard let gfn2Result else { continue }
+            updated[i].gfn2Energy = gfn2Result.totalEnergy_kcal
+            updated[i].gfn2DispersionEnergy = gfn2Result.dispersionEnergy * 627.509
+            updated[i].gfn2SolvationEnergy = gfn2Result.solvationEnergy * 627.509
+            updated[i].gfn2Converged = gfn2Result.converged
+            updated[i].gfn2OptSteps = gfn2Result.steps
+            gfn2Energies.append(gfn2Result.totalEnergy_kcal)
+
+            if config.updateCoordinates, let optPos = gfn2Result.optimizedPositions {
+                let origPos = updated[i].transformedAtomPositions
+                if origPos.count == optPos.count {
+                    var sumSq: Float = 0
+                    for j in 0..<origPos.count {
+                        sumSq += simd_distance_squared(origPos[j], optPos[j])
+                    }
+                    let rmsd = sqrt(sumSq / Float(origPos.count))
+                    if rmsd <= config.maxRMSD {
+                        updated[i].transformedAtomPositions = optPos
+                    }
+                }
+            }
+        }
+
+        if let minGFN2 = gfn2Energies.min(), config.blendWeight > 0 {
+            for i in 0..<updated.count {
+                if let gfn2E = updated[i].gfn2Energy {
+                    updated[i].energy += config.blendWeight * (gfn2E - minGFN2)
+                }
+            }
+            updated.sort { $0.energy < $1.energy }
+        }
+
+        return updated
     }
 
     // ==========================================================================
@@ -139,10 +406,10 @@ final class BenchmarkRunner: XCTestCase {
             config.gfn2Refinement.enabled = config.gfn2Refinement.enabled // preserve opt setting
         }
 
-        let resultsPath = resolve("Benchmark/results/\(outputFile)")
+        let resultsPath = resolveOutputPath(outputFile)
         let version = (try? String(contentsOfFile: resolve("VERSION"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
         var bench = BenchmarkResults(
-            benchmark: "casf-2016",
+            benchmark: Self.cfgBenchmarkName ?? manifest.benchmark,
             version: version,
             scoringMethod: label,
             timestamp: ISO8601DateFormatter().string(from: Date()),
@@ -162,7 +429,8 @@ final class BenchmarkRunner: XCTestCase {
             let t0 = CFAbsoluteTimeGetCurrent()
             var entry = BenchmarkResultEntry(
                 pdbId: complex.pdbId,
-                bestEnergy: .infinity,
+                bestEnergy: 1e9,
+                bestDisplayScore: nil,
                 bestRmsd: nil,
                 experimentalPKd: complex.pKd,
                 numPoses: 0,
@@ -182,40 +450,94 @@ final class BenchmarkRunner: XCTestCase {
                 let prepared = await Task.detached { @Sendable in
                     ProteinPreparation.prepareForDocking(
                         atoms: rawAtoms, bonds: rawBonds,
-                        rawPDBContent: pdbContent, pH: 7.4
+                        rawPDBContent: pdbContent,
+                        pH: 7.4,
+                        chargeMethod: Self.cfgChargeMethod
                     )
                 }.value
                 let protein = Molecule(name: rawProtein.name,
                                        atoms: prepared.atoms, bonds: prepared.bonds,
                                        title: rawProtein.title)
 
-                // 2. Load crystal ligand from SDF (preserves atom order for RMSD)
+                // 2. Load crystal ligand from SDF (reference for RMSD and optional redocking)
                 guard let crystalLig = loadCrystalLigand(sdfPath: resolve(complex.ligandSdf)) else {
                     throw BenchmarkError.step("parse crystal ligand SDF")
                 }
 
-                // 3. Pocket from crystal ligand position
-                guard let pocket = BindingSiteDetector.ligandGuidedPocket(
-                    protein: protein, ligand: crystalLig, distance: 6.0
-                ) else {
-                    throw BenchmarkError.step("pocket detection")
+                // 3. Ligand / pocket selection depends on benchmark mode.
+                let ligand: Molecule
+                let pocket: BindingPocket
+                let pocketMethod: String
+                if Self.cfgPipelineMode == "full" {
+                    ligand = try prepareBenchmarkLigand(from: complex)
+                    let detected = try await detectBenchmarkPocket(protein: protein, crystalLigand: nil)
+                    pocket = detected.pocket
+                    pocketMethod = detected.method
+                } else {
+                    ligand = crystalLig
+                    let detected = try await detectBenchmarkPocket(protein: protein, crystalLigand: crystalLig)
+                    pocket = detected.pocket
+                    pocketMethod = detected.method
                 }
 
-                // 4. Use crystal ligand directly for docking (preserves atom order for RMSD).
-                //    Charges are computed by the docking engine's Vina atom typing.
-                //    This matches standard redocking benchmarks (Vina, Glide, GOLD).
-                let ligand = crystalLig
+                // -- Debug diagnostics --
+                let crystalPositions = complex.crystalPositionsSIMD
+                let crystalCentroid: SIMD3<Float> = {
+                    guard !crystalPositions.isEmpty else { return .zero }
+                    let sum = crystalPositions.reduce(SIMD3<Float>.zero, +)
+                    return sum / Float(crystalPositions.count)
+                }()
+                let pocketDist = simd_distance(pocket.center, crystalCentroid)
 
-                // 5. Set protein on engine (required for grid map computation)
+                entry.pocketCenter = [pocket.center.x, pocket.center.y, pocket.center.z]
+                entry.crystalCenter = [crystalCentroid.x, crystalCentroid.y, crystalCentroid.z]
+                entry.pocketDistance = pocketDist
+                entry.pocketVolume = pocket.volume
+                entry.pocketBuriedness = pocket.buriedness
+                entry.pocketMethod = pocketMethod
+                entry.searchBoxSize = [pocket.size.x, pocket.size.y, pocket.size.z]
+                entry.crystalHeavyCount = crystalPositions.count
+                entry.ligandHeavyCount = ligand.atoms.filter { $0.element != .H }.count
+
+                // Initial ligand RMSD (prepared vs crystal, before docking)
+                if Self.cfgPipelineMode == "full" {
+                    let preparedHeavy = ligand.atoms.filter { $0.element != .H }.map(\.position)
+                    if preparedHeavy.count == crystalPositions.count {
+                        entry.initialLigandRmsd = computeRMSD(preparedHeavy, crystalPositions)
+                    }
+                }
+
+                // 4. Set protein on engine and optionally configure flexible residues.
                 eng.setProtein(protein.atoms, protein.bonds)
+                configureFlexibleResiduesIfNeeded(engine: eng, protein: protein, pocket: pocket)
 
-                // 6. Dock (DruseAF runs its own ML scoring on Metal during the GA)
+                // 5. Dock (DruseAF runs its own ML scoring on Metal during the GA)
                 let gaResults = await eng.runDocking(
                     ligand: ligand, pocket: pocket,
                     config: config, scoringMethod: scoringMethod
                 )
 
-                let results = gaResults
+                let results: [DockingResult]
+                if Self.cfgPipelineMode == "full" {
+                    var rankedResults = gaResults.sorted { $0.energy < $1.energy }
+                    if config.strainPenaltyEnabled {
+                        rankedResults = await applyStrainPenalties(
+                            results: rankedResults,
+                            smiles: complex.smiles,
+                            config: config
+                        )
+                    }
+                    if config.gfn2Refinement.enabled {
+                        rankedResults = await refineWithGFN2(
+                            results: rankedResults,
+                            originalLigand: ligand,
+                            config: config.gfn2Refinement
+                        )
+                    }
+                    results = rankedResults
+                } else {
+                    results = gaResults
+                }
 
                 let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
 
@@ -224,6 +546,7 @@ final class BenchmarkRunner: XCTestCase {
 
                 if let best = results.first {
                     entry.bestEnergy = best.energy
+                    entry.bestDisplayScore = best.displayScore(method: scoringMethod)
                     entry.success = true
 
                     // RMSD
@@ -231,6 +554,24 @@ final class BenchmarkRunner: XCTestCase {
                     let docked = best.transformedAtomPositions
                     if crystal.count == docked.count {
                         entry.bestRmsd = computeRMSD(crystal, docked)
+                    }
+
+                    // Top-N pose RMSDs for convergence analysis
+                    let topN = min(results.count, 10)
+                    var poseRmsds = [Float]()
+                    for i in 0..<topN {
+                        let pos = results[i].transformedAtomPositions
+                        if crystal.count == pos.count {
+                            poseRmsds.append(computeRMSD(crystal, pos))
+                        }
+                    }
+                    if !poseRmsds.isEmpty {
+                        entry.allPoseRmsds = poseRmsds
+                    }
+
+                    // Strain energy from best pose
+                    if let strain = best.strainEnergy {
+                        entry.strainEnergy = strain
                     }
 
                     // GFN2-xTB single-point scoring (optional, ~2ms per complex)
@@ -252,7 +593,18 @@ final class BenchmarkRunner: XCTestCase {
 
                     let rmsd = entry.bestRmsd.map { String(format: "%.2f", $0) } ?? "N/A"
                     let gfn2Str = entry.gfn2Energy.map { String(format: "  GFN2=%.0f", $0) } ?? ""
-                    emit("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
+                    let debugStr = Self.cfgDebug
+                        ? "  pocket=\(pocketMethod) dist=\(String(format: "%.1f", pocketDist))A vol=\(String(format: "%.0f", pocket.volume))A3"
+                        : ""
+                    let scoreStr: String
+                    if scoringMethod.isAffinityScore {
+                        let pKd = best.displayScore(method: scoringMethod)
+                        let conf = Int(best.afConfidence * 100)
+                        scoreStr = "pKi=\(String(format: "%.2f", pKd))  conf=\(conf)%"
+                    } else {
+                        scoreStr = "E=\(String(format: "%.2f", best.energy))"
+                    }
+                    emit("  [\(idx+1)/\(total)] \(complex.pdbId)  \(scoreStr)  RMSD=\(rmsd)A\(gfn2Str)\(debugStr)  \(String(format: "%.0f", elapsed))ms")
                     succeeded += 1
                 } else {
                     entry.error = "0 poses"
@@ -435,9 +787,68 @@ final class BenchmarkRunner: XCTestCase {
         (loadFileConfig()["maxComplexes"] as? Int) ?? 0
     }
 
+    /// Read output directory from config file.
+    private static var cfgOutputDirectory: String? {
+        loadFileConfig()["outputDir"] as? String
+    }
+
+    /// Read manifest path from config file.
+    private static var cfgManifestPath: String? {
+        guard let path = loadFileConfig()["manifestPath"] as? String,
+              !path.isEmpty else { return nil }
+        return path
+    }
+
+    /// Read benchmark label override from config file.
+    private static var cfgBenchmarkName: String? {
+        guard let name = loadFileConfig()["benchmarkName"] as? String,
+              !name.isEmpty else { return nil }
+        return name
+    }
+
+    /// Read pipeline mode from config file.
+    private static var cfgPipelineMode: String {
+        (loadFileConfig()["pipelineMode"] as? String) ?? "redock"
+    }
+
+    /// Read pocket mode from config file.
+    private static var cfgPocketMode: String {
+        (loadFileConfig()["pocketMode"] as? String) ?? "hybrid"
+    }
+
+    /// Read receptor flexibility flag from config file.
+    private static var cfgFlexResidues: Bool {
+        (loadFileConfig()["flexResidues"] as? Bool) ?? false
+    }
+
+    /// Read receptor charge method from config file.
+    private static var cfgChargeMethod: ChargeMethod {
+        guard let raw = (loadFileConfig()["chargeMethod"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return .gasteiger
+        }
+
+        switch raw {
+        case "eem":
+            return .eem
+        case "qeq":
+            return .qeq
+        case "xtb":
+            return .xtb
+        default:
+            return .gasteiger
+        }
+    }
+
     /// Read GFN2 scoring flag from config file.
     private static var cfgGFN2Scoring: Bool {
         (loadFileConfig()["gfn2Scoring"] as? Bool) ?? false
+    }
+
+    /// Read debug diagnostics flag from config file.
+    private static var cfgDebug: Bool {
+        (loadFileConfig()["debug"] as? Bool) ?? false
     }
 
     /// Read outputFile from .bench_config.json (set by run_benchmark.py per scoring method).

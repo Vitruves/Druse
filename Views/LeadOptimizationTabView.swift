@@ -105,11 +105,12 @@ struct LeadOptimizationTabView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if let energy = viewModel.leadOpt.referenceResult?.energy {
+                if let refResult = viewModel.leadOpt.referenceResult {
+                    let sm = viewModel.docking.scoringMethod
                     VStack(alignment: .trailing, spacing: 1) {
-                        Text(String(format: "%.1f", energy))
+                        Text(String(format: "%.1f", refResult.displayScore(method: sm)))
                             .font(.callout.monospaced().weight(.bold))
-                        Text("kcal/mol")
+                        Text(sm.unitLabel)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -465,6 +466,7 @@ struct LeadOptimizationTabView: View {
                     .accessibilityIdentifier(AccessibilityID.leadComparison)
                 }
 
+                let sm = viewModel.docking.scoringMethod
                 HStack(spacing: 16) {
                     VStack(alignment: .center, spacing: 2) {
                         Text("Reference")
@@ -472,7 +474,7 @@ struct LeadOptimizationTabView: View {
                             .foregroundStyle(.secondary)
                         Text(String(format: "%.1f", refEnergy ?? 0))
                             .font(.body.monospaced().weight(.bold))
-                        Text("kcal/mol")
+                        Text(sm.unitLabel)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -489,13 +491,13 @@ struct LeadOptimizationTabView: View {
                         if let e = analog.bestEnergy {
                             Text(String(format: "%.1f", e))
                                 .font(.body.monospaced().weight(.bold))
-                                .foregroundStyle(e < (refEnergy ?? 0) ? .green : .orange)
+                                .foregroundStyle(sm.isAffinityScore ? (e > (refEnergy ?? 0) ? .green : .orange) : (e < (refEnergy ?? 0) ? .green : .orange))
                         } else {
                             Text("—")
                                 .font(.body)
                                 .foregroundStyle(.secondary)
                         }
-                        Text("kcal/mol")
+                        Text(sm.unitLabel)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }

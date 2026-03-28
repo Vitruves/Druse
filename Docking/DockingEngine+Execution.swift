@@ -706,11 +706,16 @@ extension DockingEngine {
                     repGAParams.translationStep = config.explorationTranslationStep
                     repGAParams.rotationStep = config.explorationRotationStep
                     repGAParams.mutationRate = config.explorationMutationRate
+                    repGAParams.mcTemperature = config.mcTemperature
                     repGAParams.localSearchSteps = UInt32(max(config.localSearchSteps / 2, 5))
-                } else if step == explorationCutoff {
-                    repGAParams.translationStep = config.translationStep
-                    repGAParams.rotationStep = config.rotationStep
-                    repGAParams.mutationRate = config.mutationRate
+                } else {
+                    let exploitSteps = stepsPerReplica - explorationCutoff
+                    let progress = Float(step - explorationCutoff) / Float(max(exploitSteps, 1))
+                    let decay = 1.0 - progress
+                    repGAParams.translationStep = config.translationStep + decay * (config.explorationTranslationStep - config.translationStep) * 0.3
+                    repGAParams.rotationStep = config.rotationStep + decay * (config.explorationRotationStep - config.rotationStep) * 0.3
+                    repGAParams.mutationRate = config.mutationRate + decay * (config.explorationMutationRate - config.mutationRate) * 0.5
+                    repGAParams.mcTemperature = config.mcTemperature * (0.3 + 0.7 * decay)
                     repGAParams.localSearchSteps = UInt32(max(config.localSearchSteps, 1))
                 }
 
@@ -874,11 +879,19 @@ extension DockingEngine {
                     gaParams.translationStep = config.explorationTranslationStep
                     gaParams.rotationStep = config.explorationRotationStep
                     gaParams.mutationRate = config.explorationMutationRate
+                    gaParams.mcTemperature = config.mcTemperature
                     gaParams.localSearchSteps = UInt32(max(config.localSearchSteps / 2, 5))
-                } else if step == explorationCutoff {
-                    gaParams.translationStep = config.translationStep
-                    gaParams.rotationStep = config.rotationStep
-                    gaParams.mutationRate = config.mutationRate
+                } else {
+                    // Gradual annealing: linearly decay mutation rate, step sizes, and temperature
+                    // from exploration values to refinement values over the exploitation phase
+                    let exploitSteps = config.generationsPerRun - explorationCutoff
+                    let progress = Float(step - explorationCutoff) / Float(max(exploitSteps, 1))
+                    let decay = 1.0 - progress  // 1.0 at start of exploitation, 0.0 at end
+                    gaParams.translationStep = config.translationStep + decay * (config.explorationTranslationStep - config.translationStep) * 0.3
+                    gaParams.rotationStep = config.rotationStep + decay * (config.explorationRotationStep - config.rotationStep) * 0.3
+                    gaParams.mutationRate = config.mutationRate + decay * (config.explorationMutationRate - config.mutationRate) * 0.5
+                    // Cool temperature from full to 30% for tighter Metropolis acceptance late in search
+                    gaParams.mcTemperature = config.mcTemperature * (0.3 + 0.7 * decay)
                     gaParams.localSearchSteps = UInt32(max(config.localSearchSteps, 1))
                 }
 

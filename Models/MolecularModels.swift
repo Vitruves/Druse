@@ -353,6 +353,17 @@ enum ScoringMethod: String, CaseIterable, Sendable {
         case .pignet2:       "Physics-informed GNN — vdW + H-bond + metal + hydrophobic (kcal/mol)"
         }
     }
+
+    /// Unit label for display ("kcal/mol" or "pKi").
+    var unitLabel: String {
+        switch self {
+        case .druseAffinity: "pKi"
+        default:             "kcal/mol"
+        }
+    }
+
+    /// Whether the score is an affinity (positive = better) vs energy (negative = better).
+    var isAffinityScore: Bool { self == .druseAffinity }
 }
 
 // MARK: - Search Method

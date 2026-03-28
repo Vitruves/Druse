@@ -271,6 +271,9 @@ extension AppViewModel {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.docking.dockingBestEnergy = result.energy
+                    if self.docking.scoringMethod.isAffinityScore {
+                        self.docking.dockingBestPKi = result.stericEnergy  // pKd stored by DruseAF shader
+                    }
                     self.docking.currentInteractions = interactions
                     // Use lightweight ghost pose pipeline — avoids full pushToRenderer() rebuild
                     if let (newAtoms, newBonds) = self.buildTransformedLigand(result: result, originalLigand: origLig) {
@@ -311,8 +314,11 @@ extension AppViewModel {
 
             log.info("GA complete: \(results.count) poses returned", category: .dock)
             if let best = results.first {
-                log.info("  Best pose: E=\(String(format: "%.3f", best.energy)) kcal/mol, " +
-                         "cluster=\(best.clusterID), gen=\(best.generation)",
+                let method = docking.scoringMethod
+                let scoreStr = method.isAffinityScore
+                    ? "pKi=\(String(format: "%.3f", best.displayScore(method: method)))"
+                    : "E=\(String(format: "%.3f", best.energy)) kcal/mol"
+                log.info("  Best pose: \(scoreStr), cluster=\(best.clusterID), gen=\(best.generation)",
                          category: .dock)
             }
 
@@ -413,16 +419,21 @@ extension AppViewModel {
             let clusterCount = Set(results.map(\.clusterID)).count
             let elapsed = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
             if let best = rankedResults.first {
-                if docking.scoringMethod == .drusina {
+                let method = docking.scoringMethod
+                let bestDisplay = best.displayScore(method: method)
+                let unit = method.unitLabel
+                if method == .drusina {
                     let drCorr = best.drusinaCorrection
-                    log.success(String(format: "Docking complete (Drusina): best %.1f kcal/mol (correction: %.2f), %d poses, %d clusters (%.1fs)",
-                                       best.energy, drCorr, rankedResults.count, clusterCount, elapsed), category: .dock)
-                    workspace.statusMessage = String(format: "Best: %.1f kcal/mol", best.energy)
+                    log.success(String(format: "Docking complete (Drusina): best %.1f %@ (correction: %.2f), %d poses, %d clusters (%.1fs)",
+                                       bestDisplay, unit, drCorr, rankedResults.count, clusterCount, elapsed), category: .dock)
+                } else if method.isAffinityScore {
+                    log.success(String(format: "Docking complete (DruseAF): best pKi %.1f (conf: %.0f%%), %d poses, %d clusters (%.1fs)",
+                                       bestDisplay, best.afConfidence * 100, rankedResults.count, clusterCount, elapsed), category: .dock)
                 } else {
-                    log.success(String(format: "Docking complete: best %.1f kcal/mol, %d poses, %d clusters (%.1fs)",
-                                       best.energy, rankedResults.count, clusterCount, elapsed), category: .dock)
-                    workspace.statusMessage = String(format: "Best: %.1f kcal/mol", best.energy)
+                    log.success(String(format: "Docking complete: best %.1f %@, %d poses, %d clusters (%.1fs)",
+                                       bestDisplay, unit, rankedResults.count, clusterCount, elapsed), category: .dock)
                 }
+                workspace.statusMessage = String(format: "Best: %.1f %@", bestDisplay, unit)
                 if docking.currentInteractions.count > 0 {
                     let hbonds = docking.currentInteractions.filter { $0.type == .hbond }.count
                     let hydro = docking.currentInteractions.filter { $0.type == .hydrophobic }.count
@@ -479,7 +490,8 @@ extension AppViewModel {
             }
         }
 
-        workspace.statusMessage = String(format: "Pose #%d: %.1f kcal/mol", index + 1, result.energy)
+        let method = docking.scoringMethod
+        workspace.statusMessage = String(format: "Pose #%d: %.1f %@", index + 1, result.displayScore(method: method), method.unitLabel)
     }
 
     func togglePoseSelection(at index: Int) {

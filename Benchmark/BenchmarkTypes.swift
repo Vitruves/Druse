@@ -58,7 +58,8 @@ struct BenchmarkConfigRecord: Codable {
 
 struct BenchmarkResultEntry: Codable {
     let pdbId: String
-    var bestEnergy: Float             // score from the GA's scoring method
+    var bestEnergy: Float             // internal energy (kcal/mol for Vina/Drusina/PIGNet2; -pKd*conf for DruseAF)
+    var bestDisplayScore: Float?      // display score: same as bestEnergy for energy methods, pKi for DruseAF
     var bestRmsd: Float?              // vs crystal pose
     var experimentalPKd: Float?
     var numPoses: Int
@@ -69,9 +70,24 @@ struct BenchmarkResultEntry: Codable {
     var gfn2DispersionEnergy: Float?  // D4 component (kcal/mol)
     var gfn2SolvationEnergy: Float?   // GBSA/ALPB component (kcal/mol)
 
+    // Debug diagnostics (populated when config enables them)
+    var pocketCenter: [Float]?        // detected pocket center [x, y, z]
+    var crystalCenter: [Float]?       // crystal ligand centroid [x, y, z]
+    var pocketDistance: Float?         // distance between pocket center and crystal centroid
+    var pocketVolume: Float?           // detected pocket volume (A^3)
+    var pocketBuriedness: Float?       // detected pocket buriedness (0-1)
+    var pocketMethod: String?          // "ml", "geometric", or "ligand-guided"
+    var searchBoxSize: [Float]?        // pocket half-extents [x, y, z]
+    var ligandHeavyCount: Int?         // heavy atoms in prepared ligand
+    var crystalHeavyCount: Int?        // heavy atoms in crystal ligand
+    var initialLigandRmsd: Float?      // RMSD of prepared ligand vs crystal (before docking)
+    var strainEnergy: Float?           // MMFF strain of best pose (kcal/mol)
+    var allPoseRmsds: [Float]?         // RMSDs of top-N poses (for convergence analysis)
+
     enum CodingKeys: String, CodingKey {
         case pdbId = "pdb_id"
         case bestEnergy = "best_energy"
+        case bestDisplayScore = "best_display_score"
         case bestRmsd = "best_rmsd"
         case experimentalPKd = "experimental_pKd"
         case numPoses = "num_poses"
@@ -80,5 +96,17 @@ struct BenchmarkResultEntry: Codable {
         case gfn2Energy = "gfn2_energy"
         case gfn2DispersionEnergy = "gfn2_dispersion"
         case gfn2SolvationEnergy = "gfn2_solvation"
+        case pocketCenter = "pocket_center"
+        case crystalCenter = "crystal_center"
+        case pocketDistance = "pocket_distance"
+        case pocketVolume = "pocket_volume"
+        case pocketBuriedness = "pocket_buriedness"
+        case pocketMethod = "pocket_method"
+        case searchBoxSize = "search_box_size"
+        case ligandHeavyCount = "ligand_heavy_count"
+        case crystalHeavyCount = "crystal_heavy_count"
+        case initialLigandRmsd = "initial_ligand_rmsd"
+        case strainEnergy = "strain_energy"
+        case allPoseRmsds = "all_pose_rmsds"
     }
 }
