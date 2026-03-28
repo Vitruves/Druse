@@ -133,91 +133,17 @@ struct PreparationTabView: View {
             Label("Preparation", systemImage: "wand.and.stars")
                 .font(.callout.weight(.semibold))
 
-            // Water management
-            HStack(spacing: 4) {
-                Button(action: { viewModel.removeWaters() }) {
-                    Label("Remove All Waters", systemImage: "drop.triangle")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityIdentifier(AccessibilityID.prepRemoveWaters)
-
-                Button(action: { viewModel.keepPocketWaters() }) {
-                    Label("Keep Pocket Waters", systemImage: "drop.circle")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(viewModel.docking.selectedPocket == nil)
-                .help("Remove bulk waters but keep those within \(String(format: "%.0f", viewModel.molecules.pocketWaterRadius)) Å of the pocket center as bridging waters for docking.")
-                .accessibilityIdentifier(AccessibilityID.prepKeepPocketWaters)
-            }
-
-            if !viewModel.molecules.keptWaterKeys.isEmpty {
-                bridgingWaterInfo
-            }
-
-            Button(action: { viewModel.removeNonStandardResidues() }) {
-                Label("Remove Non-standard Residues", systemImage: "trash.slash")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .accessibilityIdentifier(AccessibilityID.prepRemoveNonStandard)
-
-            // Remove alt conformations
-            Button(action: { viewModel.removeAltConfs() }) {
-                Label("Remove Alt. Conformations", systemImage: "square.on.square.dashed")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .accessibilityIdentifier(AccessibilityID.prepRemoveAltConfs)
-
-            Divider()
-
-            // Hydrogen addition
-            Label("Hydrogens", systemImage: "atom")
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
-
-            Button(action: { viewModel.addHydrogens() }) {
-                Label("Add All Hydrogens", systemImage: "plus.circle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(viewModel.molecules.protein == nil)
-            .help("Add all hydrogens (polar + nonpolar) from residue templates.")
-            .accessibilityIdentifier(AccessibilityID.prepAddHydrogens)
-
-            // Polar hydrogens at pH with slider
-            protonationSection
-
-            Button(action: { viewModel.removeHydrogens() }) {
-                Label("Remove All Hydrogens", systemImage: "minus.circle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(!viewModel.proteinHasHydrogens)
-            .help("Strip all hydrogen atoms from the protein.")
-            .accessibilityIdentifier(AccessibilityID.prepRemoveHydrogens)
-
-            Divider()
-
-            // Native / RDKit-backed preparation
-            Label("Preparation Pipeline", systemImage: "cpu")
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
-
-            chargeMethodSection
-
-            // Structure Cleanup (protonation + charge assignment)
+            // One-click full preparation — the primary action
             Button(action: { viewModel.runEnergyMinimization() }) {
                 HStack {
-                    Label("Structure Cleanup", systemImage: "waveform.path.ecg")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Prepare for Docking", systemImage: "wand.and.stars")
+                            .font(.subheadline.weight(.semibold))
+                        Text("Remove alt. conformations, non-standard residues & waters, rebuild missing atoms, add hydrogens at pH \(String(format: "%.1f", viewModel.molecules.protonationPH)), assign charges")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
                     Spacer()
                     if viewModel.molecules.isMinimizing {
                         ProgressView()
@@ -226,50 +152,138 @@ struct PreparationTabView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.borderedProminent)
             .controlSize(.small)
             .disabled(viewModel.molecules.protein == nil || viewModel.molecules.isMinimizing)
-            .help("Apply protonation at current pH and assign charges. Protein structure is preserved.")
+            .help("Full preparation pipeline: cleanup structure, rebuild missing atoms, add hydrogens with pH-dependent protonation, optimize H-bond network, and assign partial charges.")
             .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
 
-            // Detect & Fix Missing Residues
-            Button(action: { viewModel.detectAndFixMissingResidues() }) {
-                Label("Fix Missing Residues", systemImage: "bandage")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Detect gaps in residue numbering, rebuild missing heavy atoms from templates, and add missing loops (≤15 residues).")
-            .accessibilityIdentifier(AccessibilityID.prepFixMissing)
+            Divider()
 
-            Button(action: { viewModel.analyzeMissingAtoms() }) {
-                Label("Analyze Missing Atoms", systemImage: "checklist")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Compare standard residues against bundled templates and report missing heavy atoms, missing hydrogens, and extra atoms.")
-            .accessibilityIdentifier(AccessibilityID.prepAnalyzeMissing)
+            // Granular controls
+            DisclosureGroup("Manual Steps") {
+                VStack(alignment: .leading, spacing: 8) {
+                    // --- Cleanup ---
+                    Label("Cleanup", systemImage: "paintbrush")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
 
-            Button(action: { viewModel.repairMissingAtoms() }) {
-                Label("Repair Missing Atoms", systemImage: "wrench.and.screwdriver")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Rebuild missing standard-residue heavy atoms from bundled geometry templates.")
-            .accessibilityIdentifier(AccessibilityID.prepRepairMissing)
+                    HStack(spacing: 4) {
+                        Button(action: { viewModel.removeWaters() }) {
+                            Label("Remove All Waters", systemImage: "drop.triangle")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityIdentifier(AccessibilityID.prepRemoveWaters)
 
-            // Bridging Waters (was Solvation Shell)
-            Button(action: { viewModel.keepPocketWaters() }) {
-                Label("Retain Bridging Waters", systemImage: "drop.circle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                        Button(action: { viewModel.keepPocketWaters() }) {
+                            Label("Keep Pocket Waters", systemImage: "drop.circle")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(viewModel.docking.selectedPocket == nil)
+                        .help("Remove bulk waters but keep those within \(String(format: "%.0f", viewModel.molecules.pocketWaterRadius)) Å of the pocket center as bridging waters for docking.")
+                        .accessibilityIdentifier(AccessibilityID.prepKeepPocketWaters)
+                    }
+
+                    if !viewModel.molecules.keptWaterKeys.isEmpty {
+                        bridgingWaterInfo
+                    }
+
+                    Button(action: { viewModel.removeNonStandardResidues() }) {
+                        Label("Remove Non-standard Residues", systemImage: "trash.slash")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier(AccessibilityID.prepRemoveNonStandard)
+
+                    Button(action: { viewModel.removeAltConfs() }) {
+                        Label("Remove Alt. Conformations", systemImage: "square.on.square.dashed")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier(AccessibilityID.prepRemoveAltConfs)
+
+                    Divider()
+
+                    // --- Structure Repair ---
+                    Label("Structure Repair", systemImage: "bandage")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    Button(action: { viewModel.detectAndFixMissingResidues() }) {
+                        Label("Fix Missing Residues", systemImage: "bandage")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Detect gaps in residue numbering, build missing loops (≤15 residues), and rebuild missing heavy atoms.")
+                    .accessibilityIdentifier(AccessibilityID.prepFixMissing)
+
+                    Button(action: { viewModel.analyzeMissingAtoms() }) {
+                        Label("Analyze Missing Atoms", systemImage: "checklist")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Compare residues against templates and report missing heavy atoms, missing hydrogens, and extra atoms.")
+                    .accessibilityIdentifier(AccessibilityID.prepAnalyzeMissing)
+
+                    Button(action: { viewModel.repairMissingAtoms() }) {
+                        Label("Repair Missing Atoms", systemImage: "wrench.and.screwdriver")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Rebuild missing heavy atoms from bundled residue geometry templates.")
+                    .accessibilityIdentifier(AccessibilityID.prepRepairMissing)
+
+                    Divider()
+
+                    // --- Hydrogens ---
+                    Label("Hydrogens", systemImage: "atom")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    Button(action: { viewModel.addHydrogens() }) {
+                        Label("Add All Hydrogens", systemImage: "plus.circle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.molecules.protein == nil)
+                    .help("Add all hydrogens (polar + nonpolar) from residue templates. Also rebuilds any missing heavy atoms needed for placement.")
+                    .accessibilityIdentifier(AccessibilityID.prepAddHydrogens)
+
+                    protonationSection
+
+                    Button(action: { viewModel.removeHydrogens() }) {
+                        Label("Remove All Hydrogens", systemImage: "minus.circle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!viewModel.proteinHasHydrogens)
+                    .help("Strip all hydrogen atoms from the protein.")
+                    .accessibilityIdentifier(AccessibilityID.prepRemoveHydrogens)
+
+                    Divider()
+
+                    // --- Charges ---
+                    Label("Charges", systemImage: "bolt")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    chargeMethodSection
+                }
+                .padding(.top, 4)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(viewModel.docking.selectedPocket == nil)
-            .help("Keep water molecules near the pocket as part of the rigid receptor for docking. Select a pocket first.")
-            .accessibilityIdentifier(AccessibilityID.prepRetainBridgingWaters)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
         }
 
         Divider()

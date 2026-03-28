@@ -121,7 +121,19 @@ else()
 endif()
 
 # Build static library
-add_library(druse_core STATIC druse_core.cpp druse_2d.cpp druse_gemmi.cpp druse_openmm.cpp druse_xtb.cpp)
+add_library(druse_core STATIC
+    druse_core.cpp
+    druse_core_ionization.cpp
+    druse_core_variants.cpp
+    druse_core_io.cpp
+    druse_core_geometry.cpp
+    druse_core_analysis.cpp
+    druse_core_protonation_tools.cpp
+    druse_2d.cpp
+    druse_gemmi.cpp
+    druse_openmm.cpp
+    druse_xtb.cpp
+)
 set_target_properties(druse_core PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION FALSE
 )

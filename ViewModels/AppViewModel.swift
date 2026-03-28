@@ -76,7 +76,7 @@ final class AppViewModel {
     /// - Parameters:
     ///   - molecule: The molecule to set as active ligand.
     ///   - entryID: Optional UUID of the `LigandEntry` this molecule came from.
-    func setLigandForDocking(_ molecule: Molecule, entryID: UUID? = nil, forms: [ChemicalForm] = []) {
+    func setLigandForDocking(_ molecule: Molecule, entryID: UUID? = nil) {
         let normalizedAtoms = molecule.atoms.enumerated().map { i, atom in
             Atom(id: i, element: atom.element, position: atom.position,
                  name: atom.name,
@@ -96,7 +96,6 @@ final class AppViewModel {
         molecules.ligand = normalizedLigand
         activeLigandEntryID = entryID
         docking.originalDockingLigand = nil
-        docking.ligandForms = forms
         docking.dockingResults = []
         docking.currentInteractions = []
         renderer?.updateInteractionLines([])
@@ -434,7 +433,18 @@ final class AppViewModel {
                     ribbonChainColors[chain.id] = palette[i % palette.count]
                 }
             }
-            let (ribbonVerts, ribbonIdxs) = RibbonMeshGenerator.generateForMolecule(visibleProt, chainColorMap: ribbonChainColors)
+            let selectedResidueKeys = Set(
+                workspace.selectedResidueIndices.compactMap { resIdx -> String? in
+                    guard resIdx < prot.residues.count else { return nil }
+                    let residue = prot.residues[resIdx]
+                    return "\(residue.chainID)|\(residue.sequenceNumber)"
+                }
+            )
+            let (ribbonVerts, ribbonIdxs) = RibbonMeshGenerator.generateForMolecule(
+                visibleProt,
+                chainColorMap: ribbonChainColors,
+                selectedResidueKeys: selectedResidueKeys
+            )
             renderer.updateRibbonMesh(vertices: ribbonVerts, indices: ribbonIdxs)
 
             var caControlPoints: [(position: SIMD3<Float>, atomID: Int)] = []
@@ -445,26 +455,6 @@ final class AppViewModel {
                 }
             }
             renderer.updateRibbonCAControlPoints(caControlPoints)
-
-            if workspace.showLigand, !docking.isDocking, let lig = molecules.ligand {
-                // Map by array position (bond.atomIndex is an array position, not atom.id)
-                var ligPosToNew: [Int: Int] = [:]
-                for (origIdx, atom) in lig.atoms.enumerated() {
-                    if !workspace.showHydrogens && atom.element == .H { continue }
-                    ligPosToNew[origIdx] = allAtoms.count
-                    allAtoms.append(Atom(
-                        id: allAtoms.count, element: atom.element, position: atom.position,
-                        name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
-                        chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
-                        isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
-                    ))
-                }
-                for bond in lig.bonds {
-                    if let a = ligPosToNew[bond.atomIndex1], let b = ligPosToNew[bond.atomIndex2] {
-                        allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
-                    }
-                }
-            }
 
             // Non-protein chains (nucleic acid, ions, etc.) as ball-and-stick overlay
             // so they remain visible in ribbon mode
@@ -491,6 +481,7 @@ final class AppViewModel {
             }
 
             // Side chain display — include CA atom to visually connect to ribbon backbone
+            var selectedRibbonResidueAtomIDs: Set<Int> = []
             if workspace.sideChainDisplay != .none, workspace.showProtein {
                 let sideChainResidueIndices = sideChainResidueSet(protein: prot)
                 if !sideChainResidueIndices.isEmpty {
@@ -510,8 +501,38 @@ final class AppViewModel {
                         }
                     }
                     var interactingPositions = Set<PosKey>()
+                    // For atom-based interactions, the proteinPosition IS an atom position.
+                    // For pi-type interactions, proteinPosition is a ring centroid (virtual
+                    // point) that won't match any real atom. For those, resolve the actual
+                    // protein residue atoms so they get included in the sidechain display.
+                    let piInteractionTypes: Set<MolecularInteraction.InteractionType> = [
+                        .piStack, .piCation, .chPi, .amideStack
+                    ]
+                    // Build heavy-atom index → original atom index mapping once
+                    var heavyToOriginal: [Int: Int] = [:]
+                    var heavyIdx = 0
+                    for (origIdx, atom) in prot.atoms.enumerated() {
+                        guard atom.element != .H else { continue }
+                        heavyToOriginal[heavyIdx] = origIdx
+                        heavyIdx += 1
+                    }
                     for ixn in docking.currentInteractions {
-                        interactingPositions.insert(PosKey(ixn.proteinPosition))
+                        if piInteractionTypes.contains(ixn.type) {
+                            // Add all ring atom positions from the residue so the
+                            // sidechain around the centroid is fully rendered
+                            if let origIdx = heavyToOriginal[ixn.proteinAtomIndex],
+                               origIdx < prot.atoms.count {
+                                let resSeq = prot.atoms[origIdx].residueSeq
+                                let chain = prot.atoms[origIdx].chainID
+                                for res in prot.residues where res.sequenceNumber == resSeq && res.chainID == chain {
+                                    for ai in res.atomIndices where ai < prot.atoms.count {
+                                        interactingPositions.insert(PosKey(prot.atoms[ai].position))
+                                    }
+                                }
+                            }
+                        } else {
+                            interactingPositions.insert(PosKey(ixn.proteinPosition))
+                        }
                     }
 
                     // First pass: collect all side chain atom indices including CA
@@ -530,6 +551,9 @@ final class AppViewModel {
                             if backboneExcludeNames.contains(trimmedName)
                                 && !interactingPositions.contains(PosKey(atom.position)) { continue }
                             scPosToNew[atomIdx] = allAtoms.count
+                            if workspace.selectedResidueIndices.contains(residueIdx) {
+                                selectedRibbonResidueAtomIDs.insert(allAtoms.count)
+                            }
                             allAtoms.append(Atom(
                                 id: allAtoms.count, element: atom.element, position: atom.position,
                                 name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
@@ -566,10 +590,33 @@ final class AppViewModel {
                 }
             }
 
+            let ribbonProteinAtomCount = allAtoms.count
+
+            if workspace.showLigand, !docking.isDocking, let lig = molecules.ligand {
+                // Map by array position (bond.atomIndex is an array position, not atom.id)
+                var ligPosToNew: [Int: Int] = [:]
+                for (origIdx, atom) in lig.atoms.enumerated() {
+                    if !workspace.showHydrogens && atom.element == .H { continue }
+                    ligPosToNew[origIdx] = allAtoms.count
+                    allAtoms.append(Atom(
+                        id: allAtoms.count, element: atom.element, position: atom.position,
+                        name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
+                        chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
+                        isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
+                    ))
+                }
+                for bond in lig.bonds {
+                    if let a = ligPosToNew[bond.atomIndex1], let b = ligPosToNew[bond.atomIndex2] {
+                        allBonds.append(Bond(id: allBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+                    }
+                }
+            }
+
             renderer.selectedAtomIndex = workspace.selectedAtomIndex ?? -1
-            renderer.selectedResidueAtomIndices = []
+            renderer.selectedResidueAtomIndices = selectedRibbonResidueAtomIDs
             renderer.renderMode = .ballAndStick
-            renderer.ligandRenderMode = workspace.ligandRenderMode
+            renderer.ligandRenderMode = workspace.effectiveLigandRenderMode
+            renderer.proteinAtomCount = ribbonProteinAtomCount
             renderer.ligandVisible = workspace.showLigand && !docking.isDocking && molecules.ligand != nil
             renderer.updateMoleculeData(atoms: allAtoms, bonds: allBonds)
             return
@@ -632,7 +679,7 @@ final class AppViewModel {
             }
         )
         renderer.renderMode = workspace.renderMode
-        renderer.ligandRenderMode = workspace.ligandRenderMode
+        renderer.ligandRenderMode = workspace.effectiveLigandRenderMode
 
         renderer.enableClipping = workspace.enableClipping
         renderer.clipNearZ = workspace.clipNearZ

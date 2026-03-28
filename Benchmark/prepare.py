@@ -26,7 +26,7 @@ except ImportError as e:
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DATA = ROOT / "Benchmark" / "data"   # CASF-2016 extracted here
-TRAINING_DATA = ROOT / "Training" / "data"       # PDBbind refined-set here
+TRAINING_DATA = ROOT / "Benchmark" / "data"       # PDBbind refined-set here
 MANIFEST_DIR = ROOT / "Benchmark" / "manifests"
 
 

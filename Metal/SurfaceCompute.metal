@@ -18,9 +18,16 @@ struct SurfaceAtom {
     float         vdwRadius;
     float         charge;
     uint          atomicNum;
-    uint          isAromatic;  // 1 if aromatic ring member
-    float         _pad0;
+    uint          flags;
+    float         hydrophobicity;
 };
+
+#define SURFACE_ATOM_FLAG_DONOR       (1u << 0)
+#define SURFACE_ATOM_FLAG_ACCEPTOR    (1u << 1)
+#define SURFACE_ATOM_FLAG_AROMATIC    (1u << 2)
+#define SURFACE_ATOM_FLAG_POSITIVE    (1u << 3)
+#define SURFACE_ATOM_FLAG_NEGATIVE    (1u << 4)
+#define SURFACE_ATOM_FLAG_HYDROPHOBIC (1u << 5)
 
 struct SurfaceGridParams {
     packed_float3 origin;
@@ -452,6 +459,46 @@ inline float3 computeGradient(
     return len > 1e-8f ? -grad / len : float3(0.0f, 1.0f, 0.0f);
 }
 
+inline float3 computeGradientInterpolated(
+    device const float *field,
+    float3 gp,
+    uint nx, uint ny, uint nz)
+{
+    float x = clamp(gp.x, 0.0f, float(nx - 1));
+    float y = clamp(gp.y, 0.0f, float(ny - 1));
+    float z = clamp(gp.z, 0.0f, float(nz - 1));
+
+    uint x0 = min(uint(floor(x)), nx - 1);
+    uint y0 = min(uint(floor(y)), ny - 1);
+    uint z0 = min(uint(floor(z)), nz - 1);
+    uint x1 = min(x0 + 1, nx - 1);
+    uint y1 = min(y0 + 1, ny - 1);
+    uint z1 = min(z0 + 1, nz - 1);
+
+    float tx = x - float(x0);
+    float ty = y - float(y0);
+    float tz = z - float(z0);
+
+    float3 g000 = computeGradient(field, x0, y0, z0, nx, ny, nz);
+    float3 g100 = computeGradient(field, x1, y0, z0, nx, ny, nz);
+    float3 g010 = computeGradient(field, x0, y1, z0, nx, ny, nz);
+    float3 g110 = computeGradient(field, x1, y1, z0, nx, ny, nz);
+    float3 g001 = computeGradient(field, x0, y0, z1, nx, ny, nz);
+    float3 g101 = computeGradient(field, x1, y0, z1, nx, ny, nz);
+    float3 g011 = computeGradient(field, x0, y1, z1, nx, ny, nz);
+    float3 g111 = computeGradient(field, x1, y1, z1, nx, ny, nz);
+
+    float3 g00 = mix(g000, g100, tx);
+    float3 g10 = mix(g010, g110, tx);
+    float3 g01 = mix(g001, g101, tx);
+    float3 g11 = mix(g011, g111, tx);
+    float3 g0 = mix(g00, g10, ty);
+    float3 g1 = mix(g01, g11, ty);
+    float3 grad = mix(g0, g1, tz);
+    float len = length(grad);
+    return len > 1e-8f ? normalize(grad) : float3(0.0f, 1.0f, 0.0f);
+}
+
 /// Marching cubes single-pass kernel (legacy fallback): each thread processes one voxel.
 /// Uses atomic counters per triangle, which causes contention with millions of voxels.
 kernel void marchingCubesSinglePass(
@@ -538,12 +585,8 @@ kernel void marchingCubesSinglePass(
     float3 edgeNormals[12];
     for (int e = 0; e < 12; e++) {
         if (edges & (1u << e)) {
-            // Find closest grid point to approximate gradient
             float3 gp = (edgeVerts[e] - origin) / sp;
-            uint gix = clamp(uint(gp.x + 0.5f), 0u, nx - 1u);
-            uint giy = clamp(uint(gp.y + 0.5f), 0u, ny - 1u);
-            uint giz = clamp(uint(gp.z + 0.5f), 0u, nz - 1u);
-            edgeNormals[e] = computeGradient(scalarField, gix, giy, giz, nx, ny, nz);
+            edgeNormals[e] = computeGradientInterpolated(scalarField, gp, nx, ny, nz);
         }
     }
 
@@ -736,10 +779,7 @@ kernel void marchingCubesEmit(
     for (int e = 0; e < 12; e++) {
         if (edges & (1u << e)) {
             float3 gp = (edgeVerts[e] - origin) / sp;
-            uint gix = clamp(uint(gp.x + 0.5f), 0u, nx - 1u);
-            uint giy = clamp(uint(gp.y + 0.5f), 0u, ny - 1u);
-            uint giz = clamp(uint(gp.z + 0.5f), 0u, nz - 1u);
-            edgeNormals[e] = computeGradient(scalarField, gix, giy, giz, nx, ny, nz);
+            edgeNormals[e] = computeGradientInterpolated(scalarField, gp, nx, ny, nz);
         }
     }
 
@@ -780,14 +820,15 @@ kernel void marchingCubesEmit(
 // MARK: - Electrostatic Potential Coloring
 // ============================================================================
 
-/// Compute electrostatic potential (ESP) coloring for surface vertices using
+/// Compute electrostatic potential (ESP) values for surface vertices using
 /// Coulomb's law with distance-dependent dielectric (Mehler-Solmajer model).
 /// Each thread processes one vertex.
-kernel void computeSurfaceESP(
+kernel void computeSurfaceESPValues(
     device SurfaceVertex       *vertices    [[buffer(0)]],
     constant SurfaceAtom       *atoms       [[buffer(1)]],
     constant SurfaceGridParams &params      [[buffer(2)]],
     device const uint          *vertexCount [[buffer(3)]],
+    device float               *outValues   [[buffer(4)]],
     uint                        tid         [[thread_position_in_grid]])
 {
     uint numVerts = vertexCount[0];
@@ -826,80 +867,50 @@ kernel void computeSurfaceESP(
         esp += kCoulomb * q / (eps * dist);
     }
 
-    // Adaptive scale: map ESP onto [-1, 1] for coloring
-    // Typical range is about +/-10 kcal/mol for druglike molecules
-    float normalized = clamp(esp / 10.0f, -1.0f, 1.0f);
-
-    float3 color;
-    if (normalized < 0.0f) {
-        // Negative potential (electron-rich): white -> red
-        float t = -normalized;
-        color = mix(float3(1.0f, 1.0f, 1.0f), float3(0.9f, 0.12f, 0.12f), t);
-    } else {
-        // Positive potential (electron-poor): white -> blue
-        float t = normalized;
-        color = mix(float3(1.0f, 1.0f, 1.0f), float3(0.12f, 0.22f, 0.92f), t);
-    }
-
-    vertices[tid].color = float4(color, 0.85f);
+    outValues[tid] = esp;
 }
 
 // ============================================================================
 // MARK: - Hydrophobicity Surface Coloring
 // ============================================================================
 
-/// Color surface by hydrophobicity: brown/tan for hydrophobic (C, S), blue for
-/// polar (N, O with charge), white for neutral. Each thread processes one vertex.
-kernel void computeSurfaceHydrophobicity(
+/// Compute smooth per-vertex hydrophobicity values by projecting nearby atom
+/// hydrophobicity scores onto the surface. Each thread processes one vertex.
+kernel void computeSurfaceHydrophobicityValues(
     device SurfaceVertex       *vertices    [[buffer(0)]],
     constant SurfaceAtom       *atoms       [[buffer(1)]],
     constant SurfaceGridParams &params      [[buffer(2)]],
     device const uint          *vertexCount [[buffer(3)]],
+    device float               *outValues   [[buffer(4)]],
     uint                        tid         [[thread_position_in_grid]])
 {
     uint numVerts = vertexCount[0];
     if (tid >= numVerts) return;
 
     float3 vertPos = float3(vertices[tid].position);
-
-    // Find nearest atom
+    float cutoff = 4.5f;
+    float cutoffSq = cutoff * cutoff;
+    float weighted = 0.0f;
+    float weightSum = 0.0f;
     float minDistSq = 1e20f;
-    uint nearestIdx = 0;
+    float nearestHydrophobicity = 0.0f;
+
     for (uint i = 0; i < params.numAtoms; i++) {
         float3 diff = vertPos - float3(atoms[i].position);
         float dSq = dot(diff, diff);
         if (dSq < minDistSq) {
             minDistSq = dSq;
-            nearestIdx = i;
+            nearestHydrophobicity = atoms[i].hydrophobicity;
         }
+        if (dSq > cutoffSq) {
+            continue;
+        }
+        float w = 1.0f / max(dSq, 0.25f);
+        weighted += atoms[i].hydrophobicity * w;
+        weightSum += w;
     }
 
-    uint anum = atoms[nearestIdx].atomicNum;
-    float q = atoms[nearestIdx].charge;
-
-    // Hydrophobicity classification
-    // C(6), S(16) without large charge => hydrophobic
-    // N(7), O(8) or any atom with |charge| > 0.3 => polar/hydrophilic
-    // Others => intermediate
-    float3 color;
-    if ((anum == 6 || anum == 16) && abs(q) < 0.3f) {
-        // Hydrophobic: golden brown
-        color = float3(0.82f, 0.62f, 0.18f);
-    } else if (anum == 7 || anum == 8 || abs(q) > 0.3f) {
-        // Hydrophilic/polar: blue-teal
-        color = float3(0.15f, 0.45f, 0.82f);
-    } else if (anum == 9 || anum == 17 || anum == 35 || anum == 53) {
-        // Halogens: slightly hydrophobic, pale green
-        color = float3(0.45f, 0.72f, 0.35f);
-    } else if (anum == 15) {
-        // Phosphorus: orange
-        color = float3(0.85f, 0.55f, 0.15f);
-    } else {
-        // Default: neutral gray-white
-        color = float3(0.85f, 0.85f, 0.85f);
-    }
-
-    vertices[tid].color = float4(color, 0.85f);
+    outValues[tid] = weightSum > 1e-6f ? weighted / weightSum : nearestHydrophobicity;
 }
 
 // ============================================================================
@@ -937,38 +948,27 @@ kernel void computeSurfacePharmacophore(
         }
     }
 
-    uint anum = atoms[nearestIdx].atomicNum;
-    float q = atoms[nearestIdx].charge;
-    uint aromatic = atoms[nearestIdx].isAromatic;
+    uint flags = atoms[nearestIdx].flags;
 
     float3 color;
-    if (aromatic == 1) {
-        // Aromatic: purple
-        color = float3(0.62f, 0.28f, 0.82f);
-    } else if (q > 0.3f && (anum == 7)) {
+    if (flags & SURFACE_ATOM_FLAG_POSITIVE) {
         // Positive charge (e.g., protonated amine): deep blue
         color = float3(0.10f, 0.25f, 0.90f);
-    } else if (q < -0.3f && (anum == 8)) {
+    } else if (flags & SURFACE_ATOM_FLAG_NEGATIVE) {
         // Negative charge (e.g., carboxylate): deep red
         color = float3(0.90f, 0.10f, 0.10f);
-    } else if (anum == 7 && q > 0.0f) {
+    } else if (flags & SURFACE_ATOM_FLAG_DONOR) {
         // N-H donor: sky blue
         color = float3(0.30f, 0.60f, 0.95f);
-    } else if (anum == 8 && q > 0.0f) {
-        // O-H donor: sky blue
-        color = float3(0.30f, 0.60f, 0.95f);
-    } else if (anum == 7 || anum == 8) {
+    } else if (flags & SURFACE_ATOM_FLAG_ACCEPTOR) {
         // N/O acceptor: red-pink
         color = float3(0.92f, 0.35f, 0.35f);
-    } else if (anum == 16) {
-        // Sulfur: dark yellow
-        color = float3(0.80f, 0.72f, 0.20f);
-    } else if (anum == 9 || anum == 17 || anum == 35 || anum == 53) {
-        // Halogens: green
-        color = float3(0.35f, 0.75f, 0.30f);
-    } else if (anum == 6) {
-        // Carbon: hydrophobic yellow
-        color = float3(0.92f, 0.82f, 0.30f);
+    } else if (flags & SURFACE_ATOM_FLAG_AROMATIC) {
+        // Aromatic: purple
+        color = float3(0.62f, 0.28f, 0.82f);
+    } else if (flags & SURFACE_ATOM_FLAG_HYDROPHOBIC) {
+        // Hydrophobe: warm yellow
+        color = float3(0.88f, 0.72f, 0.18f);
     } else {
         // Default: light gray
         color = float3(0.80f, 0.80f, 0.80f);
@@ -985,44 +985,8 @@ kernel void computeESPColoring(
     device const uint          *vertexCount [[buffer(3)]],
     uint                        tid         [[thread_position_in_grid]])
 {
-    // Delegate to the new implementation
     uint numVerts = vertexCount[0];
     if (tid >= numVerts) return;
 
-    float3 vertPos = float3(vertices[tid].position);
-    float esp = 0.0f;
-    float cutoff = 20.0f;
-    float cutoffSq = cutoff * cutoff;
-
-    const float kCoulomb = 332.06f;
-
-    for (uint i = 0; i < params.numAtoms; i++) {
-        float q = atoms[i].charge;
-        if (abs(q) < 1e-6f) continue;
-
-        float3 atomPos = float3(atoms[i].position);
-        float3 diff = vertPos - atomPos;
-        float distSq = dot(diff, diff);
-        if (distSq > cutoffSq) continue;
-
-        float dist = max(sqrt(distSq), 0.5f);
-        float A = -8.5525f;
-        float B = 78.4f - A;
-        float k = 7.7839f;
-        float lambda = 0.003627f;
-        float eps = A + B / (1.0f + k * exp(-lambda * B * dist));
-        eps = max(eps, 1.0f);
-        esp += kCoulomb * q / (eps * dist);
-    }
-
-    float normalized = clamp(esp / 10.0f, -1.0f, 1.0f);
-    float3 color;
-    if (normalized < 0.0f) {
-        float t = -normalized;
-        color = mix(float3(1.0f, 1.0f, 1.0f), float3(0.9f, 0.12f, 0.12f), t);
-    } else {
-        float t = normalized;
-        color = mix(float3(1.0f, 1.0f, 1.0f), float3(0.12f, 0.22f, 0.92f), t);
-    }
-    vertices[tid].color = float4(color, 0.85f);
+    vertices[tid].color = float4(0.82f, 0.84f, 0.86f, 0.85f);
 }

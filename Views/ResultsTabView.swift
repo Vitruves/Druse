@@ -60,25 +60,10 @@ struct ResultsTabView: View {
         .onChange(of: viewModel.docking.screeningHits.count) { _, _ in
             initializeCutoffsIfNeeded()
         }
-        .sheet(isPresented: Binding(
-            get: { viewModel.docking.showInteractionDiagram },
-            set: { viewModel.docking.showInteractionDiagram = $0 }
-        )) {
-            if let ligand = viewModel.molecules.ligand,
-               let protein = viewModel.molecules.protein,
-               viewModel.docking.interactionDiagramPoseIndex < viewModel.docking.dockingResults.count {
-                let idx = viewModel.docking.interactionDiagramPoseIndex
-                let result = viewModel.docking.dockingResults[idx]
-                InteractionDiagramView(
-                    interactions: viewModel.docking.currentInteractions,
-                    ligandAtoms: ligand.atoms.filter { $0.element != .H },
-                    ligandBonds: ligand.bonds,
-                    proteinAtoms: protein.atoms.filter { $0.element != .H },
-                    ligandSmiles: ligand.smiles ?? ligand.title,
-                    poseEnergy: result.energy,
-                    poseIndex: idx
-                )
-                .frame(minWidth: 650, minHeight: 550)
+        .onChange(of: viewModel.docking.showInteractionDiagram) { _, show in
+            if show {
+                openWindow(id: "interaction-diagram")
+                viewModel.docking.showInteractionDiagram = false
             }
         }
     }
@@ -95,8 +80,8 @@ struct ResultsTabView: View {
                     // Show ligand name with variant lineage if available
                     let displayName: String = {
                         if let entry = viewModel.ligandDB.entries.first(where: { $0.name == ligand.name || $0.smiles == (ligand.smiles ?? "") }) {
-                            if let lineage = entry.variantLineage {
-                                return "\(ligand.name) (\(lineage))"
+                            if let parent = entry.parentName {
+                                return "\(ligand.name) (from \(parent))"
                             }
                         }
                         return ligand.name

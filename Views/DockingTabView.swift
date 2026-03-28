@@ -432,14 +432,23 @@ struct DockingTabView: View {
                         vm.workspace.enableClipping = newValue
                         vm.renderer?.enableClipping = newValue
                         if newValue, let pocket = vm.docking.selectedPocket {
-                            // Set object-space slab center on the renderer
-                            let pocketRadius = max(pocket.size.x, max(pocket.size.y, pocket.size.z))
-                            let thickness = (pocketRadius + 6.0) * 2.0
-                            vm.workspace.slabThickness = thickness
-                            vm.workspace.slabOffset = 0
-                            vm.renderer?.slabCenter = pocket.center
-                            vm.renderer?.slabHalfThickness = thickness / 2.0
-                            vm.renderer?.slabOffset = 0
+                            // Zoom camera to pocket and set slab clipping
+                            viewModel.focusOnPocket(pocket)
+                            // Auto-enable molecular surface for cavity visualization
+                            if !vm.workspace.showSurface {
+                                viewModel.toggleSurface()
+                            }
+                            // Set semi-transparent surface so ligand is visible inside
+                            if vm.workspace.surfaceOpacity > 0.7 {
+                                vm.workspace.surfaceOpacity = 0.55
+                                vm.renderer?.surfaceOpacity = 0.55
+                            }
+                        } else if !newValue {
+                            // Disable: remove surface if we auto-enabled it, restore full view
+                            if vm.workspace.showSurface {
+                                viewModel.toggleSurface()
+                            }
+                            viewModel.fitToView()
                         }
                     }
                 ))
@@ -539,6 +548,8 @@ struct DockingTabView: View {
         viewModel.renderer?.slabCenter = pocket.center
         viewModel.renderer?.slabHalfThickness = thickness / 2.0
         viewModel.renderer?.slabOffset = 0
+        // Re-focus camera on pocket for the chosen slab width
+        viewModel.focusOnPocket(pocket)
     }
 
     // MARK: - Docking Configuration
@@ -1202,49 +1213,6 @@ struct DockingTabView: View {
             Divider()
                 .padding(.vertical, 2)
 
-            // Ensemble multi-start docking
-            if !viewModel.docking.ligandForms.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle(isOn: Binding(
-                        get: { viewModel.docking.dockingConfig.ensemble.enabled },
-                        set: { viewModel.docking.dockingConfig.ensemble.enabled = $0 }
-                    )) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.triangle.branch")
-                                .font(.footnote)
-                            Text("Ensemble docking")
-                                .font(.subheadline)
-                            let forms = viewModel.docking.ligandForms
-                            let qualifying = forms.filter { $0.boltzmannWeight >= viewModel.docking.dockingConfig.ensemble.populationCutoff }
-                            Text("(\(qualifying.count) forms)")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.checkbox)
-                    .controlSize(.mini)
-                    .help("Dock all qualifying tautomers/protomers x conformers as separate GA starting geometries")
-
-                    if viewModel.docking.dockingConfig.ensemble.enabled {
-                        HStack {
-                            Text("Pop. cutoff")
-                                .font(.footnote)
-                            Spacer()
-                            Text("\(String(format: "%.0f", viewModel.docking.dockingConfig.ensemble.populationCutoff * 100))%")
-                                .font(.footnote.monospaced())
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { viewModel.docking.dockingConfig.ensemble.populationCutoff },
-                                set: { viewModel.docking.dockingConfig.ensemble.populationCutoff = $0 }
-                            ),
-                            in: 0.01...0.50, step: 0.01
-                        )
-                        .controlSize(.mini)
-                    }
-                }
-            }
-
             // Post-docking refinement options
             VStack(alignment: .leading, spacing: 4) {
                 Text("Post-docking Refinement")
@@ -1455,16 +1423,9 @@ struct DockingTabView: View {
                 // Compact generation counter
                 let gen = viewModel.docking.dockingGeneration + 1
                 let total = viewModel.docking.dockingTotalGenerations
-                let ep = viewModel.docking.ensembleProgress
-                if ep.total > 1 {
-                    Text("Start \(ep.current + 1)/\(ep.total) Gen \(gen)/\(total)")
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Gen \(gen)/\(total)")
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
+                Text("Gen \(gen)/\(total)")
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
             }
 
             // Compact progress bar

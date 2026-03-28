@@ -79,6 +79,7 @@ struct WorkspaceState {
     var surfaceGridSpacing: Float = 0.5  // Å — finer = more detail but slower
     var isGeneratingSurface: Bool = false
     var surfaceGenerator: SurfaceGenerator?
+    var surfaceLegend: SurfaceLegend?
 
     // Background
     var backgroundOpacity: Float = 1.0   // 0 = fully transparent gradient → white, 1 = normal
@@ -103,12 +104,18 @@ struct WorkspaceState {
     /// nil = follow global renderMode, otherwise uses this specific mode for the ligand.
     var ligandRenderMode: RenderMode? = nil
 
+    /// Effective ligand mode used by the renderer and UI.
+    /// In ribbon mode, ligand defaults to ball-and-stick instead of inheriting ribbon.
+    var effectiveLigandRenderMode: RenderMode {
+        ligandRenderMode ?? (renderMode == .ribbon ? .ballAndStick : renderMode)
+    }
+
     // Selection
     enum SelectionMode: String, CaseIterable, Sendable {
         case atom = "Atom"
         case residue = "Residue"
     }
-    var selectionMode: SelectionMode = .atom
+    var selectionMode: SelectionMode = .residue
     var selectedAtomIndex: Int? = nil
     var selectedAtomIndices: Set<Int> = []
     var selectedResidueIndices: Set<Int> = []

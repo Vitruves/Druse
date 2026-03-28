@@ -46,11 +46,17 @@ struct MetalView: NSViewRepresentable {
             mtkView.clearColor = MTLClearColor(red: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
         }
         mtkView.preferredFramesPerSecond = 60
-        mtkView.isPaused = false
-        mtkView.enableSetNeedsDisplay = false
+        mtkView.isPaused = true
+        mtkView.enableSetNeedsDisplay = true
+
+        // Give the renderer a weak ref so it can request on-demand redraws
+        renderer.mtkView = mtkView
 
         // Accept touch events (modern API)
         mtkView.allowedTouchTypes = .indirect
+
+        // Trigger the initial frame
+        mtkView.needsDisplay = true
 
         return mtkView
     }
@@ -364,16 +370,24 @@ class MetalMTKView: MTKView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// Request a redraw after any user interaction that changes the scene.
+    private func requestRedraw() {
+        needsDisplay = true
+    }
+
     override func mouseDown(with event: NSEvent) {
         coordinator?.handleMouseDown(event, in: self)
+        requestRedraw()
     }
 
     override func mouseDragged(with event: NSEvent) {
         coordinator?.handleMouseDragged(event, in: self)
+        requestRedraw()
     }
 
     override func mouseUp(with event: NSEvent) {
         coordinator?.handleMouseUp(event, in: self)
+        requestRedraw()
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -390,26 +404,32 @@ class MetalMTKView: MTKView {
 
     override func otherMouseDown(with event: NSEvent) {
         coordinator?.handleMiddleMouseDown(event, in: self)
+        requestRedraw()
     }
 
     override func otherMouseDragged(with event: NSEvent) {
         coordinator?.handleMiddleMouseDragged(event, in: self)
+        requestRedraw()
     }
 
     override func otherMouseUp(with event: NSEvent) {
         coordinator?.handleMiddleMouseUp(event, in: self)
+        requestRedraw()
     }
 
     override func scrollWheel(with event: NSEvent) {
         coordinator?.handleScrollWheel(event, in: self)
+        requestRedraw()
     }
 
     override func magnify(with event: NSEvent) {
         coordinator?.handleMagnify(event, in: self)
+        requestRedraw()
     }
 
     override func keyDown(with event: NSEvent) {
         coordinator?.handleKeyDown(event)
+        requestRedraw()
     }
 
     override func becomeFirstResponder() -> Bool { true }

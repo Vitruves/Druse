@@ -170,6 +170,9 @@ struct ContentView: View {
                 moleculeBadges
                 Spacer()
                 VStack(alignment: .trailing, spacing: 8) {
+                    if viewModel.workspace.showSurface, let legend = viewModel.workspace.surfaceLegend {
+                        SurfaceLegendView(mode: viewModel.workspace.surfaceColorMode, legend: legend)
+                    }
                     if !viewModel.docking.currentInteractions.isEmpty {
                         InteractionLegendView(interactions: viewModel.docking.currentInteractions)
                     }
@@ -346,7 +349,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(isActive ? .primary : .secondary)
-                .help(mode.rawValue)
+                .nativeTooltip(mode.rawValue)
                 .plainButtonAccessibility(AccessibilityID.renderMode(mode.rawValue))
             }
 
@@ -381,7 +384,7 @@ struct ContentView: View {
                 .menuStyle(.borderlessButton)
                 .frame(width: 34)
                 .foregroundStyle(scActive ? .purple : .secondary)
-                .help("Side chains: \(viewModel.workspace.sideChainDisplay.rawValue)")
+                .nativeTooltip("Side chains: \(viewModel.workspace.sideChainDisplay.rawValue)")
             }
 
             Divider()
@@ -405,7 +408,7 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .foregroundStyle(hAvailable ? (hActive ? .primary : .secondary) : .tertiary)
             .disabled(!hAvailable)
-            .help(hAvailable ? (hActive ? "Hide hydrogens" : "Show hydrogens") : "No hydrogens — add them in Preparation")
+            .nativeTooltip(hAvailable ? (hActive ? "Hide hydrogens" : "Show hydrogens") : "No hydrogens — add them in Preparation")
             .plainButtonAccessibility(AccessibilityID.renderHydrogens)
 
             // Color scheme picker (ligand focus coloring)
@@ -438,7 +441,7 @@ struct ContentView: View {
             .menuStyle(.borderlessButton)
             .frame(width: 34)
             .foregroundStyle(isLigandFocus ? .yellow : .secondary)
-            .help("Color scheme: \(viewModel.workspace.colorScheme.rawValue)")
+            .nativeTooltip("Color scheme: \(viewModel.workspace.colorScheme.rawValue)")
 
             // Molecular surface toggle
             let surfActive = viewModel.workspace.showSurface
@@ -456,7 +459,7 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .foregroundStyle(surfActive ? .primary : .secondary)
             .disabled(viewModel.molecules.protein == nil || viewModel.workspace.isGeneratingSurface)
-            .help(surfActive ? "Hide molecular surface" : "Show molecular surface")
+            .nativeTooltip(surfActive ? "Hide molecular surface" : "Show molecular surface")
             .plainButtonAccessibility(AccessibilityID.renderSurface)
 
             // Surface color mode picker and opacity (only when surface is visible)
@@ -487,7 +490,7 @@ struct ContentView: View {
                 .menuStyle(.borderlessButton)
                 .frame(width: 34)
                 .foregroundStyle(scmActive ? .yellow : .secondary)
-                .help("Surface coloring: \(viewModel.workspace.surfaceColorMode.rawValue)")
+                .nativeTooltip("Surface coloring: \(viewModel.workspace.surfaceColorMode.rawValue)")
 
                 // Surface opacity slider
                 Slider(value: Binding(
@@ -496,7 +499,7 @@ struct ContentView: View {
                 ), in: 0.1...1.0)
                 .frame(width: 60)
                 .controlSize(.small)
-                .help("Surface opacity: \(Int(viewModel.workspace.surfaceOpacity * 100))%")
+                .nativeTooltip("Surface opacity: \(Int(viewModel.workspace.surfaceOpacity * 100))%")
 
                 // Probe radius control (affects channel/pocket size visibility)
                 Menu {
@@ -515,7 +518,7 @@ struct ContentView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .frame(width: 22)
-                .help("Probe: \(String(format: "%.1f", viewModel.workspace.surfaceProbeRadius)) Å, Grid: \(String(format: "%.1f", viewModel.workspace.surfaceGridSpacing)) Å")
+                .nativeTooltip("Probe: \(String(format: "%.1f", viewModel.workspace.surfaceProbeRadius)) Å, Grid: \(String(format: "%.1f", viewModel.workspace.surfaceGridSpacing)) Å")
             }
 
             // Lighting toggle
@@ -533,7 +536,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(lightActive ? .primary : .secondary)
-            .help(lightActive ? "Uniform lighting" : "Directional lighting")
+            .nativeTooltip(lightActive ? "Uniform lighting" : "Directional lighting")
             .plainButtonAccessibility(AccessibilityID.renderLighting)
 
             Divider()
@@ -558,7 +561,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(clipActive ? .orange : .secondary)
-            .help("Z-slab clipping")
+            .nativeTooltip("Z-slab clipping")
             .plainButtonAccessibility(AccessibilityID.renderClipping)
 
             if viewModel.workspace.enableClipping {
@@ -623,7 +626,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help("Fit to view (Space)")
+            .nativeTooltip("Fit to view (Space)")
             .plainButtonAccessibility(AccessibilityID.renderFitToView)
 
             Button(action: { viewModel.fitToLigand() }) {
@@ -637,7 +640,7 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .disabled(viewModel.molecules.ligand == nil)
-            .help("Center on ligand")
+            .nativeTooltip("Center on ligand")
             .plainButtonAccessibility(AccessibilityID.renderFitToLigand)
 
             Button(action: { viewModel.renderer?.camera.reset(); viewModel.pushToRenderer() }) {
@@ -650,7 +653,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help("Reset camera")
+            .nativeTooltip("Reset camera")
             .plainButtonAccessibility(AccessibilityID.renderResetCamera)
         }
     }

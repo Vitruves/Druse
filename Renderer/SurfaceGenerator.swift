@@ -8,8 +8,8 @@ private struct GPUSurfaceAtom {
     var vdwRadius: Float = 0
     var charge: Float = 0
     var atomicNum: UInt32 = 0
-    var isAromatic: UInt32 = 0
-    var _pad0: Float = 0
+    var flags: UInt32 = 0
+    var hydrophobicity: Float = 0
 }
 
 // MARK: - GPU Surface Grid Params (must match SurfaceGridParams in SurfaceCompute.metal)
@@ -51,6 +51,21 @@ enum SurfaceColorMode: String, CaseIterable {
     case pharmacophore = "Pharmacophore"
 }
 
+struct SurfaceLegend: Sendable {
+    struct Entry: Sendable {
+        let label: String
+        let color: SIMD4<Float>
+    }
+
+    enum Kind: Sendable {
+        case gradient(minLabel: String, midLabel: String?, maxLabel: String, colors: [SIMD4<Float>])
+        case categorical([Entry])
+    }
+
+    let title: String
+    let kind: Kind
+}
+
 // MARK: - Surface Generation Result
 
 struct SurfaceResult {
@@ -58,6 +73,7 @@ struct SurfaceResult {
     let indexBuffer: MTLBuffer
     let vertexCount: Int
     let indexCount: Int
+    let legend: SurfaceLegend?
 }
 
 // MARK: - Surface Generator
@@ -78,8 +94,8 @@ final class SurfaceGenerator {
     private let marchingCubesSinglePassPipeline: MTLComputePipelineState
     private let marchingCubesCountPipeline: MTLComputePipelineState
     private let marchingCubesEmitPipeline: MTLComputePipelineState
-    private let espColoringPipeline: MTLComputePipelineState
-    private let hydrophobicityPipeline: MTLComputePipelineState
+    private let espValuePipeline: MTLComputePipelineState
+    private let hydrophobicityValuePipeline: MTLComputePipelineState
     private let pharmacophorePipeline: MTLComputePipelineState
 
     // Configuration
@@ -129,15 +145,15 @@ final class SurfaceGenerator {
         }
         self.marchingCubesEmitPipeline = try device.makeComputePipelineState(function: mcEmitFn)
 
-        guard let espFn = lib.makeFunction(name: "computeSurfaceESP") else {
-            throw SurfaceGeneratorError.kernelNotFound("computeSurfaceESP")
+        guard let espFn = lib.makeFunction(name: "computeSurfaceESPValues") else {
+            throw SurfaceGeneratorError.kernelNotFound("computeSurfaceESPValues")
         }
-        self.espColoringPipeline = try device.makeComputePipelineState(function: espFn)
+        self.espValuePipeline = try device.makeComputePipelineState(function: espFn)
 
-        guard let hydroFn = lib.makeFunction(name: "computeSurfaceHydrophobicity") else {
-            throw SurfaceGeneratorError.kernelNotFound("computeSurfaceHydrophobicity")
+        guard let hydroFn = lib.makeFunction(name: "computeSurfaceHydrophobicityValues") else {
+            throw SurfaceGeneratorError.kernelNotFound("computeSurfaceHydrophobicityValues")
         }
-        self.hydrophobicityPipeline = try device.makeComputePipelineState(function: hydroFn)
+        self.hydrophobicityValuePipeline = try device.makeComputePipelineState(function: hydroFn)
 
         guard let pharmacoFn = lib.makeFunction(name: "computeSurfacePharmacophore") else {
             throw SurfaceGeneratorError.kernelNotFound("computeSurfacePharmacophore")
@@ -160,14 +176,7 @@ final class SurfaceGenerator {
 
         // Prepare GPU atom data
         let gpuAtoms = atoms.map { atom -> GPUSurfaceAtom in
-            GPUSurfaceAtom(
-                position: (atom.position.x, atom.position.y, atom.position.z),
-                vdwRadius: atom.element.vdwRadius,
-                charge: abs(atom.charge) > 0.0001 ? atom.charge : Float(atom.formalCharge),
-                atomicNum: UInt32(atom.element.rawValue),
-                isAromatic: 0,
-                _pad0: 0
-            )
+            makeSurfaceAtom(from: atom)
         }
 
         return generateSurface(
@@ -200,8 +209,8 @@ final class SurfaceGenerator {
                 vdwRadius: radii[i],
                 charge: charges[i],
                 atomicNum: 6, // default to carbon for raw arrays
-                isAromatic: 0,
-                _pad0: 0
+                flags: SurfaceAtomFlags.hydrophobic,
+                hydrophobicity: 0.35
             )
         }
 
@@ -440,25 +449,8 @@ final class SurfaceGenerator {
         }
 
         // Surface coloring (optional, based on colorMode)
-        // For coloring kernels, we store the vertex count in a small buffer
+        let legend: SurfaceLegend?
         if colorMode != .uniform {
-            let colorPipeline: MTLComputePipelineState
-            let label: String
-            switch colorMode {
-            case .esp:
-                colorPipeline = espColoringPipeline
-                label = "ESPColoring"
-            case .hydrophobicity:
-                colorPipeline = hydrophobicityPipeline
-                label = "HydrophobicityColoring"
-            case .pharmacophore:
-                colorPipeline = pharmacophorePipeline
-                label = "PharmacophoreColoring"
-            case .uniform:
-                fatalError("unreachable")
-            }
-
-            // The coloring kernels read vertexCount[0] to know how many vertices to process
             guard let vertexCounterBuffer = device.makeBuffer(
                 length: MemoryLayout<UInt32>.stride,
                 options: .storageModeShared
@@ -467,28 +459,88 @@ final class SurfaceGenerator {
             vertexCounterBuffer.contents()
                 .bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(totalVertices)
 
-            if let encoder = cmdBuf2.makeComputeCommandEncoder() {
-                encoder.label = label
-                encoder.setComputePipelineState(colorPipeline)
-                encoder.setBuffer(vertexBuffer, offset: 0, index: 0)
-                encoder.setBuffer(atomBuffer, offset: 0, index: 1)
-                encoder.setBuffer(paramsBuffer, offset: 0, index: 2)
-                encoder.setBuffer(vertexCounterBuffer, offset: 0, index: 3)
+            switch colorMode {
+            case .esp, .hydrophobicity:
+                guard let metricBuffer = device.makeBuffer(
+                    length: totalVertices * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                ) else { return nil }
+                metricBuffer.label = colorMode == .esp ? "SurfaceESPValues" : "SurfaceHydrophobicityValues"
 
-                let dispatchCount = totalVertices
-                let threadGroupSize = min(
-                    colorPipeline.maxTotalThreadsPerThreadgroup,
-                    dispatchCount
+                if let encoder = cmdBuf2.makeComputeCommandEncoder() {
+                    encoder.label = colorMode == .esp ? "ESPValues" : "HydrophobicityValues"
+                    encoder.setComputePipelineState(colorMode == .esp ? espValuePipeline : hydrophobicityValuePipeline)
+                    encoder.setBuffer(vertexBuffer, offset: 0, index: 0)
+                    encoder.setBuffer(atomBuffer, offset: 0, index: 1)
+                    encoder.setBuffer(paramsBuffer, offset: 0, index: 2)
+                    encoder.setBuffer(vertexCounterBuffer, offset: 0, index: 3)
+                    encoder.setBuffer(metricBuffer, offset: 0, index: 4)
+
+                    let dispatchCount = totalVertices
+                    let pipeline = colorMode == .esp ? espValuePipeline : hydrophobicityValuePipeline
+                    let threadGroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, dispatchCount)
+                    let threadGroups = MTLSize(
+                        width: (dispatchCount + threadGroupSize - 1) / threadGroupSize,
+                        height: 1,
+                        depth: 1
+                    )
+                    let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
+                    encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadsPerGroup)
+                    encoder.endEncoding()
+                }
+                legend = nil
+                cmdBuf2.commit()
+                cmdBuf2.waitUntilCompleted()
+                let computedLegend = applyMetricColors(
+                    to: vertexBuffer,
+                    vertexCount: totalVertices,
+                    values: metricBuffer,
+                    mode: colorMode
                 )
-                let threadGroups = MTLSize(
-                    width: (dispatchCount + threadGroupSize - 1) / threadGroupSize,
-                    height: 1,
-                    depth: 1
+                ActivityLog.shared.debug("[Surface] Complete: \(totalVertices) vertices, \(totalTriangles) triangles, grid \(nx)x\(ny)x\(nz)", category: .render)
+                return SurfaceResult(
+                    vertexBuffer: vertexBuffer,
+                    indexBuffer: indexBuffer,
+                    vertexCount: totalVertices,
+                    indexCount: totalIndices,
+                    legend: computedLegend
                 )
-                let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
-                encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadsPerGroup)
-                encoder.endEncoding()
+            case .pharmacophore:
+                if let encoder = cmdBuf2.makeComputeCommandEncoder() {
+                    encoder.label = "PharmacophoreColoring"
+                    encoder.setComputePipelineState(pharmacophorePipeline)
+                    encoder.setBuffer(vertexBuffer, offset: 0, index: 0)
+                    encoder.setBuffer(atomBuffer, offset: 0, index: 1)
+                    encoder.setBuffer(paramsBuffer, offset: 0, index: 2)
+                    encoder.setBuffer(vertexCounterBuffer, offset: 0, index: 3)
+
+                    let dispatchCount = totalVertices
+                    let threadGroupSize = min(pharmacophorePipeline.maxTotalThreadsPerThreadgroup, dispatchCount)
+                    let threadGroups = MTLSize(
+                        width: (dispatchCount + threadGroupSize - 1) / threadGroupSize,
+                        height: 1,
+                        depth: 1
+                    )
+                    let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
+                    encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadsPerGroup)
+                    encoder.endEncoding()
+                }
+                legend = SurfaceLegend(
+                    title: "Pharmacophore",
+                    kind: .categorical([
+                        .init(label: "Donor", color: SIMD4(0.30, 0.60, 0.95, 1.0)),
+                        .init(label: "Acceptor", color: SIMD4(0.92, 0.35, 0.35, 1.0)),
+                        .init(label: "Positive", color: SIMD4(0.10, 0.25, 0.90, 1.0)),
+                        .init(label: "Negative", color: SIMD4(0.90, 0.10, 0.10, 1.0)),
+                        .init(label: "Aromatic", color: SIMD4(0.62, 0.28, 0.82, 1.0)),
+                        .init(label: "Hydrophobe", color: SIMD4(0.88, 0.72, 0.18, 1.0))
+                    ])
+                )
+            case .uniform:
+                fatalError("unreachable")
             }
+        } else {
+            legend = nil
         }
 
         cmdBuf2.commit()
@@ -499,8 +551,269 @@ final class SurfaceGenerator {
             vertexBuffer: vertexBuffer,
             indexBuffer: indexBuffer,
             vertexCount: totalVertices,
-            indexCount: totalIndices
+            indexCount: totalIndices,
+            legend: legend
         )
+    }
+
+    // MARK: - Surface Chemistry
+
+    private func makeSurfaceAtom(from atom: Atom) -> GPUSurfaceAtom {
+        let atomName = atom.name.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let residue = atom.residueName.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let charge = abs(atom.charge) > 0.0001 ? atom.charge : Float(atom.formalCharge)
+        var flags: UInt32 = 0
+
+        if Self.isAromaticAtom(atomName, residue: residue) {
+            flags |= SurfaceAtomFlags.aromatic
+        }
+        if Self.isDonor(atom: atom, atomName: atomName, residue: residue) {
+            flags |= SurfaceAtomFlags.donor
+        }
+        if Self.isAcceptor(atom: atom, atomName: atomName, residue: residue) {
+            flags |= SurfaceAtomFlags.acceptor
+        }
+        if Self.isPositivelyCharged(atom: atom, atomName: atomName, residue: residue, charge: charge) {
+            flags |= SurfaceAtomFlags.positive
+        }
+        if Self.isNegativelyCharged(atom: atom, atomName: atomName, residue: residue, charge: charge) {
+            flags |= SurfaceAtomFlags.negative
+        }
+        if Self.isHydrophobic(atom: atom, atomName: atomName, residue: residue) {
+            flags |= SurfaceAtomFlags.hydrophobic
+        }
+
+        return GPUSurfaceAtom(
+            position: (atom.position.x, atom.position.y, atom.position.z),
+            vdwRadius: atom.element.vdwRadius,
+            charge: charge,
+            atomicNum: UInt32(atom.element.rawValue),
+            flags: flags,
+            hydrophobicity: Self.normalizedHydrophobicity(for: residue)
+        )
+    }
+
+    private func applyMetricColors(
+        to vertexBuffer: MTLBuffer,
+        vertexCount: Int,
+        values metricBuffer: MTLBuffer,
+        mode: SurfaceColorMode
+    ) -> SurfaceLegend {
+        let vertices = vertexBuffer.contents().bindMemory(to: GPUSurfaceVertex.self, capacity: vertexCount)
+        let values = metricBuffer.contents().bindMemory(to: Float.self, capacity: vertexCount)
+
+        switch mode {
+        case .esp:
+            let maxAbs = robustSymmetricScale(values: values, count: vertexCount, fallback: 5.0)
+            for i in 0..<vertexCount {
+                let value = values[i]
+                let normalized = simd_clamp(value / maxAbs, -1.0, 1.0)
+                let color: SIMD4<Float>
+                if normalized < 0 {
+                    let t = -normalized
+                    color = SIMD4(Self.mix(SIMD3(0.98, 0.98, 0.98), SIMD3(0.90, 0.16, 0.16), t), 0.85)
+                } else {
+                    let t = normalized
+                    color = SIMD4(Self.mix(SIMD3(0.98, 0.98, 0.98), SIMD3(0.14, 0.26, 0.92), t), 0.85)
+                }
+                vertices[i].color = color
+            }
+            return SurfaceLegend(
+                title: "Electrostatic",
+                kind: .gradient(
+                    minLabel: String(format: "-%.1f", maxAbs),
+                    midLabel: "0",
+                    maxLabel: String(format: "+%.1f", maxAbs),
+                    colors: [
+                        SIMD4(0.90, 0.16, 0.16, 1.0),
+                        SIMD4(0.98, 0.98, 0.98, 1.0),
+                        SIMD4(0.14, 0.26, 0.92, 1.0)
+                    ]
+                )
+            )
+        case .hydrophobicity:
+            let range = robustRange(values: values, count: vertexCount, fallbackMin: -1.0, fallbackMax: 1.0)
+            let negativeScale = max(abs(min(range.min, 0)), 0.05)
+            let positiveScale = max(range.max, 0.05)
+            for i in 0..<vertexCount {
+                let value = values[i]
+                let color: SIMD4<Float>
+                if value < 0 {
+                    let t = simd_clamp(-value / negativeScale, 0.0, 1.0)
+                    color = SIMD4(Self.mix(SIMD3(0.96, 0.97, 0.98), SIMD3(0.16, 0.45, 0.84), t), 0.85)
+                } else {
+                    let t = simd_clamp(value / positiveScale, 0.0, 1.0)
+                    color = SIMD4(Self.mix(SIMD3(0.96, 0.97, 0.98), SIMD3(0.86, 0.64, 0.18), t), 0.85)
+                }
+                vertices[i].color = color
+            }
+            return SurfaceLegend(
+                title: "Hydrophobicity",
+                kind: .gradient(
+                    minLabel: String(format: "%.2f", range.min),
+                    midLabel: "0",
+                    maxLabel: String(format: "%.2f", range.max),
+                    colors: [
+                        SIMD4(0.16, 0.45, 0.84, 1.0),
+                        SIMD4(0.96, 0.97, 0.98, 1.0),
+                        SIMD4(0.86, 0.64, 0.18, 1.0)
+                    ]
+                )
+            )
+        case .uniform, .pharmacophore:
+            return SurfaceLegend(
+                title: "",
+                kind: .categorical([])
+            )
+        }
+    }
+
+    private func robustSymmetricScale(values: UnsafePointer<Float>, count: Int, fallback: Float) -> Float {
+        let step = max(1, count / 4096)
+        var samples: [Float] = []
+        samples.reserveCapacity((count + step - 1) / step)
+        for i in stride(from: 0, to: count, by: step) {
+            samples.append(abs(values[i]))
+        }
+        let percentile = Self.percentile(samples, q: 0.95)
+        return max(percentile, fallback)
+    }
+
+    private func robustRange(values: UnsafePointer<Float>, count: Int, fallbackMin: Float, fallbackMax: Float) -> (min: Float, max: Float) {
+        let step = max(1, count / 4096)
+        var samples: [Float] = []
+        samples.reserveCapacity((count + step - 1) / step)
+        for i in stride(from: 0, to: count, by: step) {
+            samples.append(values[i])
+        }
+        let lo = Self.percentile(samples, q: 0.05)
+        let hi = Self.percentile(samples, q: 0.95)
+        if hi - lo < 0.1 {
+            return (fallbackMin, fallbackMax)
+        }
+        return (lo, hi)
+    }
+
+    private static func percentile(_ values: [Float], q: Float) -> Float {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let pos = Int(Float(sorted.count - 1) * simd_clamp(q, 0, 1))
+        return sorted[pos]
+    }
+
+    private static func mix(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
+        a + (b - a) * t
+    }
+
+    private enum SurfaceAtomFlags {
+        static let donor: UInt32 = 1 << 0
+        static let acceptor: UInt32 = 1 << 1
+        static let aromatic: UInt32 = 1 << 2
+        static let positive: UInt32 = 1 << 3
+        static let negative: UInt32 = 1 << 4
+        static let hydrophobic: UInt32 = 1 << 5
+    }
+
+    private static let residueHydrophobicity: [String: Float] = [
+        "ILE": 4.5, "VAL": 4.2, "LEU": 3.8, "PHE": 2.8, "CYS": 2.5,
+        "MET": 1.9, "ALA": 1.8, "GLY": -0.4, "THR": -0.7, "SER": -0.8,
+        "TRP": -0.9, "TYR": -1.3, "PRO": -1.6, "HIS": -3.2, "GLU": -3.5,
+        "GLN": -3.5, "ASP": -3.5, "ASN": -3.5, "LYS": -3.9, "ARG": -4.5
+    ]
+
+    private static let aromaticAtoms: [String: Set<String>] = [
+        "PHE": ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+        "TYR": ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+        "TRP": ["CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"],
+        "HIS": ["CG", "ND1", "CD2", "CE1", "NE2"]
+    ]
+
+    private static let donorAtoms: [String: Set<String>] = [
+        "ARG": ["NE", "NH1", "NH2"],
+        "ASN": ["ND2"],
+        "GLN": ["NE2"],
+        "HIS": ["ND1", "NE2"],
+        "LYS": ["NZ"],
+        "SER": ["OG"],
+        "THR": ["OG1"],
+        "TRP": ["NE1"],
+        "TYR": ["OH"],
+        "CYS": ["SG"]
+    ]
+
+    private static let acceptorAtoms: [String: Set<String>] = [
+        "ASP": ["OD1", "OD2"],
+        "GLU": ["OE1", "OE2"],
+        "ASN": ["OD1"],
+        "GLN": ["OE1"],
+        "HIS": ["ND1", "NE2"],
+        "SER": ["OG"],
+        "THR": ["OG1"],
+        "CYS": ["SG"],
+        "MET": ["SD"]
+    ]
+
+    private static let hydrophobicResidues: Set<String> = [
+        "ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "TYR", "PRO", "CYS"
+    ]
+
+    private static let positiveAtoms: [String: Set<String>] = [
+        "LYS": ["NZ"],
+        "ARG": ["NE", "NH1", "NH2"],
+        "HIS": ["ND1", "NE2"]
+    ]
+
+    private static let negativeAtoms: [String: Set<String>] = [
+        "ASP": ["OD1", "OD2"],
+        "GLU": ["OE1", "OE2"]
+    ]
+
+    private static func normalizedHydrophobicity(for residue: String) -> Float {
+        let raw = residueHydrophobicity[residue, default: 0]
+        return simd_clamp(raw / 4.5, -1.0, 1.0)
+    }
+
+    private static func isAromaticAtom(_ atomName: String, residue: String) -> Bool {
+        aromaticAtoms[residue]?.contains(atomName) == true
+    }
+
+    private static func isDonor(atom: Atom, atomName: String, residue: String) -> Bool {
+        if atom.element == .N && atomName == "N" && residue != "PRO" {
+            return true
+        }
+        return donorAtoms[residue]?.contains(atomName) == true
+    }
+
+    private static func isAcceptor(atom: Atom, atomName: String, residue: String) -> Bool {
+        if atom.element == .O && (atomName == "O" || atomName == "OXT") {
+            return true
+        }
+        return acceptorAtoms[residue]?.contains(atomName) == true
+    }
+
+    private static func isPositivelyCharged(atom: Atom, atomName: String, residue: String, charge: Float) -> Bool {
+        if charge > 0.25 {
+            return true
+        }
+        return positiveAtoms[residue]?.contains(atomName) == true && atom.formalCharge >= 0
+    }
+
+    private static func isNegativelyCharged(atom: Atom, atomName: String, residue: String, charge: Float) -> Bool {
+        if charge < -0.25 {
+            return true
+        }
+        return negativeAtoms[residue]?.contains(atomName) == true
+    }
+
+    private static func isHydrophobic(atom: Atom, atomName: String, residue: String) -> Bool {
+        let backbone = ["N", "CA", "C", "O", "OXT"]
+        if backbone.contains(atomName) {
+            return false
+        }
+        if atom.element == .F || atom.element == .Cl || atom.element == .Br {
+            return true
+        }
+        return hydrophobicResidues.contains(residue) && (atom.element == .C || atom.element == .S)
     }
 }
 

@@ -290,7 +290,7 @@ struct InspectorPanel: View {
                     get: { viewModel.workspace.selectionMode },
                     set: { viewModel.workspace.selectionMode = $0 }
                 )) {
-                    ForEach(WorkspaceState.SelectionMode.allCases, id: \.self) { mode in
+                    ForEach([WorkspaceState.SelectionMode.residue, .atom], id: \.self) { mode in
                         Text(mode.rawValue).tag(mode)
                     }
                 }
@@ -834,10 +834,9 @@ struct InspectorPanel: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Picker("", selection: Binding(
-                                get: { viewModel.workspace.ligandRenderMode ?? viewModel.workspace.renderMode },
+                                get: { viewModel.workspace.effectiveLigandRenderMode },
                                 set: { newMode in
-                                    viewModel.workspace.ligandRenderMode = newMode
-                                    viewModel.pushToRenderer()
+                                    viewModel.setLigandRenderMode(newMode)
                                 }
                             )) {
                                 Text("Stick").tag(RenderMode.wireframe)

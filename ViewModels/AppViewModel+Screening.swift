@@ -142,41 +142,20 @@ extension AppViewModel {
                 docking.dockingGeneration = 0
                 docking.dockingTotalGenerations = batchConfig.numGenerations
 
-                // Build ensemble starts for this entry
-                let ensembleCfg = batchConfig.ensemble
-                let starts = buildEnsembleStartingMolecules(
-                    primaryLigand: mol, forms: entry.forms, config: ensembleCfg
-                )
-
+                // One entry = one docking job (flat model, no ensemble)
                 var entryResults: [DockingResult] = []
-                for start in starts {
+                do {
                     guard !Task.isCancelled, docking.isBatchDocking else { break }
                     let startResults = await engine.runDocking(
-                        ligand: start.molecule, pocket: pocket,
+                        ligand: mol, pocket: pocket,
                         config: batchConfig, scoringMethod: docking.scoringMethod)
 
-                    if ensembleCfg.populationWeighting && start.population < 1.0 {
-                        let rt = 0.592
-                        let penalty = -rt * Foundation.log(max(start.population, 1e-10))
-                        for var result in startResults {
-                            result.energy += Float(penalty)
-                            result.formLabel = start.label
-                            result.formPopulation = Float(start.population)
-                            entryResults.append(result)
-                        }
-                    } else {
-                        for var result in startResults {
-                            result.formLabel = start.label
-                            result.formPopulation = Float(start.population)
-                            entryResults.append(result)
-                        }
-                    }
+                    entryResults.append(contentsOf: startResults)
                 }
                 entryResults.sort { $0.energy < $1.energy }
 
                 docking.isDocking = false
-                let startStr = starts.count > 1 ? " (\(starts.count) starts)" : ""
-                log.info("[Batch] \(entry.name): \(entryResults.count) poses returned\(startStr)", category: .dock)
+                log.info("[Batch] \(entry.name): \(entryResults.count) poses returned", category: .dock)
 
                 docking.batchResults.append((ligandName: entry.name, results: entryResults))
 

@@ -24,7 +24,7 @@ final class Camera {
     private var targetOrientation: Quat = .identity
     private var targetTarget: SIMD3<Float> = .zero
     private var targetDistance: Float = 15.0
-    private var animating = false
+    private(set) var isAnimating = false
     private let smoothFactor: Float = 0.15
 
     // MARK: - Computed Matrices
@@ -150,7 +150,7 @@ final class Camera {
     func focusOnPoint(_ point: SIMD3<Float>, animated: Bool = true) {
         if animated {
             targetTarget = point
-            animating = true
+            isAnimating = true
         } else {
             target = point
         }
@@ -165,11 +165,11 @@ final class Camera {
     // MARK: - Animation Update
 
     func update() {
-        guard animating else { return }
+        guard isAnimating else { return }
         target = target + (targetTarget - target) * smoothFactor
         if simd_length(targetTarget - target) < 0.001 {
             target = targetTarget
-            animating = false
+            isAnimating = false
         }
     }
 

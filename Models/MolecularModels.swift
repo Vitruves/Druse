@@ -553,6 +553,7 @@ struct ChemicalForm: Identifiable, Sendable {
     var boltzmannWeight: Double             // population fraction (sums to ~1.0 across forms)
     var relativeEnergy: Double              // kcal/mol vs best form (0.0 for best)
     var conformers: [Conformer3D]           // 3D structures, sorted by energy ascending
+    var dockingEnabled: Bool = true          // include in docking (user can uncheck)
 
     /// Best (lowest energy) conformer.
     var bestConformer: Conformer3D? { conformers.first }

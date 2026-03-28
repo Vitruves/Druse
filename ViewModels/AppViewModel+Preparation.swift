@@ -1,4 +1,5 @@
 import SwiftUI
+import Metal
 
 // MARK: - Protein Preparation, Energy Minimization, Hydrogen/Charge Management
 
@@ -163,15 +164,17 @@ extension AppViewModel {
                 self.molecules.protein = mol
                 self.molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
                 self.pushToRenderer()
-                let netSummary: String
+
+                let heavyRebuilt = completed.report.heavyAtomsAdded
+                var parts: [String] = []
+                if heavyRebuilt > 0 { parts.append("rebuilt \(heavyRebuilt) missing heavy atoms") }
+                parts.append("\(protonatedResidues) titratable residues")
+                parts.append("\(completed.report.hydrogensAdded) polar H added")
                 if let nr = completed.report.networkReport, nr.moveableGroups > 0 {
-                    netSummary = ", \(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations optimized"
-                } else {
-                    netSummary = ""
+                    parts.append("\(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations optimized")
                 }
                 self.log.success(
-                    "Added polar hydrogens at pH \(String(format: "%.1f", pH)) " +
-                    "(\(protonatedResidues) titratable, \(completed.report.hydrogensAdded) polar H\(netSummary))",
+                    "Polar hydrogens at pH \(String(format: "%.1f", pH)): \(parts.joined(separator: ", "))",
                     category: .prep
                 )
                 self.workspace.statusMessage = "Polar H at pH \(String(format: "%.1f", pH))"
@@ -198,7 +201,8 @@ extension AppViewModel {
                 bonds: prot.bonds,
                 rawPDBContent: molecules.rawPDBContent,
                 pH: molecules.protonationPH,
-                chargeMethod: docking.chargeMethod
+                chargeMethod: docking.chargeMethod,
+                device: MTLCreateSystemDefaultDevice()
             )
 
             let mol = Molecule(name: prot.name, atoms: prepared.atoms, bonds: prepared.bonds, title: prot.title)
@@ -261,7 +265,6 @@ extension AppViewModel {
         let title = prot.title
         let secondaryStructure = prot.secondaryStructureAssignments
         let rawContent = molecules.rawPDBContent
-        let pH = molecules.protonationPH
         let buildableGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
 
         Task.detached(priority: .userInitiated) {
@@ -315,27 +318,27 @@ extension AppViewModel {
                 }
             }
 
-            // Phase 2: Reconstruct missing heavy atoms in existing residues
-            let completed = ProteinPreparation.completePhase23(
-                atoms: workAtoms, bonds: workBonds, pH: pH, polarOnly: true
+            // Phase 2: Reconstruct missing heavy atoms in existing residues (no hydrogen addition)
+            let reconstructed = ProteinPreparation.reconstructMissingHeavyAtoms(
+                atoms: workAtoms, bonds: workBonds
             )
-            let atomsRebuilt = completed.atoms.count - workAtoms.count
+            let atomsRebuilt = reconstructed.addedAtomCount
             let capturedLoopsBuilt = loopsBuilt
             let capturedResiduesAdded = residuesAdded
 
             await MainActor.run {
-                let mol = Molecule(name: name, atoms: completed.atoms, bonds: completed.bonds, title: title)
+                let mol = Molecule(name: name, atoms: reconstructed.atoms, bonds: reconstructed.bonds, title: title)
                 mol.secondaryStructureAssignments = secondaryStructure
                 self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: reconstructed.atoms, bonds: reconstructed.bonds)
                 self.pushToRenderer()
                 self.renderer?.fitToContent()
 
                 var messages: [String] = []
                 if capturedLoopsBuilt > 0 { messages.append("\(capturedLoopsBuilt) loop(s) built (\(capturedResiduesAdded) residues)") }
-                if atomsRebuilt > 0 { messages.append("\(atomsRebuilt) atoms rebuilt") }
+                if atomsRebuilt > 0 { messages.append("\(atomsRebuilt) heavy atoms rebuilt") }
                 if messages.isEmpty {
-                    self.log.success("Protein structure is complete -- no missing residues or atoms", category: .prep)
+                    self.log.success("Protein structure is complete — no missing residues or atoms", category: .prep)
                     self.workspace.statusMessage = "Structure complete"
                 } else {
                     self.log.success("Fixed: \(messages.joined(separator: ", "))", category: .prep)
@@ -381,8 +384,6 @@ extension AppViewModel {
         }
 
         // Reconstruct missing heavy atoms from residue templates
-        let atomsBefore = prot.atoms
-        let pH = molecules.protonationPH
         molecules.isMinimizing = true
         log.info("Reconstructing missing heavy atoms from templates...", category: .prep)
 
@@ -393,20 +394,19 @@ extension AppViewModel {
         let secondaryStructure = prot.secondaryStructureAssignments
 
         Task.detached(priority: .userInitiated) {
-            let completed = ProteinPreparation.completePhase23(
-                atoms: atoms, bonds: bonds, pH: pH, polarOnly: true
+            let reconstructed = ProteinPreparation.reconstructMissingHeavyAtoms(
+                atoms: atoms, bonds: bonds
             )
-            let rebuilt = completed.atoms.count - atomsBefore.count
 
             await MainActor.run {
-                let mol = Molecule(name: name, atoms: completed.atoms, bonds: completed.bonds, title: title)
+                let mol = Molecule(name: name, atoms: reconstructed.atoms, bonds: reconstructed.bonds, title: title)
                 mol.secondaryStructureAssignments = secondaryStructure
                 self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: reconstructed.atoms, bonds: reconstructed.bonds)
                 self.pushToRenderer()
-                if rebuilt > 0 {
-                    self.log.success("Rebuilt \(rebuilt) missing atoms from residue templates", category: .prep)
-                    self.workspace.statusMessage = "\(rebuilt) atoms rebuilt"
+                if reconstructed.addedAtomCount > 0 {
+                    self.log.success("Rebuilt \(reconstructed.addedAtomCount) missing heavy atoms from residue templates", category: .prep)
+                    self.workspace.statusMessage = "\(reconstructed.addedAtomCount) atoms rebuilt"
                 } else {
                     self.log.info("No missing heavy atoms found to rebuild", category: .prep)
                 }
@@ -849,7 +849,7 @@ extension AppViewModel {
             return
         }
 
-        log.info("Adding template-driven hydrogens...", category: .prep)
+        log.info("Adding all hydrogens (polar + nonpolar) from residue templates...", category: .prep)
         workspace.statusMessage = "Adding hydrogens..."
 
         Task {
@@ -866,23 +866,20 @@ extension AppViewModel {
             renderer?.fitToContent()
 
             let added = completed.report.hydrogensAdded
-            let netSummary: String
+            let heavyRebuilt = completed.report.heavyAtomsAdded
+            var parts: [String] = []
+            if heavyRebuilt > 0 { parts.append("rebuilt \(heavyRebuilt) missing heavy atoms") }
+            if added > 0 { parts.append("added \(added) hydrogens") }
             if let nr = completed.report.networkReport, nr.moveableGroups > 0 {
-                netSummary = ", H-bond network: \(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations"
-            } else {
-                netSummary = ""
+                parts.append("H-bond network: \(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations")
             }
-            if added == 0 {
-                log.success("No additional hydrogens were required after template completion", category: .prep)
+
+            if parts.isEmpty {
+                log.success("Structure already complete — no missing atoms or hydrogens", category: .prep)
                 workspace.statusMessage = "No hydrogens added"
             } else {
-                log.success(
-                    "Added \(added) hydrogens" +
-                    (completed.report.heavyAtomsAdded > 0 ? " (rebuilt \(completed.report.heavyAtomsAdded) heavy atoms)" : "") +
-                    netSummary,
-                    category: .prep
-                )
-                workspace.statusMessage = "\(added) H added"
+                log.success(parts.joined(separator: ", "), category: .prep)
+                workspace.statusMessage = added > 0 ? "\(added) H added" : "No hydrogens added"
             }
             molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
         }

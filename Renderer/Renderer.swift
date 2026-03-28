@@ -108,6 +108,14 @@ final class Renderer: NSObject {
     /// Whether a ligand is currently visible (controls interaction lines and grid visibility)
     var ligandVisible: Bool = true
 
+    // On-demand rendering: weak ref to the MTKView so we can request redraws
+    weak var mtkView: MTKView?
+
+    /// Request a new frame. Call after any state change that affects the rendered image.
+    func setNeedsRedraw() {
+        mtkView?.needsDisplay = true
+    }
+
     // Molecule data (set from AppViewModel)
     private var currentAtoms: [Atom] = []
     private var currentBonds: [Bond] = []
@@ -336,6 +344,7 @@ final class Renderer: NSObject {
         currentAtoms = atoms
         currentBonds = bonds
         rebuildInstanceBuffers()
+        setNeedsRedraw()
     }
 
     /// Store all molecule atom positions for camera fitting, independent of render mode.
@@ -377,7 +386,7 @@ final class Renderer: NSObject {
                 color: color,
                 atomIndex: Int32(atom.id),
                 flags: flags,
-                _pad0: 0,
+                formalCharge: Int32(atom.formalCharge),
                 _pad1: 0
             ))
         }
@@ -575,6 +584,7 @@ final class Renderer: NSObject {
             ribbonVertexBuffer = nil
             ribbonIndexBuffer = nil
             ribbonIndexCount = 0
+            setNeedsRedraw()
             return
         }
 
@@ -587,6 +597,7 @@ final class Renderer: NSObject {
         ribbonIndexBuffer?.label = "RibbonIndices"
 
         ribbonIndexCount = indices.count
+        setNeedsRedraw()
     }
 
     func updateRibbonCAControlPoints(_ points: [(position: SIMD3<Float>, atomID: Int)]) {
@@ -598,6 +609,7 @@ final class Renderer: NSObject {
         ribbonIndexBuffer = nil
         ribbonIndexCount = 0
         ribbonCAControlPoints = []
+        setNeedsRedraw()
     }
 
     // MARK: - Interaction Lines
@@ -606,6 +618,7 @@ final class Renderer: NSObject {
         guard !interactions.isEmpty else {
             interactionLineBuffer = nil
             interactionLineCount = 0
+            setNeedsRedraw()
             return
         }
 
@@ -626,11 +639,13 @@ final class Renderer: NSObject {
             options: .storageModeShared
         )
         interactionLineBuffer?.label = "InteractionLines"
+        setNeedsRedraw()
     }
 
     func clearInteractionLines() {
         interactionLineBuffer = nil
         interactionLineCount = 0
+        setNeedsRedraw()
     }
 
     // MARK: - Constraint Indicators
@@ -641,6 +656,7 @@ final class Renderer: NSObject {
         guard !constraints.isEmpty else {
             constraintIndicatorBuffer = nil
             constraintIndicatorCount = 0
+            setNeedsRedraw()
             return
         }
 
@@ -682,11 +698,13 @@ final class Renderer: NSObject {
             )
             constraintIndicatorBuffer?.label = "ConstraintIndicators"
         }
+        setNeedsRedraw()
     }
 
     func clearConstraintIndicators() {
         constraintIndicatorBuffer = nil
         constraintIndicatorCount = 0
+        setNeedsRedraw()
     }
 
     // MARK: - Ghost Ligand Pose (translucent docking preview)
@@ -708,7 +726,7 @@ final class Renderer: NSObject {
                 color: color,
                 atomIndex: Int32(atom.id),
                 flags: 0,
-                _pad0: 0, _pad1: 0
+                formalCharge: Int32(atom.formalCharge), _pad1: 0
             )
         }
 
@@ -800,6 +818,7 @@ final class Renderer: NSObject {
         } else {
             ghostBondBuffer = nil
         }
+        setNeedsRedraw()
     }
 
     func clearGhostPose() {
@@ -807,6 +826,7 @@ final class Renderer: NSObject {
         ghostBondBuffer = nil
         ghostAtomCount = 0
         ghostBondCount = 0
+        setNeedsRedraw()
     }
 
     // MARK: - Grid Box Wireframe
@@ -841,11 +861,13 @@ final class Renderer: NSObject {
         let size = gridBoxVertexCount * MemoryLayout<GridBoxVertex>.stride
         gridBoxVertexBuffer = device.makeBuffer(bytes: vertices, length: size, options: .storageModeShared)
         gridBoxVertexBuffer?.label = "GridBoxVertices"
+        setNeedsRedraw()
     }
 
     func clearGridBox() {
         gridBoxVertexBuffer = nil
         gridBoxVertexCount = 0
+        setNeedsRedraw()
     }
 
     // MARK: - Molecular Surface
@@ -854,12 +876,14 @@ final class Renderer: NSObject {
         surfaceVertexBuffer = result.vertexBuffer
         surfaceIndexBuffer = result.indexBuffer
         surfaceIndexCount = result.indexCount
+        setNeedsRedraw()
     }
 
     func clearSurfaceMesh() {
         surfaceVertexBuffer = nil
         surfaceIndexBuffer = nil
         surfaceIndexCount = 0
+        setNeedsRedraw()
     }
 
     // MARK: - Draw
@@ -971,8 +995,8 @@ final class Renderer: NSObject {
         }
 
         // 5. Interaction lines (dashed billboard quads, between ligand and protein atoms)
-        // Hide when ligand is hidden or ghost pose is active (during docking, ghost pose has its own update path)
-        if interactionLineCount > 0, let lineBuf = interactionLineBuffer, ligandVisible {
+        // Show when the ligand is visible (post-docking) OR when the ghost pose is active (live docking)
+        if interactionLineCount > 0, let lineBuf = interactionLineBuffer, (ligandVisible || ghostAtomCount > 0) {
             encoder.setRenderPipelineState(interactionLinePipeline)
             encoder.setDepthStencilState(depthStateReadWrite)
             encoder.setVertexBuffer(lineBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
@@ -1026,6 +1050,11 @@ final class Renderer: NSObject {
             commandBuffer.present(drawable)
         }
         commandBuffer.commit()
+
+        // Keep requesting frames while camera is smoothly animating
+        if camera.isAnimating {
+            setNeedsRedraw()
+        }
     }
 
     private func updateUniforms(into buffer: MTLBuffer, viewportSize: SIMD2<Float>) {
@@ -1221,6 +1250,7 @@ final class Renderer: NSObject {
         let c = centroid(positions)
         let r = boundingRadius(positions: positions, center: c)
         camera.fitToSphere(center: c, radius: max(r, 2.0))
+        setNeedsRedraw()
     }
 
     /// Fit camera to a specific set of world-space positions (e.g., a selection).
@@ -1229,6 +1259,7 @@ final class Renderer: NSObject {
         let c = centroid(positions)
         let r = boundingRadius(positions: positions, center: c)
         camera.fitToSphere(center: c, radius: max(r, 2.0))
+        setNeedsRedraw()
     }
 
     /// Focus camera on a pocket and set Z-clipping slab to frame it.

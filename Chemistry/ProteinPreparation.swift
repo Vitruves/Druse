@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import simd
 
 enum ProteinPreparation {
@@ -576,7 +577,8 @@ enum ProteinPreparation {
         bonds: [Bond],
         rawPDBContent: String? = nil,
         pH: Float = 7.4,
-        chargeMethod: ChargeMethod = .gasteiger
+        chargeMethod: ChargeMethod = .gasteiger,
+        device: MTLDevice? = nil
     ) -> (atoms: [Atom], bonds: [Bond], report: DockingPreparationReport) {
         let totalStart = CFAbsoluteTimeGetCurrent()
         var report = DockingPreparationReport()
@@ -596,7 +598,7 @@ enum ProteinPreparation {
         report.chainBreaksCapped = cleanup.report.chainBreaks.filter(\.isCapped).count
 
         t = CFAbsoluteTimeGetCurrent()
-        let phase23 = completePhase23(atoms: cleanup.atoms, bonds: cleanup.bonds, pH: pH)
+        let phase23 = completePhase23(atoms: cleanup.atoms, bonds: cleanup.bonds, pH: pH, device: device)
         logT("Phase 2-4 reconstruct+H+network (\(cleanup.atoms.count) → \(phase23.atoms.count) atoms)", t)
         var workingAtoms = phase23.atoms
         var workingBonds = phase23.bonds

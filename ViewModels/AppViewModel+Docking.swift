@@ -299,67 +299,20 @@ extension AppViewModel {
                 log.info("Pharmacophore constraints: \(activeConstraints.count) active", category: .dock)
             }
 
-            // Build list of starting molecules for GA
-            let ensembleCfg = docking.dockingConfig.ensemble
-            let startingMolecules = buildEnsembleStartingMolecules(
-                primaryLigand: lig,
-                forms: docking.ligandForms,
-                config: ensembleCfg
-            )
-            let isMultiStart = startingMolecules.count > 1
-            if isMultiStart {
-                log.info("Ensemble docking: \(startingMolecules.count) starting geometries " +
-                         "(cutoff=\(String(format: "%.0f%%", ensembleCfg.populationCutoff * 100)))",
-                         category: .dock)
-                docking.ensembleProgress = (0, startingMolecules.count)
-            }
-
             log.info("Launching GA docking engine...", category: .dock)
 
-            var allResults: [DockingResult] = []
-            for (startIdx, start) in startingMolecules.enumerated() {
-                guard !Task.isCancelled else { break }
-                if isMultiStart {
-                    docking.ensembleProgress = (startIdx, startingMolecules.count)
-                    workspace.statusMessage = "Docking \(start.label) (\(startIdx + 1)/\(startingMolecules.count))..."
-                    log.info("  Start \(startIdx + 1)/\(startingMolecules.count): \(start.label) (pop=\(String(format: "%.1f%%", start.population * 100)))", category: .dock)
-                }
+            // One entry = one docking job (flat model)
+            let allResults = await engine.runDocking(
+                ligand: lig, pocket: pocket,
+                config: docking.dockingConfig,
+                scoringMethod: docking.scoringMethod)
 
-                let startResults = await engine.runDocking(
-                    ligand: start.molecule, pocket: pocket,
-                    config: docking.dockingConfig,
-                    scoringMethod: docking.scoringMethod)
-
-                // Apply population weighting if enabled
-                if ensembleCfg.populationWeighting && start.population < 1.0 {
-                    let rt = 0.592  // RT at 298K in kcal/mol
-                    let penalty = -rt * Foundation.log(max(start.population, 1e-10))
-                    for var result in startResults {
-                        result.energy += Float(penalty)
-                        result.formLabel = start.label
-                        result.formPopulation = Float(start.population)
-                        allResults.append(result)
-                    }
-                } else {
-                    for var result in startResults {
-                        result.formLabel = start.label
-                        result.formPopulation = Float(start.population)
-                        allResults.append(result)
-                    }
-                }
-            }
-            if isMultiStart {
-                docking.ensembleProgress = (startingMolecules.count, startingMolecules.count)
-            }
-
-            // Sort all results across all starts by energy
             let results = allResults.sorted { $0.energy < $1.energy }
 
-            log.info("GA complete: \(results.count) poses returned\(isMultiStart ? " from \(startingMolecules.count) starts" : "")", category: .dock)
+            log.info("GA complete: \(results.count) poses returned", category: .dock)
             if let best = results.first {
                 log.info("  Best pose: E=\(String(format: "%.3f", best.energy)) kcal/mol, " +
-                         "cluster=\(best.clusterID), gen=\(best.generation)" +
-                         (best.formLabel != nil ? ", form=\(best.formLabel!)" : ""),
+                         "cluster=\(best.clusterID), gen=\(best.generation)",
                          category: .dock)
             }
 
@@ -490,80 +443,7 @@ extension AppViewModel {
         log.info("Docking stopped", category: .dock)
     }
 
-    // MARK: - Ensemble Starting Molecules
-
-    struct EnsembleStart {
-        let molecule: Molecule
-        let label: String
-        let population: Double
-    }
-
-    /// Build the list of starting molecules for multi-start docking.
-    /// When ensemble is disabled or no forms are available, returns just the primary ligand.
-    func buildEnsembleStartingMolecules(
-        primaryLigand: Molecule,
-        forms: [ChemicalForm],
-        config: EnsembleDockingConfig
-    ) -> [EnsembleStart] {
-        guard config.enabled, !forms.isEmpty else {
-            return [EnsembleStart(molecule: primaryLigand, label: "primary", population: 1.0)]
-        }
-
-        var starts: [EnsembleStart] = []
-        let qualifyingForms = forms.filter { $0.boltzmannWeight >= config.populationCutoff }
-
-        if qualifyingForms.isEmpty {
-            // All forms below cutoff — fall back to best form
-            return [EnsembleStart(molecule: primaryLigand, label: "primary", population: 1.0)]
-        }
-
-        for form in qualifyingForms {
-            let conformers = form.conformers
-            guard !conformers.isEmpty else { continue }
-
-            let maxConf = config.maxConformersPerForm > 0
-                ? min(config.maxConformersPerForm, conformers.count)
-                : conformers.count
-
-            for confIdx in 0..<maxConf {
-                let conf = conformers[confIdx]
-                let mol = Molecule(
-                    name: primaryLigand.name,
-                    atoms: conf.atoms,
-                    bonds: conf.bonds,
-                    title: form.smiles,
-                    smiles: form.smiles
-                )
-                let label = "\(form.label)_conf\(confIdx)"
-                starts.append(EnsembleStart(
-                    molecule: mol,
-                    label: label,
-                    population: form.boltzmannWeight
-                ))
-            }
-        }
-
-        if starts.isEmpty {
-            return [EnsembleStart(molecule: primaryLigand, label: "primary", population: 1.0)]
-        }
-        return starts
-    }
-
-    /// Count qualifying ensemble starts for UI display (without building molecules).
-    func countEnsembleStarts(forms: [ChemicalForm], config: EnsembleDockingConfig) -> (forms: Int, conformers: Int, total: Int) {
-        guard config.enabled, !forms.isEmpty else { return (0, 0, 1) }
-        let qualifying = forms.filter { $0.boltzmannWeight >= config.populationCutoff }
-        guard !qualifying.isEmpty else { return (0, 0, 1) }
-        var total = 0
-        var totalConformers = 0
-        for form in qualifying {
-            let n = form.conformers.count
-            let maxConf = config.maxConformersPerForm > 0 ? min(config.maxConformersPerForm, n) : n
-            total += maxConf
-            totalConformers += n
-        }
-        return (qualifying.count, totalConformers, max(total, 1))
-    }
+    // (Ensemble machinery removed — each entry is docked independently as one job)
 
     /// Remove all displayed poses and interaction lines from the 3D viewport.
     /// The docking results data is preserved for re-viewing later.

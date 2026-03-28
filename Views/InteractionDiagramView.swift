@@ -14,7 +14,6 @@ struct InteractionDiagramView: View {
     let poseEnergy: Float
     let poseIndex: Int
 
-    @Environment(\.dismiss) private var dismiss
     @State private var coords2D: RDKitBridge.Coords2D?
     @State private var isLoading = true
 
@@ -50,7 +49,7 @@ struct InteractionDiagramView: View {
             Divider()
             legend
         }
-        .frame(minWidth: 1000, minHeight: 750)
+        .frame(minWidth: 650, minHeight: 550)
         .task {
             if let smiles = ligandSmiles, !smiles.isEmpty {
                 let result = await Task.detached {
@@ -149,18 +148,6 @@ struct InteractionDiagramView: View {
                     .allowsHitTesting(false)
                 }
             }
-            .overlay(alignment: .topTrailing) {
-                Button(action: { dismiss() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title)
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.escape, modifiers: [])
-                .padding(12)
-                .help("Close (Esc)")
-            }
             .onChange(of: geo.size) { _, newSize in
                 exportSize = newSize
             }
@@ -217,13 +204,6 @@ struct InteractionDiagramView: View {
             .buttonStyle(.plain)
             .help("Save as PNG")
 
-            Button(action: { dismiss() }) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Close diagram")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -332,145 +312,114 @@ struct InteractionDiagramView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Main Drawing (scaled up ~50% for legibility)
+    // MARK: - Main Drawing (auto-fit layout)
 
     private func drawDiagram(context: GraphicsContext, size: CGSize, coords: RDKitBridge.Coords2D) {
-        let padding: CGFloat = 160  // generous space for residue bubbles
-
         let positions = coords.positions
         guard !positions.isEmpty else { return }
 
-        let xs = positions.map(\.x)
-        let ys = positions.map(\.y)
+        // --- Phase 1: Project ligand to abstract space centered at (0,0) ---
+        let xs = positions.map(\.x), ys = positions.map(\.y)
         let minX = xs.min()!, maxX = xs.max()!
         let minY = ys.min()!, maxY = ys.max()!
-        let rangeX = max(maxX - minX, 1)
-        let rangeY = max(maxY - minY, 1)
+        let midX = (minX + maxX) / 2, midY = (minY + maxY) / 2
 
-        let ligandAreaW = size.width - padding * 2
-        let ligandAreaH = size.height - padding * 2
-        let scale = min(ligandAreaW / rangeX, ligandAreaH / rangeY) * 0.75
-        let cx = size.width / 2
-        let cy = size.height / 2
-        let midX = (minX + maxX) / 2
-        let midY = (minY + maxY) / 2
-
+        let baseScale: CGFloat = 30  // fixed pixels-per-RDKit-unit
         func project(_ p: CGPoint) -> CGPoint {
-            CGPoint(x: cx + (p.x - midX) * scale,
-                    y: cy - (p.y - midY) * scale)
+            CGPoint(x: (p.x - midX) * baseScale, y: -(p.y - midY) * baseScale)
         }
 
-        // 1. Draw ligand bonds (thicker)
-        for (a1, a2, order) in coords.bonds {
-            guard a1 < positions.count, a2 < positions.count else { continue }
-            let p1 = project(positions[a1])
-            let p2 = project(positions[a2])
-            drawBond(context: context, from: p1, to: p2, order: order)
-        }
+        let projectedPositions = positions.map { project($0) }
+        let ligandCenter = CGPoint(x: 0, y: 0)
 
-        // 2. Draw aromatic ring inscribed circles
-        for ring in aromaticRings {
-            guard ring.count >= 5 else { continue }
-            let ringPts = ring.compactMap { $0 < positions.count ? project(positions[$0]) : nil }
-            guard ringPts.count == ring.count else { continue }
-            let centX = ringPts.map(\.x).reduce(0, +) / CGFloat(ringPts.count)
-            let centY = ringPts.map(\.y).reduce(0, +) / CGFloat(ringPts.count)
-            let avgR = ringPts.map { hypot($0.x - centX, $0.y - centY) }.reduce(0, +) / CGFloat(ringPts.count)
-            let r = avgR * 0.55
-            context.stroke(Path(ellipseIn: CGRect(x: centX - r, y: centY - r, width: r * 2, height: r * 2)),
-                           with: .color(Color.primary.opacity(0.3)), lineWidth: 1.5)
-        }
-
-        // 3. Draw ligand atoms (larger)
-        var projectedPositions: [CGPoint] = []
-        for (i, pos) in positions.enumerated() {
-            let p = project(pos)
-            projectedPositions.append(p)
-            let atomicNum = coords.atomicNums[i]
-            drawLigandAtom(context: context, at: p, atomicNum: atomicNum, index: i)
-        }
-
-        // Compute ligand bounding box for line routing
-        let projXs = projectedPositions.map(\.x)
-        let projYs = projectedPositions.map(\.y)
+        // Ligand AABB for line routing (with padding for atom labels)
+        let projXs = projectedPositions.map(\.x), projYs = projectedPositions.map(\.y)
         let ligandAABB = CGRect(
-            x: (projXs.min() ?? cx) - 20, y: (projYs.min() ?? cy) - 20,
-            width: ((projXs.max() ?? cx) - (projXs.min() ?? cx)) + 40,
-            height: ((projYs.max() ?? cy) - (projYs.min() ?? cy)) + 40
+            x: (projXs.min() ?? 0) - 20, y: (projYs.min() ?? 0) - 20,
+            width: ((projXs.max() ?? 0) - (projXs.min() ?? 0)) + 40,
+            height: ((projYs.max() ?? 0) - (projYs.min() ?? 0)) + 40
         )
 
-        // 4. Group interactions by residue
+        // --- Phase 2: Orbit radius based on ligand extent (not window size) ---
+        let ligandHalfDiag = hypot(ligandAABB.width, ligandAABB.height) / 2
+        let orbitRadius = ligandHalfDiag + 120  // clearance for side chains + bubble
+
+        // Build ring-centroid lookup: for pi interactions, the ligandAtomIndex is the
+        // first atom of the ring — map each ring atom index to the 2D ring centroid.
+        var ringCentroidForAtom: [Int: CGPoint] = [:]
+        for ring in aromaticRings {
+            let ringPts = ring.compactMap { $0 < projectedPositions.count ? projectedPositions[$0] : nil }
+            guard ringPts.count == ring.count, !ringPts.isEmpty else { continue }
+            let centroid = CGPoint(
+                x: ringPts.map(\.x).reduce(0, +) / CGFloat(ringPts.count),
+                y: ringPts.map(\.y).reduce(0, +) / CGFloat(ringPts.count)
+            )
+            for idx in ring { ringCentroidForAtom[idx] = centroid }
+        }
+
+        // Helper: effective 2D contact point for an interaction on the ligand side.
+        // Pi-type interactions use the ring centroid; others use the atom position.
+        let piTypes: Set<MolecularInteraction.InteractionType> = [.piStack, .piCation, .chPi, .amideStack]
+        func ligandContactPoint(for ixn: MolecularInteraction) -> CGPoint? {
+            let idx = ixn.ligandAtomIndex
+            guard idx < projectedPositions.count else { return nil }
+            if piTypes.contains(ixn.type), let centroid = ringCentroidForAtom[idx] {
+                return centroid
+            }
+            return projectedPositions[idx]
+        }
+
+        // Group interactions by residue
         let residueGroups = groupInteractionsByResidue()
         guard !residueGroups.isEmpty else { return }
 
-        let ligandCenter = CGPoint(x: cx, y: cy)
         var residuePlacements: [(key: ResidueKey, center: CGPoint, interactions: [MolecularInteraction])] = []
 
         for (key, ixns) in residueGroups {
-            var sumX: CGFloat = 0, sumY: CGFloat = 0
-            var count = 0
+            var sumX: CGFloat = 0, sumY: CGFloat = 0, count = 0
             for ixn in ixns {
-                let ligIdx = ixn.ligandAtomIndex
-                if ligIdx < positions.count {
-                    let p = project(positions[ligIdx])
-                    sumX += p.x
-                    sumY += p.y
-                    count += 1
+                if let p = ligandContactPoint(for: ixn) {
+                    sumX += p.x; sumY += p.y; count += 1
                 }
             }
             guard count > 0 else { continue }
             let avgLigandPos = CGPoint(x: sumX / CGFloat(count), y: sumY / CGFloat(count))
-
             let dx = avgLigandPos.x - ligandCenter.x
             let dy = avgLigandPos.y - ligandCenter.y
             let dist = max(sqrt(dx * dx + dy * dy), 1)
-            let pushDist: CGFloat = min(size.width, size.height) * 0.44
             let residueCenter = CGPoint(
-                x: ligandCenter.x + dx / dist * pushDist,
-                y: ligandCenter.y + dy / dist * pushDist
+                x: ligandCenter.x + dx / dist * orbitRadius,
+                y: ligandCenter.y + dy / dist * orbitRadius
             )
             residuePlacements.append((key, residueCenter, ixns))
         }
 
-        // Resolve overlaps with tighter angular constraints
-        resolveOverlaps(&residuePlacements, around: ligandCenter,
-                        radius: min(size.width, size.height) * 0.44)
+        resolveOverlaps(&residuePlacements, around: ligandCenter, radius: orbitRadius)
 
-        // 4. Store positions for hover detection (in pre-transform coordinates)
-        DispatchQueue.main.async {
-            self.residuePositions = residuePlacements.map { (key, center, ixns) in
-                (name: key.label, center: center, interactions: ixns)
-            }
-        }
-
-        // 5. Pre-compute side chain positions once per residue (for consistent line + drawing)
+        // --- Phase 3: Pre-compute side chain positions ---
         struct ResidueDrawData {
             let key: ResidueKey
             let center: CGPoint
             let interactions: [MolecularInteraction]
             let avgLigandContact: CGPoint
-            let scPositions: [CGPoint]  // transformed side chain atom positions
+            let scPositions: [CGPoint]
             let template: SideChainTemplate?
         }
 
         var drawData: [ResidueDrawData] = []
         for (key, residueCenter, ixns) in residuePlacements {
-            // Average ligand contact position for this residue
             var sX: CGFloat = 0, sY: CGFloat = 0, n: CGFloat = 0
             for ixn in ixns {
-                if ixn.ligandAtomIndex < positions.count {
-                    let p = project(positions[ixn.ligandAtomIndex])
+                if let p = ligandContactPoint(for: ixn) {
                     sX += p.x; sY += p.y; n += 1
                 }
             }
             let avgContact = n > 0 ? CGPoint(x: sX / n, y: sY / n) : ligandCenter
 
-            // Compute side chain once — pivot around first matching side chain atom
             var scPos: [CGPoint] = []
             let template = sideChainTemplates[key.name]
             if let tmpl = template, !tmpl.atoms.isEmpty {
-                // Find best pivot: first interacting atom that exists in template
-                var pivotName = tmpl.atoms.last!.name // default: outermost
+                var pivotName = tmpl.atoms.last!.name
                 for ixn in ixns {
                     guard ixn.proteinAtomIndex < proteinAtoms.count else { continue }
                     let aName = proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
@@ -487,7 +436,92 @@ struct InteractionDiagramView: View {
                                              avgLigandContact: avgContact, scPositions: scPos, template: template))
         }
 
-        // 6. Draw interaction lines (behind side chains and bubbles)
+        // --- Phase 4: Auto-fit all content into the canvas ---
+        var allPoints: [CGPoint] = projectedPositions
+        for dd in drawData {
+            // Bubble corners (bubble ~80x36 with label)
+            allPoints.append(CGPoint(x: dd.center.x - 48, y: dd.center.y - 24))
+            allPoints.append(CGPoint(x: dd.center.x + 48, y: dd.center.y + 24))
+            // Side chain atom extents
+            for p in dd.scPositions {
+                allPoints.append(CGPoint(x: p.x - 14, y: p.y - 14))
+                allPoints.append(CGPoint(x: p.x + 14, y: p.y + 14))
+            }
+        }
+
+        let allXs = allPoints.map(\.x), allYs = allPoints.map(\.y)
+        let contentMinX = allXs.min()!, contentMaxX = allXs.max()!
+        let contentMinY = allYs.min()!, contentMaxY = allYs.max()!
+        let contentW = max(contentMaxX - contentMinX, 1)
+        let contentH = max(contentMaxY - contentMinY, 1)
+        let contentCX = (contentMinX + contentMaxX) / 2
+        let contentCY = (contentMinY + contentMaxY) / 2
+
+        let margin: CGFloat = 20
+        let fitScale = min((size.width - margin * 2) / contentW,
+                           (size.height - margin * 2) / contentH,
+                           1.3)
+        let fitOffsetX = size.width / 2 - contentCX * fitScale
+        let fitOffsetY = size.height / 2 - contentCY * fitScale
+
+        // Store fitted residue positions for hover detection (in view space, pre-zoom/pan)
+        DispatchQueue.main.async {
+            self.residuePositions = drawData.map { dd in
+                (name: dd.key.label,
+                 center: CGPoint(x: dd.center.x * fitScale + fitOffsetX,
+                                 y: dd.center.y * fitScale + fitOffsetY),
+                 interactions: dd.interactions)
+            }
+        }
+
+        // Apply auto-fit transform to the drawing context
+        var ctx = context
+        ctx.translateBy(x: fitOffsetX, y: fitOffsetY)
+        ctx.scaleBy(x: fitScale, y: fitScale)
+
+        // --- Phase 5: Draw everything in abstract space ---
+
+        // 1. Ligand bonds
+        for (a1, a2, order) in coords.bonds {
+            guard a1 < projectedPositions.count, a2 < projectedPositions.count else { continue }
+            drawBond(context: ctx, from: projectedPositions[a1], to: projectedPositions[a2], order: order)
+        }
+
+        // 2. Aromatic ring inscribed circles
+        for ring in aromaticRings {
+            guard ring.count >= 5 else { continue }
+            let ringPts = ring.compactMap { $0 < projectedPositions.count ? projectedPositions[$0] : nil }
+            guard ringPts.count == ring.count else { continue }
+            let centX = ringPts.map(\.x).reduce(0, +) / CGFloat(ringPts.count)
+            let centY = ringPts.map(\.y).reduce(0, +) / CGFloat(ringPts.count)
+            let avgR = ringPts.map { hypot($0.x - centX, $0.y - centY) }.reduce(0, +) / CGFloat(ringPts.count)
+            let r = avgR * 0.55
+            ctx.stroke(Path(ellipseIn: CGRect(x: centX - r, y: centY - r, width: r * 2, height: r * 2)),
+                       with: .color(Color.primary.opacity(0.3)), lineWidth: 1.5)
+        }
+
+        // 3. Ligand atoms (with formal charge labels)
+        for (i, pos) in projectedPositions.enumerated() {
+            drawLigandAtom(context: ctx, at: pos, atomicNum: coords.atomicNums[i], index: i)
+
+            // Draw formal charge indicator next to charged atoms
+            if i < ligandAtoms.count {
+                let fc = ligandAtoms[i].formalCharge
+                if fc != 0 {
+                    let label = fc > 0 ? "+" : "−"
+                    let chargeColor: Color = fc > 0
+                        ? Color(red: 0.3, green: 0.5, blue: 1.0)
+                        : Color(red: 1.0, green: 0.3, blue: 0.2)
+                    let chargeText = Text(label)
+                        .font(.system(size: 14, weight: .heavy, design: .rounded))
+                        .foregroundColor(chargeColor)
+                    ctx.draw(ctx.resolve(chargeText),
+                             at: CGPoint(x: pos.x + 10, y: pos.y - 10), anchor: .center)
+                }
+            }
+        }
+
+        // 4. Interaction lines (behind side chains and bubbles)
         for dd in drawData {
             let hydrophobic = dd.interactions.filter { $0.type == .hydrophobic }
             let directional = dd.interactions.filter { $0.type != .hydrophobic }
@@ -504,10 +538,9 @@ struct InteractionDiagramView: View {
                 arcPath.addArc(center: avgLig, radius: arcRadius,
                                startAngle: .radians(dirAngle - arcSpan / 2),
                                endAngle: .radians(dirAngle + arcSpan / 2), clockwise: false)
-                context.stroke(arcPath, with: .color(arcColor),
-                               style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
+                ctx.stroke(arcPath, with: .color(arcColor),
+                           style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
 
-                // Spokes
                 let nSpokes = min(hydrophobic.count, 5)
                 for i in 0..<nSpokes {
                     let t = nSpokes == 1 ? 0.5 : CGFloat(i) / CGFloat(nSpokes - 1)
@@ -515,44 +548,64 @@ struct InteractionDiagramView: View {
                     let inner = CGPoint(x: avgLig.x + (arcRadius - 4) * cos(a), y: avgLig.y + (arcRadius - 4) * sin(a))
                     let outer = CGPoint(x: avgLig.x + (arcRadius + 4) * cos(a), y: avgLig.y + (arcRadius + 4) * sin(a))
                     var sp = Path(); sp.move(to: inner); sp.addLine(to: outer)
-                    context.stroke(sp, with: .color(arcColor.opacity(0.6)), lineWidth: 1.5)
+                    ctx.stroke(sp, with: .color(arcColor.opacity(0.6)), lineWidth: 1.5)
                 }
 
-                // Dashed connector to residue
                 let arcTip = CGPoint(x: avgLig.x + (arcRadius + 6) * cos(dirAngle),
                                      y: avgLig.y + (arcRadius + 6) * sin(dirAngle))
                 let conn = shorten(from: arcTip, to: dd.center, fromInset: 0, toInset: 40)
-                drawDashedLine(ctx: context, from: conn.0, to: conn.1,
+                drawDashedLine(ctx: ctx, from: conn.0, to: conn.1,
                                color: arcColor.opacity(0.5), dashLen: 4, lineWidth: 1.2)
             }
 
-            // Directional interactions: connect to specific side chain atom,
-            // route around ligand AABB if line would cross through it
+            // Directional interactions: connect to specific side chain atom
             for ixn in directional {
-                let ligIdx = ixn.ligandAtomIndex
-                guard ligIdx < positions.count else { continue }
-                let ligPos = project(positions[ligIdx])
+                guard let ligPos = ligandContactPoint(for: ixn) else { continue }
 
                 var targetPos = dd.center
                 var toInset: CGFloat = 40
                 if let tmpl = dd.template, !dd.scPositions.isEmpty,
                    ixn.proteinAtomIndex < proteinAtoms.count {
-                    let atomName = proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
-                    if let idx = tmpl.atoms.firstIndex(where: { $0.name == atomName }),
-                       idx < dd.scPositions.count {
-                        targetPos = dd.scPositions[idx]
-                        toInset = 7
+                    // For pi-type interactions targeting a protein ring, connect to the
+                    // centroid of the aromatic ring atoms in the side chain template
+                    // rather than a single atom.
+                    if piTypes.contains(ixn.type) {
+                        let ringAtomNames: Set<String>
+                        let resName = proteinAtoms[ixn.proteinAtomIndex].residueName
+                        switch resName {
+                        case "PHE": ringAtomNames = ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]
+                        case "TYR": ringAtomNames = ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]
+                        case "TRP": ringAtomNames = ["CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"]
+                        case "HIS": ringAtomNames = ["CG", "ND1", "CD2", "CE1", "NE2"]
+                        default:    ringAtomNames = []
+                        }
+                        if !ringAtomNames.isEmpty {
+                            var rX: CGFloat = 0, rY: CGFloat = 0, rN: CGFloat = 0
+                            for (tIdx, tAtom) in tmpl.atoms.enumerated() where tIdx < dd.scPositions.count {
+                                if ringAtomNames.contains(tAtom.name) {
+                                    rX += dd.scPositions[tIdx].x; rY += dd.scPositions[tIdx].y; rN += 1
+                                }
+                            }
+                            if rN > 0 {
+                                targetPos = CGPoint(x: rX / rN, y: rY / rN)
+                                toInset = 7
+                            }
+                        }
+                    } else {
+                        let atomName = proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
+                        if let idx = tmpl.atoms.firstIndex(where: { $0.name == atomName }),
+                           idx < dd.scPositions.count {
+                            targetPos = dd.scPositions[idx]
+                            toInset = 7
+                        }
                     }
                 }
 
                 let fromInset: CGFloat = 8
                 let shortened = shorten(from: ligPos, to: targetPos, fromInset: fromInset, toInset: toInset)
 
-                // Check if the straight line crosses the ligand AABB
-                // (only if the line endpoint is outside the AABB — i.e. it would cross through)
                 if lineSegmentCrossesRect(from: shortened.0, to: shortened.1, rect: ligandAABB) &&
                    !ligandAABB.contains(shortened.1) {
-                    // Route around: use a bezier curve through the nearest AABB corner
                     let corners = [
                         CGPoint(x: ligandAABB.minX - 12, y: ligandAABB.minY - 12),
                         CGPoint(x: ligandAABB.maxX + 12, y: ligandAABB.minY - 12),
@@ -567,20 +620,20 @@ struct InteractionDiagramView: View {
                     let color = interactionColor(ixn.type)
                     var path = Path(); path.move(to: shortened.0)
                     path.addQuadCurve(to: shortened.1, control: ctrl)
-                    context.stroke(path, with: .color(color),
-                                   style: ixn.type == .hbond || ixn.type == .saltBridge
-                                       ? StrokeStyle(lineWidth: 2, dash: [6, 4.2])
-                                       : StrokeStyle(lineWidth: 2))
+                    ctx.stroke(path, with: .color(color),
+                               style: ixn.type == .hbond || ixn.type == .saltBridge
+                                   ? StrokeStyle(lineWidth: 2, dash: [6, 4.2])
+                                   : StrokeStyle(lineWidth: 2))
                 } else {
-                    drawInteractionLine(context: context, from: shortened.0, to: shortened.1,
+                    drawInteractionLine(context: ctx, from: shortened.0, to: shortened.1,
                                         type: ixn.type, distance: ixn.distance)
                 }
             }
         }
 
-        // 7. Draw side chains + residue bubbles (on top of lines)
+        // 5. Side chains + residue bubbles (on top of lines)
         for dd in drawData {
-            drawResidueBubble(context: context, at: dd.center, key: dd.key, interactions: dd.interactions,
+            drawResidueBubble(context: ctx, at: dd.center, key: dd.key, interactions: dd.interactions,
                               scPositions: dd.scPositions, template: dd.template)
         }
     }
@@ -744,7 +797,22 @@ struct InteractionDiagramView: View {
     }
 
     private func pharmacophoreColor(forLigandAtomIndex index: Int) -> Color? {
-        let types = interactions.filter { $0.ligandAtomIndex == index }.map(\.type)
+        // Direct interactions on this atom
+        var types = interactions.filter { $0.ligandAtomIndex == index }.map(\.type)
+
+        // For pi interactions, the ligandAtomIndex is only the first ring atom,
+        // but all ring atoms should share the halo. Check if this atom belongs
+        // to a ring that has a pi interaction.
+        if types.isEmpty {
+            let piIxnTypes: Set<MolecularInteraction.InteractionType> = [.piStack, .piCation, .chPi, .amideStack]
+            for ring in aromaticRings where ring.contains(index) {
+                for ixn in interactions where piIxnTypes.contains(ixn.type) {
+                    if ring.contains(ixn.ligandAtomIndex) {
+                        types.append(ixn.type)
+                    }
+                }
+            }
+        }
         guard !types.isEmpty else { return nil }
 
         if types.contains(.hbond) || types.contains(.halogen) {
@@ -1072,6 +1140,8 @@ struct InteractionDiagramView: View {
     }
 
     /// Resolve overlapping residue bubbles by angular redistribution.
+    /// Uses bidirectional relaxation to spread bubbles evenly while staying
+    /// close to their original angular position.
     private func resolveOverlaps(
         _ placements: inout [(key: ResidueKey, center: CGPoint, interactions: [MolecularInteraction])],
         around origin: CGPoint,
@@ -1081,39 +1151,55 @@ struct InteractionDiagramView: View {
 
         struct PolarEntry {
             var angle: CGFloat
+            var originalAngle: CGFloat
             var originalIndex: Int
         }
 
         var polar: [PolarEntry] = placements.enumerated().map { i, p in
             let dx = p.center.x - origin.x
             let dy = p.center.y - origin.y
-            return PolarEntry(angle: atan2(dy, dx), originalIndex: i)
+            let a = atan2(dy, dx)
+            return PolarEntry(angle: a, originalAngle: a, originalIndex: i)
         }
         polar.sort { $0.angle < $1.angle }
 
-        let minSpacing: CGFloat = 0.50  // ~29 degrees between bubbles
+        // Minimum angular spacing: ~32 degrees ensures bubble+sidechain clearance
+        let minSpacing: CGFloat = 0.56
 
-        // 5-pass relaxation for better distribution
-        for _ in 0..<5 {
+        // 10-pass bidirectional relaxation for better distribution
+        for _ in 0..<10 {
+            // Forward pass: push later entries away from earlier ones
             for i in 1..<polar.count {
                 let gap = polar[i].angle - polar[i - 1].angle
                 if gap < minSpacing {
                     polar[i].angle = polar[i - 1].angle + minSpacing
                 }
             }
+            // Backward pass: push earlier entries back if they were displaced too far
+            for i in stride(from: polar.count - 2, through: 0, by: -1) {
+                let gap = polar[i + 1].angle - polar[i].angle
+                if gap < minSpacing {
+                    polar[i].angle = polar[i + 1].angle - minSpacing
+                }
+            }
+            // Wrap-around: check gap between last and first (across the 2π boundary)
             if polar.count > 1 {
                 let wrapGap = (polar[0].angle + 2 * .pi) - polar[polar.count - 1].angle
                 if wrapGap < minSpacing {
-                    polar[polar.count - 1].angle = (polar[0].angle + 2 * .pi) - minSpacing
+                    let deficit = minSpacing - wrapGap
+                    polar[polar.count - 1].angle -= deficit / 2
+                    polar[0].angle += deficit / 2
                 }
             }
         }
 
-        // Scale radius outward when many residues
+        // Scale radius outward when many residues crowd the orbit
         let totalSpan = polar.last!.angle - polar.first!.angle
         let effectiveRadius: CGFloat
-        if placements.count > 12 {
-            effectiveRadius = radius * 1.25
+        if placements.count > 14 {
+            effectiveRadius = radius * 1.3
+        } else if placements.count > 10 {
+            effectiveRadius = radius * 1.2
         } else if totalSpan > 1.8 * .pi {
             effectiveRadius = radius * 1.15
         } else {

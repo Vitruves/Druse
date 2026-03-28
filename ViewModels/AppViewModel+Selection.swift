@@ -76,6 +76,7 @@ extension AppViewModel {
             return
         }
         renderer?.camera.focusOnPoint(allAtoms[atomIndex].position)
+        renderer?.setNeedsRedraw()
     }
 
     // MARK: - Extended Selection
@@ -178,6 +179,12 @@ extension AppViewModel {
 
     func setRenderMode(_ mode: RenderMode) {
         workspace.renderMode = mode
+        workspace.ligandRenderMode = nil
+        pushToRenderer()
+    }
+
+    func setLigandRenderMode(_ mode: RenderMode) {
+        workspace.ligandRenderMode = mode
         pushToRenderer()
     }
 
@@ -198,16 +205,25 @@ extension AppViewModel {
             workspace.selectedAtomIndices.removeAll()
             workspace.selectedResidueIndices.removeAll()
         }
-        workspace.selectedAtomIndices.formUnion(atomIndices)
 
-        for idx in atomIndices {
-            if let prot = molecules.protein, let resIdx = prot.residueIndex(forAtom: idx) {
-                workspace.selectedResidueIndices.insert(resIdx)
-            }
-            if let lig = molecules.ligand {
-                let adjustedIdx = idx - (molecules.protein?.atoms.count ?? 0)
-                if adjustedIdx >= 0, let resIdx = lig.residueIndex(forAtom: adjustedIdx) {
+        if workspace.selectionMode == .atom {
+            workspace.selectedAtomIndices.formUnion(atomIndices)
+        } else {
+            let proteinOffset = molecules.protein?.atoms.count ?? 0
+
+            for idx in atomIndices {
+                if let prot = molecules.protein, let resIdx = prot.residueIndex(forAtom: idx) {
                     workspace.selectedResidueIndices.insert(resIdx)
+                    workspace.selectedAtomIndices.formUnion(prot.residues[resIdx].atomIndices)
+                }
+                if let lig = molecules.ligand {
+                    let adjustedIdx = idx - proteinOffset
+                    if adjustedIdx >= 0, let resIdx = lig.residueIndex(forAtom: adjustedIdx) {
+                        workspace.selectedResidueIndices.insert(resIdx)
+                        workspace.selectedAtomIndices.formUnion(
+                            lig.residues[resIdx].atomIndices.map { $0 + proteinOffset }
+                        )
+                    }
                 }
             }
         }
@@ -215,9 +231,15 @@ extension AppViewModel {
         workspace.selectedAtomIndex = atomIndices.first
         pushToRenderer()
 
-        let count = workspace.selectedAtomIndices.count
-        log.info("Selected \(count) atom\(count == 1 ? "" : "s") by box selection", category: .molecule)
-        workspace.statusMessage = "\(count) atom\(count == 1 ? "" : "s") selected"
+        if workspace.selectionMode == .atom {
+            let count = workspace.selectedAtomIndices.count
+            log.info("Selected \(count) atom\(count == 1 ? "" : "s") by box selection", category: .molecule)
+            workspace.statusMessage = "\(count) atom\(count == 1 ? "" : "s") selected"
+        } else {
+            let count = workspace.selectedResidueIndices.count
+            log.info("Selected \(count) residue\(count == 1 ? "" : "s") by box selection", category: .molecule)
+            workspace.statusMessage = "\(count) residue\(count == 1 ? "" : "s") selected"
+        }
     }
 
     // MARK: - Molecular Surface
@@ -227,6 +249,7 @@ extension AppViewModel {
         if workspace.showSurface {
             generateSurface()
         } else {
+            workspace.surfaceLegend = nil
             renderer?.clearSurfaceMesh()
         }
     }
@@ -274,9 +297,11 @@ extension AppViewModel {
             let atoms = prot.atoms.filter { $0.element != .H }
             if let result = gen.generateSurface(atoms: atoms) {
                 renderer.updateSurfaceMesh(result)
+                workspace.surfaceLegend = result.legend
                 log.success("Surface: \(result.vertexCount) vertices, \(result.indexCount / 3) triangles", category: .molecule)
                 workspace.statusMessage = "Surface generated"
             } else {
+                workspace.surfaceLegend = nil
                 log.error("Surface generation failed", category: .molecule)
                 workspace.statusMessage = "Surface failed"
             }
@@ -480,6 +505,7 @@ extension AppViewModel {
         }
         let c = centroid(selectedPositions)
         renderer?.camera.focusOnPoint(c)
+        renderer?.setNeedsRedraw()
         log.info("Centered on selection", category: .molecule)
     }
 

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 
 // MARK: - View extension for plain-style buttons
 
@@ -11,6 +12,26 @@ extension View {
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(.isButton)
             .accessibilityIdentifier(id)
+    }
+
+    /// Native macOS tooltip via NSView.toolTip — more reliable than .help() in overlays.
+    func nativeTooltip(_ text: String) -> some View {
+        self.overlay(NativeTooltipView(text: text).allowsHitTesting(false))
+    }
+}
+
+/// Invisible NSView overlay that sets `toolTip` on the underlying AppKit view.
+private struct NativeTooltipView: NSViewRepresentable {
+    let text: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.toolTip = text
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.toolTip = text
     }
 }
 

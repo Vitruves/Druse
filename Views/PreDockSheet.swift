@@ -16,9 +16,6 @@ struct PreDockSheet: View {
                     proteinInfoSection
                     Divider()
                     ligandInfoSection
-                    if !viewModel.docking.ligandForms.isEmpty {
-                        ensembleDockingSection
-                    }
                     Divider()
                     pocketInfoSection
                     if !viewModel.docking.pharmacophoreConstraints.isEmpty {
@@ -313,105 +310,6 @@ struct PreDockSheet: View {
             .padding(12)
             .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-    }
-
-    // MARK: - Ensemble Docking
-
-    @ViewBuilder
-    private var ensembleDockingSection: some View {
-        @Bindable var vm = viewModel
-        let forms = vm.docking.ligandForms
-        let cfg = vm.docking.dockingConfig.ensemble
-        let stats = vm.countEnsembleStarts(forms: forms, config: cfg)
-        let qualifyingForms = forms.filter { $0.boltzmannWeight >= cfg.populationCutoff }
-
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                sectionLabel("Ensemble Docking", icon: "arrow.triangle.branch")
-                Spacer()
-                Toggle("", isOn: $vm.docking.dockingConfig.ensemble.enabled)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-            }
-
-            if cfg.enabled {
-                VStack(spacing: 6) {
-                    HStack(spacing: 16) {
-                        infoChip("Forms", "\(stats.forms)/\(forms.count)")
-                        infoChip("Conformers", "\(stats.conformers)")
-                        infoChip("GA starts", "\(stats.total)")
-                    }
-
-                    // Population cutoff slider
-                    HStack {
-                        Text("Pop. cutoff")
-                            .font(.footnote)
-                        Spacer()
-                        Text("\(String(format: "%.0f", cfg.populationCutoff * 100))%")
-                            .font(.footnote.monospaced())
-                    }
-                    Slider(
-                        value: $vm.docking.dockingConfig.ensemble.populationCutoff,
-                        in: 0.01...0.50, step: 0.01
-                    )
-                    .controlSize(.mini)
-
-                    // Max conformers per form
-                    HStack {
-                        Text("Max conf/form")
-                            .font(.footnote)
-                        Spacer()
-                        Text(cfg.maxConformersPerForm == 0 ? "All" : "\(cfg.maxConformersPerForm)")
-                            .font(.footnote.monospaced())
-                    }
-                    Stepper("", value: $vm.docking.dockingConfig.ensemble.maxConformersPerForm, in: 0...20)
-                        .labelsHidden()
-
-                    // Population weighting toggle
-                    HStack {
-                        Text("Population weighting")
-                            .font(.footnote)
-                        Spacer()
-                        Toggle("", isOn: $vm.docking.dockingConfig.ensemble.populationWeighting)
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                    }
-                    .help("Weight docking scores by Boltzmann population of each form")
-
-                    // Show qualifying forms
-                    if !qualifyingForms.isEmpty {
-                        Divider()
-                        ForEach(qualifyingForms) { form in
-                            HStack(spacing: 4) {
-                                Text(form.kind.symbol)
-                                    .font(.caption2.weight(.bold))
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 1)
-                                    .background(form.kind == .parent ? Color.blue.opacity(0.2) : Color.orange.opacity(0.2))
-                                    .clipShape(RoundedRectangle(cornerRadius: 3))
-                                Text(form.label)
-                                    .font(.footnote)
-                                    .lineLimit(1)
-                                Spacer()
-                                Text(String(format: "%.1f%%", form.boltzmannWeight * 100))
-                                    .font(.footnote.monospaced())
-                                    .foregroundStyle(.secondary)
-                                Text("\(form.conformerCount) conf")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-                .padding(12)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else {
-                Text("\(forms.count) chemical form(s) available — enable to dock all")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
         }
     }
 

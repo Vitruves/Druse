@@ -285,8 +285,8 @@ func transformSideChain(template: SideChainTemplate, bubbleCenter: CGPoint,
 
     let dist = max(hypot(dx, dy), 1)
     let ux = dx / dist, uy = dy / dist
-    // Place interacting atom 50px from bubble center (well outside the ~35px bubble half-width)
-    let anchorDist: CGFloat = 50
+    // Place interacting atom outside the bubble (half-width ~40px + clearance)
+    let anchorDist: CGFloat = 55
 
     return template.atoms.map { atom in
         let lx = atom.offset.x - pivot.x

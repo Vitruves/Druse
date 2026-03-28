@@ -36,8 +36,6 @@ extension LigandDatabaseWindow {
                         propertiesTab(entry)
                     case .populateAndPrepare:
                         populateAndPrepareTab(entry)
-                    case .ensemble:
-                        ensembleSummaryTab(entry)
                     }
                 }
             }
@@ -136,65 +134,36 @@ extension LigandDatabaseWindow {
                 }
             }
 
-            // Form navigator (when multiple chemical forms exist)
-            if let entry = inspectedEntry, entry.forms.count > 1 {
+            // Enumeration info (when this entry came from enumeration)
+            if let entry = inspectedEntry, entry.isEnumerated {
                 Divider()
                 HStack(spacing: 8) {
-                    Button(action: {
-                        let newIdx = max(0, selectedFormIndex - 1)
-                        selectedFormIndex = newIdx
-                        selectedFormConformerIndex = 0
-                        loadFormConformers(entry: entry, formIndex: newIdx)
-                        compute2DPreview(smiles: entry.forms[newIdx].smiles)
-                        if show3DPreview, !entry.forms[newIdx].atoms.isEmpty {
-                            updateMiniRenderer(atoms: entry.forms[newIdx].atoms, bonds: entry.forms[newIdx].bonds)
+                    if let kind = entry.formKind {
+                        let kindColor: Color = switch kind {
+                        case .parent: .green
+                        case .tautomer: .cyan
+                        case .protomer: .orange
+                        case .tautomerProtomer: .purple
                         }
-                    }) {
-                        Image(systemName: "chevron.left")
+                        Text(kind.symbol)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 16, height: 14)
+                            .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
+                        Text(kind.label)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(selectedFormIndex == 0)
-
-                    let form = entry.forms[min(selectedFormIndex, entry.forms.count - 1)]
-                    let kindColor: Color = switch form.kind {
-                    case .parent: .green
-                    case .tautomer: .cyan
-                    case .protomer: .orange
-                    case .tautomerProtomer: .purple
+                    if let pn = entry.parentName {
+                        Text("from \(pn)")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
-                    Text(form.kind.symbol)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 16, height: 14)
-                        .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
-                    Text("Form \(selectedFormIndex + 1)/\(entry.forms.count)")
-                        .font(.footnote.monospaced().weight(.medium))
-                    Text(form.label)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-
-                    Button(action: {
-                        let newIdx = min(entry.forms.count - 1, selectedFormIndex + 1)
-                        selectedFormIndex = newIdx
-                        selectedFormConformerIndex = 0
-                        loadFormConformers(entry: entry, formIndex: newIdx)
-                        compute2DPreview(smiles: entry.forms[newIdx].smiles)
-                        if show3DPreview, !entry.forms[newIdx].atoms.isEmpty {
-                            updateMiniRenderer(atoms: entry.forms[newIdx].atoms, bonds: entry.forms[newIdx].bonds)
-                        }
-                    }) {
-                        Image(systemName: "chevron.right")
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(selectedFormIndex >= entry.forms.count - 1)
-
                     Spacer()
-
-                    if form.boltzmannWeight > 0 {
-                        Text(form.populationString)
+                    if let pop = entry.populationWeight {
+                        Text(String(format: "%.1f%%", pop * 100))
                             .font(.footnote.monospaced())
-                            .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
-                                             form.boltzmannWeight > 0.1 ? .yellow : .secondary)
+                            .foregroundStyle(pop > 0.3 ? .green : pop > 0.1 ? .yellow : .secondary)
                     }
                 }
                 .padding(.horizontal, 12)
@@ -423,7 +392,7 @@ extension LigandDatabaseWindow {
             HStack {
                 Text("Conformers/form").font(.footnote)
                 Spacer()
-                Stepper("\(conformerBudgetPerVariant)", value: $conformerBudgetPerVariant, in: 1...50, step: 1)
+                Stepper("\(prepNumConformers)", value: $prepNumConformers, in: 1...50, step: 1)
                     .controlSize(.small)
             }
             HStack {
@@ -439,19 +408,19 @@ extension LigandDatabaseWindow {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-            .disabled(entry.smiles.isEmpty || isGeneratingVariants || entry.parentID != nil)
+            .disabled(entry.smiles.isEmpty || isGeneratingVariants || entry.isEnumerated)
 
             if isGeneratingVariants {
                 ProgressView("Running protomer x tautomer x conformer pipeline...")
                     .controlSize(.small)
             }
 
-            // Show ensemble summary if children exist
-            let children = db.children(of: entry.id)
-            if !children.isEmpty {
+            // Show ensemble summary if siblings exist
+            let siblings = db.siblings(of: entry)
+            if !siblings.isEmpty {
                 Divider()
-                let nForms = Set(children.map(\.smiles)).count
-                let nTotal = children.count
+                let nForms = Set(siblings.map(\.smiles)).count
+                let nTotal = siblings.count
                 HStack(spacing: 8) {
                     Label("\(nForms) forms, \(nTotal) entries", systemImage: "checkmark.circle.fill")
                         .font(.footnote.weight(.medium))
@@ -469,10 +438,9 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     func variantsTab(_ entry: LigandEntry) -> some View {
-        // When inspecting a child variant, show siblings (children of parent)
-        let effectiveParentID = entry.parentID ?? entry.id
-        let isChildEntry = entry.parentID != nil
-        let children = db.children(of: effectiveParentID)
+        // Show sibling forms (flat model — siblings share the same parentName)
+        let isChildEntry = entry.isEnumerated
+        let siblings = db.siblings(of: entry)
 
         VStack(alignment: .leading, spacing: 12) {
             Label("Tautomers & Protomers", systemImage: "arrow.triangle.2.circlepath")
@@ -526,13 +494,13 @@ extension LigandDatabaseWindow {
             }
 
             // Variant list (clickable to inspect)
-            if !children.isEmpty {
+            if !siblings.isEmpty {
                 Divider()
-                Text("\(children.count) variants")
+                Text("\(siblings.count) variants")
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
 
-                ForEach(children) { child in
+                ForEach(siblings) { child in
                     variantRow(child)
                 }
             } else if !isChildEntry {
@@ -546,21 +514,21 @@ extension LigandDatabaseWindow {
 
     @ViewBuilder
     private func variantRow(_ child: LigandEntry) -> some View {
-        let isSelected = selectedVariantID == child.id
-        let allChildren = db.children(of: child.parentID ?? child.id)
-        let minE = allChildren.compactMap(\.relativeEnergy).min() ?? 0
+        let isSelected = inspectedEntry?.id == child.id
+        let allSiblings = db.siblings(of: child)
+        let minE = allSiblings.compactMap(\.relativeEnergy).min() ?? 0
 
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 // Kind badge
-                Text(child.variantKind == .tautomer ? "T" : "P")
+                Text(child.formKind == .tautomer ? "T" : "P")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(.white)
                     .frame(width: 14, height: 14)
-                    .background(Circle().fill(child.variantKind == .tautomer ? Color.purple : Color.cyan))
+                    .background(Circle().fill(child.formKind == .tautomer ? Color.purple : Color.cyan))
 
                 // Label
-                Text(child.variantLineage ?? child.name)
+                Text(child.name)
                     .font(.footnote.weight(isSelected ? .semibold : .medium))
                     .lineLimit(1)
 
@@ -603,143 +571,9 @@ extension LigandDatabaseWindow {
         .onTapGesture { inspectVariantChild(child) }
     }
 
-    // MARK: - Ensemble Tab (forms + conformers overview, clickable to navigate)
+    // (Ensemble tab removed — forms are now shown inline in the table as expandable child rows)
 
-    @ViewBuilder
-    func ensembleSummaryTab(_ entry: LigandEntry) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if entry.forms.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.title2)
-                        .foregroundStyle(.secondary)
-                    Text("No ensemble generated yet")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Text("Run Populate & Prepare to enumerate tautomers, protomers, and conformers.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 20)
-            } else {
-                // Summary header
-                HStack {
-                    Label("\(entry.forms.count) forms, \(entry.totalConformerCount) conformers",
-                          systemImage: "arrow.triangle.2.circlepath")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text("Click a form to preview. Use \u{25C0} \u{25B6} in the viewer to navigate.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                // Forms table
-                ForEach(Array(entry.forms.enumerated()), id: \.element.id) { idx, form in
-                    let isActive = selectedFormIndex == idx
-                    let kindColor: Color = switch form.kind {
-                    case .parent: .green
-                    case .tautomer: .cyan
-                    case .protomer: .orange
-                    case .tautomerProtomer: .purple
-                    }
-
-                    HStack(spacing: 8) {
-                        // Kind badge
-                        Text(form.kind.symbol)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 18, height: 16)
-                            .background(RoundedRectangle(cornerRadius: 4).fill(kindColor))
-
-                        // Label + SMILES
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(form.label)
-                                .font(.footnote.weight(isActive ? .semibold : .regular))
-                                .lineLimit(1)
-                            Text(form.smiles)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-
-                        Spacer()
-
-                        // Conformer count
-                        Text("\(form.conformerCount) conf")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-
-                        // Population
-                        Text(form.populationString)
-                            .font(.caption.monospaced().weight(.medium))
-                            .foregroundStyle(form.boltzmannWeight > 0.3 ? .green :
-                                             form.boltzmannWeight > 0.1 ? .yellow : .secondary)
-                            .frame(width: 38, alignment: .trailing)
-
-                        // Energy
-                        if form.relativeEnergy < 0.01 {
-                            Text("best")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.green)
-                                .frame(width: 50, alignment: .trailing)
-                        } else {
-                            Text(String(format: "+%.1f", form.relativeEnergy))
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.orange)
-                                .frame(width: 50, alignment: .trailing)
-                        }
-
-                        // Remove form
-                        Button {
-                            removeForm(entryID: entry.id, formIndex: idx)
-                        } label: {
-                            Image(systemName: "xmark.circle")
-                                .font(.footnote)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.red.opacity(0.5))
-                        .help("Remove this form from the ensemble")
-                    }
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 8)
-                    .background(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        selectedFormIndex = idx
-                        selectedFormConformerIndex = 0
-                        loadFormConformers(entry: entry, formIndex: idx)
-                        compute2DPreview(smiles: form.smiles)
-                        if show3DPreview, !form.atoms.isEmpty {
-                            updateMiniRenderer(atoms: form.atoms, bonds: form.bonds)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(12)
-    }
-
-    func removeForm(entryID: UUID, formIndex: Int) {
-        guard var entry = db.entries.first(where: { $0.id == entryID }),
-              formIndex < entry.forms.count, entry.forms.count > 1 else { return }
-        entry.forms.remove(at: formIndex)
-        // Recalculate best form index
-        entry.bestFormIndex = 0
-        entry.atoms = entry.forms[0].atoms
-        entry.bonds = entry.forms[0].bonds
-        entry.conformerCount = entry.forms.reduce(0) { $0 + $1.conformerCount }
-        db.update(entry)
-        if inspectedEntry?.id == entryID {
-            inspectedEntry = entry
-        }
-        if selectedFormIndex >= entry.forms.count {
-            selectedFormIndex = max(0, entry.forms.count - 1)
-        }
-        loadFormConformers(entry: entry, formIndex: selectedFormIndex)
-    }
+    // (removeForm removed — flat model has no forms within entries)
 
     // MARK: - Conformers Tab
 
@@ -753,7 +587,7 @@ extension LigandDatabaseWindow {
                 Text("Max conformers")
                     .font(.footnote)
                 Spacer()
-                Stepper("\(conformerBudgetPerVariant)", value: $conformerBudgetPerVariant, in: 5...200, step: 5)
+                Stepper("\(prepNumConformers)", value: $prepNumConformers, in: 5...200, step: 5)
                     .controlSize(.small)
             }
 
@@ -905,7 +739,7 @@ extension LigandDatabaseWindow {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
-            .disabled(entry.smiles.isEmpty || isProcessing || entry.parentID != nil)
+            .disabled(entry.smiles.isEmpty || isProcessing || entry.isEnumerated)
 
             if isProcessing {
                 VStack(spacing: 4) {
@@ -919,8 +753,8 @@ extension LigandDatabaseWindow {
             }
 
             // Results summary
-            let children = db.children(of: entry.id)
-            if entry.isPrepared || !children.isEmpty {
+            let siblings = db.siblings(of: entry)
+            if entry.isPrepared || !siblings.isEmpty {
                 Divider()
                 Label("Output", systemImage: "checkmark.circle.fill")
                     .font(.subheadline.weight(.semibold))
@@ -951,13 +785,13 @@ extension LigandDatabaseWindow {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
 
-                if !children.isEmpty {
-                    let nForms = Set(children.map(\.smiles)).count
-                    Text("\(nForms) chemical forms, \(children.count) variant entries")
+                if !siblings.isEmpty {
+                    let nForms = Set(siblings.map(\.smiles)).count
+                    Text("\(nForms) chemical forms, \(siblings.count) variant entries")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
 
-                    ForEach(children) { child in
+                    ForEach(siblings) { child in
                         variantRow(child)
                     }
                 }
@@ -991,15 +825,27 @@ extension LigandDatabaseWindow {
 
     // MARK: - 2D Structure Drawing
 
+    /// Debounced 2D preview — cancels previous computation when a new row is selected.
+    private static var preview2DTask: Task<Void, Never>?
+
     func compute2DPreview(smiles: String) {
         guard !smiles.isEmpty else { ligand2DCoords = nil; ligand2DSVG = nil; return }
+
+        // Cancel any in-flight computation
+        Self.preview2DTask?.cancel()
         isComputing2D = true
-        Task {
+
+        Self.preview2DTask = Task {
+            // Small delay to debounce rapid clicks
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+
             let smi = smiles
             let (coords, svg) = await Task.detached { @Sendable in
                 (RDKitBridge.compute2DCoords(smiles: smi),
                  RDKitBridge.moleculeToSVG(smiles: smi, width: 500, height: 400))
             }.value
+            guard !Task.isCancelled else { return }
             ligand2DCoords = coords
             ligand2DSVG = svg
             isComputing2D = false
@@ -1108,7 +954,6 @@ extension LigandDatabaseWindow {
     /// Inspect a variant child: update detail panel, 2D/3D preview, conformers
     func inspectVariantChild(_ child: LigandEntry) {
         inspectedEntry = child
-        selectedVariantID = child.id
         compute2DPreview(smiles: child.smiles)
         conformers = child.conformers.map { c in
             ConformerEntry(id: c.id, molecule: MoleculeData(name: child.name, title: child.smiles,
@@ -1121,20 +966,20 @@ extension LigandDatabaseWindow {
     }
 
     func deleteVariant(_ id: UUID) {
-        let parentID = db.entries.first(where: { $0.id == id })?.parentID
+        let deletedEntry = db.entries.first(where: { $0.id == id })
         db.removeWithChildren(id: id)
-        // If we deleted the inspected entry, switch back to parent
+        // If we deleted the inspected entry, switch to a sibling or clear
         if inspectedEntry?.id == id {
-            if let pid = parentID {
-                inspectedEntry = db.entries.first { $0.id == pid }
-                compute2DPreview(smiles: inspectedEntry?.smiles ?? "")
+            if let pn = deletedEntry?.parentName,
+               let sibling = db.entries.first(where: { $0.parentName == pn }) {
+                inspectedEntry = sibling
+                compute2DPreview(smiles: sibling.smiles)
             } else {
                 inspectedEntry = nil
             }
             conformers = []
             selectedConformerIndex = 0
         }
-        if selectedVariantID == id { selectedVariantID = nil }
     }
 
     // MARK: - Full Ensemble Preparation (protomer x tautomer x conformer)
@@ -1148,7 +993,7 @@ extension LigandDatabaseWindow {
             let pH = variantPH, pkaT = variantPkaThreshold
             let maxT = variantMaxTautomers, maxP = variantMaxProtomers
             let cutoff = variantEnergyCutoff
-            let nConf = conformerBudgetPerVariant
+            let nConf = prepNumConformers
 
             let result = await Task.detached { @Sendable in
                 RDKitBridge.prepareEnsemble(
@@ -1174,30 +1019,29 @@ extension LigandDatabaseWindow {
             let entryID = entry.id
             let members = result.members
             db.batchMutate { entries in
-                // Remove existing children
-                let childIDs = Set(entries.filter { $0.parentID == entryID }.map(\.id))
-                if !childIDs.isEmpty {
-                    entries.removeAll { childIDs.contains($0.id) }
+                // Remove existing siblings (forms sharing the same parentName)
+                let pName = entries.first(where: { $0.id == entryID })?.name ?? nm
+                let siblingIDs = Set(entries.filter { $0.parentName == pName }.map(\.id))
+                if !siblingIDs.isEmpty {
+                    entries.removeAll { siblingIDs.contains($0.id) }
                 }
 
-                // Add each ensemble member as a child entry
+                // Add each ensemble member as a sibling entry
                 // C++ kind: 0=parent, 1=tautomer, 2=protomer, 3=taut+prot
-                let parentName = entries.first(where: { $0.id == entryID })?.name ?? nm
                 for member in members {
                     guard !member.molecule.atoms.isEmpty else { continue }
-                    let kind: VariantKind = (member.kind >= 2) ? .protomer : .tautomer
-                    let child = LigandEntry(
-                        name: "\(parentName)_\(member.label)",
+                    let kind: ChemicalFormKind = (member.kind >= 2) ? .protomer : .tautomer
+                    var child = LigandEntry(
+                        name: "\(pName)_\(member.label)",
                         smiles: member.smiles,
                         atoms: member.molecule.atoms,
                         bonds: member.molecule.bonds,
                         isPrepared: true,
-                        conformerCount: 1,
-                        variantLineage: "\(member.label) of \(parentName)",
-                        parentID: entryID,
-                        variantKind: kind,
-                        relativeEnergy: member.mmffEnergy
+                        conformerCount: 1
                     )
+                    child.parentName = pName
+                    child.formKind = kind
+                    child.relativeEnergy = member.mmffEnergy
                     entries.append(child)
                 }
 
@@ -1212,8 +1056,6 @@ extension LigandDatabaseWindow {
                     entries[idx].conformerCount = members.count
                 }
             }
-
-            expandedEntryIDs.insert(entry.id)
 
             // Refresh inspected entry
             if inspectedEntry?.id == entry.id {
@@ -1252,26 +1094,26 @@ extension LigandDatabaseWindow {
                                                 maxTautomers: maxT, energyCutoff: cutoff)
             }.value
 
-            // Replace existing tautomer children (batch to avoid save storm)
+            // Replace existing tautomer siblings (batch to avoid save storm)
             let entryID = entry.id
             db.batchMutate { entries in
-                let existingIDs = Set(entries.filter { $0.parentID == entryID && $0.variantKind == .tautomer }.map(\.id))
+                let pName = entries.first(where: { $0.id == entryID })?.name ?? nm
+                let existingIDs = Set(entries.filter { $0.parentName == pName && $0.formKind == .tautomer }.map(\.id))
                 if !existingIDs.isEmpty {
                     entries.removeAll { existingIDs.contains($0.id) }
                 }
-                let parentName = entries.first(where: { $0.id == entryID })?.name ?? nm
                 for r in results {
-                    entries.append(LigandEntry(
-                        name: "\(parentName)_\(r.label)", smiles: r.smiles,
+                    var child = LigandEntry(
+                        name: "\(pName)_\(r.label)", smiles: r.smiles,
                         atoms: r.molecule.atoms, bonds: r.molecule.bonds,
-                        isPrepared: !r.molecule.atoms.isEmpty, conformerCount: 0,
-                        variantLineage: "\(r.label) of \(parentName)",
-                        parentID: entryID, variantKind: .tautomer,
-                        relativeEnergy: r.score
-                    ))
+                        isPrepared: !r.molecule.atoms.isEmpty, conformerCount: 0
+                    )
+                    child.parentName = pName
+                    child.formKind = .tautomer
+                    child.relativeEnergy = r.score
+                    entries.append(child)
                 }
             }
-            expandedEntryIDs.insert(entry.id)
             isGeneratingVariants = false
             viewModel.log.success("Generated \(results.count) tautomers for \(nm)", category: .molecule)
         }
@@ -1292,23 +1134,23 @@ extension LigandDatabaseWindow {
 
             let entryID = entry.id
             db.batchMutate { entries in
-                let existingIDs = Set(entries.filter { $0.parentID == entryID && $0.variantKind == .protomer }.map(\.id))
+                let pName = entries.first(where: { $0.id == entryID })?.name ?? nm
+                let existingIDs = Set(entries.filter { $0.parentName == pName && $0.formKind == .protomer }.map(\.id))
                 if !existingIDs.isEmpty {
                     entries.removeAll { existingIDs.contains($0.id) }
                 }
-                let parentName = entries.first(where: { $0.id == entryID })?.name ?? nm
                 for r in results {
-                    entries.append(LigandEntry(
-                        name: "\(parentName)_\(r.label)", smiles: r.smiles,
+                    var child = LigandEntry(
+                        name: "\(pName)_\(r.label)", smiles: r.smiles,
                         atoms: r.molecule.atoms, bonds: r.molecule.bonds,
-                        isPrepared: !r.molecule.atoms.isEmpty, conformerCount: 0,
-                        variantLineage: "\(r.label) of \(parentName)",
-                        parentID: entryID, variantKind: .protomer,
-                        relativeEnergy: r.score
-                    ))
+                        isPrepared: !r.molecule.atoms.isEmpty, conformerCount: 0
+                    )
+                    child.parentName = pName
+                    child.formKind = .protomer
+                    child.relativeEnergy = r.score
+                    entries.append(child)
                 }
             }
-            expandedEntryIDs.insert(entry.id)
             isGeneratingVariants = false
             viewModel.log.success("Generated \(results.count) protomers for \(nm) at pH \(String(format: "%.1f", pH))", category: .molecule)
         }
@@ -1322,7 +1164,7 @@ extension LigandDatabaseWindow {
 
         Task {
             let smi = entry.smiles, nm = entry.name
-            let nc = conformerBudgetPerVariant, mn = prepMinimize
+            let nc = prepNumConformers, mn = prepMinimize
 
             let results = await Task.detached { @Sendable in
                 RDKitBridge.generateConformers(smiles: smi, name: nm, count: nc, minimize: mn)

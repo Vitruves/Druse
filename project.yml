@@ -36,6 +36,8 @@ targets:
       - path: Services
       - path: Utils
       - path: Resources/Assets.xcassets
+      - path: Resources/dun2010bbdep.bin
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.druse.app

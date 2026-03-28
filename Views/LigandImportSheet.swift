@@ -267,7 +267,11 @@ extension LigandDatabaseWindow {
                     let ic50 = ic50Idx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
 
                     guard !smiles.isEmpty else { continue }
-                    entries.append(LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50))
+                    var entry = LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50)
+                    if let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
+                        entry.descriptors = desc
+                    }
+                    entries.append(entry)
                 }
                 return entries
             }.value
@@ -339,10 +343,14 @@ extension LigandDatabaseWindow {
                     }.value ?? ""
                 }
 
-                parsed.append(LigandEntry(
+                var entry = LigandEntry(
                     name: name, smiles: smiles, atoms: mol.atoms, bonds: mol.bonds,
-                    isPrepared: true, ki: ki, pKi: pKi, ic50: ic50
-                ))
+                    isPrepared: false, ki: ki, pKi: pKi, ic50: ic50
+                )
+                if !smiles.isEmpty, let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
+                    entry.descriptors = desc
+                }
+                parsed.append(entry)
             }
 
             let count = parsed.count

@@ -77,7 +77,8 @@ enum RibbonMeshGenerator {
     /// Generate a proper ribbon mesh from Cα positions and SS assignments.
     static func generate(
         caPositions: [SIMD3<Float>],
-        ssAssignments: [SecondaryStructure]
+        ssAssignments: [SecondaryStructure],
+        selectedResidues: [Bool] = []
     ) -> (vertices: [RibbonVertex], indices: [UInt32]) {
         let n = caPositions.count
         guard n >= 4 else { return ([], []) }
@@ -87,8 +88,10 @@ enum RibbonMeshGenerator {
         var splineTangents: [SIMD3<Float>] = []
         var splineSecondary: [SecondaryStructure] = []
         var splineArrowParam: [Float] = []
+        var splineFlags: [UInt32] = []
 
         let subs = subdivisionsPerResidue
+        let selected = selectedResidues.count == n ? selectedResidues : Array(repeating: false, count: n)
 
         for seg in 0..<(n - 1) {
             let i0 = max(seg - 1, 0)
@@ -101,6 +104,7 @@ enum RibbonMeshGenerator {
             let p2 = caPositions[i2]
             let p3 = caPositions[i3]
             let ssType = ssAssignments[i1]
+            let isSelected = selected[i1] || selected[i2]
 
             // Detect C-terminal end of sheet for arrow
             let isLastSheet = (ssType == .sheet) &&
@@ -112,6 +116,7 @@ enum RibbonMeshGenerator {
                 splineTangents.append(catmullRomTangent(p0: p0, p1: p1, p2: p2, p3: p3, t: t))
                 splineSecondary.append(ssType)
                 splineArrowParam.append(isLastSheet ? t : 0.0)
+                splineFlags.append(isSelected ? 1 : 0)
             }
         }
 
@@ -120,6 +125,7 @@ enum RibbonMeshGenerator {
         splineTangents.append(splineTangents.last ?? SIMD3<Float>(0, 0, 1))
         splineSecondary.append(ssAssignments[n - 1])
         splineArrowParam.append(0.0)
+        splineFlags.append(selected[n - 1] ? 1 : 0)
 
         let splineCount = splinePositions.count
         guard splineCount >= 2 else { return ([], []) }
@@ -200,7 +206,8 @@ enum RibbonMeshGenerator {
                     position: surfPos,
                     normal: localNormal,
                     color: vertColor,
-                    texCoord: SIMD2<Float>(texU, texV)
+                    texCoord: SIMD2<Float>(texU, texV),
+                    flags: splineFlags[i]
                 ))
             }
         }
@@ -237,7 +244,8 @@ enum RibbonMeshGenerator {
     @MainActor
     static func generateForMolecule(
         _ molecule: Molecule,
-        chainColorMap: [String: SIMD3<Float>] = [:]
+        chainColorMap: [String: SIMD3<Float>] = [:],
+        selectedResidueKeys: Set<String> = []
     ) -> (vertices: [RibbonVertex], indices: [UInt32]) {
         var allVertices: [RibbonVertex] = []
         var allIndices: [UInt32] = []
@@ -266,7 +274,15 @@ enum RibbonMeshGenerator {
                 return .coil
             }
 
-            let (verts, idxs) = generate(caPositions: caPositions, ssAssignments: ssAssignments)
+            let selectedResidues = caAtoms.map { atom in
+                selectedResidueKeys.contains("\(atom.chainID)|\(atom.residueSeq)")
+            }
+
+            let (verts, idxs) = generate(
+                caPositions: caPositions,
+                ssAssignments: ssAssignments,
+                selectedResidues: selectedResidues
+            )
 
             // Override vertex colors with per-chain color when chain coloring is active
             var finalVerts = verts

@@ -79,11 +79,13 @@ struct LigandDatabaseView: View {
 
             // Quick SMILES add
             HStack(spacing: 4) {
-                TextField("SMILES", text: $smilesInput)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.footnote.monospaced())
-                    .onSubmit { if !smilesInput.isEmpty { addFromSMILES() } }
-                    .accessibilityIdentifier(AccessibilityID.ligSmilesField)
+                PastableTextField(
+                    text: $smilesInput,
+                    placeholder: "SMILES",
+                    font: .monospacedSystemFont(ofSize: 11, weight: .regular),
+                    onSubmit: { if !smilesInput.isEmpty { addFromSMILES() } }
+                )
+                .accessibilityIdentifier(AccessibilityID.ligSmilesField)
 
                 if showAddConfirmation {
                     Image(systemName: "checkmark.circle.fill")
@@ -242,6 +244,6 @@ struct LigandDatabaseView: View {
             return
         }
         let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds, title: entry.smiles, smiles: entry.smiles)
-        viewModel.setLigandForDocking(mol, entryID: entry.id, forms: entry.forms)
+        viewModel.setLigandForDocking(mol, entryID: entry.id)
     }
 }

@@ -188,6 +188,71 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(frag.searchMethod, .fragmentBased)
     }
 
+    @MainActor
+    func testRenderModeStateKeepsLigandSpecificAndGlobalModesConsistent() {
+        let viewModel = AppViewModel()
+
+        XCTAssertEqual(viewModel.workspace.effectiveLigandRenderMode, .ballAndStick)
+
+        viewModel.setLigandRenderMode(.spaceFilling)
+        XCTAssertEqual(viewModel.workspace.ligandRenderMode, .spaceFilling)
+        XCTAssertEqual(viewModel.workspace.effectiveLigandRenderMode, .spaceFilling)
+
+        viewModel.setRenderMode(.wireframe)
+        XCTAssertNil(viewModel.workspace.ligandRenderMode)
+        XCTAssertEqual(viewModel.workspace.effectiveLigandRenderMode, .wireframe)
+
+        viewModel.setLigandRenderMode(.spaceFilling)
+        viewModel.setRenderMode(.ribbon)
+        XCTAssertNil(viewModel.workspace.ligandRenderMode)
+        XCTAssertEqual(viewModel.workspace.effectiveLigandRenderMode, .ballAndStick)
+    }
+
+    @MainActor
+    func testSelectionDefaultsToResidueMode() {
+        let viewModel = AppViewModel()
+        XCTAssertEqual(viewModel.workspace.selectionMode, .residue)
+    }
+
+    @MainActor
+    func testBoxSelectionHonorsResidueMode() {
+        let viewModel = AppViewModel()
+        viewModel.molecules.protein = Molecule(
+            name: "Test",
+            atoms: [
+                Atom(id: 0, element: .C, position: .zero, name: "CA", residueName: "ALA", residueSeq: 1, chainID: "A"),
+                Atom(id: 1, element: .N, position: SIMD3<Float>(1, 0, 0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+                Atom(id: 2, element: .C, position: SIMD3<Float>(2, 0, 0), name: "CA", residueName: "GLY", residueSeq: 2, chainID: "A"),
+                Atom(id: 3, element: .O, position: SIMD3<Float>(3, 0, 0), name: "O", residueName: "GLY", residueSeq: 2, chainID: "A"),
+            ],
+            bonds: []
+        )
+
+        viewModel.handleBoxSelection(atomIndices: [0], addToExisting: false)
+
+        XCTAssertEqual(viewModel.workspace.selectedResidueIndices, Set([0]))
+        XCTAssertEqual(viewModel.workspace.selectedAtomIndices, Set([0, 1]))
+    }
+
+    @MainActor
+    func testBoxSelectionHonorsAtomMode() {
+        let viewModel = AppViewModel()
+        viewModel.workspace.selectionMode = .atom
+        viewModel.molecules.protein = Molecule(
+            name: "Test",
+            atoms: [
+                Atom(id: 0, element: .C, position: .zero, name: "CA", residueName: "ALA", residueSeq: 1, chainID: "A"),
+                Atom(id: 1, element: .N, position: SIMD3<Float>(1, 0, 0), name: "N", residueName: "ALA", residueSeq: 1, chainID: "A"),
+            ],
+            bonds: []
+        )
+
+        viewModel.handleBoxSelection(atomIndices: [0], addToExisting: false)
+
+        XCTAssertTrue(viewModel.workspace.selectedResidueIndices.isEmpty)
+        XCTAssertEqual(viewModel.workspace.selectedAtomIndices, Set([0]))
+    }
+
     // MARK: - PDB / mmCIF Parsing
 
     @MainActor
@@ -447,5 +512,53 @@ final class CoreTests: XCTestCase {
         // Benzene: no ionizable groups → 1 protomer (parent)
         let benz = RDKitBridge.enumerateProtomers(smiles: "c1ccccc1")
         XCTAssertGreaterThanOrEqual(benz.count, 1)
+    }
+
+    func testImatinibEnsemble() {
+        // Imatinib: N-methylpiperazine (pKa1 ~8.1, pKa2 ~2.8 due to electrostatic
+        // depression), pyridine N, aminopyrimidine. At pH 7.4 with 2.0 threshold,
+        // the piperazine monocation is dominant (~82%) and the neutral form (~18%)
+        // should also be present. We must get ≥2 forms (protomers or tautomers).
+        let imatinib = "Cc1ccc(NC(=O)c2ccc(CN3CCN(C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1"
+        let result = RDKitBridge.prepareEnsemble(
+            smiles: imatinib, name: "Imatinib",
+            pH: 7.4, pkaThreshold: 2.0,
+            maxTautomers: 10, maxProtomers: 8,
+            energyCutoff: 15.0, conformersPerForm: 3
+        )
+        XCTAssertTrue(result.success, "Imatinib ensemble should succeed: \(result.errorMessage)")
+        XCTAssertGreaterThanOrEqual(result.members.count, 2,
+            "Imatinib should produce ≥2 ensemble members (protomers + conformers)")
+
+        let forms = RDKitBridge.ensembleResultToForms(result)
+        XCTAssertGreaterThanOrEqual(forms.count, 2,
+            "Imatinib should have ≥2 chemical forms (monocation + neutral at minimum)")
+
+        // At least one form should be a protomer (kind=2) or tautomer+protomer (kind=3)
+        let hasProtomer = forms.contains { $0.kind == .protomer || $0.kind == .tautomerProtomer }
+        XCTAssertTrue(hasProtomer, "Imatinib should have at least one protomer form")
+
+        // Dominant form should have >50% population
+        if let dominant = forms.first {
+            XCTAssertGreaterThan(dominant.boltzmannWeight, 0.5,
+                "Dominant imatinib form should have >50% population")
+        }
+
+        // All forms should have valid SMILES and atoms
+        for form in forms {
+            XCTAssertFalse(form.smiles.isEmpty)
+            XCTAssertGreaterThan(form.atoms.count, 0)
+        }
+    }
+
+    func testPiperazineDetection() {
+        // N,N'-dimethylpiperazine: both N should be detected as ionizable sites
+        let sites = RDKitBridge.detectIonizableSites(smiles: "CN1CCN(C)CC1")
+        let basicN = sites.filter { !$0.isAcid && $0.defaultPKa > 3.0 }
+        XCTAssertGreaterThanOrEqual(basicN.count, 2,
+            "N,N'-dimethylpiperazine should have ≥2 basic N detected, got \(basicN.count): \(basicN.map { "\($0.groupName) pKa=\($0.defaultPKa)" })")
+
+        // After electrostatic depression, detecting ionizable sites should still
+        // find both N but they'll have different effective pKa in the ensemble pipeline
     }
 }

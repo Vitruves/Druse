@@ -50,7 +50,7 @@ struct AtomInstance {
     simd_float4 color;
     int32_t     atomIndex;
     int32_t     flags;      // bit 0: atom selected, bit 1: residue highlighted
-    float       _pad0;
+    int32_t     formalCharge; // integer formal charge (+1, -1, etc.) for visual indicator
     float       _pad1;
 };
 
@@ -70,6 +70,7 @@ struct RibbonVertex {
     simd_float3 normal;
     simd_float4 color;
     simd_float2 texCoord;
+    uint32_t    flags;       // bit 0: residue selected
 };
 
 // Per-vertex data for interaction dashed lines
@@ -982,6 +983,66 @@ struct LoopRefineParams {
     float       stericCutoff;    // cutoff for steric evaluation (Angstrom)
     uint32_t    computeGrad;     // 0 = energy only, 1 = energy + gradient
     uint32_t    _pad0;
+};
+
+// ============================================================================
+// MARK: - FASPR Sidechain Packing GPU Types
+// ============================================================================
+
+/// Atom for FASPR energy calculations (VDW parameters baked in).
+struct FASPRGPUAtom {
+    simd_float3 position;        // Angstrom
+    float       radius;          // VDW radius (Angstrom)
+    float       depth;           // VDW well depth (kcal/mol)
+    uint32_t    atomTypeIdx;     // 1-based FASPR atom type index
+    uint32_t    _pad0;
+};
+
+/// Parameters for FASPR self-energy kernel (rotamer vs backbone).
+struct FASPRSelfParams {
+    uint32_t    rotamerCount;         // number of rotamers for this site
+    uint32_t    backboneAtomCount;    // total backbone/environment atoms
+    uint32_t    maxAtomsPerRotamer;   // max sidechain atoms per rotamer (padded)
+    float       vdwRepCut;            // 10.0 kcal/mol cap
+    float       dstarMinCut;          // 0.015
+    float       dstarMaxCut;          // 1.90
+};
+
+/// Parameters for FASPR pair-energy kernel (rotamer vs rotamer).
+struct FASPRPairParams {
+    uint32_t    rot1Count;
+    uint32_t    rot2Count;
+    uint32_t    maxAtoms1;            // max sidechain atoms per rotamer (site 1)
+    uint32_t    maxAtoms2;            // max sidechain atoms per rotamer (site 2)
+    float       vdwRepCut;            // 10.0 kcal/mol
+    float       dstarMinCut;
+    float       dstarMaxCut;
+    uint32_t    _pad0;
+};
+
+// ============================================================================
+// MARK: - Preparation Minimizer GPU Types
+// ============================================================================
+
+/// Atom for preparation minimization with region-based restraints.
+struct PrepMinAtom {
+    simd_float3 position;        // current position (Angstrom)
+    float       sigma;           // LJ sigma (Angstrom), combined for mixing
+    float       epsilon;         // LJ epsilon (kcal/mol), combined for mixing
+    uint32_t    region;          // 0=backbone, 1=existingSidechain, 2=reconstructed, 3=hydrogen
+    float       _pad0;
+};
+
+/// Parameters for preparation minimization kernel.
+struct PrepMinParams {
+    uint32_t    atomCount;
+    float       restraintK_backbone;      // kcal/mol/A^2
+    float       restraintK_existing;      // kcal/mol/A^2
+    float       restraintK_reconstructed; // kcal/mol/A^2 (typically 0)
+    float       stericCutoff;             // Angstrom
+    uint32_t    computeGrad;              // 0 = energy only, 1 = energy + gradient
+    uint32_t    _pad0;
+    uint32_t    _pad1;
 };
 
 #endif /* ShaderTypes_h */

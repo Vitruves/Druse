@@ -44,12 +44,7 @@ struct DockingCoordinator {
     /// Original ligand preserved before docking mutates the active ligand with pose transforms.
     var originalDockingLigand: Molecule?
 
-    /// Chemical forms from the active ligand's ensemble (populated from LigandEntry.forms).
-    /// Used for multi-start docking across tautomers/protomers/conformers.
-    var ligandForms: [ChemicalForm] = []
-
-    /// Multi-start docking progress: (current start index, total starts).
-    var ensembleProgress: (current: Int, total: Int) = (0, 0)
+    // (Ensemble docking removed — each entry is docked independently as one job)
 
     // Batch docking state
     var batchResults: [(ligandName: String, results: [DockingResult])] = []

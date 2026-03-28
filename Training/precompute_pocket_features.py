@@ -20,7 +20,7 @@ from torch_geometric.data import Data
 from torch_geometric.nn import radius_graph
 from tqdm import tqdm
 
-from Training.trainPocketML import (
+from train_pocket_detector import (
     compute_surface_features,
     PocketSurfaceDataset,
     SURFACE_FEAT_DIM,

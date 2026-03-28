@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import simd
 
 extension ProteinPreparation {
@@ -30,7 +31,8 @@ extension ProteinPreparation {
         atoms: [Atom],
         bonds: [Bond],
         pH: Float = 7.4,
-        polarOnly: Bool = false
+        polarOnly: Bool = false,
+        device: MTLDevice? = nil
     ) -> (atoms: [Atom], bonds: [Bond], report: ReconstructionReport, protonation: [Protonation.ResiduePrediction]) {
         let logSync = { (msg: String) in
             _ = Task { @MainActor in ActivityLog.shared.debug(msg, category: .prep) }
@@ -40,20 +42,65 @@ extension ProteinPreparation {
         let reconstructed = reconstructMissingHeavyAtoms(atoms: atoms, bonds: bonds)
         logSync("[Phase2] Reconstruction done: \(reconstructed.atoms.count) atoms (+\(reconstructed.addedAtomCount) added)")
 
+        // Phase 2b: FASPR sidechain packing
+        var workAtoms = reconstructed.atoms
+        var workBonds = reconstructed.bonds
+        if DunbrackRotamerLibrary.shared.isLoaded {
+            logSync("[Phase2b] FASPR sidechain packing (\(workAtoms.count) atoms)...")
+            let packed = FASPRSidechainPacker.packSidechains(
+                atoms: workAtoms,
+                bonds: workBonds,
+                device: device,
+                onlyIncomplete: true
+            )
+            workAtoms = packed.atoms
+            workBonds = packed.bonds
+            logSync("[Phase2b] Packing done: \(packed.report.residuesPacked) residues in \(String(format: "%.0f", packed.report.elapsedMs))ms")
+        }
+
+        // Phase 2c: Preparation minimization
+        if let dev = device, let minimizer = PreparationMinimizer(device: dev) {
+            logSync("[Phase2c] Preparation minimization (\(workAtoms.count) atoms)...")
+            let regions: [PreparationMinimizer.AtomRegion] = workAtoms.map { atom in
+                if atom.element == .H { return .hydrogen }
+                let name = atom.name.padding(toLength: 4, withPad: " ", startingAt: 0)
+                if name == " N  " || name == " CA " || name == " C  " || name == " O  " {
+                    return .backbone
+                }
+                return .existingSidechain
+            }
+
+            let result = minimizer.minimize(
+                input: PreparationMinimizer.MinimizationInput(
+                    atoms: workAtoms,
+                    bonds: workBonds,
+                    atomRegions: regions,
+                    angles: [],
+                    torsions: []
+                ),
+                maxIterations: 100
+            )
+
+            for i in 0..<min(result.positions.count, workAtoms.count) {
+                workAtoms[i].position = result.positions[i]
+            }
+            logSync("[Phase2c] Minimization done: E=\(String(format: "%.1f", result.finalEnergy)) kcal/mol, \(result.iterations) iterations, converged=\(result.converged)")
+        }
+
         logSync("[Phase2] Predicting protonation states at pH \(pH)...")
         let protonation = Protonation.predictResidueStates(
-            atoms: reconstructed.atoms,
-            bonds: reconstructed.bonds,
+            atoms: workAtoms,
+            bonds: workBonds,
             pH: pH
         )
         logSync("[Phase2] Protonation: \(protonation.count) predictions")
 
-        let chargedAtoms = Protonation.applyProtonation(atoms: reconstructed.atoms, predictions: protonation)
+        let chargedAtoms = Protonation.applyProtonation(atoms: workAtoms, predictions: protonation)
 
         logSync("[Phase3] Adding template hydrogens (\(chargedAtoms.count) atoms, polarOnly=\(polarOnly))...")
         let hydrogenated = addTemplateHydrogens(
             atoms: chargedAtoms,
-            bonds: reconstructed.bonds,
+            bonds: workBonds,
             pH: pH,
             predictions: protonation,
             polarOnly: polarOnly

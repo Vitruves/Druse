@@ -110,6 +110,17 @@ struct DruseApp: App {
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
+        // Interaction Diagram window — 2D protein-ligand interaction view
+        Window("Interaction Diagram", id: "interaction-diagram") {
+            InteractionDiagramWindow()
+                .environment(viewModel)
+                .preferredColorScheme(selectedColorScheme)
+        }
+        .defaultSize(width: 1050, height: 800)
+        .windowStyle(.titleBar)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
         // Results Database window — full pose analysis, interaction diagrams, correlation
         Window("Results Database", id: "results-database") {
             ResultsDatabaseWindow()

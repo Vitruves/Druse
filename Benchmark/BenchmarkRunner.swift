@@ -50,6 +50,14 @@ final class BenchmarkRunner: XCTestCase {
 
     // MARK: - Helpers
 
+    /// Write directly to stdout with immediate flush (bypasses xcodebuild buffering).
+    private func emit(_ msg: String) {
+        let line = msg + "\n"
+        if let data = line.data(using: .utf8) {
+            FileHandle.standardOutput.write(data)
+        }
+    }
+
     private func computeRMSD(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>]) -> Float {
         let n = min(a.count, b.count)
         guard n > 0 else { return .infinity }
@@ -168,10 +176,6 @@ final class BenchmarkRunner: XCTestCase {
                 guard let rawProtein = loadProtein(path: resolve(complex.proteinPdb)) else {
                     throw BenchmarkError.step("parse protein")
                 }
-                let rawAtomCount = rawProtein.atoms.count
-                print("    protein: \(rawAtomCount) raw atoms")
-                fflush(stdout)
-
                 let pdbContent = try? String(contentsOfFile: resolve(complex.proteinPdb), encoding: .utf8)
                 let rawAtoms = rawProtein.atoms
                 let rawBonds = rawProtein.bonds
@@ -181,7 +185,6 @@ final class BenchmarkRunner: XCTestCase {
                         rawPDBContent: pdbContent, pH: 7.4
                     )
                 }.value
-                print("    prepared: \(prepared.atoms.count) atoms (+\(prepared.report.hydrogensAdded) H)")
                 let protein = Molecule(name: rawProtein.name,
                                        atoms: prepared.atoms, bonds: prepared.bonds,
                                        title: rawProtein.title)
@@ -207,8 +210,6 @@ final class BenchmarkRunner: XCTestCase {
                 eng.setProtein(protein.atoms, protein.bonds)
 
                 // 6. Dock (DruseAF runs its own ML scoring on Metal during the GA)
-                print("    docking (pop=\(config.populationSize) gen=\(config.generationsPerRun))...")
-                fflush(stdout)
                 let gaResults = await eng.runDocking(
                     ligand: ligand, pocket: pocket,
                     config: config, scoringMethod: scoringMethod
@@ -251,8 +252,7 @@ final class BenchmarkRunner: XCTestCase {
 
                     let rmsd = entry.bestRmsd.map { String(format: "%.2f", $0) } ?? "N/A"
                     let gfn2Str = entry.gfn2Energy.map { String(format: "  GFN2=%.0f", $0) } ?? ""
-                    print("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
-                    fflush(stdout)
+                    emit("  [\(idx+1)/\(total)] \(complex.pdbId)  E=\(String(format: "%.2f", best.energy))  RMSD=\(rmsd)A\(gfn2Str)  \(String(format: "%.0f", elapsed))ms")
                     succeeded += 1
                 } else {
                     entry.error = "0 poses"
@@ -264,14 +264,12 @@ final class BenchmarkRunner: XCTestCase {
                 entry.error = e.message
                 entry.dockingTimeMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
                 failed += 1
-                print("  [\(idx+1)/\(total)] \(complex.pdbId)  FAILED: \(e.message)")
-                fflush(stdout)
+                emit("  [\(idx+1)/\(total)] \(complex.pdbId)  FAILED: \(e.message)")
             } catch {
                 entry.error = "\(error)"
                 entry.dockingTimeMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
                 failed += 1
-                print("  [\(idx+1)/\(total)] \(complex.pdbId)  FAILED: \(error)")
-                fflush(stdout)
+                emit("  [\(idx+1)/\(total)] \(complex.pdbId)  FAILED: \(error)")
             }
 
             bench.entries.append(entry)

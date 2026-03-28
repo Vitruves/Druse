@@ -6,6 +6,7 @@ import AppKit
 struct ResultsDatabaseWindow: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
 
     @State private var selectedPoseIndex: Int? = nil
     @State private var showInteractionDiagram: Bool = false
@@ -81,20 +82,10 @@ struct ResultsDatabaseWindow: View {
             statusBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .sheet(isPresented: $showInteractionDiagram) {
-            if let idx = selectedPoseIndex, idx < displayedResults.count,
-               let ligand = viewModel.molecules.ligand, let protein = viewModel.molecules.protein {
-                let result = displayedResults[idx]
-                InteractionDiagramView(
-                    interactions: viewModel.docking.currentInteractions,
-                    ligandAtoms: ligand.atoms.filter { $0.element != .H },
-                    ligandBonds: ligand.bonds,
-                    proteinAtoms: protein.atoms.filter { $0.element != .H },
-                    ligandSmiles: ligand.smiles ?? ligand.title,
-                    poseEnergy: result.energy,
-                    poseIndex: idx
-                )
-                .frame(minWidth: 700, minHeight: 600)
+        .onChange(of: showInteractionDiagram) { _, show in
+            if show {
+                openWindow(id: "interaction-diagram")
+                showInteractionDiagram = false
             }
         }
         .sheet(isPresented: $showCorrelation) {

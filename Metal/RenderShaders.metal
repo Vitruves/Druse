@@ -71,6 +71,7 @@ struct AtomVertexOut {
     int    atomIndex;
     int    flags;
     float  expandedRadius;
+    int    formalCharge;
 };
 
 struct AtomFragmentOut {
@@ -117,6 +118,7 @@ vertex AtomVertexOut atomVertex(
     out.atomIndex      = inst.atomIndex;
     out.flags          = inst.flags;
     out.expandedRadius = expand;
+    out.formalCharge   = inst.formalCharge;
     return out;
 }
 
@@ -187,6 +189,42 @@ fragment AtomFragmentOut atomFragment(
         litColor = baseColor * (uniforms.ambientIntensity + NdotL * uniforms.lightColor)
                  + specular * uniforms.lightColor
                  + rim * float3(0.4, 0.5, 0.7);
+    }
+
+    // Formal charge indicator: colored rim + symbol on sphere face
+    if (in.formalCharge != 0) {
+        float3 viewDir2 = float3(0.0, 0.0, 1.0);
+        float NdotV2 = max(dot(normal, viewDir2), 0.0);
+
+        // Fresnel rim glow — visible edge tint for charged atoms
+        float rim2 = 1.0 - NdotV2;
+        float rimStrength = smoothstep(0.45, 0.85, rim2);
+        float3 chargeColor = in.formalCharge > 0
+            ? float3(0.3, 0.5, 1.0)   // blue for cation (+)
+            : float3(1.0, 0.3, 0.2);  // red for anion (-)
+        litColor = mix(litColor, chargeColor, rimStrength * 0.65);
+
+        // +/- symbol rendered on the sphere face (screen-space on billboard)
+        float2 symCenter = float2(0.0, -0.30);  // upper portion of sphere face
+        float2 symPos = in.quadCoord - symCenter;
+        float symScale = 0.18;
+        float barThick = 0.06;
+
+        bool symbolHit = false;
+        // Horizontal bar (both + and -)
+        bool hBar = abs(symPos.x) < symScale && abs(symPos.y) < barThick;
+        if (in.formalCharge > 0) {
+            // Vertical bar (+ only)
+            bool vBar = abs(symPos.x) < barThick && abs(symPos.y) < symScale;
+            symbolHit = hBar || vBar;
+        } else {
+            symbolHit = hBar;
+        }
+
+        // Only draw symbol where the sphere surface faces the camera (front hemisphere)
+        if (symbolHit && NdotV2 > 0.3) {
+            litColor = chargeColor;
+        }
     }
 
     AtomFragmentOut out;
@@ -446,6 +484,7 @@ struct RibbonVertexOut {
     float4 color;
     float3 viewPos;
     float2 texCoord;
+    uint   flags;
 };
 
 vertex RibbonVertexOut ribbonVertex(
@@ -464,6 +503,7 @@ vertex RibbonVertexOut ribbonVertex(
     out.color = v.color;
     out.viewPos = viewPos.xyz;
     out.texCoord = v.texCoord;
+    out.flags = v.flags;
 
     return out;
 }
@@ -501,6 +541,10 @@ fragment float4 ribbonFragment(
 
         color = in.color.rgb * (ambient + (diffuse + backDiffuse) * uniforms.lightColor)
               + specular * uniforms.lightColor;
+    }
+
+    if (in.flags & 1) {
+        color = mix(color, float3(0.0, 0.9, 0.9), 0.35);
     }
 
     return float4(color, in.color.a);
