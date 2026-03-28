@@ -499,7 +499,7 @@ final class DockingEngine {
 
         let gridMapCount: UInt64 = activeVinaTypes.isEmpty ? 3 : UInt64(3 + activeVinaTypes.count)
 
-        let searchPadding: Float = 4.0
+        let searchPadding: Float = 0.0  // pocket.size already includes 4A padding from BindingSite
         let gridPadding: Float = 3.0
         let ligandMargin = ligandExtent ?? SIMD3<Float>(repeating: 4.0)
         let searchCenter = pocket.center

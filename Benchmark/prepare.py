@@ -53,6 +53,35 @@ def mol_to_smiles(mol):
         return None
 
 
+def compute_smiles_atom_map(mol, smiles):
+    """Compute mapping from SMILES canonical atom order to SDF atom order.
+
+    Returns a list where smiles_atom_map[smiles_idx] = sdf_heavy_atom_idx.
+    This allows the benchmark to reorder SDF-order crystal positions to match
+    SMILES-derived ligand atom order in full pipeline mode.
+    Returns None if mapping fails.
+    """
+    try:
+        sdf_noH = Chem.RemoveHs(mol)
+        smiles_mol = Chem.MolFromSmiles(smiles)
+        if smiles_mol is None or sdf_noH.GetNumAtoms() != smiles_mol.GetNumAtoms():
+            return None
+        match = sdf_noH.GetSubstructMatch(smiles_mol)
+        if len(match) != sdf_noH.GetNumAtoms():
+            return None
+        return list(match)
+    except Exception as e:
+        print(f"    [WARN] atom map failed: {e}")
+        return None
+
+
+def reorder_positions(positions, atom_map):
+    """Apply atom map to reorder positions: result[i] = positions[atom_map[i]]."""
+    if atom_map is None or len(atom_map) != len(positions):
+        return None
+    return [positions[atom_map[i]] for i in range(len(atom_map))]
+
+
 def get_casf_core_ids():
     """Get CASF-2016 core set PDB IDs + pKd values.
 
@@ -129,13 +158,15 @@ def prepare_manifest():
 
         smiles = mol_to_smiles(mol)
         crystal_pos = extract_heavy_positions(mol)
+        atom_map = compute_smiles_atom_map(mol, smiles) if smiles and crystal_pos else None
         heavy_count = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() > 1) if mol else 0
 
         if not smiles or not crystal_pos:
             skipped += 1
             continue
 
-        complexes.append({
+        smiles_pos = reorder_positions(crystal_pos, atom_map)
+        entry = {
             "pdb_id": pdb_id,
             "protein_pdb": str(protein_pdb.relative_to(ROOT)),
             "pocket_pdb": str(pocket_pdb.relative_to(ROOT)) if pocket_pdb.exists() else None,
@@ -144,7 +175,12 @@ def prepare_manifest():
             "crystal_positions": crystal_pos,
             "heavy_atom_count": heavy_count,
             "pKd": round(pKd, 2),
-        })
+        }
+        if atom_map is not None:
+            entry["smiles_atom_map"] = atom_map
+        if smiles_pos is not None:
+            entry["crystal_positions_smiles"] = smiles_pos
+        complexes.append(entry)
 
     manifest = {
         "benchmark": "casf-2016",

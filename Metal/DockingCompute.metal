@@ -2431,8 +2431,8 @@ kernel void localSearch(
         gradMag = sqrt(gradMag);
         if (gradMag < 1e-6f) break;  // converged
 
-        // Normalize gradient to step in consistent direction
-        float scale = stepSize / gradMag;
+        // Normalize and clamp
+        float scale = min(stepSize / gradMag, stepSize);
 
         // ---- Apply gradient step ----
         float3 newT = pose.translation;
@@ -2478,7 +2478,7 @@ kernel void localSearch(
 
         if (newE < baseE) {
             pose.energy = newE;
-            stepSize = min(stepSize * 1.2f, 1.0f);
+            stepSize = min(stepSize * 1.2f, 0.5f);
         } else {
             // Rollback
             pose.translation = oldT;
@@ -2487,7 +2487,7 @@ kernel void localSearch(
             pose.energy = baseE;
             stepSize *= 0.5f;
         }
-        if (stepSize < 0.0005f) break;
+        if (stepSize < 0.001f) break;
     }
 }
 
@@ -2736,9 +2736,8 @@ kernel void localSearchAnalytical(
         gradMag = sqrt(gradMag);
         if (gradMag < 1e-6f) break;
 
-        // Gradient-normalized step: always step proportional to gradient direction,
-        // scaled by stepSize. This avoids overshooting when gradient is small.
-        float scale = stepSize / gradMag;
+        // Normalize and clamp
+        float scale = min(stepSize / gradMag, stepSize);
 
         // Apply gradient step
         float3 newT = pose.translation;
@@ -2785,7 +2784,7 @@ kernel void localSearchAnalytical(
 
         if (newE < baseE) {
             pose.energy = newE;
-            stepSize = min(stepSize * 1.2f, 1.0f);
+            stepSize = min(stepSize * 1.2f, 0.5f);
         } else {
             pose.translation = oldT;
             pose.rotation = oldRot;
@@ -2793,7 +2792,7 @@ kernel void localSearchAnalytical(
             pose.energy = baseE;
             stepSize *= 0.5f;
         }
-        if (stepSize < 0.0005f) break;
+        if (stepSize < 0.001f) break;
     }
 }
 
@@ -2843,20 +2842,8 @@ kernel void localSearchAnalyticalSIMD(
     threadgroup float4 tg_oldRot;
     threadgroup float  tg_oldTor[32];
 
+    float stepSize = 0.08f;
     int maxSteps = max(int(gaParams.localSearchSteps), 1);
-
-    // L-BFGS history (m=5): store position and gradient differences
-    const uint LBFGS_M = 5;
-    const uint NDIM = 6 + nTor;  // 3 translation + 3 rotation + nTorsions
-    float lbfgs_s[LBFGS_M][38];  // s_k = x_{k+1} - x_k  (position diff)
-    float lbfgs_y[LBFGS_M][38];  // y_k = g_{k+1} - g_k  (gradient diff)
-    float lbfgs_rho[LBFGS_M];    // 1 / dot(y_k, s_k)
-    uint lbfgs_count = 0;         // how many history pairs stored
-    uint lbfgs_newest = 0;        // circular buffer index
-
-    float prevGrad[38];           // previous gradient for L-BFGS update
-    float prevX[38];              // previous position for L-BFGS update
-    bool hasPrev = false;
 
     for (int step = 0; step < maxSteps; step++) {
         // === Transform atoms: rigid body parallel, torsions sequential ===
@@ -2963,99 +2950,14 @@ kernel void localSearchAnalyticalSIMD(
         totalEnergy = simd_broadcast_first(totalEnergy);
         for (int i = 0; i < 3; i++) { gradT[i] = simd_broadcast_first(gradT[i]); gradR[i] = simd_broadcast_first(gradR[i]); }
 
-        // Pack current gradient and position into flat vectors
-        float curGrad[38], curX[38];
-        curGrad[0] = gradT[0]; curGrad[1] = gradT[1]; curGrad[2] = gradT[2];
-        curGrad[3] = gradR[0]; curGrad[4] = gradR[1]; curGrad[5] = gradR[2];
-        for (uint t = 0; t < nTor; t++) curGrad[6+t] = gradTor[t];
-
-        curX[0] = pose.translation.x; curX[1] = pose.translation.y; curX[2] = pose.translation.z;
-        // Pack rotation as axis-angle (for L-BFGS position diffs)
-        curX[3] = pose.rotation.x; curX[4] = pose.rotation.y; curX[5] = pose.rotation.z;
-        for (uint t = 0; t < nTor; t++) curX[6+t] = pose.torsions[t];
-
         float gradMag = 0;
-        for (uint d = 0; d < NDIM; d++) gradMag += curGrad[d] * curGrad[d];
+        for (int i = 0; i < 3; i++) gradMag += gradT[i] * gradT[i] + gradR[i] * gradR[i];
+        for (uint t = 0; t < nTor; t++) gradMag += gradTor[t] * gradTor[t];
         gradMag = sqrt(gradMag);
         if (gradMag < 1e-6f) break;
 
-        // === Update L-BFGS history from previous step ===
-        if (hasPrev) {
-            float s_vec[38], y_vec[38];
-            float sy = 0.0f;
-            for (uint d = 0; d < NDIM; d++) {
-                s_vec[d] = curX[d] - prevX[d];
-                y_vec[d] = curGrad[d] - prevGrad[d];
-                sy += s_vec[d] * y_vec[d];
-            }
-            if (sy > 1e-10f) {
-                uint idx = lbfgs_newest;
-                for (uint d = 0; d < NDIM; d++) {
-                    lbfgs_s[idx][d] = s_vec[d];
-                    lbfgs_y[idx][d] = y_vec[d];
-                }
-                lbfgs_rho[idx] = 1.0f / sy;
-                lbfgs_newest = (lbfgs_newest + 1) % LBFGS_M;
-                if (lbfgs_count < LBFGS_M) lbfgs_count++;
-            }
-        }
-
-        // Save current for next iteration
-        for (uint d = 0; d < NDIM; d++) { prevGrad[d] = curGrad[d]; prevX[d] = curX[d]; }
-        hasPrev = true;
-
-        // === L-BFGS two-loop recursion to compute search direction ===
-        float q[38];
-        for (uint d = 0; d < NDIM; d++) q[d] = curGrad[d];
-
-        float alpha[LBFGS_M];
-        // First loop: newest to oldest
-        for (uint k = 0; k < lbfgs_count; k++) {
-            uint idx = (lbfgs_newest + LBFGS_M - 1 - k) % LBFGS_M;
-            float dotSQ = 0.0f;
-            for (uint d = 0; d < NDIM; d++) dotSQ += lbfgs_s[idx][d] * q[d];
-            alpha[k] = lbfgs_rho[idx] * dotSQ;
-            for (uint d = 0; d < NDIM; d++) q[d] -= alpha[k] * lbfgs_y[idx][d];
-        }
-
-        // Initial Hessian estimate: H0 = (s'y / y'y) * I
-        float H0 = 1.0f;
-        if (lbfgs_count > 0) {
-            uint lastIdx = (lbfgs_newest + LBFGS_M - 1) % LBFGS_M;
-            float yy = 0.0f, sy2 = 0.0f;
-            for (uint d = 0; d < NDIM; d++) {
-                yy += lbfgs_y[lastIdx][d] * lbfgs_y[lastIdx][d];
-                sy2 += lbfgs_s[lastIdx][d] * lbfgs_y[lastIdx][d];
-            }
-            if (yy > 1e-10f) H0 = sy2 / yy;
-        }
-
-        float r_dir[38];
-        for (uint d = 0; d < NDIM; d++) r_dir[d] = H0 * q[d];
-
-        // Second loop: oldest to newest
-        for (uint k = lbfgs_count; k > 0; k--) {
-            uint idx = (lbfgs_newest + LBFGS_M - k) % LBFGS_M;
-            float dotYR = 0.0f;
-            for (uint d = 0; d < NDIM; d++) dotYR += lbfgs_y[idx][d] * r_dir[d];
-            float beta = lbfgs_rho[idx] * dotYR;
-            for (uint d = 0; d < NDIM; d++) r_dir[d] += (alpha[lbfgs_count - k] - beta) * lbfgs_s[idx][d];
-        }
-
-        // r_dir is now the L-BFGS search direction (descent: -H*g)
-        // Apply with a fixed step size of 1.0 (L-BFGS direction is already scaled)
-        // but cap to prevent overshooting
-        float dirMag = 0.0f;
-        for (uint d = 0; d < NDIM; d++) dirMag += r_dir[d] * r_dir[d];
-        dirMag = sqrt(dirMag);
-        float maxStep = 0.5f;  // max displacement per step
-        float scale = (dirMag > maxStep) ? (maxStep / dirMag) : 1.0f;
-
-        // Unpack search direction
-        float dirT[3] = {r_dir[0], r_dir[1], r_dir[2]};
-        float dirR[3] = {r_dir[3], r_dir[4], r_dir[5]};
-        float dirTor[32];
-        for (uint t = 0; t < nTor; t++) dirTor[t] = r_dir[6+t];
+        // Normalize and clamp
+        float scale = min(stepSize / gradMag, stepSize);
 
         // === Apply step (lane 0 saves old pose, applies trial pose) ===
         if (lane == 0) {
@@ -3064,10 +2966,10 @@ kernel void localSearchAnalyticalSIMD(
             for (uint t = 0; t < nTor; t++) tg_oldTor[t] = pose.torsions[t];
 
             float3 newT = pose.translation;
-            for (int i = 0; i < 3; i++) newT[i] -= scale * dirT[i];
+            for (int i = 0; i < 3; i++) newT[i] -= scale * gradT[i];
             newT = clamp(newT, gMin, gMax);
 
-            float3 rs = float3(-scale * dirR[0], -scale * dirR[1], -scale * dirR[2]);
+            float3 rs = float3(-scale * gradR[0], -scale * gradR[1], -scale * gradR[2]);
             float ra = length(rs);
             float4 newRot = pose.rotation;
             if (ra > 1e-6f) {
@@ -3081,7 +2983,7 @@ kernel void localSearchAnalyticalSIMD(
             }
             pose.translation = newT; pose.rotation = newRot;
             for (uint t = 0; t < nTor; t++) {
-                pose.torsions[t] -= scale * dirTor[t];
+                pose.torsions[t] -= scale * gradTor[t];
                 if (pose.torsions[t] > M_PI_F) pose.torsions[t] -= 2.0f * M_PI_F;
                 if (pose.torsions[t] < -M_PI_F) pose.torsions[t] += 2.0f * M_PI_F;
             }
@@ -3153,23 +3055,17 @@ kernel void localSearchAnalyticalSIMD(
         newE = simd_broadcast_first(newE);
 
         // === Accept/reject ===
-        bool accepted = (newE < totalEnergy);
         if (lane == 0) {
-            if (accepted) {
-                pose.energy = newE;
+            if (newE < totalEnergy) {
+                pose.energy = newE; stepSize = min(stepSize * 1.2f, 0.5f);
             } else {
                 pose.translation = tg_oldT; pose.rotation = tg_oldRot;
                 for (uint t = 0; t < nTor; t++) pose.torsions[t] = tg_oldTor[t];
-                pose.energy = totalEnergy;
+                pose.energy = totalEnergy; stepSize *= 0.5f;
             }
         }
-        // On rejection, invalidate L-BFGS history (position didn't change,
-        // so s_k would be zero). Reset and fall back to steepest descent next step.
-        if (!accepted) {
-            lbfgs_count = 0;
-            lbfgs_newest = 0;
-            hasPrev = false;
-        }
+        stepSize = simd_broadcast_first(stepSize);
+        if (stepSize < 0.001f) break;
     }
 }
 

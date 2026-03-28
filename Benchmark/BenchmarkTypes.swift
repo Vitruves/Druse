@@ -15,9 +15,11 @@ struct CASFComplex: Codable {
     let pocketPdb: String?
     let ligandSdf: String
     let smiles: String
-    let crystalPositions: [[Float]]
+    let crystalPositions: [[Float]]             // Heavy atom positions in SDF file order
+    let crystalPositionsSmiles: [[Float]]?       // Heavy atom positions in SMILES canonical order (pre-computed)
     let heavyAtomCount: Int
     let pKd: Float
+    let smilesAtomMap: [Int]?                    // smilesAtomMap[smiles_idx] = sdf_idx (for diagnostics)
 
     enum CodingKeys: String, CodingKey {
         case pdbId = "pdb_id"
@@ -26,12 +28,23 @@ struct CASFComplex: Codable {
         case ligandSdf = "ligand_sdf"
         case smiles
         case crystalPositions = "crystal_positions"
+        case crystalPositionsSmiles = "crystal_positions_smiles"
         case heavyAtomCount = "heavy_atom_count"
         case pKd
+        case smilesAtomMap = "smiles_atom_map"
     }
 
+    /// Crystal positions in SDF order (for redock mode).
     var crystalPositionsSIMD: [SIMD3<Float>] {
         crystalPositions.compactMap { arr in
+            guard arr.count >= 3 else { return nil }
+            return SIMD3<Float>(arr[0], arr[1], arr[2])
+        }
+    }
+
+    /// Crystal positions in SMILES canonical order (for full pipeline mode).
+    var crystalPositionsSMILESOrder: [SIMD3<Float>]? {
+        crystalPositionsSmiles?.compactMap { arr in
             guard arr.count >= 3 else { return nil }
             return SIMD3<Float>(arr[0], arr[1], arr[2])
         }
@@ -80,7 +93,7 @@ struct BenchmarkResultEntry: Codable {
     var searchBoxSize: [Float]?        // pocket half-extents [x, y, z]
     var ligandHeavyCount: Int?         // heavy atoms in prepared ligand
     var crystalHeavyCount: Int?        // heavy atoms in crystal ligand
-    var initialLigandRmsd: Float?      // RMSD of prepared ligand vs crystal (before docking)
+    var conformerRmsd: Float?           // RMSD of SMILES-derived conformer vs crystal (measures 3D embedding quality, not docking)
     var strainEnergy: Float?           // MMFF strain of best pose (kcal/mol)
     var allPoseRmsds: [Float]?         // RMSDs of top-N poses (for convergence analysis)
 
@@ -105,7 +118,7 @@ struct BenchmarkResultEntry: Codable {
         case searchBoxSize = "search_box_size"
         case ligandHeavyCount = "ligand_heavy_count"
         case crystalHeavyCount = "crystal_heavy_count"
-        case initialLigandRmsd = "initial_ligand_rmsd"
+        case conformerRmsd = "conformer_rmsd"
         case strainEnergy = "strain_energy"
         case allPoseRmsds = "all_pose_rmsds"
     }

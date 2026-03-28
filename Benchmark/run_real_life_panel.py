@@ -463,13 +463,13 @@ def generate_debug_report(panel: dict, selected_cases: list[dict], result_paths:
             "",
             "Atom count mismatches indicate the SMILES-derived ligand differs from the crystal.",
             "",
-            "| PDB | Crystal Heavy | Prepared Heavy | Match | Initial RMSD (A) |",
-            "|-----|---------------|----------------|-------|------------------|",
+            "| PDB | Crystal Heavy | Prepared Heavy | Match | Conformer RMSD (A) |",
+            "|-----|---------------|----------------|-------|-------------------|",
         ]
         for entry in ordered_entries:
             chc = entry.get("crystal_heavy_count")
             lhc = entry.get("ligand_heavy_count")
-            irmsd = entry.get("initial_ligand_rmsd")
+            irmsd = entry.get("conformer_rmsd") or entry.get("initial_ligand_rmsd")
             match = "YES" if chc and lhc and chc == lhc else ("MISMATCH" if chc and lhc else "N/A")
             lines.append(
                 f"| {entry['pdb_id']} | {chc or 'N/A'} | {lhc or 'N/A'} | {match} | {fmt_float(irmsd, 1)} |"

@@ -89,6 +89,95 @@ final class BenchmarkRunner: XCTestCase {
         return sqrt(sum / Float(n))
     }
 
+    /// Symmetry-corrected RMSD: matches atoms by element type then finds the
+    /// minimum-RMSD assignment within each element group.
+    /// `refPositions`/`refElements` = crystal; `probePositions`/`probeElements` = docked.
+    private func computeSymmetryRMSD(
+        refPositions: [SIMD3<Float>], refElements: [Element],
+        probePositions: [SIMD3<Float>], probeElements: [Element]
+    ) -> Float {
+        guard refPositions.count == probePositions.count,
+              refPositions.count == refElements.count,
+              probePositions.count == probeElements.count,
+              !refPositions.isEmpty else { return .infinity }
+
+        let n = refPositions.count
+        // Group indices by element
+        var refGroups: [Element: [Int]] = [:]
+        var probeGroups: [Element: [Int]] = [:]
+        for i in 0..<n {
+            refGroups[refElements[i], default: []].append(i)
+            probeGroups[probeElements[i], default: []].append(i)
+        }
+
+        // Verify element counts match
+        for (elem, refIdxs) in refGroups {
+            guard let probeIdxs = probeGroups[elem], probeIdxs.count == refIdxs.count else {
+                return .infinity
+            }
+        }
+
+        // For each element group, find optimal assignment (minimize sum of squared distances).
+        // Use Hungarian for groups > 6, brute force for small groups.
+        var mapping = [Int](repeating: -1, count: n)  // mapping[probe_i] = ref_i
+
+        for (elem, refIdxs) in refGroups {
+            let probeIdxs = probeGroups[elem]!
+            let k = refIdxs.count
+
+            if k == 1 {
+                mapping[probeIdxs[0]] = refIdxs[0]
+            } else if k <= 8 {
+                // Brute-force: try all permutations of refIdxs, pick min cost
+                var bestCost: Float = .infinity
+                var bestPerm = refIdxs
+                permute(refIdxs) { perm in
+                    var cost: Float = 0
+                    for j in 0..<k {
+                        cost += simd_distance_squared(probePositions[probeIdxs[j]], refPositions[perm[j]])
+                    }
+                    if cost < bestCost {
+                        bestCost = cost
+                        bestPerm = perm
+                    }
+                }
+                for j in 0..<k { mapping[probeIdxs[j]] = bestPerm[j] }
+            } else {
+                // Greedy nearest-neighbor for large groups
+                var availableRef = Set(refIdxs)
+                for pi in probeIdxs {
+                    var bestRef = -1
+                    var bestDist: Float = .infinity
+                    for ri in availableRef {
+                        let d = simd_distance_squared(probePositions[pi], refPositions[ri])
+                        if d < bestDist { bestDist = d; bestRef = ri }
+                    }
+                    mapping[pi] = bestRef
+                    availableRef.remove(bestRef)
+                }
+            }
+        }
+
+        var sum: Float = 0
+        for i in 0..<n {
+            sum += simd_distance_squared(probePositions[i], refPositions[mapping[i]])
+        }
+        return sqrt(sum / Float(n))
+    }
+
+    /// Generate all permutations and call closure for each.
+    private func permute(_ arr: [Int], _ body: ([Int]) -> Void) {
+        var a = arr
+        func helper(_ n: Int) {
+            if n == 1 { body(a); return }
+            for i in 0..<n {
+                helper(n - 1)
+                a.swapAt(n % 2 == 0 ? i : 0, n - 1)
+            }
+        }
+        helper(a.count)
+    }
+
     private func pearsonR(_ x: [Float], _ y: [Float]) -> Float {
         let n = Float(x.count)
         guard n > 2 else { return 0 }
@@ -277,9 +366,10 @@ final class BenchmarkRunner: XCTestCase {
         var changed = false
         for (i, strain) in strainResults {
             guard let strain else { continue }
-            updated[i].strainEnergy = strain
-            if strain > threshold {
-                updated[i].energy += weight * (strain - threshold)
+            let clamped = min(max(strain, 0.0), 100.0)
+            updated[i].strainEnergy = clamped
+            if clamped > threshold {
+                updated[i].energy += weight * (clamped - threshold)
                 changed = true
             }
         }
@@ -481,7 +571,13 @@ final class BenchmarkRunner: XCTestCase {
                 }
 
                 // -- Debug diagnostics --
-                let crystalPositions = complex.crystalPositionsSIMD
+                let smilesOrder = complex.crystalPositionsSMILESOrder
+                let crystalPositions: [SIMD3<Float>]
+                if Self.cfgPipelineMode == "full", let order = smilesOrder {
+                    crystalPositions = order
+                } else {
+                    crystalPositions = complex.crystalPositionsSIMD
+                }
                 let crystalCentroid: SIMD3<Float> = {
                     guard !crystalPositions.isEmpty else { return .zero }
                     let sum = crystalPositions.reduce(SIMD3<Float>.zero, +)
@@ -499,11 +595,11 @@ final class BenchmarkRunner: XCTestCase {
                 entry.crystalHeavyCount = crystalPositions.count
                 entry.ligandHeavyCount = ligand.atoms.filter { $0.element != .H }.count
 
-                // Initial ligand RMSD (prepared vs crystal, before docking)
+                // Conformer RMSD: SMILES-derived 3D embedding vs crystal (large values expected — measures embedding quality, not docking)
                 if Self.cfgPipelineMode == "full" {
                     let preparedHeavy = ligand.atoms.filter { $0.element != .H }.map(\.position)
                     if preparedHeavy.count == crystalPositions.count {
-                        entry.initialLigandRmsd = computeRMSD(preparedHeavy, crystalPositions)
+                        entry.conformerRmsd = computeRMSD(preparedHeavy, crystalPositions)
                     }
                 }
 
@@ -550,19 +646,52 @@ final class BenchmarkRunner: XCTestCase {
                     entry.success = true
 
                     // RMSD
-                    let crystal = complex.crystalPositionsSIMD
                     let docked = best.transformedAtomPositions
-                    if crystal.count == docked.count {
-                        entry.bestRmsd = computeRMSD(crystal, docked)
+                    if Self.cfgPipelineMode == "full" {
+                        // Full mode: atom orderings differ (SDF vs SMILES).
+                        // Use symmetry-corrected RMSD with element-based matching.
+                        let crystalHeavy = crystalLig.atoms.filter { $0.element != .H }
+                        let dockedHeavy = ligand.atoms.filter { $0.element != .H }
+                        if crystalHeavy.count == docked.count && dockedHeavy.count == docked.count {
+                            let refPositions = crystalHeavy.map(\.position)
+                            let refElements = crystalHeavy.map(\.element)
+                            let probeElements = dockedHeavy.map(\.element)
+                            entry.bestRmsd = computeSymmetryRMSD(
+                                refPositions: refPositions, refElements: refElements,
+                                probePositions: docked, probeElements: probeElements)
+                        }
+                    } else {
+                        // Redock mode: same atom ordering (both from SDF).
+                        let crystal = complex.crystalPositionsSIMD
+                        if crystal.count == docked.count {
+                            entry.bestRmsd = computeRMSD(crystal, docked)
+                        }
                     }
 
                     // Top-N pose RMSDs for convergence analysis
                     let topN = min(results.count, 10)
                     var poseRmsds = [Float]()
-                    for i in 0..<topN {
-                        let pos = results[i].transformedAtomPositions
-                        if crystal.count == pos.count {
-                            poseRmsds.append(computeRMSD(crystal, pos))
+                    if Self.cfgPipelineMode == "full" {
+                        let crystalHeavy = crystalLig.atoms.filter { $0.element != .H }
+                        let dockedHeavy = ligand.atoms.filter { $0.element != .H }
+                        let refPositions = crystalHeavy.map(\.position)
+                        let refElements = crystalHeavy.map(\.element)
+                        let probeElements = dockedHeavy.map(\.element)
+                        for i in 0..<topN {
+                            let pos = results[i].transformedAtomPositions
+                            if refPositions.count == pos.count {
+                                poseRmsds.append(computeSymmetryRMSD(
+                                    refPositions: refPositions, refElements: refElements,
+                                    probePositions: pos, probeElements: probeElements))
+                            }
+                        }
+                    } else {
+                        let crystal = complex.crystalPositionsSIMD
+                        for i in 0..<topN {
+                            let pos = results[i].transformedAtomPositions
+                            if crystal.count == pos.count {
+                                poseRmsds.append(computeRMSD(crystal, pos))
+                            }
                         }
                     }
                     if !poseRmsds.isEmpty {
