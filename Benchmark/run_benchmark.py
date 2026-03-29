@@ -93,7 +93,7 @@ def parse_args():
                     help="Benchmark mode: classic redocking or full end-to-end Druse pipeline")
     ds.add_argument("--pocket-mode", type=str, default="hybrid",
                     choices=["ligand-guided", "geometric", "ml", "hybrid"],
-                    help="Pocket selection mode. In full mode, 'hybrid' means ML first then geometric fallback")
+                    help="Pocket selection mode. In full mode, 'hybrid' ranks ML and geometric candidates with sanity checks")
     ds.add_argument("--quick", type=int, metavar="N", default=0,
                     help="Limit to first N complexes (fast validation)")
 

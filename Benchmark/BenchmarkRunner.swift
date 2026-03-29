@@ -284,8 +284,12 @@ final class BenchmarkRunner: XCTestCase {
         case "hybrid":
             let detector = pocketDetector()
             let mlPockets = await detector.detectPockets(protein: protein)
-            if let pocket = mlPockets.first {
-                return (pocket, "ml")
+            let geometricPockets = BindingSiteDetector.detectPockets(protein: protein)
+            if let selected = PocketSelectionHeuristics.bestHybridCandidate(
+                mlPockets: mlPockets,
+                geometricPockets: geometricPockets
+            ) {
+                return (selected.pocket, selected.method.rawValue)
             }
             fallthrough
 
@@ -616,7 +620,8 @@ final class BenchmarkRunner: XCTestCase {
                 let results: [DockingResult]
                 if Self.cfgPipelineMode == "full" {
                     var rankedResults = gaResults.sorted { $0.energy < $1.energy }
-                    if config.strainPenaltyEnabled {
+                    // Keep the benchmark Vina path scorer-pure; strain reranking is a Druse-side heuristic.
+                    if config.strainPenaltyEnabled && scoringMethod != .vina {
                         rankedResults = await applyStrainPenalties(
                             results: rankedResults,
                             smiles: complex.smiles,
@@ -721,6 +726,9 @@ final class BenchmarkRunner: XCTestCase {
                                 "ch_pi": d.chPi,
                                 "torsion_strain": d.torsionStrain,
                                 "cooperativity": d.cooperativity,
+                                "hbond_dir": d.hbondDir,
+                                "desolv_polar": d.desolvPolar,
+                                "desolv_hydrophobic": d.desolvHydrophobic,
                                 "total": d.total,
                             ]
                         }

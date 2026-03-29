@@ -736,9 +736,17 @@ final class PocketDetectorInference {
         atoms: [Atom]
     ) -> [BindingPocket] {
         let eps: Float = 4.0
+        let contactDistance: Float = 4.5
         let positions = points.map(\.position)
         var labels = [Int](repeating: -1, count: points.count)
         var clusterId = 0
+        var atomResidueMap: [Int: Int] = [:]
+
+        for (resIdx, residue) in residues.enumerated() {
+            for atomIdx in residue.atomIndices {
+                atomResidueMap[atomIdx] = resIdx
+            }
+        }
 
         for i in 0..<points.count {
             guard labels[i] == -1 else { continue }
@@ -775,29 +783,77 @@ final class PocketDetectorInference {
             let halfSize = maxExt + SIMD3<Float>(repeating: 4.0)
             let volume = 8.0 * halfSize.x * halfSize.y * halfSize.z
 
-            // Find nearby residues
-            var residueSet = Set<Int>()
-            for (resIdx, residue) in residues.enumerated() {
-                guard residue.isStandard else { continue }
-                for atomIdx in residue.atomIndices {
-                    guard atomIdx < atoms.count else { continue }
-                    if simd_distance(atoms[atomIdx].position, center) < 8.0 {
-                        residueSet.insert(resIdx)
+            let searchRadius = max(maxExt.x, max(maxExt.y, maxExt.z)) + contactDistance
+            let contactDistSq = contactDistance * contactDistance
+            let searchRadiusSq = searchRadius * searchRadius
+            var pocketAtomIndices: [Int] = []
+            pocketAtomIndices.reserveCapacity(64)
+
+            for atomIndex in atoms.indices {
+                let atom = atoms[atomIndex]
+                if atom.element == .H || atom.isHetAtom { continue }
+                if simd_distance_squared(atom.position, center) > searchRadiusSq { continue }
+
+                for clusterPoint in clusterPos {
+                    if simd_distance_squared(atom.position, clusterPoint) <= contactDistSq {
+                        pocketAtomIndices.append(atomIndex)
                         break
                     }
                 }
             }
 
-            pockets.append(BindingPocket(
+            var residueSet = Set<Int>()
+            var polarCount = 0
+            var hydrophobicCount = 0
+            for atomIndex in pocketAtomIndices {
+                let atom = atoms[atomIndex]
+                if let resIdx = atomResidueMap[atomIndex],
+                   resIdx >= 0,
+                   resIdx < residues.count,
+                   residues[resIdx].isStandard {
+                    residueSet.insert(resIdx)
+                }
+
+                if atom.element == .N || atom.element == .O {
+                    polarCount += 1
+                }
+                if atom.element == .C || atom.element == .S {
+                    hydrophobicCount += 1
+                }
+            }
+
+            let totalPocketAtoms = max(Float(pocketAtomIndices.count), 1)
+            let polarity = Float(polarCount) / totalPocketAtoms
+            let hydrophobicity = Float(hydrophobicCount) / totalPocketAtoms
+            let localPolarity: Float
+            if pocketAtomIndices.isEmpty {
+                localPolarity = 0.5
+            } else {
+                localPolarity = min(max((polarity + (1.0 - hydrophobicity)) * 0.5, 0.0), 1.0)
+            }
+
+            let pocket = BindingPocket(
                 id: pockets.count,
                 center: center,
                 size: halfSize,
                 volume: volume,
                 buriedness: avgProb,
-                polarity: 0.5,
-                druggability: volume * avgProb,
+                polarity: localPolarity,
+                druggability: 0,
                 residueIndices: Array(residueSet).sorted(),
                 probePositions: clusterPos
+            )
+
+            pockets.append(BindingPocket(
+                id: pocket.id,
+                center: pocket.center,
+                size: pocket.size,
+                volume: pocket.volume,
+                buriedness: pocket.buriedness,
+                polarity: pocket.polarity,
+                druggability: PocketSelectionHeuristics.score(pocket, method: .ml),
+                residueIndices: pocket.residueIndices,
+                probePositions: pocket.probePositions
             ))
         }
 

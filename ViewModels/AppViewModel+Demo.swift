@@ -163,24 +163,28 @@ extension AppViewModel {
 
         try await Task.sleep(for: .seconds(3.0))
 
-        // ML first (more robust), then geometric fallback
-        var pockets: [BindingPocket] = []
+        let geometricPockets = BindingSiteDetector.detectPockets(protein: prot)
+        let mlPockets: [BindingPocket]
 
         if pocketDetectorML.isAvailable {
-            pockets = await pocketDetectorML.detectPockets(protein: prot)
-            if !pockets.isEmpty {
-                log.info("Demo: ML pocket detection → \(pockets.count) pocket(s)", category: .dock)
+            mlPockets = await pocketDetectorML.detectPockets(protein: prot)
+            if !mlPockets.isEmpty {
+                log.info("Demo: ML pocket detection → \(mlPockets.count) pocket(s)", category: .dock)
             }
+        } else {
+            mlPockets = []
         }
 
-        if pockets.isEmpty {
-            log.info("Demo: Trying geometric pocket detection...", category: .dock)
-            pockets = BindingSiteDetector.detectPockets(protein: prot)
-        }
+        let candidates = PocketSelectionHeuristics.rankedHybridCandidates(
+            mlPockets: mlPockets,
+            geometricPockets: geometricPockets
+        )
+        let pockets = candidates.map(\.pocket)
 
-        guard let best = pockets.first else {
+        guard let bestCandidate = candidates.first else {
             throw DemoError.noPockets
         }
+        let best = bestCandidate.pocket
 
         docking.detectedPockets = pockets
         docking.selectedPocket = best

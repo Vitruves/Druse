@@ -121,6 +121,18 @@ inline float smoothSlopeStep(float xBad, float xGood, float x) {
     return 1.0f / (1.0f + exp(-t));
 }
 
+/// Soft Vina quality gate: attenuates Drusina only for badly clashing poses (vinaE > 0).
+/// Much softer than the original gate (offset=1, slope=0.35): this only kicks in when
+/// Vina energy is positive (steric clashes), allowing Drusina to contribute for all
+/// reasonable poses. Prevents Drusina from creating false attractors in empty space.
+inline float drusinaVinaQuality(float vinaE, constant DrusinaParams &params) {
+    // Sigmoid centered at vinaE = +2 kcal/mol, gentle slope.
+    // quality ≈ 1.0 for vinaE < 0 (any favorable pose)
+    // quality ≈ 0.5 at vinaE = +2 (moderate clash)
+    // quality → 0.0 for vinaE >> +2 (severe clash)
+    return 1.0f / (1.0f + exp(0.5f * (vinaE - 2.0f)));
+}
+
 /// Derivative of smoothSlopeStep w.r.t. x.
 inline float smoothSlopeStepDeriv(float xBad, float xGood, float x) {
     float k = 10.0f;
@@ -1178,7 +1190,9 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     device const half            *elecGrid,
     constant GridParams          &gridParams,
     constant ProteinChalcogenGPU *proteinChalcogens,
-    constant TorsionStrainInfo   *torsionStrain)
+    constant TorsionStrainInfo   *torsionStrain,
+    constant LigandHBondInfoGPU  *ligandHBondInfo,
+    constant ProteinHBondInfoGPU *proteinHBondInfo)
 {
     DrusinaDecomposition decomp = {};
     float drusinaE = 0.0f;
@@ -1188,6 +1202,7 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     float piPiE = 0.0f, piCationE = 0.0f, saltBridgeE = 0.0f, amidePiE = 0.0f;
     float halogenE = 0.0f, chalcogenE = 0.0f, metalE = 0.0f, coulombTermE = 0.0f;
     float chPiE = 0.0f, strainTermE = 0.0f, cooperativityE = 0.0f;
+    float hbondDirE = 0.0f, desolvPolarE = 0.0f, desolvHydrophobicE = 0.0f;
 
     // Pre-compute ligand centroid for spatial gating of protein partners.
     // Protein features beyond ligandCutoff from centroid cannot interact with any
@@ -1559,6 +1574,134 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     }
     strainTermE = params.wTorsionStrain * strainE;
 
+    // ---- H-bond directionality correction ----
+    // Bonus-only: reward well-directed H-bonds that Vina already scores by distance.
+    // Only fires on close-contact pairs (d < 3.0Å = actual H-bond distance) to avoid
+    // scoring non-H-bond contacts. Pure bonus (no penalty for bad angles) to avoid
+    // destabilizing pose ranking.
+    // Reference: Korb 2009 (PLANTS), Verdonk 2003 (GoldScore)
+    for (uint lh = 0; lh < params.numLigandHBondAtoms; lh++) {
+        int li = ligandHBondInfo[lh].atomIndex;
+        int lAnt = ligandHBondInfo[lh].antecedentIndex;
+        bool ligIsDonor = ligandHBondInfo[lh].isDonor != 0;
+        if (li < 0 || lAnt < 0 || uint(li) >= nAtoms || uint(lAnt) >= nAtoms) continue;
+
+        float3 ligPos = positions[li];
+        float3 ligAntPos = positions[lAnt];
+
+        for (uint ph = 0; ph < params.numProteinHBondAtoms; ph++) {
+            // Spatial gating: skip protein atoms far from ligand centroid
+            if (distance_squared(ligCentroid, proteinHBondInfo[ph].position) > ligandCutoffSq) continue;
+
+            bool protIsDonor = proteinHBondInfo[ph].isDonor > 0.5f;
+            if (ligIsDonor == protIsDonor) continue;
+
+            float3 protPos = proteinHBondInfo[ph].position;
+            float d = distance(ligPos, protPos);
+            // Tight cutoff: only actual H-bonds (< 3.2Å heavy-atom distance)
+            if (d < 1.5f || d > 3.2f) continue;
+
+            float3 protAntPos = proteinHBondInfo[ph].antecedent;
+
+            // Distance factor: strongest at 2.7Å (optimal N-O), fading at 3.2Å
+            float distFactor = drusinaRamp(d - 2.7f, 0.2f, 0.5f);
+
+            // Donor angle: X-D...A, optimal 180°
+            float3 donorPos, donorAntPos, acceptorPos;
+            if (ligIsDonor) {
+                donorPos = ligPos; donorAntPos = ligAntPos; acceptorPos = protPos;
+            } else {
+                donorPos = protPos; donorAntPos = protAntPos; acceptorPos = ligPos;
+            }
+            float3 dToAnt = normalize(donorAntPos - donorPos);
+            float3 dToA   = normalize(acceptorPos - donorPos);
+            float cosDonor = dot(dToAnt, dToA);
+            // Score: 0 when bent (cos > -0.5), 1 when linear (cos = -1)
+            float donorAngleScore = smoothstep(-0.5f, -1.0f, cosDonor);
+
+            // Acceptor angle: D...A-Y, optimal ~120° (sp2)
+            float3 accPos, accAntPos;
+            if (ligIsDonor) {
+                accPos = protPos; accAntPos = protAntPos;
+            } else {
+                accPos = ligPos; accAntPos = ligAntPos;
+            }
+            float3 aToD   = normalize(donorPos - accPos);
+            float3 aToAnt = normalize(accAntPos - accPos);
+            float cosAcc = dot(aToD, aToAnt);
+            float accAngleScore = smoothstep(0.34f, -0.17f, cosAcc);
+
+            // Pure bonus: only reward good angles (no penalty)
+            float angleFactor = donorAngleScore * accAngleScore;
+            if (angleFactor > 0.25f) {
+                hbondDirE += params.wHBondDir * angleFactor * distFactor;
+                interactionCount++;
+            }
+        }
+    }
+
+    // ---- Polar desolvation penalty ----
+    // Penalize DEEPLY BURIED ligand polar atoms that lack H-bond satisfaction.
+    // Only triggers when a polar is surrounded by many protein atoms (truly buried)
+    // but has no H-bond partner. Surface-facing polars are not penalized.
+    // Reference: HYDE scoring (Schneider 2013)
+    for (uint a = 0; a < nAtoms; a++) {
+        int lt = ligandAtoms[a].vinaType;
+        bool isPolar = (lt == VINA_N_A || lt == VINA_N_D || lt == VINA_N_DA ||
+                        lt == VINA_O_A || lt == VINA_O_D || lt == VINA_O_DA);
+        if (!isPolar) continue;
+
+        float3 lPos = positions[a];
+
+        // Count protein neighbors for burial estimate and check H-bond satisfaction
+        int nearbyCount = 0;
+        bool hbondSatisfied = false;
+        for (uint p = 0; p < numProteinAtoms; p++) {
+            float d = distance(lPos, proteinAtoms[p].position);
+            if (d < 5.0f) nearbyCount++;
+            // H-bond partner check: tight distance for actual H-bonds
+            if (d < 3.2f) {
+                int pt = proteinAtoms[p].vinaType;
+                if (xsHBondPossible(lt, pt)) {
+                    hbondSatisfied = true;
+                }
+            }
+        }
+
+        // Only penalize deeply buried unsatisfied polars (>= 12 neighbors within 5Å)
+        if (!hbondSatisfied && nearbyCount >= 12) {
+            // Burial ramp: 0 at 12 neighbors, 1.0 at 25+ neighbors
+            float burial = clamp(float(nearbyCount - 12) / 13.0f, 0.0f, 1.0f);
+            desolvPolarE += params.wDesolvPolar * burial;
+        }
+    }
+
+    // ---- Hydrophobic desolvation penalty ----
+    // Penalize ligand hydrophobic atoms that are fully exposed to solvent.
+    // Only triggers when a hydrophobic C has very few protein contacts (< 3 within 4.5Å),
+    // indicating the atom is dangling into solvent rather than buried in the pocket.
+    // Reference: Böhm 1994, ChemScore (Eldridge 1997)
+    for (uint a = 0; a < nAtoms; a++) {
+        if (ligandAtoms[a].vinaType != VINA_C_H) continue;
+        float3 lPos = positions[a];
+
+        int nearbyCount = 0;
+        for (uint p = 0; p < numProteinAtoms; p++) {
+            float d = distance(lPos, proteinAtoms[p].position);
+            if (d < 4.5f) {
+                nearbyCount++;
+                if (nearbyCount >= 3) break;  // no penalty, early exit
+            }
+        }
+
+        // Only penalize truly exposed atoms (< 3 protein neighbors)
+        if (nearbyCount < 3) {
+            // 0 neighbors → full penalty, 2 neighbors → 1/3 penalty
+            float exposure = 1.0f - float(nearbyCount) / 3.0f;
+            desolvHydrophobicE += params.wDesolvHydrophobic * exposure;
+        }
+    }
+
     // ---- Cooperativity bonus: reward multiple simultaneous interactions ----
     // Simple count-based: bonus for 2+ scored interaction types
     if (interactionCount > 1) {
@@ -1568,12 +1711,12 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     // Sum all terms
     drusinaE = piPiE + piCationE + saltBridgeE + amidePiE + halogenE
              + chalcogenE + metalE + coulombTermE + chPiE + strainTermE
-             + cooperativityE;
+             + cooperativityE + hbondDirE + desolvPolarE + desolvHydrophobicE;
 
-    // Safety cap: Drusina corrections should complement Vina, not overwhelm it.
-    // Typical Vina scores are -5 to -15 kcal/mol; cap Drusina at -4 kcal/mol
-    // to keep corrections as a minor refinement (~10-30% of Vina).
-    drusinaE = max(drusinaE, -4.0f);
+    // Safety cap: Drusina corrections should remain bounded, but the cap itself
+    // is a tunable parameter because Drusina is intended to be more than a tiny
+    // post-hoc Vina correction.
+    drusinaE = max(drusinaE, params.minCorrection);
 
     // Fill decomposition struct
     decomp.piPi = piPiE;
@@ -1587,6 +1730,9 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     decomp.chPi = chPiE;
     decomp.torsionStrain = strainTermE;
     decomp.cooperativity = cooperativityE;
+    decomp.hbondDir = hbondDirE;
+    decomp.desolvPolar = desolvPolarE;
+    decomp.desolvHydrophobic = desolvHydrophobicE;
     decomp.total = drusinaE;
 
     return decomp;
@@ -1616,6 +1762,8 @@ kernel void scorePosesDrusina(
     device const half            *elecGrid        [[buffer(18)]],
     constant ProteinChalcogenGPU *proteinChalcogens [[buffer(19)]],
     constant TorsionStrainInfo   *torsionStrain   [[buffer(20)]],
+    constant LigandHBondInfoGPU  *ligandHBondInfo [[buffer(21)]],
+    constant ProteinHBondInfoGPU *proteinHBondInfo [[buffer(22)]],
     uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1648,13 +1796,14 @@ kernel void scorePosesDrusina(
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
     float normalizedE = totalIntermolecular * normFactor;
 
-    // --- Drusina corrections ---
+    // --- Drusina corrections (soft gate: only attenuates for clashing poses) ---
     DrusinaDecomposition decomp = computeDrusinaCorrections(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
         proteinAmides, chalcogenInfo, saltBridgeGroups,
-        elecGrid, gridParams, proteinChalcogens, torsionStrain);
+        elecGrid, gridParams, proteinChalcogens, torsionStrain,
+        ligandHBondInfo, proteinHBondInfo);
 
     pose.stericEnergy      = totalIntermolecular;
     pose.hydrophobicEnergy = 0.0f;
@@ -1662,9 +1811,8 @@ kernel void scorePosesDrusina(
     pose.torsionPenalty    = normalizedE - totalIntermolecular;
     pose.clashPenalty      = wPenalty * penalty + intraDelta;
 
-    // Attenuate Drusina when Vina score is poor: if Vina says the pose is
-    // terrible (positive energy / steric clashes), Drusina shouldn't rescue it.
-    float vinaQuality = 1.0f / (1.0f + exp(0.5f * (normalizedE + 2.0f)));
+    // Soft gate: full contribution for vinaE < 0, attenuated for clashing poses
+    float vinaQuality = drusinaVinaQuality(normalizedE, drusinaParams);
     float drusinaE = decomp.total * vinaQuality;
 
     pose.drusinaCorrection = drusinaE;
@@ -1691,6 +1839,8 @@ kernel void applyDrusinaCorrection(
     device const half            *elecGrid        [[buffer(15)]],
     constant ProteinChalcogenGPU *proteinChalcogens [[buffer(16)]],
     constant TorsionStrainInfo   *torsionStrain   [[buffer(17)]],
+    constant LigandHBondInfoGPU  *ligandHBondInfo [[buffer(18)]],
+    constant ProteinHBondInfoGPU *proteinHBondInfo [[buffer(19)]],
     uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1708,12 +1858,12 @@ kernel void applyDrusinaCorrection(
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
         proteinAmides, chalcogenInfo, saltBridgeGroups,
-        elecGrid, gridParams, proteinChalcogens, torsionStrain);
+        elecGrid, gridParams, proteinChalcogens, torsionStrain,
+        ligandHBondInfo, proteinHBondInfo);
 
-    // Attenuate Drusina when Vina score is poor (same logic as scorePosesDrusina).
-    // pose.energy here is the pre-Drusina Vina-based score.
+    // Soft gate: only attenuate for clashing poses (vinaE > +2)
     float vinaE = pose.energy;
-    float vinaQuality = 1.0f / (1.0f + exp(0.5f * (vinaE + 2.0f)));
+    float vinaQuality = drusinaVinaQuality(vinaE, drusinaParams);
     float drusinaE = decomp.total * vinaQuality;
 
     pose.drusinaCorrection = drusinaE;
@@ -1742,6 +1892,8 @@ kernel void scorePosesDecomposition(
     constant ProteinChalcogenGPU *proteinChalcogens [[buffer(16)]],
     constant TorsionStrainInfo   *torsionStrain   [[buffer(17)]],
     device DrusinaDecomposition  *decompositions  [[buffer(18)]],
+    constant LigandHBondInfoGPU  *ligandHBondInfo [[buffer(19)]],
+    constant ProteinHBondInfoGPU *proteinHBondInfo [[buffer(20)]],
     uint                          tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -1759,7 +1911,8 @@ kernel void scorePosesDecomposition(
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
         proteinAmides, chalcogenInfo, saltBridgeGroups,
-        elecGrid, gridParams, proteinChalcogens, torsionStrain);
+        elecGrid, gridParams, proteinChalcogens, torsionStrain,
+        ligandHBondInfo, proteinHBondInfo);
 
     decompositions[tid] = decomp;
 }

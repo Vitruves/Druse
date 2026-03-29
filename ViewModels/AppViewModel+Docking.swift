@@ -6,18 +6,31 @@ extension AppViewModel {
 
     // MARK: - Pocket Detection
 
-    func detectPockets() {
+    func detectPockets(excludedChainIDs: Set<String> = []) {
         guard let prot = molecules.protein else { return }
-        log.info("Detecting binding pockets...", category: .dock)
+        let usesHybrid = excludedChainIDs.isEmpty && pocketDetectorML.isAvailable
+        log.info(usesHybrid ? "Detecting binding pockets (hybrid)..." : "Detecting binding pockets...", category: .dock)
         workspace.statusMessage = "Detecting pockets..."
 
         Task {
-            let pockets = BindingSiteDetector.detectPockets(protein: prot)
+            let geometricPockets = BindingSiteDetector.detectPockets(
+                protein: prot,
+                excludedChainIDs: excludedChainIDs
+            )
+            let mlPockets = usesHybrid ? await pocketDetectorML.detectPockets(protein: prot) : []
+            let rankedCandidates = PocketSelectionHeuristics.rankedHybridCandidates(
+                mlPockets: mlPockets,
+                geometricPockets: geometricPockets
+            )
+            let pockets = rankedCandidates.map(\.pocket)
+
             docking.detectedPockets = pockets
-            if let best = pockets.first {
+            if let bestCandidate = rankedCandidates.first {
+                let best = bestCandidate.pocket
                 docking.selectedPocket = best
                 showGridBoxForPocket(best)
-                log.success("Found \(pockets.count) pocket(s), best: \(String(format: "%.0f", best.volume)) ų, druggability: \(String(format: "%.1f", best.druggability))", category: .dock)
+                let methodLabel = bestCandidate.method == .ml ? "ML" : "geometric"
+                log.success("Found \(pockets.count) pocket(s), best via \(methodLabel): \(String(format: "%.0f", best.volume)) ų, druggability: \(String(format: "%.1f", best.druggability))", category: .dock)
                 log.info("  Best pocket: \(best.residueIndices.count) residues, center=(\(String(format: "%.1f, %.1f, %.1f", best.center.x, best.center.y, best.center.z)))", category: .dock)
             } else {
                 renderer?.clearGridBox()
@@ -350,7 +363,9 @@ extension AppViewModel {
 
             // MMFF94 ligand strain penalty (post-docking, CPU-side)
             let strainSmiles = origLig.smiles ?? (origLig.title.isEmpty ? nil : origLig.title)
-            if docking.dockingConfig.strainPenaltyEnabled, let smiles = strainSmiles {
+            if docking.dockingConfig.strainPenaltyEnabled,
+               docking.scoringMethod != .vina,
+               let smiles = strainSmiles {
                 rankedResults = await computeStrainPenalties(
                     results: rankedResults, smiles: smiles, config: docking.dockingConfig
                 )
@@ -867,7 +882,7 @@ extension AppViewModel {
     func detectPocketsML() {
         guard let prot = molecules.protein else { return }
         guard pocketDetectorML.isAvailable else {
-            log.warn("PocketDetector model not available, falling back to geometric detection", category: .dock)
+            log.warn("PocketDetector model not available, falling back to auto detection", category: .dock)
             detectPockets()
             return
         }

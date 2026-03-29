@@ -74,6 +74,8 @@ final class DockingEngine {
     var electrostaticGridBuffer: MTLBuffer?
     var proteinChalcogenBuffer: MTLBuffer?
     var torsionStrainBuffer: MTLBuffer?
+    var ligandHBondInfoBuffer: MTLBuffer?
+    var proteinHBondInfoBuffer: MTLBuffer?
 
     // Pharmacophore constraint buffers
     var pharmaConstraintBuffer: MTLBuffer?
@@ -1181,30 +1183,200 @@ final class DockingEngine {
             length: torsionStrains.count * MemoryLayout<TorsionStrainInfo>.stride,
             options: .storageModeShared)
 
+        // --- Ligand H-bond donors/acceptors with antecedent atoms ---
+        var ligHBondInfo: [LigandHBondInfoGPU] = []
+        for (i, gpuAtom) in gpuLigAtoms.enumerated() {
+            let vt = gpuAtom.vinaType
+            let isDonor = (vt == Int32(VINA_N_D.rawValue) || vt == Int32(VINA_N_DA.rawValue) ||
+                           vt == Int32(VINA_O_D.rawValue) || vt == Int32(VINA_O_DA.rawValue))
+            let isAcceptor = (vt == Int32(VINA_N_A.rawValue) || vt == Int32(VINA_N_DA.rawValue) ||
+                              vt == Int32(VINA_O_A.rawValue) || vt == Int32(VINA_O_DA.rawValue))
+            guard isDonor || isAcceptor else { continue }
+
+            // Find bonded heavy atom as antecedent (prefer C, then any)
+            var antecedent: Int = -1
+            for bond in ligandBonds {
+                let partner: Int?
+                if bond.atomIndex1 == i { partner = bond.atomIndex2 }
+                else if bond.atomIndex2 == i { partner = bond.atomIndex1 }
+                else { partner = nil }
+                if let p = partner, p < gpuLigAtoms.count {
+                    antecedent = p
+                    if ligandAtoms[p].element == .C { break } // prefer carbon antecedent
+                }
+            }
+            guard antecedent >= 0 else { continue }
+
+            // For DA atoms (both donor and acceptor), add both entries
+            if isDonor {
+                ligHBondInfo.append(LigandHBondInfoGPU(
+                    atomIndex: Int32(i), antecedentIndex: Int32(antecedent),
+                    isDonor: 1, _pad: 0))
+            }
+            if isAcceptor {
+                ligHBondInfo.append(LigandHBondInfoGPU(
+                    atomIndex: Int32(i), antecedentIndex: Int32(antecedent),
+                    isDonor: 0, _pad: 0))
+            }
+        }
+        if ligHBondInfo.isEmpty {
+            ligHBondInfo.append(LigandHBondInfoGPU(atomIndex: -1, antecedentIndex: -1, isDonor: 0, _pad: 0))
+        }
+        ligandHBondInfoBuffer = device.makeBuffer(
+            bytes: &ligHBondInfo,
+            length: ligHBondInfo.count * MemoryLayout<LigandHBondInfoGPU>.stride,
+            options: .storageModeShared)
+
+        // --- Protein H-bond donors/acceptors with antecedent atoms ---
+        // Use residue-based rules to identify donors (backbone N, sidechain NH) and
+        // acceptors (backbone O, sidechain C=O/OH) with their antecedent heavy atoms.
+        // Only include residues within 12Å of the ligand centroid (pocket atoms).
+        let hbondPocketRadius: Float = 12.0
+        let hbondPocketRadiusSq = hbondPocketRadius * hbondPocketRadius
+        var protHBondInfo: [ProteinHBondInfoGPU] = []
+        var residueAtomsHB: [String: [Atom]] = [:]
+        for atom in proteinAtoms {
+            let key = "\(atom.chainID)_\(atom.residueSeq)"
+            residueAtomsHB[key, default: []].append(atom)
+        }
+        for (_, atoms) in residueAtomsHB {
+            // Skip residues far from the pocket
+            let resCentroid = atoms.reduce(SIMD3<Float>.zero) { $0 + $1.position } / Float(atoms.count)
+            guard simd_distance_squared(resCentroid, centroid) < hbondPocketRadiusSq else { continue }
+            func findAtom(_ name: String) -> Atom? {
+                atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == name }
+            }
+            // Backbone N (donor) → antecedent = CA
+            if let n = findAtom("N"), let ca = findAtom("CA") {
+                protHBondInfo.append(ProteinHBondInfoGPU(
+                    position: n.position, isDonor: 1.0,
+                    antecedent: ca.position, _pad0: 0))
+            }
+            // Backbone O (acceptor) → antecedent = C
+            if let o = findAtom("O"), let c = findAtom("C") {
+                protHBondInfo.append(ProteinHBondInfoGPU(
+                    position: o.position, isDonor: 0.0,
+                    antecedent: c.position, _pad0: 0))
+            }
+            let resName = atoms.first?.residueName.trimmingCharacters(in: .whitespaces) ?? ""
+            // Sidechain donors/acceptors by residue type
+            switch resName {
+            case "SER":
+                if let og = findAtom("OG"), let cb = findAtom("CB") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: og.position, isDonor: 1.0, antecedent: cb.position, _pad0: 0))
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: og.position, isDonor: 0.0, antecedent: cb.position, _pad0: 0))
+                }
+            case "THR":
+                if let og1 = findAtom("OG1"), let cb = findAtom("CB") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: og1.position, isDonor: 1.0, antecedent: cb.position, _pad0: 0))
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: og1.position, isDonor: 0.0, antecedent: cb.position, _pad0: 0))
+                }
+            case "TYR":
+                if let oh = findAtom("OH"), let cz = findAtom("CZ") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: oh.position, isDonor: 1.0, antecedent: cz.position, _pad0: 0))
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: oh.position, isDonor: 0.0, antecedent: cz.position, _pad0: 0))
+                }
+            case "ASN":
+                if let od1 = findAtom("OD1"), let cg = findAtom("CG") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: od1.position, isDonor: 0.0, antecedent: cg.position, _pad0: 0))
+                }
+                if let nd2 = findAtom("ND2"), let cg = findAtom("CG") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: nd2.position, isDonor: 1.0, antecedent: cg.position, _pad0: 0))
+                }
+            case "GLN":
+                if let oe1 = findAtom("OE1"), let cd = findAtom("CD") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: oe1.position, isDonor: 0.0, antecedent: cd.position, _pad0: 0))
+                }
+                if let ne2 = findAtom("NE2"), let cd = findAtom("CD") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: ne2.position, isDonor: 1.0, antecedent: cd.position, _pad0: 0))
+                }
+            case "ASP":
+                if let od1 = findAtom("OD1"), let cg = findAtom("CG") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: od1.position, isDonor: 0.0, antecedent: cg.position, _pad0: 0))
+                }
+                if let od2 = findAtom("OD2"), let cg = findAtom("CG") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: od2.position, isDonor: 0.0, antecedent: cg.position, _pad0: 0))
+                }
+            case "GLU":
+                if let oe1 = findAtom("OE1"), let cd = findAtom("CD") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: oe1.position, isDonor: 0.0, antecedent: cd.position, _pad0: 0))
+                }
+                if let oe2 = findAtom("OE2"), let cd = findAtom("CD") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: oe2.position, isDonor: 0.0, antecedent: cd.position, _pad0: 0))
+                }
+            case "HIS":
+                if let nd1 = findAtom("ND1"), let cg = findAtom("CG") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: nd1.position, isDonor: 1.0, antecedent: cg.position, _pad0: 0))
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: nd1.position, isDonor: 0.0, antecedent: cg.position, _pad0: 0))
+                }
+                if let ne2 = findAtom("NE2"), let ce1 = findAtom("CE1") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: ne2.position, isDonor: 1.0, antecedent: ce1.position, _pad0: 0))
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: ne2.position, isDonor: 0.0, antecedent: ce1.position, _pad0: 0))
+                }
+            case "LYS":
+                if let nz = findAtom("NZ"), let ce = findAtom("CE") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: nz.position, isDonor: 1.0, antecedent: ce.position, _pad0: 0))
+                }
+            case "ARG":
+                if let nh1 = findAtom("NH1"), let cz = findAtom("CZ") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: nh1.position, isDonor: 1.0, antecedent: cz.position, _pad0: 0))
+                }
+                if let nh2 = findAtom("NH2"), let cz = findAtom("CZ") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: nh2.position, isDonor: 1.0, antecedent: cz.position, _pad0: 0))
+                }
+                if let ne = findAtom("NE"), let cd = findAtom("CD") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: ne.position, isDonor: 1.0, antecedent: cd.position, _pad0: 0))
+                }
+            case "TRP":
+                if let ne1 = findAtom("NE1"), let ce2 = findAtom("CE2") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: ne1.position, isDonor: 1.0, antecedent: ce2.position, _pad0: 0))
+                }
+            case "CYS":
+                if let sg = findAtom("SG"), let cb = findAtom("CB") {
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: sg.position, isDonor: 1.0, antecedent: cb.position, _pad0: 0))
+                    protHBondInfo.append(ProteinHBondInfoGPU(position: sg.position, isDonor: 0.0, antecedent: cb.position, _pad0: 0))
+                }
+            default: break
+            }
+        }
+        if protHBondInfo.isEmpty {
+            protHBondInfo.append(ProteinHBondInfoGPU(position: .zero, isDonor: 0.0, antecedent: .zero, _pad0: 0))
+        }
+        proteinHBondInfoBuffer = device.makeBuffer(
+            bytes: &protHBondInfo,
+            length: protHBondInfo.count * MemoryLayout<ProteinHBondInfoGPU>.stride,
+            options: .storageModeShared)
+
         // --- Drusina parameters ---
         var params = DrusinaParams(
             numProteinRings: UInt32(protRings.count),
             numLigandRings: UInt32(ligRings.count),
             numProteinCations: UInt32(max(cations.count - (cations.first == .zero ? 1 : 0), 0)),
             numHalogens: UInt32(halogens.first?.halogenAtomIndex == -1 ? 0 : halogens.count),
-            wPiPi: -0.35,
-            wPiCation: -0.40,
-            wHalogenBond: -0.40,
-            wMetalCoord: -0.95,
+            // Calibrated on PDBbind v2020 refined set (4641 complexes, 5-fold CV r=-0.349)
+            wPiPi: -0.20,             // confirmed by calibration (unchanged)
+            wPiCation: -0.05,         // calibrated: was -0.50, reduced (weak signal)
+            wHalogenBond: -0.40,      // not testable in Python (kept)
+            wMetalCoord: -0.91,       // calibrated: was -0.95 (strong signal)
             numProteinAmides: UInt32(amides.first?.centroid == .zero && amides.count == 1 ? 0 : amides.count),
             numChalcogens: UInt32(chalcogens.first?.sulfurAtomIndex == -1 ? 0 : chalcogens.count),
-            wSaltBridge: -0.35,
-            wAmideStack: -0.30,
-            wChalcogenBond: -0.20,
+            wSaltBridge: -0.20,       // not significant on native poses (kept for docking)
+            wAmideStack: -0.15,       // not testable in Python (kept)
+            wChalcogenBond: -0.10,    // not testable in Python (kept)
             numSaltBridgeGroups: UInt32(sbGroups.first?.chargeSign == 0 ? 0 : sbGroups.count),
-            wCoulomb: 0.012,
-            wCHPi: -0.08,
+            wCoulomb: 0.015,          // not testable in Python (kept)
+            wCHPi: -0.26,            // calibrated: was -0.04, strong boost (fires 40%)
             wCooperativity: 0.0,
-            wTorsionStrain: 1.5,
+            wTorsionStrain: 1.0,      // not testable in Python (kept)
+            minCorrection: -5.5,
+            wHBondDir: -0.32,         // calibrated: was -0.25, confirmed useful
+            wDesolvPolar: 0.0,        // zeroed by calibration (too noisy on native poses)
             numProteinChalcogens: UInt32(protChalcogens.first?.bondedCDir == .zero ? 0 : protChalcogens.count),
             numTorsionStrains: UInt32(torsionStrains.first?.atom0 == -1 ? 0 : torsionStrains.count),
-            _padDP0: 0,
-            _padDP1: 0)
+            numProteinHBondAtoms: UInt32(protHBondInfo.first?.position == .zero && protHBondInfo.count == 1 ? 0 : protHBondInfo.count),
+            numLigandHBondAtoms: UInt32(ligHBondInfo.first?.atomIndex == -1 ? 0 : ligHBondInfo.count),
+            wDesolvHydrophobic: 0.0,  // zeroed by calibration (too noisy on native poses)
+            _padDP0: 0)
         drusinaParamsBuffer = device.makeBuffer(
             bytes: &params,
             length: MemoryLayout<DrusinaParams>.stride,

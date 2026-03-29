@@ -17,6 +17,131 @@ struct BindingPocket: Identifiable, Sendable {
     var probePositions: [SIMD3<Float>]    // retained for visualization
 }
 
+enum PocketSelectionMethod: String, Sendable {
+    case geometric
+    case ml
+}
+
+struct PocketSelectionCandidate: Sendable {
+    let pocket: BindingPocket
+    let method: PocketSelectionMethod
+    let score: Float
+    let suspicious: Bool
+}
+
+enum PocketSelectionHeuristics {
+    static func score(_ pocket: BindingPocket, method: PocketSelectionMethod) -> Float {
+        let logVolume = log(max(pocket.volume, 1.0))
+        let buriedness = max(pocket.buriedness, 0.05)
+        let polarity = max(pocket.polarity, 0.25)
+        let minExtent = min(pocket.size.x, min(pocket.size.y, pocket.size.z))
+        let maxExtent = max(pocket.size.x, max(pocket.size.y, pocket.size.z))
+        let residueBonus = 0.04 * Float(min(pocket.residueIndices.count, 30))
+
+        var score = logVolume * buriedness * (1.0 + polarity) + residueBonus
+
+        if pocket.buriedness < 0.12 { score -= 4.0 }
+        if pocket.volume < 1_500 { score -= 2.0 }
+        if minExtent < 5.0 { score -= 1.5 }
+        if maxExtent > 18.0 { score -= 0.5 }
+        if method == .geometric { score += 0.3 }
+
+        return score
+    }
+
+    static func isSuspicious(_ pocket: BindingPocket) -> Bool {
+        let minExtent = min(pocket.size.x, min(pocket.size.y, pocket.size.z))
+        return pocket.buriedness < 0.12 ||
+            pocket.volume < 1_500 ||
+            minExtent < 5.0 ||
+            pocket.residueIndices.isEmpty
+    }
+
+    static func rankedHybridCandidates(
+        mlPockets: [BindingPocket],
+        geometricPockets: [BindingPocket],
+        maxCandidatesPerMethod: Int = 3,
+        dedupeDistance: Float = 4.0
+    ) -> [PocketSelectionCandidate] {
+        var candidates: [PocketSelectionCandidate] = []
+        candidates.reserveCapacity(maxCandidatesPerMethod * 2)
+
+        for pocket in mlPockets.prefix(maxCandidatesPerMethod) {
+            candidates.append(PocketSelectionCandidate(
+                pocket: pocket,
+                method: .ml,
+                score: score(pocket, method: .ml),
+                suspicious: isSuspicious(pocket)
+            ))
+        }
+
+        for pocket in geometricPockets.prefix(maxCandidatesPerMethod) {
+            candidates.append(PocketSelectionCandidate(
+                pocket: pocket,
+                method: .geometric,
+                score: score(pocket, method: .geometric),
+                suspicious: isSuspicious(pocket)
+            ))
+        }
+
+        let sorted = candidates.sorted { lhs, rhs in
+            if lhs.suspicious != rhs.suspicious {
+                return !lhs.suspicious && rhs.suspicious
+            }
+            if lhs.score != rhs.score {
+                return lhs.score > rhs.score
+            }
+            return lhs.pocket.druggability > rhs.pocket.druggability
+        }
+
+        var deduped: [PocketSelectionCandidate] = []
+        deduped.reserveCapacity(sorted.count)
+        for candidate in sorted {
+            let overlapsExisting = deduped.contains {
+                simd_distance($0.pocket.center, candidate.pocket.center) < dedupeDistance
+            }
+            if !overlapsExisting {
+                deduped.append(candidate)
+            }
+        }
+
+        return deduped.enumerated().map { index, candidate in
+            PocketSelectionCandidate(
+                pocket: pocketWithID(candidate.pocket, id: index),
+                method: candidate.method,
+                score: candidate.score,
+                suspicious: candidate.suspicious
+            )
+        }
+    }
+
+    static func bestHybridCandidate(
+        mlPockets: [BindingPocket],
+        geometricPockets: [BindingPocket],
+        maxCandidatesPerMethod: Int = 3
+    ) -> PocketSelectionCandidate? {
+        rankedHybridCandidates(
+            mlPockets: mlPockets,
+            geometricPockets: geometricPockets,
+            maxCandidatesPerMethod: maxCandidatesPerMethod
+        ).first
+    }
+
+    private static func pocketWithID(_ pocket: BindingPocket, id: Int) -> BindingPocket {
+        BindingPocket(
+            id: id,
+            center: pocket.center,
+            size: pocket.size,
+            volume: pocket.volume,
+            buriedness: pocket.buriedness,
+            polarity: pocket.polarity,
+            druggability: pocket.druggability,
+            residueIndices: pocket.residueIndices,
+            probePositions: pocket.probePositions
+        )
+    }
+}
+
 // MARK: - Sendable snapshot for off-main-actor computation
 
 /// A lightweight, Sendable snapshot of the protein data needed for pocket detection.

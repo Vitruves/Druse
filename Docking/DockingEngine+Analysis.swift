@@ -169,8 +169,13 @@ extension DockingEngine {
     func clusterPoses(_ results: [DockingResult]) async -> [DockingResult] {
         guard !results.isEmpty else { return [] }
         let threshold: Float = 2.0
-        var out = results
+        var out = results.sorted { $0.energy < $1.energy }
         let n = out.count
+
+        for i in 0..<n {
+            out[i].clusterID = -1
+            out[i].clusterRank = 0
+        }
 
         let rmsdMatrix = await computeRMSDMatrixGPU(out) ?? computeRMSDMatrixCPU(out)
 

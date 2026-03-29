@@ -22,6 +22,7 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
         var admetFilter: Bool = true
         var openMMRefineTopN: Int = 25
         var gfn2RefineTopN: Int = 0  // 0 = disabled; >0 = refine top N hits with GFN2-xTB (D4 + solvation)
+        var applyStrainPenalty: Bool = false
         var maxRotatableBonds: Int = 15 // skip very flexible molecules
     }
 
@@ -324,18 +325,20 @@ final class VirtualScreeningPipeline: @unchecked Sendable {
             }
         }
 
-        // Phase 2.5: MMFF94 strain penalty for GA-docked hits
-        for i in 0..<allHits.count {
-            if isCancelled { state = .idle; return }
-            let hit = allHits[i]
-            guard !hit.bestPoseAtoms.isEmpty else { continue }
-            if let refE = RDKitBridge.mmffReferenceEnergy(smiles: hit.smiles),
-               let dockedE = RDKitBridge.mmffStrainEnergy(smiles: hit.smiles, heavyPositions: hit.bestPoseAtoms) {
-                let strain = Float(dockedE - refE)
-                allHits[i].strainEnergy = strain
-                if strain > 6.0 {
-                    allHits[i].bestEnergy += 0.5 * (strain - 6.0)
-                    allHits[i].compositeScore = allHits[i].bestEnergy
+        // Keep Vina screening scorer-pure by default; strain is optional product-side post-processing.
+        if config.applyStrainPenalty {
+            for i in 0..<allHits.count {
+                if isCancelled { state = .idle; return }
+                let hit = allHits[i]
+                guard !hit.bestPoseAtoms.isEmpty else { continue }
+                if let refE = RDKitBridge.mmffReferenceEnergy(smiles: hit.smiles),
+                   let dockedE = RDKitBridge.mmffStrainEnergy(smiles: hit.smiles, heavyPositions: hit.bestPoseAtoms) {
+                    let strain = Float(dockedE - refE)
+                    allHits[i].strainEnergy = strain
+                    if strain > 6.0 {
+                        allHits[i].bestEnergy += 0.5 * (strain - 6.0)
+                        allHits[i].compositeScore = allHits[i].bestEnergy
+                    }
                 }
             }
         }

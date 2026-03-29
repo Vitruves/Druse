@@ -205,7 +205,7 @@ struct DockingTabView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(viewModel.molecules.protein == nil)
-                .help("Alpha-sphere + DBSCAN pocket detection")
+                .help("Hybrid pocket detection: ML candidates plus geometric fallback")
                 .accessibilityIdentifier(AccessibilityID.dockDetectAuto)
 
                 Button(action: { viewModel.detectPocketsML() }) {
@@ -1608,19 +1608,11 @@ struct DockingTabView: View {
     // MARK: - Actions
 
     private func detectPocketsAuto() {
-        guard let prot = viewModel.molecules.protein else { return }
+        guard viewModel.molecules.protein != nil else { return }
         let excluded = viewModel.workspace.hiddenChainIDs
         let chainMsg = excluded.isEmpty ? "" : " (excluding chains: \(excluded.sorted().joined(separator: ", ")))"
         viewModel.log.info("Detecting binding pockets\(chainMsg)...", category: .dock)
-
-        Task {
-            let pockets = BindingSiteDetector.detectPockets(protein: prot, excludedChainIDs: excluded)
-            viewModel.docking.detectedPockets = pockets
-            if let first = pockets.first {
-                viewModel.docking.selectedPocket = first
-            }
-            viewModel.log.success("Found \(pockets.count) pocket\(pockets.count == 1 ? "" : "s")", category: .dock)
-        }
+        viewModel.detectPockets(excludedChainIDs: excluded)
     }
 
     private func detectFromLigand() {

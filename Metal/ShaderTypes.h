@@ -370,6 +370,22 @@ struct TorsionStrainInfo {
     float       _pad1;
 };
 
+// Ligand H-bond donor/acceptor with heavy-atom antecedent for angle check
+struct LigandHBondInfoGPU {
+    int32_t     atomIndex;         // index into DockLigandAtom array
+    int32_t     antecedentIndex;   // bonded heavy atom index (for D-X...A angle)
+    int32_t     isDonor;           // 1 = donor, 0 = acceptor
+    int32_t     _pad;
+};
+
+// Protein H-bond donor/acceptor with antecedent position
+struct ProteinHBondInfoGPU {
+    simd_float3 position;          // donor/acceptor atom position
+    float       isDonor;           // 1.0 = donor, 0.0 = acceptor
+    simd_float3 antecedent;        // bonded heavy atom position (for angle check)
+    float       _pad0;
+};
+
 // Drusina scoring parameters
 struct DrusinaParams {
     uint32_t    numProteinRings;
@@ -387,15 +403,21 @@ struct DrusinaParams {
     float       wAmideStack;     // amide-π stacking weight
     float       wChalcogenBond;  // chalcogen bond weight
     uint32_t    numSaltBridgeGroups; // number of protein charged groups
-    // New scoring terms
+    // Scoring terms
     float       wCoulomb;        // screened Coulomb weight (ε=4r dielectric)
     float       wCHPi;           // CH-π interaction weight
     float       wCooperativity;  // cooperativity bonus per extra interaction
     float       wTorsionStrain;  // torsion planarity penalty (positive = penalty)
+    float       minCorrection;   // lower cap for total Drusina correction
+    // H-bond directionality & desolvation (replaces removed Vina quality gate)
+    float       wHBondDir;       // H-bond directionality correction weight
+    float       wDesolvPolar;    // polar desolvation penalty (positive = penalty)
     uint32_t    numProteinChalcogens; // protein S atoms (Met/Cys) for bidirectional scoring
     uint32_t    numTorsionStrains;    // amide/conjugated torsion count
-    uint32_t    _padDP0;
-    uint32_t    _padDP1;
+    uint32_t    numProteinHBondAtoms; // protein donors/acceptors for angle correction
+    uint32_t    numLigandHBondAtoms;  // ligand donors/acceptors for angle correction
+    float       wDesolvHydrophobic;   // hydrophobic desolvation penalty (positive = penalty)
+    float       _padDP0;
 };
 
 // ============================================================================
@@ -1006,7 +1028,11 @@ struct DrusinaDecomposition {
     float chPi;
     float torsionStrain;
     float cooperativity;
-    float total;          // sum after cap
+    float hbondDir;          // H-bond directionality correction
+    float desolvPolar;       // polar desolvation penalty
+    float desolvHydrophobic; // hydrophobic desolvation penalty
+    float total;             // sum after cap
+    float _pad;
 };
 
 #endif /* ShaderTypes_h */

@@ -52,6 +52,40 @@ extension DockingEngine {
         return wrapped
     }
 
+    private struct RerankProfile {
+        var variantsPerCluster: Int
+        var localSearchSteps: Int
+        var translationJitter: Float
+        var rotationJitter: Float
+        var torsionJitter: Float
+
+        var runsLocalOptimization: Bool { localSearchSteps > 0 }
+    }
+
+    private func rerankProfile(for scoringMethod: ScoringMethod) -> RerankProfile {
+        switch scoringMethod {
+        case .drusina:
+            // Drusina rerank should stay close to sampled basin leaders. Its score is not
+            // aligned with the Vina-style local optimizer, so aggressive second-pass
+            // refinement tends to move poses off the Drusina-preferred basin.
+            return RerankProfile(
+                variantsPerCluster: 1,
+                localSearchSteps: 0,
+                translationJitter: 0,
+                rotationJitter: 0,
+                torsionJitter: 0
+            )
+        default:
+            return RerankProfile(
+                variantsPerCluster: max(config.explicitRerankVariantsPerCluster, 1),
+                localSearchSteps: max(config.explicitRerankLocalSearchSteps, 1),
+                translationJitter: 0.75,
+                rotationJitter: 0.18,
+                torsionJitter: 0.30
+            )
+        }
+    }
+
     func makeDockPose(from result: DockingResult) -> DockPose {
         var pose = DockPose()
         pose.translation = result.pose.translation
@@ -82,7 +116,11 @@ extension DockingEngine {
         return pose
     }
 
-    private func makeRerankSeedPose(from result: DockingResult, variantIndex: Int) -> DockPose {
+    private func makeRerankSeedPose(
+        from result: DockingResult,
+        variantIndex: Int,
+        profile: RerankProfile
+    ) -> DockPose {
         var pose = makeDockPose(from: result)
         guard variantIndex > 0 else { return pose }
 
@@ -91,10 +129,10 @@ extension DockingEngine {
             ^ variantIndex &* 668_265_263))
         var rng = RerankRNG(seed: seed)
 
-        pose.translation += rng.vectorInUnitSphere(scale: 0.75)
+        pose.translation += rng.vectorInUnitSphere(scale: profile.translationJitter)
 
         let axis = simd_normalize(rng.vectorInUnitSphere(scale: 1))
-        let deltaRotation = simd_quatf(angle: rng.signed(amplitude: 0.18), axis: axis)
+        let deltaRotation = simd_quatf(angle: rng.signed(amplitude: profile.rotationJitter), axis: axis)
         let currentRotation = simd_quatf(ix: pose.rotation.x, iy: pose.rotation.y, iz: pose.rotation.z, r: pose.rotation.w)
         let updatedRotation = deltaRotation * currentRotation
         pose.rotation = SIMD4<Float>(
@@ -109,7 +147,7 @@ extension DockingEngine {
         withUnsafeMutablePointer(to: &pose.torsions) {
             $0.withMemoryRebound(to: Float.self, capacity: 32) { buffer in
                 for index in 0..<torsionCount {
-                    buffer[index] = wrappedAngle(buffer[index] + rng.signed(amplitude: 0.30))
+                    buffer[index] = wrappedAngle(buffer[index] + rng.signed(amplitude: profile.torsionJitter))
                 }
             }
         }
@@ -172,6 +210,7 @@ extension DockingEngine {
 
     func rerankClusterRepresentativesExplicit(
         _ results: [DockingResult],
+        scoringMethod: ScoringMethod,
         ligandAtoms: [Atom],
         centroid: SIMD3<Float>
     ) -> [DockingResult] {
@@ -190,7 +229,8 @@ extension DockingEngine {
         guard !leaders.isEmpty else { return results }
 
         let rerankCount = min(config.explicitRerankTopClusters, leaders.count)
-        let variantsPerCluster = max(config.explicitRerankVariantsPerCluster, 1)
+        let rerankProfile = rerankProfile(for: scoringMethod)
+        let variantsPerCluster = rerankProfile.variantsPerCluster
         let rerankLeaders = Array(leaders.prefix(rerankCount))
         var representativePoses: [DockPose] = []
         var variantClusterIDs: [Int] = []
@@ -198,7 +238,11 @@ extension DockingEngine {
         variantClusterIDs.reserveCapacity(rerankLeaders.count * variantsPerCluster)
         for leader in rerankLeaders {
             for variantIndex in 0..<variantsPerCluster {
-                representativePoses.append(makeRerankSeedPose(from: leader, variantIndex: variantIndex))
+                representativePoses.append(makeRerankSeedPose(
+                    from: leader,
+                    variantIndex: variantIndex,
+                    profile: rerankProfile
+                ))
                 variantClusterIDs.append(leader.clusterID)
             }
         }
@@ -213,7 +257,7 @@ extension DockingEngine {
         let currentGA = gaParamsBuffer.contents().bindMemory(to: GAParams.self, capacity: 1).pointee
         var rerankGA = currentGA
         rerankGA.populationSize = UInt32(representativePoses.count)
-        rerankGA.localSearchSteps = UInt32(max(config.explicitRerankLocalSearchSteps, 1))
+        rerankGA.localSearchSteps = UInt32(rerankProfile.localSearchSteps)
         let rerankGABuffer = device.makeBuffer(
             bytes: &rerankGA,
             length: MemoryLayout<GAParams>.stride,
@@ -221,18 +265,31 @@ extension DockingEngine {
         )
         guard let rerankGABuffer else { return results }
 
-        localOptimizeGrid(
-            buffer: repBuffer,
-            gridParamsBuffer: gridParamsBuffer,
-            gaParamsBuffer: rerankGABuffer,
-            populationSize: representativePoses.count
-        )
-        scorePopulationExplicit(
-            buffer: repBuffer,
-            gridParamsBuffer: gridParamsBuffer,
-            gaParamsBuffer: rerankGABuffer,
-            populationSize: representativePoses.count
-        )
+        if rerankProfile.runsLocalOptimization {
+            localOptimizeGrid(
+                buffer: repBuffer,
+                gridParamsBuffer: gridParamsBuffer,
+                gaParamsBuffer: rerankGABuffer,
+                populationSize: representativePoses.count
+            )
+        }
+        if scoringMethod == .drusina {
+            let tgSize = MTLSize(width: min(representativePoses.count, 256), height: 1, depth: 1)
+            let tgCount = MTLSize(width: (representativePoses.count + 255) / 256, height: 1, depth: 1)
+            scoreDrusina(
+                buffer: repBuffer,
+                gaParamsBuffer: rerankGABuffer,
+                tg: tgCount,
+                tgs: tgSize
+            )
+        } else {
+            scorePopulationExplicit(
+                buffer: repBuffer,
+                gridParamsBuffer: gridParamsBuffer,
+                gaParamsBuffer: rerankGABuffer,
+                populationSize: representativePoses.count
+            )
+        }
 
         let rescoredLeaders = extractAllResults(
             from: repBuffer,
@@ -957,7 +1014,9 @@ extension DockingEngine {
                           let sbgb = saltBridgeGroupBuffer,
                           let elecBuf = electrostaticGridBuffer,
                           let pchBuf = proteinChalcogenBuffer,
-                          let tsBuf = torsionStrainBuffer {
+                          let tsBuf = torsionStrainBuffer,
+                          let lhbBuf = ligandHBondInfoBuffer,
+                          let phbBuf = proteinHBondInfoBuffer {
                     var drusinaBuffers = vinaScoreBuffers
                     drusinaBuffers.append(contentsOf: [
                         (prb, 9), (lrb, 10),
@@ -965,7 +1024,8 @@ extension DockingEngine {
                         (pab, 13), (hib, 14),
                         (pamb, 15), (cib, 16),
                         (sbgb, 17),
-                        (elecBuf, 18), (pchBuf, 19), (tsBuf, 20)
+                        (elecBuf, 18), (pchBuf, 19), (tsBuf, 20),
+                        (lhbBuf, 21), (phbBuf, 22)
                     ])
                     dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
                 } else {
@@ -1090,6 +1150,7 @@ extension DockingEngine {
         let clustered = await clusterPoses(aggregatedResults)
         var reranked = rerankClusterRepresentativesExplicit(
             clustered,
+            scoringMethod: scoringMethod,
             ligandAtoms: heavyAtoms,
             centroid: centroid
         )
@@ -1365,6 +1426,8 @@ extension DockingEngine {
               let elecBuf = electrostaticGridBuffer,
               let pchBuf = proteinChalcogenBuffer,
               let tsBuf = torsionStrainBuffer,
+              let lhbBuf = ligandHBondInfoBuffer,
+              let phbBuf = proteinHBondInfoBuffer,
               let ligBuf = ligandAtomBuffer,
               let affBuf = vinaAffinityGridBuffer,
               let typBuf = vinaTypeIndexBuffer,
@@ -1383,7 +1446,8 @@ extension DockingEngine {
             (ipBuf, 8),
             (prBuf, 9), (lrBuf, 10), (pcBuf, 11), (dpBuf, 12), (paBuf, 13), (hiBuf, 14),
             (amBuf, 15), (chBuf, 16), (sbBuf, 17),
-            (elecBuf, 18), (pchBuf, 19), (tsBuf, 20)
+            (elecBuf, 18), (pchBuf, 19), (tsBuf, 20),
+            (lhbBuf, 21), (phbBuf, 22)
         ], threadGroups: tg, threadGroupSize: tgs)
     }
 
@@ -1600,6 +1664,8 @@ extension DockingEngine {
               let elecBuf = electrostaticGridBuffer,
               let pchBuf = proteinChalcogenBuffer,
               let tsBuf = torsionStrainBuffer,
+              let lhbBuf = ligandHBondInfoBuffer,
+              let phbBuf = proteinHBondInfoBuffer,
               let ligBuf = ligandAtomBuffer,
               let gpBuf = gridParamsBuffer,
               let teBuf = torsionEdgeBuffer,
@@ -1620,7 +1686,8 @@ extension DockingEngine {
             (teBuf, 3), (miBuf, 4),
             (prBuf, 5), (lrBuf, 6), (pcBuf, 7), (dpBuf, 8), (paBuf, 9),
             (gpBuf, 10), (hiBuf, 11), (amBuf, 12), (chBuf, 13), (sbBuf, 14),
-            (elecBuf, 15), (pchBuf, 16), (tsBuf, 17), (decompBuf, 18)
+            (elecBuf, 15), (pchBuf, 16), (tsBuf, 17), (decompBuf, 18),
+            (lhbBuf, 19), (phbBuf, 20)
         ]
         for (buf, idx) in buffers { enc.setBuffer(buf, offset: 0, index: idx) }
         enc.dispatchThreadgroups(tg, threadsPerThreadgroup: tgs)

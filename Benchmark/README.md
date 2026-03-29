@@ -71,7 +71,7 @@ For day-to-day docking work, use the curated real-life panel instead of the full
 It runs a fixed subset of 16 CASF complexes grouped by practical failure mode:
 rigid fragments, metal coordination, charged/flexible ligands, and bulky hydrophobics.
 Unlike the classic redocking benchmark, the panel defaults to the full Druse path:
-ligand regeneration from SMILES, automatic pocket detection (ML first, geometric fallback),
+ligand regeneration from SMILES, automatic pocket detection (ranked ML + geometric candidates),
 then docking plus app-style post-processing.
 
 ```bash
