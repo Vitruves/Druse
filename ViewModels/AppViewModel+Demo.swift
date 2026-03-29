@@ -80,7 +80,7 @@ extension AppViewModel {
         }
         guard molecules.protein != nil else { throw DemoError.missingProtein }
 
-        // Discard any co-crystallized ligand — we build Tamiflu from SMILES later
+        // Discard any co-crystallized ligand — we build Nafamostat from SMILES later
         molecules.ligand = nil
 
         molecules.preparationReport = ProteinPreparation.analyze(
@@ -89,6 +89,28 @@ extension AppViewModel {
             waterCount: result.waterCount
         )
         workspace.hiddenChainIDs.removeAll()
+
+        // Compute EEM partial charges so the Drusina electrostatic grid and ESP
+        // surface are functional. EEM is fast (GPU-accelerated) and doesn't require
+        // full protein preparation (protonation, H-bond network, etc.)
+        if let prot = molecules.protein {
+            let calculator = EEMChargeCalculator(device: renderer?.device)
+            if let charges = try? await calculator.computeCharges(
+                atoms: prot.atoms, bonds: prot.bonds, totalCharge: 0
+            ) {
+                var updatedAtoms = prot.atoms
+                for i in 0..<min(charges.count, updatedAtoms.count) {
+                    updatedAtoms[i].charge = charges[i]
+                }
+                let charged = Molecule(name: prot.name, atoms: updatedAtoms,
+                                       bonds: prot.bonds, title: prot.title)
+                charged.secondaryStructureAssignments = prot.secondaryStructureAssignments
+                molecules.protein = charged
+                let nonZero = charges.filter { abs($0) > 0.001 }.count
+                log.success("Demo: EEM charges — \(nonZero)/\(charges.count) non-zero", category: .prep)
+            }
+        }
+
         pushToRenderer()
         renderer?.fitToContent()
 
@@ -112,6 +134,20 @@ extension AppViewModel {
         setRenderMode(.ribbon)
         pushToRenderer()
         renderer?.fitToContent()
+        try await Task.sleep(for: .seconds(6.0))
+
+        // Generate a translucent Connolly surface with electrostatic coloring.
+        // EEM charges were computed in Phase 1, so ESP mapping is functional.
+        workspace.surfaceType = .connolly
+        workspace.surfaceColorMode = .esp
+        workspace.surfaceOpacity = 0.85
+        workspace.showSurface = true
+        generateSurface()
+        renderer?.surfaceOpacity = 0.85
+
+        setDemoStep(.ribbon,
+            narration: "The electrostatic surface reveals the pocket chemistry — red regions are negative (Asp189), blue regions are positive. The deep S1 slot is clearly visible as a concavity.")
+
         try await Task.sleep(for: .seconds(6.0))
     }
 
@@ -249,36 +285,42 @@ extension AppViewModel {
         // amidinium↔Asp189 ionic interaction that drives binding
         docking.scoringMethod = .drusina
 
-        // Configure docking for VISUAL DEMO — maximum exploration, minimum convergence.
-        // The goal: the ligand visibly moves through the grid every frame, jumping between
-        // orientations and positions, then gradually settles into the pocket.
-        docking.dockingConfig.generationsPerRun = 200
-        docking.dockingConfig.numRuns = 8                       // 8 independent starts = 8 dramatic position resets
-        docking.dockingConfig.populationSize = 120              // enough diversity for visual motion + enough for convergence
+        // Configure docking for VISUAL DEMO — dramatic exploration that still converges.
+        // Exploration phase: large jumps for visual movement.
+        // Refinement phase: full-strength local search so the ligand reaches the pocket floor.
+        docking.dockingConfig.generationsPerRun = 300
+        docking.dockingConfig.numRuns = 5                       // 5 independent starts — visible resets without diluting sampling
+        docking.dockingConfig.populationSize = 300              // full population for deep-pocket convergence
         docking.dockingConfig.liveUpdateFrequency = 1           // ghost pose updates EVERY generation
         docking.dockingConfig.autoMode = false
 
-        // Exploration: 70% exploration gives visible movement + 30% real refinement
-        docking.dockingConfig.explorationPhaseRatio = 0.70      // 70% exploration = good visual, 30% convergence
-        docking.dockingConfig.explorationTranslationStep = 7.0  // large jumps — cross the pocket
-        docking.dockingConfig.explorationRotationStep = 1.2     // ~69° flips — dramatic but not chaotic
-        docking.dockingConfig.explorationMutationRate = 0.40    // 40% mutation — visible diversity
-        docking.dockingConfig.translationStep = 2.5             // moderate refinement steps
-        docking.dockingConfig.rotationStep = 0.5                // tighter rotations in refinement
-        docking.dockingConfig.mutationRate = 0.15               // moderate mutation in refinement
+        // Exploration: 55% exploration for visible movement, 45% serious refinement
+        docking.dockingConfig.explorationPhaseRatio = 0.55
+        docking.dockingConfig.explorationTranslationStep = 6.0  // large jumps — cross the pocket visually
+        docking.dockingConfig.explorationRotationStep = 1.0     // ~57° flips — dramatic but recoverable
+        docking.dockingConfig.explorationMutationRate = 0.30    // visible diversity during exploration
+        docking.dockingConfig.translationStep = 2.0             // default refinement steps
+        docking.dockingConfig.rotationStep = 0.3                // default — fine-grained convergence
+        docking.dockingConfig.mutationRate = 0.10               // default refinement mutation
 
-        // Local search: sparse during exploration for movement, frequent in refinement for accuracy
-        docking.dockingConfig.localSearchFrequency = 8          // LS every 8th gen in refinement → proper convergence
-        docking.dockingConfig.localSearchSteps = 15             // meaningful refinement when it fires
-        docking.dockingConfig.explorationLocalSearchFrequency = 30  // rare during exploration (movement preserved)
+        // Local search: frequent in refinement so the ligand sinks into deep pockets
+        docking.dockingConfig.localSearchFrequency = 3          // every 3rd gen in refinement (default)
+        docking.dockingConfig.localSearchSteps = 20             // full gradient descent per refinement
+        docking.dockingConfig.explorationLocalSearchFrequency = 10  // sparse during exploration (movement preserved)
 
-        // High MC temperature during exploration, but not so high that refinement is meaningless
-        docking.dockingConfig.mcTemperature = 3.0
+        // Moderate MC temperature — enough acceptance for exploration, tight enough for convergence
+        docking.dockingConfig.mcTemperature = 1.5
+
+        // Accuracy: explicit reranking refines top cluster representatives against
+        // actual protein atoms (not grid approximation) for reliable final ranking
+        docking.dockingConfig.explicitRerankTopClusters = 15
+        docking.dockingConfig.explicitRerankVariantsPerCluster = 6
+        docking.dockingConfig.explicitRerankLocalSearchSteps = 30
 
         setDemoStep(.dockingStart,
-            narration: "Launching the Metal GPU docking engine — 8 independent trajectories exploring the pocket. Watch Nafamostat jump between positions, flip orientations, and gradually find the optimal binding pose.")
+            narration: "Launching the Metal GPU docking engine — 5 independent trajectories exploring the pocket. Watch Nafamostat jump between positions, flip orientations, and gradually find the optimal binding pose.")
 
-        log.info("Demo: Docking config — 8 runs × 200 gens, pop=120, exploration=70%, LS=8/15, mcTemp=3.0", category: .dock)
+        log.info("Demo: Docking config — 5 runs × 300 gens, pop=300, exploration=55%, LS=3/20, mcTemp=1.5", category: .dock)
 
         try await Task.sleep(for: .seconds(3.0))
 
@@ -298,8 +340,8 @@ extension AppViewModel {
             let total = docking.dockingTotalGenerations
             let energy = docking.dockingBestEnergy
 
-            if !hasConverged && total > 0 && gen > total / 2 {
-                hasConverged = true
+            // Update narration with current best energy so it stays in sync with the live counter
+            if total > 0 && gen > total / 2 {
                 let eStr = energy < .infinity ? String(format: "%.1f", energy) : "---"
                 setDemoStep(.dockingConverge,
                     narration: "Converging — poses cluster in the S1 pocket. Best energy: \(eStr) kcal/mol. The amidinium groups form salt bridges with Asp189 and nearby residues.")
@@ -324,10 +366,14 @@ extension AppViewModel {
         }
 
         let best = docking.dockingResults[0]
+        let totalPoses = docking.dockingResults.count
+        let clusterCount = Set(docking.dockingResults.map(\.clusterID)).subtracting([-1]).count
+        let energySpread = docking.dockingResults.last.map { $0.energy - best.energy } ?? 0
+
         showDockingPose(at: 0)
 
         setDemoStep(.bestPose,
-            narration: "Best pose: \(String(format: "%.1f", best.energy)) kcal/mol. Nafamostat binds in the S1 pocket — the amidinium cation points toward Asp189 at the pocket floor, while the ester bridge spans the catalytic cleft.")
+            narration: "Best pose: \(String(format: "%.1f", best.energy)) kcal/mol — ranked #1 of \(totalPoses) poses across \(clusterCount) distinct clusters (energy spread \(String(format: "%.1f", energySpread)) kcal/mol). The amidinium cation points toward Asp189 at the pocket floor.")
 
         workspace.colorScheme = .ligandFocus
         pushToRenderer()
@@ -340,7 +386,7 @@ extension AppViewModel {
         let total = docking.currentInteractions.count
 
         setDemoStep(.interactions,
-            narration: "\(total) interactions: \(hbonds) hydrogen bonds, \(salt) salt bridges (amidinium↔Asp189), \(hydro) hydrophobic contacts. Nafamostat covalently inhibits trypsin in vivo — this pose shows the initial recognition complex.")
+            narration: "\(total) interactions: \(hbonds) hydrogen bonds, \(salt) salt bridges, \(hydro) hydrophobic contacts. Nafamostat covalently inhibits trypsin in vivo — this pose shows the initial recognition complex.")
 
         log.success("Demo: Best \(String(format: "%.1f", best.energy)) kcal/mol — \(hbonds) H-bonds, \(salt) salt bridges, \(hydro) hydrophobic", category: .dock)
 

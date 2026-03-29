@@ -34,7 +34,7 @@ MANIFESTS_DIR = BENCHMARK_DIR / "manifests"
 RESULTS_DIR = BENCHMARK_DIR / "results"
 REPORTS_DIR = BENCHMARK_DIR / "reports"
 RUN_BENCHMARK = BENCHMARK_DIR / "run_benchmark.py"
-DEFAULT_PANEL = PANELS_DIR / "real_life_panel_v1.json"
+DEFAULT_PANEL = PANELS_DIR / "real_life_panel_v2.json"
 
 
 def parse_args():
@@ -52,8 +52,7 @@ def parse_args():
     )
     panel_group.add_argument(
         "--groups", type=str, default="",
-        help="Run only these groups (comma-separated). "
-             "Available: rigid_fragments, metal_coordination, charged_flexible, bulky_hydrophobic",
+        help="Run only these groups (comma-separated). Use --list to see available groups.",
     )
     panel_group.add_argument(
         "--limit", type=int, default=0,
@@ -712,7 +711,6 @@ def main():
         print_panel(panel, selected, verbose=True)
         return
 
-    print_panel(panel, selected, verbose=False)
     subset_manifest = write_subset_manifest(panel, selected)
 
     result_paths: list[Path]

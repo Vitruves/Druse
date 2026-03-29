@@ -1,0 +1,296 @@
+{
+  "id": "real_life_panel_v2",
+  "name": "Real-Life Docking Panel v2",
+  "description": "48 CASF complexes covering generic drug-like cases and interaction-specific stress tests. Generic cases (42%) provide baseline accuracy; specialized groups expose scoring method strengths and weaknesses for halogen bonds, aromatic stacking, metal coordination, ionic interactions, and large flexible ligands.",
+  "source_manifest": "Benchmark/manifests/casf_manifest.json",
+  "cases": [
+    {
+      "pdb_id": "3nq9",
+      "group": "generic",
+      "title": "Tiny neutral binder",
+      "reason": "Minimal ligand (10 heavy atoms). Baseline for smallest drug fragments."
+    },
+    {
+      "pdb_id": "3u9q",
+      "group": "generic",
+      "title": "Small neutral heterocycle",
+      "reason": "Small heterocyclic ligand. Simple case where both scoring methods should succeed."
+    },
+    {
+      "pdb_id": "3ueu",
+      "group": "generic",
+      "title": "Small polar binder",
+      "reason": "Small ligand with moderate polarity. Tests basic H-bond scoring."
+    },
+    {
+      "pdb_id": "4ciw",
+      "group": "generic",
+      "title": "Small drug-like fragment",
+      "reason": "Fragment-sized ligand. Quick baseline for pose placement accuracy."
+    },
+    {
+      "pdb_id": "2v00",
+      "group": "generic",
+      "title": "Small low-affinity binder",
+      "reason": "Weak binder, tests whether scoring correctly ranks low-affinity poses."
+    },
+    {
+      "pdb_id": "2vvn",
+      "group": "generic",
+      "title": "Small moderate-affinity binder",
+      "reason": "Small ligand with good affinity. Tests scoring discrimination."
+    },
+    {
+      "pdb_id": "4k77",
+      "group": "generic",
+      "title": "Medium neutral heterocycle",
+      "reason": "Standard-sized heterocyclic ligand. Representative drug-like case."
+    },
+    {
+      "pdb_id": "1nc1",
+      "group": "generic",
+      "title": "Medium polar binder",
+      "reason": "Moderate-sized ligand with mixed H-bond donors/acceptors."
+    },
+    {
+      "pdb_id": "1qkt",
+      "group": "generic",
+      "title": "Medium high-affinity binder",
+      "reason": "Strong binder at medium size. Tests whether high-affinity poses are ranked correctly."
+    },
+    {
+      "pdb_id": "2pog",
+      "group": "generic",
+      "title": "Medium potent inhibitor",
+      "reason": "High-affinity medium ligand. Good calibration point for scoring power."
+    },
+    {
+      "pdb_id": "1pxn",
+      "group": "generic",
+      "title": "Medium aromatic binder",
+      "reason": "Moderately aromatic ligand in a standard pocket."
+    },
+    {
+      "pdb_id": "2cet",
+      "group": "generic",
+      "title": "Medium balanced binder",
+      "reason": "Well-balanced size and polarity. Standard drug-like case."
+    },
+    {
+      "pdb_id": "2wn9",
+      "group": "generic",
+      "title": "Medium compact binder",
+      "reason": "Compact drug-like molecule with good affinity."
+    },
+    {
+      "pdb_id": "2c3i",
+      "group": "generic",
+      "title": "Medium aromatic scaffold",
+      "reason": "Three-ring aromatic scaffold. Common medicinal chemistry motif."
+    },
+    {
+      "pdb_id": "2qe4",
+      "group": "generic",
+      "title": "Medium strong binder",
+      "reason": "Strong affinity, medium size. Tests whether scoring reflects binding strength."
+    },
+    {
+      "pdb_id": "1o0h",
+      "group": "generic",
+      "title": "Medium-large polar ligand",
+      "reason": "Slightly larger ligand with hydrogen-bond-rich binding."
+    },
+    {
+      "pdb_id": "1z95",
+      "group": "generic",
+      "title": "Larger drug-like ligand",
+      "reason": "Larger standard drug molecule. Tests search at moderate torsional complexity."
+    },
+    {
+      "pdb_id": "2fvd",
+      "group": "generic",
+      "title": "Larger potent binder",
+      "reason": "30-atom ligand with high affinity. Transition point to large ligands."
+    },
+    {
+      "pdb_id": "2p15",
+      "group": "generic",
+      "title": "Large high-affinity inhibitor",
+      "reason": "Large ligand with very high affinity (pKd 10.3). Scoring power stress test."
+    },
+    {
+      "pdb_id": "3qgy",
+      "group": "generic",
+      "title": "Larger balanced ligand",
+      "reason": "30-atom ligand with moderate affinity. Tests search vs scoring balance."
+    },
+    {
+      "pdb_id": "2hb1",
+      "group": "halogen_bond",
+      "title": "Small Br-containing fragment",
+      "reason": "Small ligand with bromine. Tests whether halogen bond scoring activates for simple cases."
+    },
+    {
+      "pdb_id": "3wtj",
+      "group": "halogen_bond",
+      "title": "Cl-aromatic binder",
+      "reason": "Chloro-aromatic ligand. Common medicinal chemistry motif with potential Cl...O halogen bond."
+    },
+    {
+      "pdb_id": "3b65",
+      "group": "halogen_bond",
+      "title": "Iodo-aromatic high-affinity binder",
+      "reason": "Iodine-containing ligand with strong affinity. I forms strongest halogen bonds (sigma-hole)."
+    },
+    {
+      "pdb_id": "3p5o",
+      "group": "halogen_bond",
+      "title": "Larger Cl-aromatic binder",
+      "reason": "Larger chloro-aromatic. Tests halogen bond scoring with more torsional complexity."
+    },
+    {
+      "pdb_id": "1bcu",
+      "group": "aromatic",
+      "title": "Flat aromatic fragment",
+      "reason": "Compact tri-ring aromatic. Tests pi-pi stacking and CH-pi recognition."
+    },
+    {
+      "pdb_id": "4m0y",
+      "group": "aromatic",
+      "title": "Medium tri-aromatic scaffold",
+      "reason": "Three aromatic rings. Tests aromatic interaction terms at medium size."
+    },
+    {
+      "pdb_id": "3e92",
+      "group": "aromatic",
+      "title": "Aromatic high-affinity binder",
+      "reason": "Tri-aromatic with strong affinity. Tests whether pi-stacking aids correct ranking."
+    },
+    {
+      "pdb_id": "2br1",
+      "group": "aromatic",
+      "title": "Quad-aromatic scaffold",
+      "reason": "Four aromatic rings. Stress test for pi-pi and amide-pi scoring."
+    },
+    {
+      "pdb_id": "3uo4",
+      "group": "aromatic",
+      "title": "Quad-aromatic medium binder",
+      "reason": "Four-ring system at moderate affinity. Tests aromatic scoring discrimination."
+    },
+    {
+      "pdb_id": "3wz8",
+      "group": "aromatic",
+      "title": "Large quad-aromatic ligand",
+      "reason": "Large ligand with four aromatic rings. Tests search + aromatic scoring at scale."
+    },
+    {
+      "pdb_id": "2weg",
+      "group": "metal",
+      "title": "Small Zn-pocket fragment",
+      "reason": "Tiny ligand in a Zn-containing site. Tests metal coordination for fragments."
+    },
+    {
+      "pdb_id": "3d4z",
+      "group": "metal",
+      "title": "Compact bicyclic in Zn pocket",
+      "reason": "Small rigid ligand near Zn. Separates metal coordination from search issues."
+    },
+    {
+      "pdb_id": "3kr8",
+      "group": "metal",
+      "title": "Medium Zn-coordinating ligand",
+      "reason": "Medium ligand with direct Zn coordination. Standard metalloprotein docking case."
+    },
+    {
+      "pdb_id": "2zcq",
+      "group": "metal",
+      "title": "Mg-bound aromatic binder",
+      "reason": "Aromatic ligand with Mg coordination. Tests non-Zn metal handling."
+    },
+    {
+      "pdb_id": "3oe5",
+      "group": "metal",
+      "title": "Mg-assisted larger pocket",
+      "reason": "Larger ligand in Mg-containing site. Tests metal scoring at higher torsional complexity."
+    },
+    {
+      "pdb_id": "1k1i",
+      "group": "metal",
+      "title": "Ca-containing aromatic binder",
+      "reason": "Ca-dependent binding. Tests whether non-Zn/Mg metals are treated consistently."
+    },
+    {
+      "pdb_id": "3udh",
+      "group": "charged",
+      "title": "Small charged fused-ring",
+      "reason": "Small cationic ligand. Tests charge handling with minimal search complexity."
+    },
+    {
+      "pdb_id": "1q8t",
+      "group": "charged",
+      "title": "Small charged amino acid analogue",
+      "reason": "Amino-acid-like charged ligand. Tests salt bridge and Coulomb at small scale."
+    },
+    {
+      "pdb_id": "1owh",
+      "group": "charged",
+      "title": "Amidine/guanidine binder",
+      "reason": "Guanidine-containing ligand. Tests cation-anion and salt bridge recognition."
+    },
+    {
+      "pdb_id": "1a30",
+      "group": "charged",
+      "title": "Peptidic charged ligand",
+      "reason": "Flexible charged peptide-like ligand. Tests electrostatics with high torsional freedom."
+    },
+    {
+      "pdb_id": "1h22",
+      "group": "charged",
+      "title": "Long dicationic binder",
+      "reason": "Highly charged flexible ligand. Stress test for electrostatic scoring and search."
+    },
+    {
+      "pdb_id": "4cig",
+      "group": "charged",
+      "title": "Charged aromatic medium ligand",
+      "reason": "Mixed charge + aromaticity. Tests whether charge terms interact correctly with pi terms."
+    },
+    {
+      "pdb_id": "3b1m",
+      "group": "large_flexible",
+      "title": "Large tri-aromatic ligand",
+      "reason": "38-atom ligand. Tests GA exploration at high torsional complexity."
+    },
+    {
+      "pdb_id": "3o9i",
+      "group": "large_flexible",
+      "title": "Very large high-affinity inhibitor",
+      "reason": "42-atom ligand with pKd 11.8. Tests whether search finds high-affinity poses for large molecules."
+    },
+    {
+      "pdb_id": "3gnw",
+      "group": "large_flexible",
+      "title": "Very large quad-aromatic ligand",
+      "reason": "44-atom ligand with four aromatic rings. Search exhaustiveness stress test."
+    },
+    {
+      "pdb_id": "1g2k",
+      "group": "large_flexible",
+      "title": "Very large drug-like ligand",
+      "reason": "45-atom standard drug. Tests runtime and convergence for large ligands."
+    },
+    {
+      "pdb_id": "1eby",
+      "group": "large_flexible",
+      "title": "Bulky heteroatom-rich ligand",
+      "reason": "48-atom ligand with extensive polar functionality. Large-ligand scoring test."
+    },
+    {
+      "pdb_id": "3prs",
+      "group": "large_flexible",
+      "title": "Very large aromatic scaffold",
+      "reason": "50-atom multi-ring ligand. Extreme search space test for GA convergence."
+    }
+  ]
+}
