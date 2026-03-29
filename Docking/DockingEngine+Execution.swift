@@ -446,15 +446,14 @@ extension DockingEngine {
             category: .dock
         )
 
-        // Prepare Drusina buffers if using extended scoring
+        // Prepare Drusina buffers (always — needed for per-term decomposition diagnostics
+        // even when the GA uses a different scoring method)
         let useDrusina = scoringMethod == .drusina && drusinaScorePipeline != nil
-        if useDrusina {
-            prepareDrusinaBuffers(
-                ligandAtoms: heavyAtoms,
-                ligandBonds: heavyBonds,
-                gpuLigAtoms: &gpuLigAtoms,
-                centroid: centroid)
-        }
+        prepareDrusinaBuffers(
+            ligandAtoms: heavyAtoms,
+            ligandBonds: heavyBonds,
+            gpuLigAtoms: &gpuLigAtoms,
+            centroid: centroid)
 
         // Prepare DruseAF Metal ML scoring buffers
         let useDruseAF = scoringMethod == .druseAffinity
@@ -1586,5 +1585,50 @@ extension DockingEngine {
     func copyPoseBuffer(from source: MTLBuffer, to destination: MTLBuffer, poseCount: Int) {
         let byteCount = poseCount * MemoryLayout<DockPose>.stride
         destination.contents().copyMemory(from: source.contents(), byteCount: byteCount)
+    }
+
+    /// Compute per-term Drusina decomposition for poses in the given buffer.
+    /// Returns one DrusinaDecomposition per pose, or nil if buffers are missing.
+    /// Note: bypasses the isRunning guard since this is called after docking completes.
+    func computeDrusinaDecomposition(poseBuffer: MTLBuffer, gaParamsBuffer: MTLBuffer, poseCount: Int) -> [DrusinaDecomposition]? {
+        guard let pipe = drusinaDecompositionPipeline,
+              let prBuf = proteinRingBuffer, let lrBuf = ligandRingBuffer,
+              let pcBuf = proteinCationBuffer, let dpBuf = drusinaParamsBuffer,
+              let paBuf = proteinAtomBuffer, let hiBuf = halogenInfoBuffer,
+              let amBuf = proteinAmideBuffer, let chBuf = chalcogenInfoBuffer,
+              let sbBuf = saltBridgeGroupBuffer,
+              let elecBuf = electrostaticGridBuffer,
+              let pchBuf = proteinChalcogenBuffer,
+              let tsBuf = torsionStrainBuffer,
+              let ligBuf = ligandAtomBuffer,
+              let gpBuf = gridParamsBuffer,
+              let teBuf = torsionEdgeBuffer,
+              let miBuf = movingIndicesBuffer else { return nil }
+
+        let decompSize = MemoryLayout<DrusinaDecomposition>.stride * poseCount
+        guard let decompBuf = device.makeBuffer(length: max(decompSize, 48), options: .storageModeShared) else { return nil }
+
+        let tgs = MTLSize(width: min(poseCount, 256), height: 1, depth: 1)
+        let tg = MTLSize(width: (poseCount + tgs.width - 1) / tgs.width, height: 1, depth: 1)
+
+        // Dispatch directly (not via dispatchCompute which requires isRunning)
+        guard let cmdBuf = commandQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder() else { return nil }
+        enc.setComputePipelineState(pipe)
+        let buffers: [(MTLBuffer, Int)] = [
+            (poseBuffer, 0), (ligBuf, 1), (gaParamsBuffer, 2),
+            (teBuf, 3), (miBuf, 4),
+            (prBuf, 5), (lrBuf, 6), (pcBuf, 7), (dpBuf, 8), (paBuf, 9),
+            (gpBuf, 10), (hiBuf, 11), (amBuf, 12), (chBuf, 13), (sbBuf, 14),
+            (elecBuf, 15), (pchBuf, 16), (tsBuf, 17), (decompBuf, 18)
+        ]
+        for (buf, idx) in buffers { enc.setBuffer(buf, offset: 0, index: idx) }
+        enc.dispatchThreadgroups(tg, threadsPerThreadgroup: tgs)
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        let ptr = decompBuf.contents().bindMemory(to: DrusinaDecomposition.self, capacity: poseCount)
+        return Array(UnsafeBufferPointer(start: ptr, count: poseCount))
     }
 }

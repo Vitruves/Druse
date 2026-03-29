@@ -209,15 +209,27 @@ enum PDBParser {
             bonds: structure.bonds
         )
 
+        // Metal ions (Zn²⁺, Mg²⁺, Ca²⁺, etc.) are HETATM records but belong to the
+        // protein scaffold for docking — they participate in metal coordination scoring.
+        let metalIonResidues: Set<String> = [
+            "ZN", "MG", "CA", "FE", "MN", "CU", "CO", "NI", "NA", "K"
+        ]
         let proteinSubstructure = buildSubstructure(atoms: resolved.atoms, bonds: resolved.bonds) { atom in
-            !atom.isHetAtom || isWaterResidueName(atom.residueName)
+            if !atom.isHetAtom { return true }
+            if isWaterResidueName(atom.residueName) { return true }
+            // Single-atom metal ion HETATM → include in protein
+            let resName = atom.residueName.trimmingCharacters(in: .whitespaces).uppercased()
+            return metalIonResidues.contains(resName)
         }
         let proteinBonds = proteinSubstructure.bonds.isEmpty
             ? BondPerception.perceiveBonds(in: proteinSubstructure.atoms)
             : proteinSubstructure.bonds
 
         let heterogenSubstructure = buildSubstructure(atoms: resolved.atoms, bonds: resolved.bonds) { atom in
-            atom.isHetAtom && !isWaterResidueName(atom.residueName)
+            if !atom.isHetAtom { return false }
+            if isWaterResidueName(atom.residueName) { return false }
+            let resName = atom.residueName.trimmingCharacters(in: .whitespaces).uppercased()
+            return !metalIonResidues.contains(resName)
         }
         let heterogenBonds = heterogenSubstructure.bonds.isEmpty
             ? BondPerception.perceiveBonds(in: heterogenSubstructure.atoms)

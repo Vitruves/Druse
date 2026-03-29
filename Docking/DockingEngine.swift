@@ -25,6 +25,7 @@ final class DockingEngine {
     var localSearchAnalyticalSIMDPipeline: MTLComputePipelineState!
     var drusinaScorePipeline: MTLComputePipelineState?
     var drusinaCorrectionPipeline: MTLComputePipelineState?
+    var drusinaDecompositionPipeline: MTLComputePipelineState?
 
     // Parallel Tempering / Replica Exchange pipelines
     var mcPerturbReplicaPipeline: MTLComputePipelineState?
@@ -204,6 +205,9 @@ final class DockingEngine {
             }
             if let drusinaCorrFunc = library.makeFunction(name: "applyDrusinaCorrection") {
                 drusinaCorrectionPipeline = try device.makeComputePipelineState(function: drusinaCorrFunc)
+            }
+            if let decompFunc = library.makeFunction(name: "scorePosesDecomposition") {
+                drusinaDecompositionPipeline = try device.makeComputePipelineState(function: decompFunc)
             }
             if let rmsdFunction = library.makeFunction(name: "computePairwiseRMSD") {
                 pairwiseRMSDPipeline = try device.makeComputePipelineState(function: rmsdFunction)
@@ -1184,7 +1188,7 @@ final class DockingEngine {
             numProteinCations: UInt32(max(cations.count - (cations.first == .zero ? 1 : 0), 0)),
             numHalogens: UInt32(halogens.first?.halogenAtomIndex == -1 ? 0 : halogens.count),
             wPiPi: -0.35,
-            wPiCation: -0.65,
+            wPiCation: -0.40,
             wHalogenBond: -0.40,
             wMetalCoord: -0.95,
             numProteinAmides: UInt32(amides.first?.centroid == .zero && amides.count == 1 ? 0 : amides.count),
@@ -1193,7 +1197,7 @@ final class DockingEngine {
             wAmideStack: -0.30,
             wChalcogenBond: -0.20,
             numSaltBridgeGroups: UInt32(sbGroups.first?.chargeSign == 0 ? 0 : sbGroups.count),
-            wCoulomb: -0.06,
+            wCoulomb: 0.012,
             wCHPi: -0.08,
             wCooperativity: 0.0,
             wTorsionStrain: 1.5,
@@ -1849,7 +1853,10 @@ final class DockingEngine {
         guard !heavyAtoms.isEmpty else { return ligand }
 
         let hasPartialCharges = heavyAtoms.contains { abs($0.charge) > 1e-4 }
-        guard !hasPartialCharges else { return ligand }
+        let hasFormalCharges = heavyAtoms.contains { $0.formalCharge != 0 }
+
+        // If both partial and formal charges are already set, nothing to do
+        guard !hasPartialCharges || !hasFormalCharges else { return ligand }
 
         let molBlock = SDFWriter.molBlock(
             name: ligand.name,
@@ -1864,7 +1871,9 @@ final class DockingEngine {
 
         var mergedAtoms = ligand.atoms
         for i in mergedAtoms.indices {
-            mergedAtoms[i].charge = charged.atoms[i].charge
+            if !hasPartialCharges {
+                mergedAtoms[i].charge = charged.atoms[i].charge
+            }
             if mergedAtoms[i].formalCharge == 0 {
                 mergedAtoms[i].formalCharge = charged.atoms[i].formalCharge
             }

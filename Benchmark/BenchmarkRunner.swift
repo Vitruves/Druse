@@ -703,6 +703,29 @@ final class BenchmarkRunner: XCTestCase {
                         entry.strainEnergy = strain
                     }
 
+                    // Drusina per-term decomposition (works with any scoring method)
+                    if let popBuf = eng.populationBuffer,
+                       let gaBuf = eng.gaParamsBuffer {
+                        if let decomps = eng.computeDrusinaDecomposition(
+                            poseBuffer: popBuf, gaParamsBuffer: gaBuf, poseCount: 1
+                        ), let d = decomps.first {
+                            entry.drusinaDecomposition = [
+                                "pi_pi": d.piPi,
+                                "pi_cation": d.piCation,
+                                "salt_bridge": d.saltBridge,
+                                "amide_pi": d.amidePi,
+                                "halogen_bond": d.halogenBond,
+                                "chalcogen_bond": d.chalcogenBond,
+                                "metal_coord": d.metalCoord,
+                                "coulomb": d.coulomb,
+                                "ch_pi": d.chPi,
+                                "torsion_strain": d.torsionStrain,
+                                "cooperativity": d.cooperativity,
+                                "total": d.total,
+                            ]
+                        }
+                    }
+
                     // GFN2-xTB single-point scoring (optional, ~2ms per complex)
                     if enableGFN2Scoring {
                         let heavyAtoms = ligand.atoms.filter { $0.element != .H }

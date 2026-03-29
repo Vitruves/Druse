@@ -96,6 +96,7 @@ struct BenchmarkResultEntry: Codable {
     var conformerRmsd: Float?           // RMSD of SMILES-derived conformer vs crystal (measures 3D embedding quality, not docking)
     var strainEnergy: Float?           // MMFF strain of best pose (kcal/mol)
     var allPoseRmsds: [Float]?         // RMSDs of top-N poses (for convergence analysis)
+    var drusinaDecomposition: [String: Float]?  // per-term Drusina scores on crystal pose
 
     enum CodingKeys: String, CodingKey {
         case pdbId = "pdb_id"
@@ -121,5 +122,6 @@ struct BenchmarkResultEntry: Codable {
         case conformerRmsd = "conformer_rmsd"
         case strainEnergy = "strain_energy"
         case allPoseRmsds = "all_pose_rmsds"
+        case drusinaDecomposition = "drusina_decomposition"
     }
 }

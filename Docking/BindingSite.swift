@@ -589,8 +589,14 @@ enum BindingSiteDetector {
             }
 
             // ---- Step 7: Search box = max extent + 4 angstrom padding ----
+            // Enforce minimum half-extent of 7.5A per axis (15A full width) so that
+            // even shallow geometric pockets produce a box large enough to dock into.
             let boxPadding: Float = 4.0
-            let halfSize = pocketExtent + SIMD3<Float>(repeating: boxPadding)
+            let minHalfExtent: Float = 7.5
+            let halfSize = simd_max(
+                pocketExtent + SIMD3<Float>(repeating: boxPadding),
+                SIMD3<Float>(repeating: minHalfExtent)
+            )
 
             pockets.append(BindingPocket(
                 id: 0, // temporary, reassigned after sorting

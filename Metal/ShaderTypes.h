@@ -992,4 +992,21 @@ struct PrepMinParams {
     uint32_t    _pad1;
 };
 
+/// Per-term Drusina scoring decomposition for diagnostic analysis.
+/// Each field stores the weighted energy contribution of one interaction type.
+struct DrusinaDecomposition {
+    float piPi;
+    float piCation;
+    float saltBridge;
+    float amidePi;
+    float halogenBond;
+    float chalcogenBond;
+    float metalCoord;
+    float coulomb;
+    float chPi;
+    float torsionStrain;
+    float cooperativity;
+    float total;          // sum after cap
+};
+
 #endif /* ShaderTypes_h */

@@ -1161,7 +1161,7 @@ inline float drusinaRamp(float x, float inner, float outer) {
 ///   - Group-based salt bridge scoring (1 contribution per charged-group pair)
 ///   - Burial-weighted salt bridges (exposed contribute little, Bissantz 2010)
 ///   - Corrected optimal distances from CSD/PDB statistics
-inline float computeDrusinaCorrections(
+inline DrusinaDecomposition computeDrusinaCorrections(
     thread float3                *positions,
     constant DockLigandAtom      *ligandAtoms,
     uint                          nAtoms,
@@ -1180,16 +1180,22 @@ inline float computeDrusinaCorrections(
     constant ProteinChalcogenGPU *proteinChalcogens,
     constant TorsionStrainInfo   *torsionStrain)
 {
+    DrusinaDecomposition decomp = {};
     float drusinaE = 0.0f;
     int interactionCount = 0;
 
+    // Per-term accumulators (weighted)
+    float piPiE = 0.0f, piCationE = 0.0f, saltBridgeE = 0.0f, amidePiE = 0.0f;
+    float halogenE = 0.0f, chalcogenE = 0.0f, metalE = 0.0f, coulombTermE = 0.0f;
+    float chPiE = 0.0f, strainTermE = 0.0f, cooperativityE = 0.0f;
+
     // Pre-compute ligand centroid for spatial gating of protein partners.
     // Protein features beyond ligandCutoff from centroid cannot interact with any
-    // ligand atom (max ligand radius ~8Å + max interaction range ~6Å = 14Å).
+    // ligand atom (max ligand radius ~6Å + max interaction range ~4Å = 10Å).
     float3 ligCentroid = float3(0);
     for (uint a = 0; a < nAtoms; a++) ligCentroid += positions[a];
     ligCentroid /= float(max(nAtoms, 1u));
-    const float ligandCutoff = 14.0f;
+    const float ligandCutoff = 10.0f;
     const float ligandCutoffSq = ligandCutoff * ligandCutoff;
 
     // Pre-compute ligand ring centroids and normals for reuse (π-π + amide-π)
@@ -1247,7 +1253,7 @@ inline float computeDrusinaCorrections(
             // Optimal 3.5 Å (Bissantz 2010 Table 2), ramp from 3.3-4.5 Å
             if (dotN > 0.8f) {
                 float dd = d - 3.5f;
-                drusinaE += params.wPiPi * dotN * drusinaRamp(dd, 0.3f, 1.0f);
+                piPiE += params.wPiPi * dotN * drusinaRamp(dd, 0.3f, 1.0f);
                 interactionCount++;
             }
             // Edge-to-face / T-shaped (perpendicular, |dotN| < 0.4)
@@ -1255,7 +1261,7 @@ inline float computeDrusinaCorrections(
             else if (dotN < 0.4f) {
                 float dd = d - 4.8f;
                 float perpFactor = 1.0f - dotN;  // stronger when more perpendicular
-                drusinaE += params.wPiPi * 0.6f * perpFactor * drusinaRamp(dd, 0.4f, 1.0f);
+                piPiE += params.wPiPi * 0.6f * perpFactor * drusinaRamp(dd, 0.4f, 1.0f);
                 interactionCount++;
             }
         }
@@ -1277,7 +1283,7 @@ inline float computeDrusinaCorrections(
             // Require above-plane approach (cosA > 0.5 = within 60° of normal)
             if (cosA > 0.5f) {
                 float dd = d - 3.8f;
-                drusinaE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
+                piCationE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
                 interactionCount++;
             }
         }
@@ -1294,7 +1300,7 @@ inline float computeDrusinaCorrections(
             float cosA = abs(dot(toAtom, proteinRings[pr].normal));
             if (cosA > 0.5f) {
                 float dd = d - 3.8f;
-                drusinaE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
+                piCationE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
                 interactionCount++;
             }
         }
@@ -1305,9 +1311,19 @@ inline float computeDrusinaCorrections(
     // Optimal N-O distance 2.8 Å (Bissantz 2010 Table 2, CSD median).
     // Ramp: full score at 2.5-3.1 Å, fading to zero at 4.0 Å.
     // Burial-weighted: exposed salt bridges contribute little (Bissantz 2010).
+    // Fallback: use sign of large Gasteiger partial charges when formal charge is 0
+    // (handles neutral SMILES where ionizable groups aren't protonated).
+    // Threshold 0.35 to only catch clearly ionic groups (amines ~0.3-0.4, carboxylates ~-0.4-0.5).
     for (uint a = 0; a < nAtoms; a++) {
         int ligCharge = ligandAtoms[a].formalCharge;
-        if (ligCharge == 0) continue;
+        float chargeScale = 1.0f;  // full weight for formal charges
+        if (ligCharge == 0) {
+            float q = ligandAtoms[a].charge;
+            if (q > 0.35f) ligCharge = 1;
+            else if (q < -0.35f) ligCharge = -1;
+            else continue;
+            chargeScale = 0.5f;  // partial charge inference is less certain
+        }
 
         for (uint g = 0; g < params.numSaltBridgeGroups; g++) {
             if (distance_squared(ligCentroid, saltBridgeGroups[g].centroid) > ligandCutoffSq) continue;
@@ -1326,7 +1342,7 @@ inline float computeDrusinaCorrections(
             // Burial dampening (Bissantz 2010: exposed salt bridges ≈ no free energy)
             float burial = saltBridgeGroups[g].burialFactor;
 
-            drusinaE += params.wSaltBridge * distScore * burial;
+            saltBridgeE += params.wSaltBridge * distScore * burial * chargeScale;
             interactionCount++;
         }
     }
@@ -1348,13 +1364,13 @@ inline float computeDrusinaCorrections(
             // Parallel stacking (Harder 2013: interplanar ≤30°, |dotN| > 0.8)
             if (dotN > 0.8f) {
                 float dd = d - 3.6f;
-                drusinaE += params.wAmideStack * dotN * drusinaRamp(dd, 0.3f, 0.9f);
+                amidePiE += params.wAmideStack * dotN * drusinaRamp(dd, 0.3f, 0.9f);
                 interactionCount++;
             }
             // Tilted/offset stacking (weaker, broader distance range)
             else if (dotN > 0.6f) {
                 float dd = d - 4.0f;
-                drusinaE += params.wAmideStack * 0.4f * dotN * drusinaRamp(dd, 0.3f, 1.0f);
+                amidePiE += params.wAmideStack * 0.4f * dotN * drusinaRamp(dd, 0.3f, 1.0f);
                 interactionCount++;
             }
         }
@@ -1396,7 +1412,7 @@ inline float computeDrusinaCorrections(
             if (cosTheta < -0.766f) {
                 float dd = d - optDist;
                 float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                drusinaE += params.wHalogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
+                halogenE += params.wHalogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
                 interactionCount++;
             }
         }
@@ -1428,7 +1444,7 @@ inline float computeDrusinaCorrections(
             if (cosTheta < -0.766f) {
                 float dd = d - 3.3f;
                 float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                drusinaE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
+                chalcogenE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
                 interactionCount++;
             }
         }
@@ -1455,27 +1471,32 @@ inline float computeDrusinaCorrections(
             if (cosTheta < -0.766f) {
                 float dd = d - 3.3f;
                 float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                drusinaE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
+                chalcogenE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
                 interactionCount++;
             }
         }
     }
 
     // ---- Enhanced metal coordination ----
-    // Verdonk 2003: optimal distance loosened from 2.2 to 2.6 Å for raw PDB structures.
-    // We use 2.4 Å optimal with cutoff at 3.5 Å (widened for prepared structure tolerance).
-    // Also accept N_D (donor-only nitrogen, e.g. imidazole) as coordinating atom.
+    // Verdonk 2003: optimal distance ~2.0-2.4 Å for N/O/S → metal.
+    // Moderate funnel: cutoff 4.5 Å, ramp out to 1.6 Å from optimal (full score 2.0-2.8 Å,
+    // fading to zero at 4.0 Å). Cap at one interaction per metal to avoid multi-counting.
     for (uint p = 0; p < numProteinAtoms; p++) {
         if (proteinAtoms[p].vinaType != VINA_MET_D) continue;
+        float bestMetalScore = 0.0f;
         for (uint a = 0; a < nAtoms; a++) {
             int lt = ligandAtoms[a].vinaType;
             bool isCoord = (lt == VINA_N_A || lt == VINA_N_DA || lt == VINA_N_D ||
                             lt == VINA_O_A || lt == VINA_O_DA || lt == VINA_S_P);
             if (!isCoord) continue;
             float d = distance(positions[a], proteinAtoms[p].position);
-            if (d > 3.5f) continue;
+            if (d > 4.5f) continue;
             float dd = d - 2.4f;
-            drusinaE += params.wMetalCoord * drusinaRamp(dd, 0.3f, 1.1f);
+            float score = drusinaRamp(dd, 0.4f, 1.6f);
+            bestMetalScore = min(bestMetalScore, params.wMetalCoord * score);
+        }
+        if (bestMetalScore < 0.0f) {
+            metalE += bestMetalScore;
             interactionCount++;
         }
     }
@@ -1491,11 +1512,13 @@ inline float computeDrusinaCorrections(
         if (phi < 99.0f)  // skip out-of-grid penalty values
             coulombE += ligandAtoms[a].charge * phi;
     }
-    drusinaE += params.wCoulomb * coulombE;
+    coulombTermE = params.wCoulomb * coulombE;
 
     // ---- CH-π interactions: ligand aliphatic C → protein aromatic rings ----
     // Weaker individually (~-1 kcal/mol) but very frequent (2-5× per complex).
     // Score C...ring centroid distance (3.5-5.0 Å) without explicit H.
+    // Tightened geometry: require approach within ~55° of ring normal (cosA > 0.55)
+    // and use cosA² to strongly favor perpendicular approach.
     for (uint a = 0; a < nAtoms; a++) {
         if (ligandAtoms[a].vinaType != VINA_C_H) continue;
         if (ligandAtoms[a].flags & LIGATOM_FLAG_AROMATIC) continue;
@@ -1506,9 +1529,9 @@ inline float computeDrusinaCorrections(
             if (d < 3.5f || d > 5.0f) continue;
             float3 toC = normalize(cPos - proteinRings[pr].centroid);
             float cosA = abs(dot(toC, proteinRings[pr].normal));
-            if (cosA > 0.3f) {  // within ~70° of ring normal
+            if (cosA > 0.55f) {  // within ~55° of ring normal
                 float dd = d - 4.0f;
-                drusinaE += params.wCHPi * cosA * drusinaRamp(dd, 0.5f, 1.0f);
+                chPiE += params.wCHPi * cosA * cosA * drusinaRamp(dd, 0.5f, 1.0f);
                 interactionCount++;
             }
         }
@@ -1534,20 +1557,39 @@ inline float computeDrusinaCorrections(
         float dev = min(phi, M_PI_F - phi);
         strainE += ts.forceConstant * dev * dev;
     }
-    drusinaE += params.wTorsionStrain * strainE;
+    strainTermE = params.wTorsionStrain * strainE;
 
     // ---- Cooperativity bonus: reward multiple simultaneous interactions ----
     // Simple count-based: bonus for 2+ scored interaction types
     if (interactionCount > 1) {
-        drusinaE += params.wCooperativity * float(interactionCount - 1);
+        cooperativityE = params.wCooperativity * float(interactionCount - 1);
     }
 
-    // Safety cap: Drusina corrections should complement Vina, not overwhelm it.
-    // Typical Vina scores are -5 to -15 kcal/mol; cap Drusina at -10 kcal/mol
-    // to allow strong metal coordination + salt bridge contributions.
-    drusinaE = max(drusinaE, -10.0f);
+    // Sum all terms
+    drusinaE = piPiE + piCationE + saltBridgeE + amidePiE + halogenE
+             + chalcogenE + metalE + coulombTermE + chPiE + strainTermE
+             + cooperativityE;
 
-    return drusinaE;
+    // Safety cap: Drusina corrections should complement Vina, not overwhelm it.
+    // Typical Vina scores are -5 to -15 kcal/mol; cap Drusina at -4 kcal/mol
+    // to keep corrections as a minor refinement (~10-30% of Vina).
+    drusinaE = max(drusinaE, -4.0f);
+
+    // Fill decomposition struct
+    decomp.piPi = piPiE;
+    decomp.piCation = piCationE;
+    decomp.saltBridge = saltBridgeE;
+    decomp.amidePi = amidePiE;
+    decomp.halogenBond = halogenE;
+    decomp.chalcogenBond = chalcogenE;
+    decomp.metalCoord = metalE;
+    decomp.coulomb = coulombTermE;
+    decomp.chPi = chPiE;
+    decomp.torsionStrain = strainTermE;
+    decomp.cooperativity = cooperativityE;
+    decomp.total = drusinaE;
+
+    return decomp;
 }
 
 /// Score poses with Vina grid maps + Drusina extended interaction corrections.
@@ -1607,7 +1649,7 @@ kernel void scorePosesDrusina(
     float normalizedE = totalIntermolecular * normFactor;
 
     // --- Drusina corrections ---
-    float drusinaE = computeDrusinaCorrections(
+    DrusinaDecomposition decomp = computeDrusinaCorrections(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
@@ -1619,6 +1661,12 @@ kernel void scorePosesDrusina(
     pose.hbondEnergy       = 0.0f;
     pose.torsionPenalty    = normalizedE - totalIntermolecular;
     pose.clashPenalty      = wPenalty * penalty + intraDelta;
+
+    // Attenuate Drusina when Vina score is poor: if Vina says the pose is
+    // terrible (positive energy / steric clashes), Drusina shouldn't rescue it.
+    float vinaQuality = 1.0f / (1.0f + exp(0.5f * (normalizedE + 2.0f)));
+    float drusinaE = decomp.total * vinaQuality;
+
     pose.drusinaCorrection = drusinaE;
     pose.energy = normalizedE + pose.clashPenalty + drusinaE;
 }
@@ -1655,15 +1703,65 @@ kernel void applyDrusinaCorrection(
     uint nA = min(nAtoms, 128u);
     transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
 
-    float drusinaE = computeDrusinaCorrections(
+    DrusinaDecomposition decomp = computeDrusinaCorrections(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
         proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
         proteinAmides, chalcogenInfo, saltBridgeGroups,
         elecGrid, gridParams, proteinChalcogens, torsionStrain);
 
+    // Attenuate Drusina when Vina score is poor (same logic as scorePosesDrusina).
+    // pose.energy here is the pre-Drusina Vina-based score.
+    float vinaE = pose.energy;
+    float vinaQuality = 1.0f / (1.0f + exp(0.5f * (vinaE + 2.0f)));
+    float drusinaE = decomp.total * vinaQuality;
+
     pose.drusinaCorrection = drusinaE;
     pose.energy += drusinaE;
+}
+
+/// Compute per-term Drusina decomposition for benchmark diagnostics.
+/// Scores poses and writes DrusinaDecomposition to a side buffer (no vinaQuality attenuation).
+kernel void scorePosesDecomposition(
+    device DockPose              *poses           [[buffer(0)]],
+    constant DockLigandAtom      *ligandAtoms     [[buffer(1)]],
+    constant GAParams            &gaParams        [[buffer(2)]],
+    constant TorsionEdge         *torsionEdges    [[buffer(3)]],
+    constant int32_t             *movingIndices   [[buffer(4)]],
+    constant ProteinRingGPU      *proteinRings    [[buffer(5)]],
+    constant LigandRingGPU       *ligandRings     [[buffer(6)]],
+    constant float4              *proteinCations  [[buffer(7)]],
+    constant DrusinaParams       &drusinaParams   [[buffer(8)]],
+    constant GridProteinAtom     *proteinAtoms    [[buffer(9)]],
+    constant GridParams          &gridParams      [[buffer(10)]],
+    constant HalogenBondInfo     *halogenInfo     [[buffer(11)]],
+    constant ProteinAmideGPU     *proteinAmides   [[buffer(12)]],
+    constant ChalcogenBondInfo   *chalcogenInfo   [[buffer(13)]],
+    constant SaltBridgeGroupGPU  *saltBridgeGroups [[buffer(14)]],
+    device const half            *elecGrid        [[buffer(15)]],
+    constant ProteinChalcogenGPU *proteinChalcogens [[buffer(16)]],
+    constant TorsionStrainInfo   *torsionStrain   [[buffer(17)]],
+    device DrusinaDecomposition  *decompositions  [[buffer(18)]],
+    uint                          tid             [[thread_position_in_grid]])
+{
+    if (tid >= gaParams.populationSize) return;
+
+    device DockPose &pose = poses[tid];
+    uint nAtoms = gaParams.numLigandAtoms;
+    uint nTorsions = min(gaParams.numTorsions, 32u);
+
+    float3 positions[128];
+    uint nA = min(nAtoms, 128u);
+    transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
+
+    DrusinaDecomposition decomp = computeDrusinaCorrections(
+        positions, ligandAtoms, nA,
+        proteinRings, ligandRings, proteinCations, drusinaParams,
+        proteinAtoms, gridParams.numProteinAtoms, halogenInfo,
+        proteinAmides, chalcogenInfo, saltBridgeGroups,
+        elecGrid, gridParams, proteinChalcogens, torsionStrain);
+
+    decompositions[tid] = decomp;
 }
 
 // ============================================================================
