@@ -277,6 +277,33 @@ extension AppViewModel {
         workspace.statusMessage = "Generating surface..."
 
         Task {
+            // Auto-compute charges for electrostatic surface if not yet available
+            if workspace.surfaceColorMode == .esp {
+                let hasCharges = prot.atoms.contains { abs($0.charge) > 0.0001 }
+                if !hasCharges {
+                    workspace.statusMessage = "Computing charges for electrostatic surface..."
+                    let calculator = EEMChargeCalculator(device: renderer.device)
+                    if let charges = try? await calculator.computeCharges(
+                        atoms: prot.atoms, bonds: prot.bonds, totalCharge: 0
+                    ) {
+                        for i in 0..<min(charges.count, prot.atoms.count) {
+                            molecules.protein?.atoms[i].charge = charges[i]
+                        }
+                        // Apply formal charge fallback for any atoms still uncharged
+                        if var atoms = molecules.protein?.atoms {
+                            atoms = applyElectrostaticFallback(to: atoms)
+                            molecules.protein?.atoms = atoms
+                        }
+                        log.info("Auto-computed EEM charges for electrostatic surface", category: .molecule)
+                    }
+                }
+            }
+
+            guard let prot = molecules.protein else {
+                workspace.isGeneratingSurface = false
+                return
+            }
+
             if workspace.surfaceGenerator == nil {
                 workspace.surfaceGenerator = try? SurfaceGenerator(
                     device: renderer.device,

@@ -33,6 +33,8 @@ struct MoleculeData: Sendable {
     let title: String
     let atoms: [Atom]
     let bonds: [Bond]
+    /// Canonical SMILES from CCD template (set for PDB-extracted ligands)
+    var smiles: String?
     var ssRanges: [SecondaryStructureRange] = []
     /// SDF data block properties (e.g. Ki, pKi, IC50)
     var properties: [String: String] = [:]
@@ -580,6 +582,24 @@ enum PDBParser {
 
     // MARK: - Ligand Grouping
 
+    /// Common crystallographic additives, buffers, and small ions that should not
+    /// appear as docking ligands. These are artefacts of crystallization conditions.
+    private static let crystallographicArtifacts: Set<String> = [
+        // Buffers & pH agents
+        "SO4", "PO4", "CIT", "ACT", "FMT", "TRS", "HEP", "MES", "EPE",
+        "BMA", "TAR", "MLI", "ACA", "IPA", "MPD",
+        // Cryoprotectants & solvents
+        "GOL", "EDO", "PEG", "PGE", "DMS", "1PE", "2PE", "P6G", "P33",
+        "PG4", "PE4", "PGR", "PGO", "PE8",
+        // Common ions (beyond metals already in protein)
+        "CL", "BR", "IOD", "FLC", "NO3", "SCN",
+        // Detergents & lipids
+        "BOG", "LDA", "SDS", "LMT", "OLC", "PLM", "MYR", "UNL",
+        "D7V", "CLR", "CDL", "LHG", "OLA", "STE", "LMG", "HTG",
+        // Other frequent artifacts
+        "UNX", "UNK", "DIO",
+    ]
+
     private static func groupLigands(hetAtoms: [Atom], hetBonds: [Bond]) -> [MoleculeData] {
         // Group by (chainID, residueName, residueSeq)
         struct LigandKey: Hashable {
@@ -592,6 +612,9 @@ enum PDBParser {
         var groupOrder: [LigandKey] = []
 
         for (i, atom) in hetAtoms.enumerated() {
+            let resName = atom.residueName.trimmingCharacters(in: .whitespaces).uppercased()
+            // Skip crystallographic artifacts (buffers, cryoprotectants, etc.)
+            if crystallographicArtifacts.contains(resName) { continue }
             let key = LigandKey(chainID: atom.chainID, resName: atom.residueName, resSeq: atom.residueSeq)
             if groups[key] == nil { groupOrder.append(key) }
             groups[key, default: []].append(i)
@@ -633,7 +656,8 @@ enum PDBParser {
                 name: key.resName,
                 title: template?.canonicalSmiles ?? "\(key.resName) chain \(key.chainID)",
                 atoms: repaired.atoms,
-                bonds: repaired.bonds
+                bonds: repaired.bonds,
+                smiles: template?.canonicalSmiles
             ))
         }
 
@@ -745,7 +769,7 @@ enum PDBParser {
                 }
                 return nil
             }
-            return range
+            return range.start <= range.end ? range : nil
         }
     }
 

@@ -60,7 +60,7 @@ extension AppViewModel {
                     for ligData in result.ligands {
                         let entry = LigandEntry(
                             name: ligData.name,
-                            smiles: "",
+                            smiles: ligData.smiles ?? "",
                             atoms: ligData.atoms,
                             bonds: ligData.bonds,
                             isPrepared: true,

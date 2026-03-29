@@ -105,7 +105,7 @@ struct DruseApp: App {
             DruseHelpView()
                 .preferredColorScheme(selectedColorScheme)
         }
-        .defaultSize(width: 860, height: 680)
+        .defaultSize(width: 960, height: 750)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
@@ -202,7 +202,9 @@ struct DruseApp: App {
         switch theme {
         case .light: renderer.themeMode = 1
         case .dark:  renderer.themeMode = 0
-        case .auto:  renderer.themeMode = (selectedColorScheme == .light) ? 1 : 0
+        case .auto:
+            let systemIsDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            renderer.themeMode = systemIsDark ? 0 : 1
         }
         renderer.backgroundOpacity = viewModel.workspace.backgroundOpacity
         renderer.surfaceOpacity = viewModel.workspace.surfaceOpacity

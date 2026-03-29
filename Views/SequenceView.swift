@@ -501,6 +501,7 @@ struct SequenceView: View {
     private func rebuildSSCache(prot: Molecule) {
         var cache: [String: SecondaryStructure] = [:]
         for ssa in prot.secondaryStructureAssignments {
+            guard ssa.start <= ssa.end else { continue }
             for seq in ssa.start...ssa.end {
                 cache["\(ssa.chain)_\(seq)"] = ssa.type
             }

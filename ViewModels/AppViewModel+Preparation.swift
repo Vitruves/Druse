@@ -266,6 +266,9 @@ extension AppViewModel {
         let secondaryStructure = prot.secondaryStructureAssignments
         let rawContent = molecules.rawPDBContent
         let buildableGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
+        let hadHydrogens = atoms.contains { $0.element == .H }
+        let capturedPH = molecules.protonationPH
+        let capturedChargeMethod = docking.chargeMethod
 
         Task.detached(priority: .userInitiated) {
             var workAtoms = atoms
@@ -326,17 +329,73 @@ extension AppViewModel {
             let capturedLoopsBuilt = loopsBuilt
             let capturedResiduesAdded = residuesAdded
 
+            var finalAtoms = reconstructed.atoms
+            var finalBonds = reconstructed.bonds
+
+            // Phase 3: If the protein was already prepared (had hydrogens), re-run
+            // protonation + hydrogen addition + charge assignment so that newly built
+            // residues are fully integrated with the prior preparation state.
+            var hAdded = 0
+            if hadHydrogens {
+                // Strip existing hydrogens — completePhase23 will re-add them consistently
+                let heavyAtoms = finalAtoms.filter { $0.element != .H }
+                let heavyIndices = finalAtoms.indices.filter { finalAtoms[$0].element != .H }
+                let indexMap = Dictionary(uniqueKeysWithValues: heavyIndices.enumerated().map { ($0.element, $0.offset) })
+                let heavyBonds = finalBonds.compactMap { bond -> Bond? in
+                    guard let i1 = indexMap[bond.atomIndex1], let i2 = indexMap[bond.atomIndex2] else { return nil }
+                    return Bond(id: i1 * 100000 + i2, atomIndex1: i1, atomIndex2: i2, order: bond.order)
+                }
+
+                let metalDevice = await MainActor.run { self.renderer?.device }
+                let phase23 = ProteinPreparation.completePhase23(
+                    atoms: heavyAtoms, bonds: heavyBonds, pH: capturedPH, device: metalDevice
+                )
+                finalAtoms = phase23.atoms
+                finalBonds = phase23.bonds
+                hAdded = phase23.report.hydrogensAdded
+
+                // Re-apply charges
+                switch capturedChargeMethod {
+                case .gasteiger:
+                    if let pdbContent = rawContent, finalAtoms.count <= 6000,
+                       let chargeData = RDKitBridge.computeChargesPDB(pdbContent: pdbContent) {
+                        let merged = ProteinPreparation.mergeProteinAtoms(
+                            currentAtoms: finalAtoms, sourceAtoms: chargeData.atoms
+                        ) { current, source in current.charge = source.charge }
+                        finalAtoms = merged.atoms
+                    }
+                case .eem, .qeq, .xtb:
+                    let calculator: ChargeCalculator = {
+                        switch capturedChargeMethod {
+                        case .eem: return EEMChargeCalculator(device: nil)
+                        case .qeq: return QEqChargeCalculator(device: nil)
+                        case .xtb: return XTBChargeCalculator()
+                        default:   return GasteigerChargeCalculator()
+                        }
+                    }()
+                    if let charges = try? await calculator.computeCharges(
+                        atoms: finalAtoms, bonds: finalBonds, totalCharge: 0
+                    ) {
+                        for i in 0..<min(charges.count, finalAtoms.count) {
+                            finalAtoms[i].charge = charges[i]
+                        }
+                    }
+                }
+                finalAtoms = ProteinPreparation.applyElectrostaticFallback(to: finalAtoms)
+            }
+
             await MainActor.run {
-                let mol = Molecule(name: name, atoms: reconstructed.atoms, bonds: reconstructed.bonds, title: title)
+                let mol = Molecule(name: name, atoms: finalAtoms, bonds: finalBonds, title: title)
                 mol.secondaryStructureAssignments = secondaryStructure
                 self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: reconstructed.atoms, bonds: reconstructed.bonds)
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: finalAtoms, bonds: finalBonds)
                 self.pushToRenderer()
                 self.renderer?.fitToContent()
 
                 var messages: [String] = []
                 if capturedLoopsBuilt > 0 { messages.append("\(capturedLoopsBuilt) loop(s) built (\(capturedResiduesAdded) residues)") }
                 if atomsRebuilt > 0 { messages.append("\(atomsRebuilt) heavy atoms rebuilt") }
+                if hAdded > 0 { messages.append("re-protonated (\(hAdded) H)") }
                 if messages.isEmpty {
                     self.log.success("Protein structure is complete — no missing residues or atoms", category: .prep)
                     self.workspace.statusMessage = "Structure complete"

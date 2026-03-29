@@ -90,12 +90,12 @@ struct PipelineBar: View {
                 ZStack {
                     Circle()
                         .fill(circleFill(status: status, isSelected: isSelected))
-                        .frame(width: 24, height: 24)
+                        .frame(width: 26, height: 26)
 
                     if isSelected {
                         Circle()
                             .stroke(Color.accentColor, lineWidth: 1.5)
-                            .frame(width: 24, height: 24)
+                            .frame(width: 26, height: 26)
                     }
 
                     circleContent(tab: tab, status: status, isSelected: isSelected)
@@ -107,7 +107,7 @@ struct PipelineBar: View {
                         .foregroundStyle(isSelected ? .primary : .secondary)
                         .lineLimit(1)
                     Text(tab.subtitle)
-                        .font(.footnote)
+                        .font(.caption)
                         .foregroundStyle(isSelected ? .secondary : .secondary)
                         .lineLimit(1)
                 }
@@ -165,15 +165,15 @@ struct PipelineBar: View {
     private func circleContent(tab: SidebarTab, status: StepStatus, isSelected: Bool) -> some View {
         if status == .completed && !isSelected {
             Image(systemName: "checkmark")
-                .font(.footnote.weight(.bold))
+                .font(.caption.weight(.bold))
                 .foregroundStyle(.green)
         } else if status == .available && !isSelected {
             Image(systemName: tab.icon)
-                .font(.footnote)
+                .font(.caption)
                 .foregroundStyle(.orange)
         } else {
             Image(systemName: tab.icon)
-                .font(.footnote)
+                .font(.caption)
                 .foregroundStyle(isSelected ? .primary : .secondary)
         }
     }

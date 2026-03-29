@@ -1,67 +1,221 @@
-# Druse
+<p align="center">
+  <img src="Resources/Assets.xcassets/AppIcon.appiconset/icon_256x256.png" alt="Druse" width="128" height="128">
+</p>
 
-GPU-accelerated molecular docking for macOS.
+<h1 align="center">Druse</h1>
 
-Native Swift/SwiftUI application using Metal compute shaders and Apple Silicon unified memory for the full docking workflow: protein loading, preparation, ligand import, binding pocket detection, GPU-accelerated docking, ML re-ranking, and virtual screening.
+<p align="center">
+  <strong>GPU-Accelerated Molecular Docking for macOS</strong>
+</p>
 
-## Features
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-macOS_26+-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/Chip-Apple_Silicon-333333?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/GPU-Metal_3-8A2BE2?style=flat-square" alt="Metal">
+  <img src="https://img.shields.io/badge/Version-0.1.16--beta-blue?style=flat-square" alt="Version">
+</p>
 
-- **Metal GPU docking** — Genetic algorithm with Vina-style scoring (gauss, repulsion, hydrophobic, H-bond, torsion penalty), iterated local search, all on GPU
-- **Pocket detection** — Alpha-sphere probing with DBSCAN clustering and Metal-accelerated buriedness scoring
-- **ML re-ranking** — CoreML inference with SE(3)-equivariant GNN (DruseScore) for pose rescoring
-- **Virtual screening** — Batch workflow with shared grid reuse, ADMET filtering, and ranked export
-- **Real-time 3D rendering** — Impostor sphere/cylinder rendering, Connolly surfaces, ribbon diagrams, electrostatic coloring, Z-slab clipping
-- **Full format support** — PDB, mmCIF, SDF, MOL2, SMILES
+<p align="center">
+  <em>A native macOS application for structure-based drug discovery.<br>Built from the ground up for Apple Silicon with Metal compute shaders.</em>
+</p>
 
-## Architecture
+<br>
 
-Three-layer stack:
+---
 
-| Layer | Tech | Role |
-|-------|------|------|
-| **C++ Core** | RDKit, nanoflann, TBB | SMILES→3D, conformers, charges, fingerprints, torsion trees, KD-tree queries |
-| **Metal GPU** | Metal Shading Language | Grid maps, GA docking, surface generation, impostor rendering, post-processing |
-| **Swift App** | SwiftUI, CoreML | UI, docking orchestration, ML inference, state management |
+<br>
 
-## Requirements
+## Download
 
-- macOS 26.0+
-- Apple Silicon (M1 or later)
-- Xcode 26+
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+<p align="center">
+  <a href="https://github.com/vitruves/Druse/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Druse.dmg-blue?style=for-the-badge&logo=apple&logoColor=white" alt="Download DMG">
+  </a>
+</p>
 
-### Dependencies
+> **Requirements** — macOS 26.0 or later, Apple Silicon (M1 or newer).
+> Download the `.dmg` from [Releases](https://github.com/vitruves/Druse/releases/latest), open it, and drag Druse into Applications.
 
-```bash
-brew install rdkit boost eigen nanoflann tbb
-```
+<br>
 
-The repository vendors gemmi under `third_parties_deps/gemmi` for offline builds. To test against a different local checkout during development, configure CMake with `-DGEMMI_SOURCE_DIR=/path/to/gemmi`.
+---
 
-## Build
+<br>
 
-```bash
-# Build the C++ core library
-cd CppCore/build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j8
-cd ../..
+## Why Druse
 
-# Generate Xcode project
-xcodegen generate
+Most docking software was designed for Linux clusters and command-line workflows. Druse takes a different approach — a fully native macOS application that puts the entire docking pipeline in a single window, accelerated by Metal on the GPU you already have.
 
-# Build
-xcodebuild -project Druse.xcodeproj -scheme Druse -configuration Release build
-```
+| | |
+|---|---|
+| **Native & Fast** | Built in Swift and Metal. No Python runtimes, no Docker, no X11. Just a `.app` that launches instantly. |
+| **GPU Everything** | 20+ Metal compute kernels — from genetic algorithm search to neural network scoring to surface rendering. All on your M-series chip. |
+| **Unified Memory** | Apple Silicon's shared CPU/GPU memory means zero-copy data transfer between the docking engine, ML models, and 3D renderer. |
+| **Interactive** | Real-time 3D visualization with impostor rendering, Connolly surfaces, and ribbon diagrams — all at retina resolution. |
 
-## Training
+<br>
 
-The `Training/` directory contains PyTorch scripts for DruseScore, pocket detector, and ADMET models. Trained models export to CoreML. Training data (PDBbind v2020, CrossDocked2020, CASF-2016) is not included — see `Training/download_data.py`.
+---
 
-```bash
-pip install -r Training/requirements.txt
-python Training/train_druse_score.py
-python Training/export_coreml.py
-```
+<br>
 
-## License
+## The Pipeline
 
-All rights reserved.
+Druse covers the full structure-based drug discovery workflow in a single application.
+
+### Load & Prepare
+
+- **Fetch from RCSB** — Enter a PDB ID and Druse downloads the structure directly
+- **Format support** — PDB, mmCIF, SDF (V2000/V3000), MOL2, SMILES
+- **Protein preparation** — Automated pipeline: water removal, alternate conformer selection, missing atom reconstruction, polar hydrogen addition, H-bond network optimization (Asn/Gln flips, His tautomers), sidechain packing (FASPR with Dunbrack rotamers), and energy minimization
+- **Protonation** — pH-dependent protonation with table lookup or optional GFN2-xTB quantum pKa prediction
+- **Partial charges** — Four methods: EEM (GPU-accelerated), QEq, Gasteiger, and RDKit template matching
+
+### Detect Binding Sites
+
+- **Alpha-sphere probing** — Geometric pocket detection with DBSCAN clustering and 26-direction buriedness scoring
+- **ML-enhanced detection** — Optional neural network pocket predictor combined with geometric scoring
+- **Ligand-guided** — Auto-center from a co-crystallized ligand, or define a custom box manually
+- **Pocket metrics** — Volume (ų), buriedness score, druggability rating, and resident residue identification
+
+### Dock
+
+- **Genetic Algorithm** — Population-based search with adaptive mutation, crossover, and iterated local search — all on GPU
+- **Fragment-Based Docking** — Hierarchical fragment growth with anchor placement and beam search pruning
+- **Parallel Tempering** — Replica exchange Monte Carlo for enhanced sampling of flexible ligands
+- **Diffusion-Guided Docking** — Reverse diffusion process with DruseAF attention gradient guidance
+- **Flexible Docking** — Simultaneous optimization of ligand pose and sidechain rotamers (3–6 residues)
+- **Pharmacophore Constraints** — H-bond, hydrophobic, aromatic, salt bridge, and metal coordination constraints with configurable strength
+- **Auto-Tuning** — Automatically adapts search parameters to protein size, pocket shape, and ligand flexibility
+- **Analytical Gradients** — SIMD-cooperative local search, faster than numerical finite differences
+
+### Score
+
+Four scoring functions, each with different strengths:
+
+| Scoring Function | Type | Description |
+|---|---|---|
+| **Vina** | Empirical | Gaussian + repulsion + hydrophobic + H-bond + torsion penalty |
+| **Drusina** | Extended empirical | Vina baseline plus electrostatics, salt bridges, π-π stacking, π-cation, halogen bonds, metal coordination, CH-π, amide-π, chalcogen bonds, and torsion strain |
+| **DruseAF v4** | Neural network | SE(3)-equivariant pairwise geometric network for pKd prediction |
+| **PIGNet2** | Physics-informed GNN | Graph neural network with physics-based interaction constraints |
+
+### Analyze
+
+- **Pose clustering** — GPU-accelerated pairwise RMSD with hierarchical clustering and consensus pose extraction
+- **Energy decomposition** — Per-term breakdown across all scoring components
+- **Interaction detection** — 10+ interaction types with color-coded 3D visualization and 2D interaction diagrams
+- **Explicit atom rescoring** — Top clusters re-scored against explicit receptor atoms with basin hopping refinement
+- **Strain filtering** — MMFF94 torsion strain penalty to flag unrealistic conformations
+- **GFN2-xTB refinement** — Optional semi-empirical QM post-docking optimization with D4 dispersion and ALPB solvation
+
+<br>
+
+---
+
+<br>
+
+## Virtual Screening
+
+Batch-dock up to 100,000 molecules with shared grid reuse and parallel 3D generation.
+
+- **Pre-filtering** — Rotatable bond cutoff, rapid pre-scoring for fast rejection
+- **ADMET filtering** — Lipinski Rule of Five, Veber rules, hERG cardiotoxicity risk, CYP2D6/CYP3A4 inhibition, aqueous solubility (ESOL)
+- **ML re-ranking** — DruseScore, DruseAF v4, or PIGNet2 rescoring of top hits
+- **Ranked export** — CSV with full metrics and SDF with posed geometries
+
+<br>
+
+---
+
+<br>
+
+## Lead Optimization
+
+Generate and evaluate analogs directly inside Druse.
+
+- **Analog generation** — 18+ curated substitution rules: halogen swaps, alkyl extensions, heteroatom substitutions, aromatic replacements, functional group interchanges, ring size modifications
+- **Property sliders** — Dial in polarity, rigidity, lipophilicity, and size to bias generation toward desired property space
+- **Mini-docking** — Sub-second per-analog docking with RMSD tracking against the parent compound
+- **ADMET gating** — Real-time Lipinski, Veber, hERG, CYP, and solubility checks on every analog
+- **Trade-off analysis** — Binding affinity vs. ADMET property landscape with Pareto frontier identification
+
+<br>
+
+---
+
+<br>
+
+## Visualization
+
+Real-time Metal-rendered 3D molecular graphics, triple-buffered for smooth interaction.
+
+- **Rendering modes** — Ball & stick, space filling, wireframe, ribbon (helix/sheet/coil)
+- **Surfaces** — Connolly (solvent-accessible) and Gaussian blob isosurfaces with electrostatic potential, hydrophobicity, or pharmacophore coloring
+- **Interactions** — Color-coded lines for hydrogen bonds, salt bridges, π-stacking, halogen bonds, metal coordination, and more
+- **GPU picking** — Click any atom or residue directly in the 3D view for instant selection and inspection
+- **Ghost ligands** — Translucent overlay of docking poses for comparison
+- **Z-slab clipping** — Slice through the structure to focus on the binding site interior
+
+<br>
+
+---
+
+<br>
+
+## Ligand Library
+
+A built-in molecular database for organizing your compounds.
+
+- **Multi-format import** — SDF, MOL2, PDB files, co-crystallized ligands from loaded structures, or direct SMILES input
+- **Chemical form enumeration** — Tautomers, protomers, and cross-enumeration with Boltzmann population weighting
+- **Conformer generation** — RDKit 3D embedding with energy-ranked conformer selection
+- **Batch preparation** — Hydrogen addition, charge calculation, and minimization across the library
+- **Search & filter** — By name, SMILES, molecular weight, rotatable bonds, H-bond donors/acceptors
+
+<br>
+
+---
+
+<br>
+
+## Guided Demo
+
+New to molecular docking? Druse includes a fully interactive guided walkthrough that docks Nafamostat into Trypsin (PDB: 3PTB) — from protein fetch to scored poses — with step-by-step narration. Just click **Demo** on the welcome screen.
+
+<br>
+
+---
+
+<br>
+
+## Metal Under the Hood
+
+Druse runs 20+ specialized Metal compute kernels on Apple Silicon:
+
+- Genetic algorithm evolution and selection
+- Analytical gradient local search (SIMD-cooperative)
+- Grid map generation (steric, hydrophobic, H-bond, affinity)
+- Neural network inference (DruseAF v4, PIGNet2)
+- EEM partial charge calculation
+- Connolly surface generation
+- Pairwise RMSD computation
+- Fragment growth and diffusion denoising
+- Flexible sidechain scoring
+- Impostor sphere/cylinder rendering with depth-correct post-processing
+
+Half-precision grid storage, shared memory tiling, and on-demand rendering keep memory usage low and battery life long.
+
+<br>
+
+---
+
+<br>
+
+<p align="center">
+  <strong>Druse</strong> — Molecular docking, native on your Mac.
+</p>
+
+<p align="center">
+  <sub>All rights reserved.</sub>
+</p>

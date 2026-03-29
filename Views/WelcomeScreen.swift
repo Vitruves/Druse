@@ -128,7 +128,14 @@ struct WelcomeScreen: View {
             .opacity(appeared ? 1 : 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background {
+            ZStack {
+                Color(nsColor: .windowBackgroundColor)
+                WelcomeRibbonBackground()
+                    .opacity(0.4)
+                    .blur(radius: 6)
+            }
+        }
         .onAppear {
             withAnimation(.easeOut(duration: 0.6).delay(0.1)) {
                 appeared = true

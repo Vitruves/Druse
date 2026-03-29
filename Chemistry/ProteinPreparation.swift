@@ -874,7 +874,7 @@ enum ProteinPreparation {
         )
     }
 
-    private static func mergeProteinAtoms(
+    static func mergeProteinAtoms(
         currentAtoms: [Atom],
         sourceAtoms: [Atom],
         update: (inout Atom, Atom) -> Void
@@ -1285,7 +1285,7 @@ enum ProteinPreparation {
         return (remappedAtoms, remappedBonds)
     }
 
-    private static func applyElectrostaticFallback(to atoms: [Atom]) -> [Atom] {
+    static func applyElectrostaticFallback(to atoms: [Atom]) -> [Atom] {
         atoms.map { atom in
             var atom = atom
             if abs(atom.charge) <= 0.0001 {

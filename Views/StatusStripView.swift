@@ -218,15 +218,6 @@ struct StatusStripView: View {
 
                 Spacer(minLength: 4)
 
-                // Project save/load
-                statusBarButton(icon: "square.and.arrow.down", help: "Save Project (Cmd+S)",
-                                accessibilityID: AccessibilityID.statusSaveProject) { saveProject() }
-
-                statusBarButton(icon: "folder", help: "Open Project (Cmd+Shift+O)",
-                                accessibilityID: AccessibilityID.statusOpenProject) { openProject() }
-
-                Divider().frame(height: 12)
-
                 if showConsole {
                     Picker("", selection: $filterLevel) {
                         Text("All").tag(nil as LogLevel?)
@@ -333,6 +324,13 @@ struct StatusStripView: View {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
+                    .onChange(of: showConsole) { _, visible in
+                        if visible, let last = filteredEntries.last {
+                            DispatchQueue.main.async {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
+                        }
+                    }
                     .onKeyPress(.escape) {
                         selectedEntryIDs.removeAll()
                         lastClickedID = nil
@@ -388,11 +386,14 @@ struct StatusStripView: View {
                 .textSelection(.enabled)
             Spacer()
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
         .padding(.horizontal, 4)
         .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .contentShape(Rectangle())
+        .overlay(alignment: .bottom) {
+            Divider().padding(.leading, 8)
+        }
         .onTapGesture {
             handleEntryClick(entry, shiftKey: NSEvent.modifierFlags.contains(.shift))
         }

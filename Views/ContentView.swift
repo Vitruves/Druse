@@ -7,7 +7,7 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var showInspector = false
     @State private var showConsole = false
-    @State private var consoleHeight: CGFloat = 54
+    @State private var consoleHeight: CGFloat = 130
     @State private var isDragTargeted = false
     @State private var pipelineTab: SidebarTab = .search
     @State private var pipelinePanelOpen: Bool = false
