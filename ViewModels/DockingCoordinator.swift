@@ -79,6 +79,9 @@ struct DockingCoordinator {
     // Scaffold enforcement UI
     var showScaffoldInput: Bool = false
 
+    // Pharmacophore editor
+    var showPharmacophoreEditor: Bool = false
+
     // Search method and scoring method preferences
     var searchMethod: SearchMethod = .genetic
     var scoringMethod: ScoringMethod = .vina

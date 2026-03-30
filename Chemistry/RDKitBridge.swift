@@ -745,6 +745,111 @@ enum RDKitBridge {
         return Coords2D(positions: positions, atomicNums: atomicNums, bonds: bonds)
     }
 
+    // MARK: - Pharmacophore Feature Detection
+
+    /// Detected pharmacophore feature from RDKit BaseFeatures.fdef
+    struct DetectedFeature: Sendable {
+        let type: PharmacophoreFeatureType
+        let position: SIMD3<Float>
+        let atomIndices: [Int32]
+        let familyName: String
+    }
+
+    /// Detect pharmacophore features from a SMILES string.
+    /// Generates a 3D conformer internally, then uses RDKit's feature factory.
+    static func detectPharmacophoreFeatures(smiles: String) -> [DetectedFeature]? {
+        guard let result = druse_detect_pharmacophore_features(smiles) else { return nil }
+        defer { druse_free_pharmacophore_features(result) }
+        guard result.pointee.success else { return nil }
+
+        return convertFeatureResult(result)
+    }
+
+    /// Detect pharmacophore features using pre-existing 3D coordinates.
+    /// heavyPositions: array of heavy atom positions matching the SMILES heavy atom order.
+    static func detectPharmacophoreFeatures(smiles: String, heavyPositions: [SIMD3<Float>]) -> [DetectedFeature]? {
+        var interleaved = [Float](repeating: 0, count: heavyPositions.count * 3)
+        for (i, pos) in heavyPositions.enumerated() {
+            interleaved[i * 3] = pos.x
+            interleaved[i * 3 + 1] = pos.y
+            interleaved[i * 3 + 2] = pos.z
+        }
+        guard let result = druse_detect_pharmacophore_features_with_coords(
+            smiles, interleaved, Int32(heavyPositions.count)) else { return nil }
+        defer { druse_free_pharmacophore_features(result) }
+        guard result.pointee.success else { return nil }
+
+        return convertFeatureResult(result)
+    }
+
+    private static func convertFeatureResult(
+        _ result: UnsafeMutablePointer<DrusePharmacophoreFeatureResult>
+    ) -> [DetectedFeature] {
+        let count = Int(result.pointee.featureCount)
+        var features: [DetectedFeature] = []
+        features.reserveCapacity(count)
+
+        for i in 0..<count {
+            let f = result.pointee.features[i]
+            guard let featureType = PharmacophoreFeatureType(cType: f.type) else { continue }
+
+            let indices: [Int32]
+            if let ptr = f.atomIndices, f.atomCount > 0 {
+                indices = Array(UnsafeBufferPointer(start: ptr, count: Int(f.atomCount)))
+            } else {
+                indices = []
+            }
+
+            let name = withUnsafePointer(to: f.familyName) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 32) { String(cString: $0) }
+            }
+
+            features.append(DetectedFeature(
+                type: featureType,
+                position: SIMD3<Float>(f.x, f.y, f.z),
+                atomIndices: indices,
+                familyName: name
+            ))
+        }
+        return features
+    }
+
+    // MARK: - Maximum Common Substructure (MCS)
+
+    /// Result of MCS computation.
+    struct MCSResult: Sendable {
+        let smartsPattern: String
+        let numAtoms: Int
+        let numBonds: Int
+        let completed: Bool
+    }
+
+    /// Find the Maximum Common Substructure among multiple SMILES.
+    static func findMCS(smilesArray: [String], timeoutSeconds: Int = 30) -> MCSResult? {
+        guard smilesArray.count >= 2 else { return nil }
+
+        let cStrings = smilesArray.map { strdup($0) }
+        defer { cStrings.forEach { free($0) } }
+
+        var ptrs: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
+        guard let result = druse_find_mcs(&ptrs, Int32(smilesArray.count), Int32(timeoutSeconds)) else {
+            return nil
+        }
+        defer { druse_free_mcs_result(result) }
+        guard result.pointee.success else { return nil }
+
+        let smarts = withUnsafePointer(to: result.pointee.smartsPattern) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 2048) { String(cString: $0) }
+        }
+
+        return MCSResult(
+            smartsPattern: smarts,
+            numAtoms: Int(result.pointee.numAtoms),
+            numBonds: Int(result.pointee.numBonds),
+            completed: result.pointee.completed
+        )
+    }
+
     // MARK: - Internal
 
     private static func convertResult(_ r: DruseMoleculeResult) -> MoleculeData {

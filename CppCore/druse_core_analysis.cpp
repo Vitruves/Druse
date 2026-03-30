@@ -1,10 +1,12 @@
 #include "druse_core_internal.h"
 
-// Parallel batch helpers, fingerprints, fragments, and scaffold matching.
+// Parallel batch helpers, fingerprints, fragments, scaffold matching,
+// pharmacophore feature detection, and MCS.
 
 #include <tbb/parallel_for.h>
 #include <GraphMol/Fingerprints/MorganFingerprints.h>
 #include <GraphMol/Substruct/SubstructMatch.h>
+#include <GraphMol/FMCS/FMCS.h>
 #include <DataStructs/ExplicitBitVect.h>
 #include <DataStructs/BitOps.h>
 #include <map>
@@ -383,4 +385,253 @@ float druse_tanimoto_similarity(const char *smiles1, const char *smiles2) {
     } catch (...) {
         return 0.0f;
     }
+}
+
+// ============================================================================
+// MARK: - Pharmacophore Feature Detection
+// ============================================================================
+
+namespace {
+
+int32_t pharma_type_from_family(const std::string &family) {
+    if (family == "Donor")        return DRUSE_PHARMA_DONOR;
+    if (family == "Acceptor")     return DRUSE_PHARMA_ACCEPTOR;
+    if (family == "Hydrophobe")   return DRUSE_PHARMA_HYDROPHOBIC;
+    if (family == "Aromatic")     return DRUSE_PHARMA_AROMATIC;
+    if (family == "PosIonizable") return DRUSE_PHARMA_POS_IONIZABLE;
+    if (family == "NegIonizable") return DRUSE_PHARMA_NEG_IONIZABLE;
+    if (family == "LumpedHydrophobe") return DRUSE_PHARMA_HYDROPHOBIC;
+    return -1;  // unknown, skip
+}
+
+/// Build heavy-atom index mapping: original atom idx → heavy atom idx
+std::map<int, int> build_heavy_map(const ROMol &mol) {
+    std::map<int, int> m;
+    int heavyIdx = 0;
+    for (unsigned i = 0; i < mol.getNumAtoms(); i++) {
+        if (mol.getAtomWithIdx(i)->getAtomicNum() > 1) {
+            m[i] = heavyIdx++;
+        }
+    }
+    return m;
+}
+
+DrusePharmacophoreFeatureResult* detect_features_impl(
+    RWMol &mol,
+    const std::map<int, int> &heavyMap,
+    const Conformer &conf
+) {
+    auto *result = new DrusePharmacophoreFeatureResult();
+    std::memset(result, 0, sizeof(DrusePharmacophoreFeatureResult));
+    result->success = false;
+
+    const auto *factory = vina_feature_factory();
+    if (!factory) {
+        std::strncpy(result->errorMessage, "Could not load feature factory", 511);
+        return result;
+    }
+
+    auto features = factory->getFeaturesForMol(mol);
+
+    struct FeatureData {
+        float x, y, z;
+        int32_t type;
+        std::vector<int32_t> atomIndices;
+        std::string familyName;
+    };
+    std::vector<FeatureData> collected;
+
+    for (const auto &feat : features) {
+        if (!feat) continue;
+
+        const std::string &family = feat->getFamily();
+        int32_t ptype = pharma_type_from_family(family);
+        if (ptype < 0) continue;
+
+        // Compute centroid from involved atoms
+        float cx = 0, cy = 0, cz = 0;
+        std::vector<int32_t> indices;
+        int count = 0;
+        for (const auto *atom : feat->getAtoms()) {
+            if (!atom) continue;
+            unsigned idx = atom->getIdx();
+            auto pos = conf.getAtomPos(idx);
+            cx += (float)pos.x;
+            cy += (float)pos.y;
+            cz += (float)pos.z;
+            count++;
+
+            auto it = heavyMap.find((int)idx);
+            if (it != heavyMap.end()) {
+                indices.push_back(it->second);
+            }
+        }
+        if (count == 0) continue;
+        cx /= count; cy /= count; cz /= count;
+
+        FeatureData fd;
+        fd.x = cx; fd.y = cy; fd.z = cz;
+        fd.type = ptype;
+        fd.atomIndices = indices;
+        fd.familyName = family;
+        if (fd.familyName == "LumpedHydrophobe") fd.familyName = "Hydrophobe";
+        collected.push_back(std::move(fd));
+    }
+
+    result->featureCount = (int32_t)collected.size();
+    result->features = new DrusePharmacophoreFeature[collected.size()];
+
+    for (int i = 0; i < (int)collected.size(); i++) {
+        auto &fd = collected[i];
+        auto &out = result->features[i];
+        out.x = fd.x; out.y = fd.y; out.z = fd.z;
+        out.type = fd.type;
+        out.atomCount = (int32_t)fd.atomIndices.size();
+        out.atomIndices = new int32_t[fd.atomIndices.size()];
+        std::memcpy(out.atomIndices, fd.atomIndices.data(), fd.atomIndices.size() * sizeof(int32_t));
+        std::strncpy(out.familyName, fd.familyName.c_str(), 31);
+        out.familyName[31] = '\0';
+    }
+
+    result->success = true;
+    return result;
+}
+
+} // namespace
+
+DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features(const char *smiles) {
+    auto *result = new DrusePharmacophoreFeatureResult();
+    std::memset(result, 0, sizeof(DrusePharmacophoreFeatureResult));
+    result->success = false;
+
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) {
+            std::strncpy(result->errorMessage, "Failed to parse SMILES", 511);
+            return result;
+        }
+        MolOps::addHs(*mol);
+        if (embed_molecule(*mol) < 0) {
+            std::strncpy(result->errorMessage, "3D embedding failed", 511);
+            return result;
+        }
+        mmff_minimize_single(*mol);
+
+        auto heavyMap = build_heavy_map(*mol);
+        const auto &conf = mol->getConformer();
+
+        delete result;
+        return detect_features_impl(*mol, heavyMap, conf);
+    } catch (const std::exception &e) {
+        std::strncpy(result->errorMessage, e.what(), 511);
+        return result;
+    }
+}
+
+DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features_with_coords(
+    const char *smiles,
+    const float *heavyCoords,
+    int32_t numHeavy
+) {
+    auto *result = new DrusePharmacophoreFeatureResult();
+    std::memset(result, 0, sizeof(DrusePharmacophoreFeatureResult));
+    result->success = false;
+
+    try {
+        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
+        if (!mol) {
+            std::strncpy(result->errorMessage, "Failed to parse SMILES", 511);
+            return result;
+        }
+        MolOps::addHs(*mol);
+
+        // Create a conformer with the provided heavy atom coords.
+        // Place H atoms at origin (not used for feature detection centroids).
+        auto *conf = new Conformer(mol->getNumAtoms());
+        int heavyIdx = 0;
+        for (unsigned i = 0; i < mol->getNumAtoms(); i++) {
+            if (mol->getAtomWithIdx(i)->getAtomicNum() > 1) {
+                if (heavyIdx < numHeavy) {
+                    conf->setAtomPos(i, RDGeom::Point3D(
+                        heavyCoords[heavyIdx * 3],
+                        heavyCoords[heavyIdx * 3 + 1],
+                        heavyCoords[heavyIdx * 3 + 2]));
+                    heavyIdx++;
+                }
+            } else {
+                conf->setAtomPos(i, RDGeom::Point3D(0, 0, 0));
+            }
+        }
+        mol->addConformer(conf, true);
+
+        auto heavyMap = build_heavy_map(*mol);
+        delete result;
+        return detect_features_impl(*mol, heavyMap, *conf);
+    } catch (const std::exception &e) {
+        std::strncpy(result->errorMessage, e.what(), 511);
+        return result;
+    }
+}
+
+void druse_free_pharmacophore_features(DrusePharmacophoreFeatureResult *result) {
+    if (!result) return;
+    for (int i = 0; i < result->featureCount; i++) {
+        delete[] result->features[i].atomIndices;
+    }
+    delete[] result->features;
+    delete result;
+}
+
+// ============================================================================
+// MARK: - Maximum Common Substructure (MCS)
+// ============================================================================
+
+DruseMCSResult* druse_find_mcs(
+    const char **smilesArray,
+    int32_t numMols,
+    int32_t timeoutSeconds
+) {
+    auto *result = new DruseMCSResult();
+    std::memset(result, 0, sizeof(DruseMCSResult));
+    result->success = false;
+
+    if (numMols < 2) {
+        std::strncpy(result->errorMessage, "Need at least 2 molecules for MCS", 511);
+        return result;
+    }
+
+    try {
+        std::vector<ROMOL_SPTR> mols;
+        mols.reserve(numMols);
+        for (int i = 0; i < numMols; i++) {
+            std::unique_ptr<RWMol> mol(SmilesToMol(smilesArray[i]));
+            if (!mol) {
+                std::snprintf(result->errorMessage, 511,
+                    "Failed to parse SMILES at index %d", i);
+                return result;
+            }
+            mols.push_back(ROMOL_SPTR(mol.release()));
+        }
+
+        MCSResult mcsResult = findMCS(mols, true /* maximizeBonds */,
+            1.0 /* threshold */, timeoutSeconds > 0 ? (unsigned)timeoutSeconds : 3600,
+            false /* verbose */, false /* matchValences */,
+            true /* ringMatchesRingOnly */, true /* completeRingsOnly */);
+
+        std::strncpy(result->smartsPattern, mcsResult.SmartsString.c_str(), 2047);
+        result->smartsPattern[2047] = '\0';
+        result->numAtoms = (int32_t)mcsResult.NumAtoms;
+        result->numBonds = (int32_t)mcsResult.NumBonds;
+        result->completed = mcsResult.isCompleted();
+        result->success = mcsResult.NumAtoms > 0;
+
+        return result;
+    } catch (const std::exception &e) {
+        std::strncpy(result->errorMessage, e.what(), 511);
+        return result;
+    }
+}
+
+void druse_free_mcs_result(DruseMCSResult *result) {
+    delete result;
 }

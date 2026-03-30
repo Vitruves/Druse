@@ -75,12 +75,12 @@ std::unique_ptr<MolChemicalFeatureFactory> make_vina_feature_factory() {
     return std::unique_ptr<MolChemicalFeatureFactory>(buildFeatureFactory(buffer.str()));
 }
 
+} // namespace
+
 const MolChemicalFeatureFactory *vina_feature_factory() {
     static const std::unique_ptr<MolChemicalFeatureFactory> factory = make_vina_feature_factory();
     return factory.get();
 }
-
-} // namespace
 
 void compute_donor_acceptor_flags(
     const ROMol &mol,

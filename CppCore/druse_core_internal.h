@@ -55,6 +55,8 @@ void compute_donor_acceptor_flags(
     std::vector<bool> &acceptorFlags
 );
 
+const MolChemicalFeatureFactory *vina_feature_factory();
+
 int32_t vina_xs_type_for_atom(
     const ROMol &mol,
     const Atom &atom,

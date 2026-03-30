@@ -183,6 +183,7 @@ target_link_libraries(druse_core
     RDKitGenericGroups
     RDKitMolChemicalFeatures
     RDKitRingDecomposerLib
+    RDKitFMCS
 )
 
 install(TARGETS druse_core ARCHIVE DESTINATION lib)

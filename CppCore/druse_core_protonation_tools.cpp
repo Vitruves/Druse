@@ -3,6 +3,7 @@
 // Ionizable-site inspection, per-site protomer generation, and ensemble v2.
 
 #include <limits>
+#include <map>
 #include <set>
 
 DruseIonSiteResult* druse_detect_ionizable_sites(const char *smiles) {
@@ -157,19 +158,50 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
             return result;
         }
 
-        // Use GNN-provided sites directly — no SMARTS re-detection needed.
-        // GNN pKa values already account for electronic environment, so no
-        // proximity depression is applied (would double-count).
+        // GNN-provided sites — cross-validate against SMARTS lookup table
+        // to catch systematic mispredictions (e.g. aminopyridazine vs piperazine).
+        // No proximity depression is applied (GNN already accounts for environment).
+        auto smartsSites = detectIonSitesInternal(*parentMol);
+        std::map<int, double> smartsPKa;
+        for (const auto &[aIdx, gIdx, isA, pk] : smartsSites) {
+            smartsPKa[aIdx] = pk;
+        }
+
+        // Build corrected site list: use GNN pKa but clamp against SMARTS
+        // when they disagree by more than 3 pKa units.
+        struct CorrectedSite { int atomIdx; bool isAcid; double pKa; };
+        std::vector<CorrectedSite> correctedSites;
+        for (int32_t i = 0; i < nSites; i++) {
+            int atomIdx = sites[i].atomIdx;
+            if (atomIdx < 0 || atomIdx >= (int)parentMol->getNumAtoms()) continue;
+            double gnnPKa = sites[i].pKa;
+            bool isAcid = sites[i].isAcid;
+
+            auto it = smartsPKa.find(atomIdx);
+            if (it != smartsPKa.end()) {
+                double smartsPk = it->second;
+                double diff = gnnPKa - smartsPk;
+                if (std::abs(diff) > 3.0) {
+                    // GNN prediction disagrees strongly with SMARTS table —
+                    // use weighted blend biased toward SMARTS for large errors
+                    double blend = 0.3 * gnnPKa + 0.7 * smartsPk;
+                    fprintf(stderr, "[druse] pKa sanity: atom %d GNN=%.1f SMARTS=%.1f → %.1f\n",
+                            atomIdx, gnnPKa, smartsPk, blend);
+                    gnnPKa = blend;
+                }
+            }
+            correctedSites.push_back({atomIdx, isAcid, gnnPKa});
+        }
+
         auto washedMol = std::make_unique<RWMol>(*parentMol);
 
         struct AmbSite { int atomIdx; bool isAcid; double pKa; };
         std::vector<AmbSite> ambSites;
 
-        for (int32_t i = 0; i < nSites; i++) {
-            int atomIdx = sites[i].atomIdx;
-            if (atomIdx < 0 || atomIdx >= (int)parentMol->getNumAtoms()) continue;
-            bool isAcid = sites[i].isAcid;
-            double pKa = sites[i].pKa;
+        for (size_t i = 0; i < correctedSites.size(); i++) {
+            int atomIdx = correctedSites[i].atomIdx;
+            bool isAcid = correctedSites[i].isAcid;
+            double pKa = correctedSites[i].pKa;
             double deltaPH = pH - pKa;
 
             if (isAcid && deltaPH > pkaThreshold) {

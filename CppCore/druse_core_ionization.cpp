@@ -285,6 +285,10 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"Piperaz NR di-sub","[NX3H0;R1]([CX4])1CC[NX3H1;R1]CC1", 9.0, false},
     {"Piperazine NH 1st","[NX3H1;R1]1CC[NX3H1;R1]CC1",  9.8, false},
     {"Piperaz NR,NR 1st","[NX3H0;R1]([CX4])1CC[NX3H0;R1]([CX4])CC1", 9.0, false},
+    {"Piperaz NR,N-acyl","[NX3H0;R1;!$(NC=O)]1CC[NX3H0;R1](C(=O))CC1", 8.5, false},
+    {"Piperaz N-acyl,NR","[NX3H0;R1](C(=O))1CC[NX3H0;R1;!$(NC=O)]CC1", -1.0, false},
+    {"Piperaz NH,N-acyl","[NX3H1;R1;!$(NC=O)]1CC[NX3H0;R1](C(=O))CC1", 9.0, false},
+    {"Piperaz N-acyl,NH","[NX3H0;R1](C(=O))1CC[NX3H1;R1;!$(NC=O)]CC1", -1.0, false},
     {"1-Tosylpiperazine","[NX3H1;R1]1CC[NX3;R1](S(=O)(=O))CC1", 7.4, false},
     {"N-Bz piperazine",  "[NX3H1;R1]1CC[NX3;R1](C(=O)c)CC1", 7.8, false},
     {"Piperazine N",     "[NX3H1;R1;!$(NC=O);!$(NS(=O)=O)]1CC[NX3;R1]CC1", 9.0, false},
@@ -381,7 +385,10 @@ const IonizableGroupDef kIonizableGroups[] = {
     {"Purine N",         "[nH0;X2]1c2[nH]cnc2ncc1",       2.52, false},
     {"Caffeine N",       "[nH0;X2]1c2n(C)c(=O)n(C)c(=O)c2n(C)c1", 0.6, false},
 
-    // ---- Aminopyrimidines / Aminopyrazines ----
+    // ---- Aminopyridazines / Aminopyrimidines / Aminopyrazines ----
+    {"3-Aminopyridazine","[nH0;X2]1[nH0;X2]c(N)ccc1",    5.10, false},
+    {"4-Aminopyridazine","[nH0;X2]1[nH0;X2]ccc(N)c1",    5.50, false},
+    {"3,5-Diaminopyridazine","[nH0;X2]1[nH0;X2]c(N)cc(N)c1", 6.20, false},
     {"4-Aminopyrimidine","[nH0;X2]1c[nH0;X2]c(N)cc1",    5.71, false},
     {"2-Aminopyrimidine","[nH0;X2]1c(N)[nH0;X2]ccc1",    3.54, false},
     {"4,6-Diamino-pyrimidine","[nH0;X2]1c[nH0;X2]c(N)cc(N)1", 7.26, false},

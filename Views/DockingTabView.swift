@@ -32,11 +32,9 @@ struct DockingTabView: View {
             Divider()
             // 4. Docking parameters
             dockingConfigSection
-            // 4b. Pharmacophore constraints (only shown when constraints exist)
-            if !viewModel.docking.pharmacophoreConstraints.isEmpty {
-                Divider()
-                constraintSummarySection
-            }
+            // 4b. Pharmacophore constraints
+            Divider()
+            constraintSummarySection
             // 4c. Flexible residues (induced fit)
             if viewModel.docking.selectedPocket != nil {
                 Divider()
@@ -930,6 +928,7 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private var constraintSummarySection: some View {
+        @Bindable var vm = viewModel
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Constraints (\(viewModel.docking.pharmacophoreConstraints.count))",
@@ -937,13 +936,36 @@ struct DockingTabView: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Clear All") {
-                    viewModel.docking.pharmacophoreConstraints.removeAll()
+                if !viewModel.docking.pharmacophoreConstraints.isEmpty {
+                    Button("Clear All") {
+                        viewModel.docking.pharmacophoreConstraints.removeAll()
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                    .help("Remove all pharmacophore constraints")
                 }
-                .font(.footnote)
-                .buttonStyle(.plain)
-                .foregroundStyle(.red)
-                .help("Remove all pharmacophore constraints")
+            }
+
+            // Pharmacophore editor button
+            Button {
+                viewModel.docking.showPharmacophoreEditor = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "circle.hexagongrid.circle")
+                        .font(.footnote)
+                    Text("Pharmacophore Editor...")
+                        .font(.footnote)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 3)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Create constraints from a reference ligand's pharmacophoric features")
+            .sheet(isPresented: $vm.docking.showPharmacophoreEditor) {
+                PharmacophoreEditorView()
+                    .environment(viewModel)
             }
 
             ForEach(Array(viewModel.docking.pharmacophoreConstraints.enumerated()), id: \.element.id) { idx, constraint in

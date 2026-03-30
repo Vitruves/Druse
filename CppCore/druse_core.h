@@ -696,6 +696,81 @@ DruseEntitySequenceResult* druse_get_entity_sequences(const char *content);
 /// Free result from druse_get_entity_sequences.
 void druse_free_entity_sequence_result(DruseEntitySequenceResult *result);
 
+// ============================================================================
+// MARK: - Pharmacophore Feature Detection
+// ============================================================================
+
+/// Types of pharmacophore features detected from a molecule.
+/// Maps to RDKit BaseFeatures.fdef families.
+enum DrusePharmacophoreType {
+    DRUSE_PHARMA_DONOR = 0,
+    DRUSE_PHARMA_ACCEPTOR = 1,
+    DRUSE_PHARMA_HYDROPHOBIC = 2,
+    DRUSE_PHARMA_AROMATIC = 3,
+    DRUSE_PHARMA_POS_IONIZABLE = 4,
+    DRUSE_PHARMA_NEG_IONIZABLE = 5,
+};
+
+/// A single pharmacophore feature detected in a molecule.
+typedef struct {
+    float x, y, z;                      // 3D position (centroid of involved atoms)
+    int32_t type;                       // DrusePharmacophoreType
+    int32_t *atomIndices;               // heavy atom indices involved in this feature
+    int32_t atomCount;                  // number of atoms in this feature
+    char familyName[32];                // e.g. "Donor", "Acceptor", "Hydrophobe"
+} DrusePharmacophoreFeature;
+
+/// Result of pharmacophore feature detection.
+typedef struct {
+    DrusePharmacophoreFeature *features;
+    int32_t featureCount;
+    bool success;
+    char errorMessage[512];
+} DrusePharmacophoreFeatureResult;
+
+/// Detect pharmacophore features from a SMILES string using RDKit's
+/// MolChemicalFeatureFactory with BaseFeatures.fdef. The molecule is
+/// embedded in 3D (ETKDGv3 + MMFF94) so feature positions are meaningful.
+/// Caller must free with druse_free_pharmacophore_features().
+DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features(const char *smiles);
+
+void druse_free_pharmacophore_features(DrusePharmacophoreFeatureResult *result);
+
+// ============================================================================
+// MARK: - Maximum Common Substructure (MCS)
+// ============================================================================
+
+/// Result of MCS computation between multiple molecules.
+typedef struct {
+    char smartsPattern[2048];           // SMARTS of the MCS
+    int32_t numAtoms;                   // number of atoms in MCS
+    int32_t numBonds;                   // number of bonds in MCS
+    bool completed;                     // false if timed out
+    bool success;
+    char errorMessage[512];
+} DruseMCSResult;
+
+/// Find the Maximum Common Substructure among a set of SMILES.
+/// timeoutSeconds: max time in seconds (0 = no timeout).
+/// Caller must free with druse_free_mcs_result().
+DruseMCSResult* druse_find_mcs(
+    const char **smilesArray,
+    int32_t numMols,
+    int32_t timeoutSeconds
+);
+
+void druse_free_mcs_result(DruseMCSResult *result);
+
+/// Detect pharmacophore features from a SMILES string, using provided
+/// 3D coordinates for heavy atoms instead of generating a new conformer.
+/// heavyCoords: interleaved [x0,y0,z0, x1,y1,z1, ...] for numHeavy atoms.
+/// Caller must free with druse_free_pharmacophore_features().
+DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features_with_coords(
+    const char *smiles,
+    const float *heavyCoords,
+    int32_t numHeavy
+);
+
 #ifdef __cplusplus
 }
 #endif
