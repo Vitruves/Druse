@@ -239,7 +239,7 @@ struct GAParams {
     float       mcTemperature;
     float       referenceIntraEnergy;
     uint32_t    numIntraPairs;       // number of packed pairs in intraPairs buffer (replaces exclusion bitmask)
-    uint32_t    _pad0;
+    uint32_t    runSeed;             // per-run random seed for independent MC trajectories (0, 1, 2, ...)
 };
 
 struct BatchLigandInfo {

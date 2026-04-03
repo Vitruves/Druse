@@ -114,9 +114,44 @@ def get_ligand_center_and_size(sdf_path: str) -> tuple[list[float], list[float]]
     return center, size
 
 
+def parse_pdbqt_coords(pdbqt_path: str) -> np.ndarray | None:
+    """Extract heavy atom coordinates from a PDBQT file."""
+    coords = []
+    with open(pdbqt_path) as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    # Skip hydrogens (element in columns 77-78)
+                    elem = line[76:78].strip() if len(line) > 77 else ""
+                    if elem == "H" or elem == "HD":
+                        continue
+                    coords.append([x, y, z])
+                except (ValueError, IndexError):
+                    pass
+    return np.array(coords) if coords else None
+
+
+def compute_symmetry_rmsd(ref_coords: np.ndarray, pose_coords: np.ndarray) -> float | None:
+    """Compute RMSD between two coordinate sets. Uses Hungarian matching if sizes differ."""
+    if ref_coords is None or pose_coords is None:
+        return None
+    if len(ref_coords) == len(pose_coords):
+        return float(np.sqrt(np.mean(np.sum((ref_coords - pose_coords) ** 2, axis=1))))
+    # Size mismatch — use nearest-neighbor matching on the smaller set
+    from scipy.spatial.distance import cdist
+    if len(ref_coords) > len(pose_coords):
+        ref_coords, pose_coords = pose_coords, ref_coords
+    dists = cdist(ref_coords, pose_coords)
+    min_dists = dists.min(axis=1)
+    return float(np.sqrt(np.mean(min_dists ** 2)))
+
+
 def run_vina_single(args_tuple):
-    """Run AutoDock-Vina on a single complex. Returns (pdb_id, score, rmsd, time_s)."""
-    pdb_id, prot_pdb, lig_sdf, pkd = args_tuple
+    """Run AutoDock-Vina on a single complex. Returns (pdb_id, score, pkd, rmsd, time_s, status)."""
+    pdb_id, prot_pdb, lig_sdf, pkd, exhaustiveness = args_tuple
 
     with tempfile.TemporaryDirectory(prefix=f"vina_{pdb_id}_") as tmpdir:
         prot_pdbqt = os.path.join(tmpdir, "protein.pdbqt")
@@ -125,14 +160,17 @@ def run_vina_single(args_tuple):
 
         # Prepare inputs
         if not pdb_to_pdbqt(prot_pdb, prot_pdbqt):
-            return (pdb_id, None, None, 0, "prot_prep_fail")
+            return (pdb_id, None, None, None, 0, "prot_prep_fail")
         if not sdf_to_pdbqt(lig_sdf, lig_pdbqt):
-            return (pdb_id, None, None, 0, "lig_prep_fail")
+            return (pdb_id, None, None, None, 0, "lig_prep_fail")
+
+        # Get reference ligand coords for RMSD
+        ref_coords = parse_pdbqt_coords(lig_pdbqt)
 
         # Get search box
         box = get_ligand_center_and_size(lig_sdf)
         if box is None:
-            return (pdb_id, None, None, 0, "box_fail")
+            return (pdb_id, None, None, None, 0, "box_fail")
         center, size = box
 
         # Run Vina
@@ -148,11 +186,11 @@ def run_vina_single(args_tuple):
                 "--size_x", f"{size[0]:.1f}",
                 "--size_y", f"{size[1]:.1f}",
                 "--size_z", f"{size[2]:.1f}",
-                "--exhaustiveness", "8",
+                "--exhaustiveness", str(exhaustiveness),
                 "--out", out_pdbqt,
                 "--num_modes", "1",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             elapsed = time.time() - t0
 
             # Parse score from output
@@ -182,12 +220,18 @@ def run_vina_single(args_tuple):
                             except ValueError:
                                 pass
 
-            return (pdb_id, score, pkd, elapsed, "ok" if score else "parse_fail")
+            # Compute RMSD against crystal ligand
+            rmsd = None
+            if score is not None and os.path.exists(out_pdbqt):
+                pose_coords = parse_pdbqt_coords(out_pdbqt)
+                rmsd = compute_symmetry_rmsd(ref_coords, pose_coords)
+
+            return (pdb_id, score, pkd, rmsd, elapsed, "ok" if score else "parse_fail")
 
         except subprocess.TimeoutExpired:
-            return (pdb_id, None, None, 120, "timeout")
+            return (pdb_id, None, None, None, 300, "timeout")
         except Exception as e:
-            return (pdb_id, None, None, 0, str(e))
+            return (pdb_id, None, None, None, 0, str(e))
 
 
 def main():
@@ -197,6 +241,8 @@ def main():
     parser.add_argument("--druse-result", type=str, help="Druse benchmark JSON to compare against")
     parser.add_argument("--match-druse", action="store_true",
                         help="Only run on PDB IDs present in --druse-result")
+    parser.add_argument("--exhaustiveness", type=int, default=32,
+                        help="Vina exhaustiveness (default 32 to match Druse standard preset)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel workers")
     args = parser.parse_args()
 
@@ -220,7 +266,7 @@ def main():
         prot = REFINED_SET / pdb_id / f"{pdb_id}_protein.pdb"
         lig = REFINED_SET / pdb_id / f"{pdb_id}_ligand.sdf"
         if prot.exists() and lig.exists():
-            work.append((pdb_id, str(prot), str(lig), pkd))
+            work.append((pdb_id, str(prot), str(lig), pkd, args.exhaustiveness))
 
     # Filter to match Druse result if requested
     if args.match_druse and args.druse_result:
@@ -231,7 +277,8 @@ def main():
     if args.quick > 0:
         work = work[:args.quick]
 
-    print(f"Running AutoDock-Vina 1.2.7 on {len(work)} complexes ({args.workers} workers)")
+    print(f"Running AutoDock-Vina 1.2.7 on {len(work)} complexes "
+          f"(exhaustiveness={args.exhaustiveness}, {args.workers} workers)")
     print()
 
     # Run
@@ -242,9 +289,10 @@ def main():
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(run_vina_single, w): w[0] for w in work}
         for i, future in enumerate(as_completed(futures)):
-            pdb_id, score, pkd, elapsed, status = future.result()
+            pdb_id, score, pkd, rmsd, elapsed, status = future.result()
             if status == "ok" and score is not None:
-                results.append({'pdb_id': pdb_id, 'score': score, 'pkd': pkd, 'time': elapsed})
+                results.append({'pdb_id': pdb_id, 'score': score, 'pkd': pkd,
+                                'rmsd': rmsd, 'time': elapsed})
             else:
                 errors += 1
 
@@ -269,10 +317,23 @@ def main():
     r_vina, _ = pearsonr(scores, pkds)
     avg_time = np.mean([r['time'] for r in results])
 
+    # Docking power
+    rmsds_ref = np.array([r['rmsd'] for r in results if r['rmsd'] is not None])
+    n_with_rmsd = len(rmsds_ref)
+    dock_2a = int(np.sum(rmsds_ref < 2.0)) if n_with_rmsd > 0 else 0
+    dock_3a = int(np.sum(rmsds_ref < 3.0)) if n_with_rmsd > 0 else 0
+    dock_5a = int(np.sum(rmsds_ref < 5.0)) if n_with_rmsd > 0 else 0
+
     print(f"\n{'='*50}")
-    print(f"  AutoDock-Vina 1.2.7 Reference")
+    print(f"  AutoDock-Vina 1.2.7 Reference (exhaustiveness={args.exhaustiveness})")
     print(f"{'='*50}")
     print(f"  Complexes scored: {len(results)}")
+    if n_with_rmsd > 0:
+        print(f"  Docking Power:")
+        print(f"    RMSD < 2.0A: {dock_2a}/{n_with_rmsd} ({100*dock_2a/n_with_rmsd:.1f}%)")
+        print(f"    RMSD < 3.0A: {dock_3a}/{n_with_rmsd} ({100*dock_3a/n_with_rmsd:.1f}%)")
+        print(f"    RMSD < 5.0A: {dock_5a}/{n_with_rmsd} ({100*dock_5a/n_with_rmsd:.1f}%)")
+        print(f"    Mean: {np.mean(rmsds_ref):.2f}A  Median: {np.median(rmsds_ref):.2f}A")
     print(f"  Scoring Power: Pearson r = {r_vina:.4f}")
     print(f"  Avg time/complex: {avg_time:.1f}s")
     print(f"  Mean score: {np.mean(scores):.2f} kcal/mol")
@@ -295,12 +356,24 @@ def main():
             r_ref, _ = pearsonr(vina_ref, vina_ref_pkd)
             r_druse, _ = pearsonr(druse_scores, vina_ref_pkd)
 
+            # Docking power on common complexes
+            vina_ref_rmsds = {}
+            for r in results:
+                if r['pdb_id'] in common_ids and r['rmsd'] is not None:
+                    vina_ref_rmsds[r['pdb_id']] = r['rmsd']
+            druse_rmsds_common = {pid: druse_map[pid].get('best_rmsd', 99) for pid in common_ids}
+
             print(f"\n  Comparison on {len(common_ids)} common complexes:")
             print(f"  {'AutoDock-Vina 1.2.7':>25}  Pearson r = {r_ref:.4f}")
             print(f"  {'Druse ' + method:>25}  Pearson r = {r_druse:.4f}")
+
+            if vina_ref_rmsds:
+                n_ref_rmsd = len(vina_ref_rmsds)
+                ref_dock_2a = sum(1 for v in vina_ref_rmsds.values() if v < 2.0)
+                print(f"  {'AutoDock-Vina 1.2.7':>25}  Docking power: {ref_dock_2a}/{n_ref_rmsd} (<2A)")
             if 'best_rmsd' in druse['entries'][0]:
-                docking_ok = sum(1 for pid in common_ids if druse_map[pid].get('best_rmsd', 99) < 2.0)
-                print(f"  Druse docking power: {docking_ok}/{len(common_ids)} (<2Å)")
+                druse_dock_2a = sum(1 for pid in common_ids if druse_map[pid].get('best_rmsd', 99) < 2.0)
+                print(f"  {'Druse ' + method:>25}  Docking power: {druse_dock_2a}/{len(common_ids)} (<2A)")
 
     # Save results
     out_path = RESULTS_DIR / f"autodock_vina_reference_{len(results)}cpx.json"

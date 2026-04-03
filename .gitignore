@@ -49,6 +49,7 @@ Package.resolved
 # === ML models & weights ===
 *.mlmodelc/
 *.mlpackage/
+!Models/druse-models/PocketDetector.mlpackage
 *.pt
 *.pth
 *.onnx
@@ -57,6 +58,7 @@ Package.resolved
 *.pickle
 *.safetensors
 *.bin
+!Resources/dun2010bbdep.bin
 !Training/*.py
 
 
@@ -130,3 +132,10 @@ VERSION
 
 
 build/
+
+.gitignore
+Litterature/
+
+scripts/
+
+Training/

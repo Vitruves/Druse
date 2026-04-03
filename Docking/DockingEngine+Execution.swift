@@ -179,6 +179,33 @@ extension DockingEngine {
                         threadGroups: tgCount, threadGroupSize: tgSize)
     }
 
+    /// Decompose Vina intermolecular energy into steric/hydrophobic/hbond via explicit
+    /// pair evaluation.  Only updates the three decomposition fields; total energy is
+    /// left untouched so rankings are not affected.
+    func decomposeVinaEnergy(
+        buffer: MTLBuffer,
+        populationSize: Int
+    ) {
+        guard let ligBuf = ligandAtomBuffer,
+              let paBuf = proteinAtomBuffer,
+              let gpBuf = gridParamsBuffer,
+              let gaBuf = gaParamsBuffer,
+              let teBuf = torsionEdgeBuffer,
+              let miBuf = movingIndicesBuffer else { return }
+
+        let simdWidth = decomposeVinaEnergyPipeline.threadExecutionWidth
+        let totalThreads = max(populationSize, 1) * simdWidth
+        let tgSize = MTLSize(width: simdWidth, height: 1, depth: 1)
+        let tgCount = MTLSize(width: (totalThreads + tgSize.width - 1) / tgSize.width, height: 1, depth: 1)
+        let buffers: [(MTLBuffer, Int)] = [
+            (buffer, 0), (ligBuf, 1), (paBuf, 2),
+            (gpBuf, 3), (gaBuf, 4),
+            (teBuf, 5), (miBuf, 6)
+        ]
+        dispatchCompute(pipeline: decomposeVinaEnergyPipeline, buffers: buffers,
+                        threadGroups: tgCount, threadGroupSize: tgSize)
+    }
+
     func localOptimizeGrid(
         buffer: MTLBuffer,
         gridParamsBuffer: MTLBuffer,
@@ -572,7 +599,7 @@ extension DockingEngine {
             mcTemperature: config.mcTemperature,
             referenceIntraEnergy: referenceIntraEnergy,
             numIntraPairs: UInt32(pairList.count),
-            _pad0: 0
+            runSeed: 0
         )
         gaParamsBuffer = device.makeBuffer(bytes: &gaParams, length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
 
@@ -870,6 +897,8 @@ extension DockingEngine {
                 await buf.completed()
             }
 
+            decomposeVinaEnergy(buffer: replicaBestBuf, populationSize: totalPoses)
+
             aggregatedResults = extractAllResults(
                 from: replicaBestBuf,
                 ligandAtoms: heavyAtoms,
@@ -888,6 +917,10 @@ extension DockingEngine {
 
         runLoop: for runIndex in 0..<totalRuns {
             guard isRunning else { break }
+
+            // Per-run random seed ensures truly independent MC trajectories (Vina-aligned).
+            gaParams.runSeed = UInt32(runIndex) &* 1000003 &+ UInt32.random(in: 0..<1_000_000)
+            gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
 
             dispatchCompute(pipeline: initPopPipeline, buffers: [
                 (popBuf, 0), (gpBuf, 1), (gaBuf, 2)
@@ -918,6 +951,7 @@ extension DockingEngine {
                         await buf.completed()
                         lastCmdBuf = nil
                     }
+                    decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
                     aggregatedResults.append(contentsOf: extractAllResults(
                         from: bestBuf,
                         ligandAtoms: heavyAtoms,
@@ -1136,6 +1170,8 @@ extension DockingEngine {
                 lastCmdBuf = nil
             }
 
+            decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+
             aggregatedResults.append(contentsOf: extractAllResults(
                 from: bestPopulationBuffer,
                 ligandAtoms: heavyAtoms,
@@ -1331,7 +1367,7 @@ extension DockingEngine {
                 pairList: rrPairList
             ),
             numIntraPairs: UInt32(rrPairList.count),
-            _pad0: 0
+            runSeed: 0
         )
         gaParamsBuffer = device.makeBuffer(
             bytes: &gaParams,
@@ -1344,6 +1380,7 @@ extension DockingEngine {
         let wasRunning = isRunning
         isRunning = true
         scorePopulation(buffer: populationBuffer!, tg: tgCount, tgs: tgSize)
+        decomposeVinaEnergy(buffer: populationBuffer!, populationSize: 1)
         isRunning = wasRunning
 
         return extractBestPose(ligandAtoms: heavyAtoms, centroid: centroid)

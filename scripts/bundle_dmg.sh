@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────
-# bundle_dmg.sh — Create a portable DMG for Druse
+# bundle_dmg.sh — Create a fully portable DMG for Druse
 #
-# Copies all Homebrew/build dylibs into Druse.app/Contents/Frameworks,
-# rewrites load paths so the app is fully self-contained.
+# Recursively discovers all non-system dylib dependencies,
+# copies them into Druse.app/Contents/Frameworks, and rewrites
+# all load paths so the app needs zero Homebrew deps.
 #
 # Usage:  ./scripts/bundle_dmg.sh [path/to/Druse.app]
-#
-# If no .app path given, builds Release first.
+# Env:    CODESIGN_IDENTITY="-" (default ad-hoc)
 # ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,16 +17,16 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION=$(cat "$PROJECT_DIR/VERSION")
 BUILD_DIR="$PROJECT_DIR/build"
 DMG_DIR="$BUILD_DIR/dmg"
-FRAMEWORKS_DIR=""  # set after we know APP_PATH
 
-# Temp file for collecting dylib paths
-DYLIB_LIST=$(mktemp)
-trap "rm -f $DYLIB_LIST" EXIT
-
-# ── Codesign identity (set to "-" for ad-hoc, or your Developer ID) ──
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 
-# ── Resolve or build the .app ──
+# Temp files
+SEEN_FILE=$(mktemp)
+QUEUE_FILE=$(mktemp)
+trap "rm -f $SEEN_FILE $QUEUE_FILE" EXIT
+
+# ── Build or locate the .app ──────────────────────────────────
+
 if [ -n "${1:-}" ] && [ -d "$1" ]; then
     APP_PATH="$1"
 else
@@ -44,91 +44,148 @@ fi
 
 echo "==> Using app: $APP_PATH"
 FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
+MAIN_EXEC="$APP_PATH/Contents/MacOS/Druse"
 mkdir -p "$FRAMEWORKS_DIR"
 
-# ─────────────────────────────────────────────────────────────
-# 1. Collect all dylibs that need bundling
-# ─────────────────────────────────────────────────────────────
+# ── Helper: resolve a path to its real file ───────────────────
 
-HOMEBREW="/opt/homebrew"
-OPENMM_LIB="$PROJECT_DIR/CppCore/build/_deps/openmm-install/lib"
-
-# Helper: get the real file behind a path (follow symlinks)
 realfile() {
     python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1"
 }
 
-# Helper: add a dylib to the list (resolves symlinks, deduplicates later)
-add_dylib() {
-    local path="$1"
-    if [ -f "$path" ] || [ -L "$path" ]; then
-        realfile "$path" >> "$DYLIB_LIST"
-    else
-        echo "  WARNING: not found: $path"
-    fi
+# ── Helper: check if a dep is a system lib we should skip ─────
+
+is_system_lib() {
+    case "$1" in
+        /usr/lib/*) return 0 ;;
+        /System/*) return 0 ;;
+        @executable_path/*) return 0 ;;
+    esac
+    return 1
 }
 
-echo "==> Collecting dylibs..."
+# LLVM's libc++ / libc++abi / libunwind should NOT be bundled.
+# OpenMM links against them, but macOS ships compatible system versions.
+# We'll rewrite OpenMM to use system libc++ instead.
+is_llvm_cxx_lib() {
+    case "$1" in
+        */llvm/lib/c++/*) return 0 ;;
+        */libc++.1*|*/libc++abi*|*/libunwind*)
+            # Only skip if it's LLVM's copy, not the system one
+            case "$1" in
+                /usr/lib/*) return 1 ;;
+                *llvm*|*homebrew*) return 0 ;;
+            esac
+            ;;
+    esac
+    # Also check @rpath refs that resolve to LLVM's libc++
+    case "$1" in
+        @rpath/libc++.1*|@rpath/libc++abi*|@rpath/libunwind*) return 0 ;;
+    esac
+    return 1
+}
 
-# RDKit libs (from project.yml)
-for lib in \
-    RDKitSmilesParse RDKitGraphMol RDKitRDGeneral \
-    RDKitDistGeomHelpers RDKitDistGeometry \
-    RDKitForceFieldHelpers RDKitForceField \
-    RDKitPartialCharges RDKitDescriptors \
-    RDKitMolTransforms RDKitSubstructMatch \
-    RDKitEigenSolvers RDKitAlignment \
-    RDKitRDGeometryLib RDKitDataStructs \
-    RDKitDepictor RDKitFileParsers \
-    RDKitChemTransforms RDKitFingerprints \
-    RDKitGenericGroups RDKitMolDraw2D \
-    RDKitCIPLabeler RDKitRingDecomposerLib \
-    RDKitOptimizer RDKitRDStreams \
-    RDKitCatalogs RDKitSubgraphs \
-    RDKitMMPA RDKitMolChemicalFeatures \
-    RDKitFMCS RDKitMolStandardize \
-; do
-    add_dylib "$HOMEBREW/lib/lib${lib}.dylib"
-done
+# Known rpath search directories (where @rpath and @loader_path resolve to)
+RPATH_DIRS="/opt/homebrew/lib /opt/homebrew/opt/rdkit/lib /opt/homebrew/opt/boost/lib /opt/homebrew/opt/coordgen/lib /opt/homebrew/opt/maeparser/lib /opt/homebrew/opt/tbb/lib /opt/homebrew/opt/llvm/lib /opt/homebrew/opt/llvm/lib/c++ /opt/homebrew/opt/icu4c@78/lib /opt/homebrew/opt/xz/lib /opt/homebrew/opt/zstd/lib /opt/homebrew/opt/freetype/lib /opt/homebrew/opt/cairo/lib /opt/homebrew/opt/libpng/lib /opt/homebrew/opt/fontconfig/lib /opt/homebrew/opt/libx11/lib /opt/homebrew/opt/libxext/lib /opt/homebrew/opt/libxrender/lib /opt/homebrew/opt/libxcb/lib /opt/homebrew/opt/pixman/lib /opt/homebrew/opt/libxau/lib /opt/homebrew/opt/libxdmcp/lib /opt/homebrew/opt/gettext/lib $PROJECT_DIR/CppCore/build/_deps/openmm-install/lib"
 
-# coordgen + maeparser
-add_dylib "$HOMEBREW/opt/coordgen/lib/libcoordgen.dylib"
-add_dylib "$HOMEBREW/opt/maeparser/lib/libmaeparser.dylib"
+# ── Helper: resolve a dependency path to a real file ──────────
+# Handles /opt/homebrew paths, build paths, etc.
 
-# TBB
-add_dylib "$HOMEBREW/opt/tbb/lib/libtbb.dylib"
+resolve_dep_path() {
+    local dep="$1"
 
-# Boost (serialization, iostreams, random, regex)
-for lib in libboost_serialization libboost_iostreams libboost_random libboost_regex; do
-    add_dylib "$HOMEBREW/opt/boost/lib/${lib}.dylib"
-done
-
-# ICU (needed by boost_iostreams)
-for lib in libicudata.78 libicui18n.78 libicuuc.78; do
-    add_dylib "$HOMEBREW/opt/icu4c@78/lib/${lib}.dylib"
-done
-
-# lzma (needed by boost_iostreams)
-add_dylib "$HOMEBREW/opt/xz/lib/liblzma.5.dylib"
-
-# OpenMM
-if [ -d "$OPENMM_LIB" ]; then
-    for f in "$OPENMM_LIB"/libOpenMM*.dylib; do
-        add_dylib "$f"
-    done
-    # libomp (needed by OpenMM)
-    add_dylib "$HOMEBREW/opt/llvm/lib/libomp.dylib"
-    # LLVM's libc++ (needed by OpenMM)
-    if [ -f "$HOMEBREW/opt/llvm/lib/c++/libc++.1.dylib" ]; then
-        add_dylib "$HOMEBREW/opt/llvm/lib/c++/libc++.1.dylib"
+    # Direct absolute path
+    if [ -f "$dep" ] || [ -L "$dep" ]; then
+        realfile "$dep"
+        return 0
     fi
-fi
 
-# Deduplicate
-sort -u "$DYLIB_LIST" > "${DYLIB_LIST}.dedup"
-mv "${DYLIB_LIST}.dedup" "$DYLIB_LIST"
+    # @rpath or @loader_path — search known directories
+    case "$dep" in
+        @rpath/*|@loader_path/*)
+            local basename_dep
+            basename_dep=$(basename "$dep")
+            for dir in $RPATH_DIRS; do
+                if [ -f "$dir/$basename_dep" ] || [ -L "$dir/$basename_dep" ]; then
+                    realfile "$dir/$basename_dep"
+                    return 0
+                fi
+            done
+            ;;
+    esac
 
-DYLIB_COUNT=$(wc -l < "$DYLIB_LIST" | tr -d ' ')
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────
+# 1. Recursively discover all non-system dylib dependencies
+# ─────────────────────────────────────────────────────────────
+
+echo "==> Discovering dependencies recursively..."
+
+# Seed the queue with the main executable
+echo "$MAIN_EXEC" > "$QUEUE_FILE"
+> "$SEEN_FILE"
+
+collect_deps() {
+    local binary="$1"
+
+    otool -L "$binary" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r dep; do
+        # Skip system libs
+        if is_system_lib "$dep"; then
+            continue
+        fi
+
+        # Skip LLVM's libc++ chain (will rewrite to system libc++ later)
+        if is_llvm_cxx_lib "$dep"; then
+            continue
+        fi
+
+        # Resolve to real file
+        local real=""
+        real=$(resolve_dep_path "$dep" 2>/dev/null || true)
+        if [ -z "$real" ]; then
+            continue
+        fi
+
+        # Skip if already seen
+        if grep -qxF "$real" "$SEEN_FILE" 2>/dev/null; then
+            continue
+        fi
+
+        echo "$real" >> "$SEEN_FILE"
+        echo "$real"
+    done
+}
+
+# BFS: process queue until empty
+iteration=0
+while true; do
+    iteration=$((iteration + 1))
+    new_queue=$(mktemp)
+    found_new=0
+
+    while IFS= read -r binary; do
+        for dep in $(collect_deps "$binary"); do
+            echo "$dep" >> "$new_queue"
+            found_new=1
+        done
+    done < "$QUEUE_FILE"
+
+    if [ "$found_new" -eq 0 ]; then
+        rm -f "$new_queue"
+        break
+    fi
+
+    mv "$new_queue" "$QUEUE_FILE"
+
+    if [ "$iteration" -gt 20 ]; then
+        echo "WARNING: dependency resolution exceeded 20 iterations, stopping"
+        break
+    fi
+done
+
+DYLIB_COUNT=$(wc -l < "$SEEN_FILE" | tr -d ' ')
 echo "  Found $DYLIB_COUNT dylibs to bundle"
 
 # ─────────────────────────────────────────────────────────────
@@ -137,170 +194,209 @@ echo "  Found $DYLIB_COUNT dylibs to bundle"
 
 echo "==> Copying dylibs to Frameworks/..."
 while IFS= read -r dylib; do
-    cp -f "$dylib" "$FRAMEWORKS_DIR/"
-    chmod 755 "$FRAMEWORKS_DIR/$(basename "$dylib")"
-    echo "  $(basename "$dylib")"
-done < "$DYLIB_LIST"
+    dest_name=$(basename "$dylib")
+    cp -f "$dylib" "$FRAMEWORKS_DIR/$dest_name"
+    chmod 755 "$FRAMEWORKS_DIR/$dest_name"
+    echo "  $dest_name"
+done < "$SEEN_FILE"
 
 # ─────────────────────────────────────────────────────────────
-# 3. Rewrite load paths with install_name_tool
+# 3. Create versioned symlinks BEFORE rewriting paths
+#    (so install_name_tool -change can match the target names)
 # ─────────────────────────────────────────────────────────────
 
-echo "==> Rewriting dylib load paths..."
-
-# Helper: rewrite all non-system references in a Mach-O binary
-rewrite_paths() {
-    local binary="$1"
-
-    # Change the install name of the binary itself (if it's a dylib)
-    local current_id
-    current_id=$(otool -D "$binary" 2>/dev/null | tail -1)
-    if [ -n "$current_id" ] && [ "$current_id" != "$binary" ]; then
-        case "$current_id" in
-            *"not an object"*) ;;
-            *)
-                local basename_id
-                basename_id=$(basename "$current_id")
-                install_name_tool -id "@rpath/$basename_id" "$binary" 2>/dev/null || true
-                ;;
-        esac
-    fi
-
-    # Rewrite all dependency paths
-    otool -L "$binary" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r dep; do
-        local dep_basename
-        dep_basename=$(basename "$dep")
-
-        # Skip system libs
-        case "$dep" in
-            /usr/lib/*|/System/*) continue ;;
-        esac
-
-        # If this dep is one of our bundled dylibs, rewrite to @rpath
-        if [ -f "$FRAMEWORKS_DIR/$dep_basename" ]; then
-            install_name_tool -change "$dep" "@rpath/$dep_basename" "$binary" 2>/dev/null || true
-        fi
-
-        # Handle @rpath references with versioned names (e.g. libRDKitFoo.1.dylib)
-        case "$dep" in
-            @rpath/*)
-                if [ ! -f "$FRAMEWORKS_DIR/$dep_basename" ]; then
-                    # Try to find the actual file (strip version number)
-                    local unversioned
-                    unversioned=$(echo "$dep_basename" | sed 's/\.[0-9]*\.dylib/.dylib/')
-                    if [ -f "$FRAMEWORKS_DIR/$unversioned" ]; then
-                        ln -sf "$unversioned" "$FRAMEWORKS_DIR/$dep_basename" 2>/dev/null || true
-                    fi
-                fi
-                ;;
-        esac
-
-        # Handle @loader_path references (e.g., Boost internal refs)
-        case "$dep" in
-            @loader_path/*)
-                if [ -f "$FRAMEWORKS_DIR/$dep_basename" ]; then
-                    install_name_tool -change "$dep" "@rpath/$dep_basename" "$binary" 2>/dev/null || true
-                fi
-                ;;
-        esac
-    done
-}
-
-# Rewrite paths in all bundled dylibs
-for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
-    [ -L "$dylib" ] && continue  # skip symlinks
-    rewrite_paths "$dylib"
-done
-
-# Rewrite paths in the main executable
-MAIN_EXEC="$APP_PATH/Contents/MacOS/Druse"
-if [ -f "$MAIN_EXEC" ]; then
-    rewrite_paths "$MAIN_EXEC"
-
-    # Add @executable_path/../Frameworks as rpath if not already present
-    install_name_tool -add_rpath "@executable_path/../Frameworks" "$MAIN_EXEC" 2>/dev/null || true
-fi
-
-# ─────────────────────────────────────────────────────────────
-# 4. Create versioned symlinks for @rpath references
-# ─────────────────────────────────────────────────────────────
-
-echo "==> Creating versioned symlinks..."
+echo "==> Creating symlinks..."
 cd "$FRAMEWORKS_DIR"
 for dylib in *.dylib; do
-    [ -L "$dylib" ] && continue  # skip existing symlinks
+    [ -L "$dylib" ] && continue
 
-    # RDKit: full-version name like libRDKitFoo.2025.09.6.dylib -> .1.dylib + unversioned
+    # Extract the install name to figure out what symlinks are needed
+    install_id=$(otool -D "$FRAMEWORKS_DIR/$dylib" 2>/dev/null | tail -1)
+    if [ -n "$install_id" ]; then
+        id_base=$(basename "$install_id")
+        if [ "$id_base" != "$dylib" ] && [ ! -e "$id_base" ]; then
+            ln -sf "$dylib" "$id_base"
+            echo "  $id_base -> $dylib"
+        fi
+    fi
+
+    # Also create unversioned symlinks (e.g. libRDKitFoo.dylib -> libRDKitFoo.2025.09.6.dylib)
+    # Strip version numbers: lib<name>.<version>.dylib -> lib<name>.dylib
     case "$dylib" in
         libRDKit*.*.*.*.dylib)
-            short_name=$(echo "$dylib" | sed 's/\.[0-9][0-9]*\.[0-9]*\.[0-9]*\.dylib/.1.dylib/')
             unversioned=$(echo "$dylib" | sed 's/\.[0-9][0-9]*\.[0-9]*\.[0-9]*\.dylib/.dylib/')
-            ln -sf "$dylib" "$short_name" 2>/dev/null || true
-            ln -sf "$dylib" "$unversioned" 2>/dev/null || true
-            echo "  $short_name -> $dylib"
-            ;;
-    esac
-
-    # TBB versioned symlink
-    case "$dylib" in
-        libtbb.12.*.dylib)
-            ln -sf "$dylib" "libtbb.12.dylib" 2>/dev/null || true
-            ln -sf "$dylib" "libtbb.dylib" 2>/dev/null || true
-            ;;
-    esac
-
-    # coordgen versioned symlink
-    case "$dylib" in
-        libcoordgen.3.*.dylib)
-            ln -sf "$dylib" "libcoordgen.3.dylib" 2>/dev/null || true
-            ln -sf "$dylib" "libcoordgen.dylib" 2>/dev/null || true
-            ;;
-    esac
-
-    # maeparser versioned symlink
-    case "$dylib" in
-        libmaeparser.1.*.dylib)
-            ln -sf "$dylib" "libmaeparser.1.dylib" 2>/dev/null || true
-            ln -sf "$dylib" "libmaeparser.dylib" 2>/dev/null || true
+            if [ ! -e "$unversioned" ]; then
+                ln -sf "$dylib" "$unversioned"
+            fi
             ;;
     esac
 done
 cd "$PROJECT_DIR"
 
 # ─────────────────────────────────────────────────────────────
-# 5. Ad-hoc codesign everything
+# 4. Rewrite load paths with install_name_tool
+# ─────────────────────────────────────────────────────────────
+
+echo "==> Rewriting load paths..."
+
+# Build a mapping of original dep path -> @rpath/bundled_name
+# We need to handle cases where the dep is referenced by various paths
+# (absolute, @rpath, @loader_path) but the bundled file may have a
+# different name (versioned vs unversioned).
+
+rewrite_binary() {
+    local binary="$1"
+
+    # Change install name of the dylib itself
+    local current_id
+    current_id=$(otool -D "$binary" 2>/dev/null | tail -1 || true)
+    case "$current_id" in
+        ""|*"not an object"*|*"is not an object"*) ;;
+        *)
+            install_name_tool -id "@rpath/$(basename "$current_id")" "$binary" 2>/dev/null || true
+            ;;
+    esac
+
+    # Rewrite each dependency
+    otool -L "$binary" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r dep; do
+        case "$dep" in
+            /usr/lib/*|/System/*) continue ;;
+        esac
+
+        # Rewrite LLVM's libc++ references to system libc++
+        if is_llvm_cxx_lib "$dep"; then
+            local dep_base
+            dep_base=$(basename "$dep")
+            case "$dep_base" in
+                libc++.1*|libc++.dylib)
+                    install_name_tool -change "$dep" "/usr/lib/libc++.1.dylib" "$binary" 2>/dev/null || true
+                    ;;
+                libc++abi*)
+                    install_name_tool -change "$dep" "/usr/lib/libc++abi.dylib" "$binary" 2>/dev/null || true
+                    ;;
+                libunwind*)
+                    # System libunwind is part of libSystem, no explicit ref needed
+                    # but rewrite to system path just in case
+                    install_name_tool -change "$dep" "/usr/lib/libunwind.dylib" "$binary" 2>/dev/null || true
+                    ;;
+            esac
+            continue
+        fi
+
+        local dep_base
+        dep_base=$(basename "$dep")
+
+        # Check if we have this file (or a symlink to it) in Frameworks
+        if [ -e "$FRAMEWORKS_DIR/$dep_base" ]; then
+            install_name_tool -change "$dep" "@rpath/$dep_base" "$binary" 2>/dev/null || true
+        else
+            # Try to find it by resolving the original path and matching basenames
+            local real_base=""
+            if [ -f "$dep" ] || [ -L "$dep" ]; then
+                real_base=$(basename "$(realfile "$dep")")
+            fi
+            if [ -n "$real_base" ] && [ -e "$FRAMEWORKS_DIR/$real_base" ]; then
+                # Create a symlink for the versioned name too
+                if [ ! -e "$FRAMEWORKS_DIR/$dep_base" ]; then
+                    ln -sf "$real_base" "$FRAMEWORKS_DIR/$dep_base"
+                fi
+                install_name_tool -change "$dep" "@rpath/$dep_base" "$binary" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+# Rewrite the main executable
+rewrite_binary "$MAIN_EXEC"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$MAIN_EXEC" 2>/dev/null || true
+
+# Rewrite all bundled dylibs
+for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
+    [ -L "$dylib" ] && continue
+    rewrite_binary "$dylib"
+done
+
+# ── Second pass: ensure all @rpath refs within dylibs also point
+#    to bundled files (catches cross-references between bundled libs)
+
+echo "==> Verifying cross-references (second pass)..."
+for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
+    [ -L "$dylib" ] && continue
+    otool -L "$dylib" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r dep; do
+        # Skip LLVM libc++ refs (already rewritten to system paths)
+        if is_llvm_cxx_lib "$dep"; then
+            continue
+        fi
+        case "$dep" in
+            @rpath/*)
+                dep_base=$(basename "$dep")
+                if [ ! -e "$FRAMEWORKS_DIR/$dep_base" ]; then
+                    echo "  WARNING: missing @rpath target: $dep_base (from $(basename "$dylib"))"
+                fi
+                ;;
+            /opt/homebrew/*)
+                dep_base=$(basename "$dep")
+                echo "  FIXING: $dep in $(basename "$dylib")"
+                if [ -e "$FRAMEWORKS_DIR/$dep_base" ]; then
+                    install_name_tool -change "$dep" "@rpath/$dep_base" "$dylib" 2>/dev/null || true
+                else
+                    # The file might be under a different versioned name
+                    if [ -f "$dep" ] || [ -L "$dep" ]; then
+                        real_base=$(basename "$(realfile "$dep")")
+                        if [ -e "$FRAMEWORKS_DIR/$real_base" ]; then
+                            ln -sf "$real_base" "$FRAMEWORKS_DIR/$dep_base" 2>/dev/null || true
+                            install_name_tool -change "$dep" "@rpath/$dep_base" "$dylib" 2>/dev/null || true
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    done
+done
+
+# ─────────────────────────────────────────────────────────────
+# 5. Ad-hoc codesign
 # ─────────────────────────────────────────────────────────────
 
 echo "==> Codesigning..."
-# Sign frameworks first, then the app
 for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
-    [ -L "$dylib" ] && continue  # skip symlinks
+    [ -L "$dylib" ] && continue
     codesign --force --sign "$CODESIGN_IDENTITY" "$dylib" 2>/dev/null || true
 done
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH" 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────
-# 6. Verify
+# 6. Final verification
 # ─────────────────────────────────────────────────────────────
 
-echo "==> Verifying bundle..."
-otool -L "$MAIN_EXEC" 2>/dev/null | tail -n +2 | awk '{print $1}' | while IFS= read -r dep; do
-    case "$dep" in
-        /usr/lib/*|/System/*|@rpath/*|@executable_path/*) continue ;;
-        /opt/homebrew/*) echo "  WARNING: unbundled dependency: $dep" ;;
-    esac
+echo "==> Final verification..."
+PROBLEMS=0
+
+# Check main executable
+BAD=$(otool -L "$MAIN_EXEC" 2>/dev/null | awk '{print $1}' | grep "/opt/homebrew" || true)
+if [ -n "$BAD" ]; then
+    echo "  FAIL: main executable still references Homebrew:"
+    echo "$BAD" | sed 's/^/    /'
+    PROBLEMS=1
+fi
+
+# Check all bundled dylibs
+for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
+    [ -L "$dylib" ] && continue
+    BAD=$(otool -L "$dylib" 2>/dev/null | awk '{print $1}' | grep "/opt/homebrew" || true)
+    if [ -n "$BAD" ]; then
+        echo "  FAIL: $(basename "$dylib") still references Homebrew:"
+        echo "$BAD" | sed 's/^/    /'
+        PROBLEMS=1
+    fi
 done
 
-# Also verify a bundled dylib
-echo "  Checking a sample bundled dylib..."
-SAMPLE=$(ls "$FRAMEWORKS_DIR"/libRDKitSmilesParse*.dylib 2>/dev/null | head -1)
-if [ -n "$SAMPLE" ]; then
-    UNBUNDLED=$(otool -L "$SAMPLE" | awk '{print $1}' | grep -c "/opt/homebrew" || true)
-    if [ "$UNBUNDLED" -gt 0 ]; then
-        echo "  WARNING: $UNBUNDLED unbundled references in $(basename "$SAMPLE")"
-    else
-        echo "  OK — no Homebrew references in bundled dylibs"
-    fi
+if [ "$PROBLEMS" -eq 0 ]; then
+    echo "  OK — no Homebrew references remain"
+else
+    echo ""
+    echo "  WARNING: Some Homebrew references remain. The DMG may not be portable."
+    echo "  Re-run to attempt fixing, or inspect manually."
 fi
 
 # ─────────────────────────────────────────────────────────────
@@ -328,6 +424,8 @@ DMG_SIZE=$(du -sh "$DMG_PATH" | awk '{print $1}')
 echo ""
 echo "==> Done! DMG created:"
 echo "    $DMG_PATH ($DMG_SIZE)"
+FWCOUNT=$(ls -1 "$FRAMEWORKS_DIR"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+echo "    Bundled $FWCOUNT dylibs in Frameworks/"
 echo ""
 echo "    To notarize (requires Developer ID):"
 echo "    xcrun notarytool submit $DMG_PATH --apple-id YOU --team-id TEAM --password APP_PWD --wait"

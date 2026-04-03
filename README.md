@@ -36,6 +36,61 @@
 > **Requirements** — macOS 26.0 or later, Apple Silicon (M1 or newer).
 > Download the `.dmg` from [Releases](https://github.com/vitruves/Druse/releases/latest), open it, and drag Druse into Applications.
 
+> **Note** — Druse is currently distributed unsigned. On first launch, macOS Gatekeeper will block the app.
+> Right-click (or Control-click) `Druse.app` and select **Open**, then click **Open** in the confirmation dialog.
+> Alternatively, run `xattr -cr /path/to/Druse.app` in Terminal.
+
+<details>
+<summary><strong>Build from Source</strong></summary>
+
+<br>
+
+**Prerequisites**
+
+- macOS 26.0+, Apple Silicon (M1 or newer)
+- Xcode 26.0+ (with Command Line Tools)
+- [Homebrew](https://brew.sh)
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.35+
+
+**1. Install dependencies**
+
+```bash
+brew install rdkit boost eigen nanoflann tbb
+brew install xcodegen
+```
+
+Optional (for GFN2-xTB quantum refinement):
+```bash
+brew install xtb
+```
+
+**2. Build the C++ core**
+
+```bash
+cd CppCore
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(sysctl -n hw.ncpu)
+cd ../..
+```
+
+OpenMM is fetched and built automatically by CMake. This step may take a few minutes on the first run.
+
+**3. Generate the Xcode project and build**
+
+```bash
+xcodegen generate
+xcodebuild -project Druse.xcodeproj -scheme Druse -configuration Release build
+```
+
+The built app will be in `build/Release/Druse.app` (or under `DerivedData/`).
+
+</details>
+
+<p align="center">
+  <img src="img/menu.png" alt="Druse welcome screen" width="700">
+</p>
+
 <br>
 
 ---
@@ -65,6 +120,10 @@ Druse covers the full structure-based drug discovery workflow in a single applic
 
 ### Load & Prepare
 
+<p align="center">
+  <img src="img/protein.png" alt="Protein structure loaded in Druse" width="700">
+</p>
+
 - **Fetch from RCSB** — Enter a PDB ID and Druse downloads the structure directly
 - **Format support** — PDB, mmCIF, SDF (V2000/V3000), MOL2, SMILES
 - **Protein preparation** — Automated pipeline: water removal, alternate conformer selection, missing atom reconstruction, polar hydrogen addition, H-bond network optimization (Asn/Gln flips, His tautomers), sidechain packing (FASPR with Dunbrack rotamers), and energy minimization
@@ -79,6 +138,10 @@ Druse covers the full structure-based drug discovery workflow in a single applic
 - **Pocket metrics** — Volume (ų), buriedness score, druggability rating, and resident residue identification
 
 ### Dock
+
+<p align="center">
+  <img src="img/ligand.png" alt="Docking configuration with ligand in binding pocket" width="700">
+</p>
 
 - **Genetic Algorithm** — Population-based search with adaptive mutation, crossover, and iterated local search — all on GPU
 - **Fragment-Based Docking** — Hierarchical fragment growth with anchor placement and beam search pruning
@@ -102,9 +165,18 @@ Four scoring functions, each with different strengths:
 
 ### Analyze
 
+<p align="center">
+  <img src="img/docking_result.png" alt="Docking results with electrostatic surface" width="700">
+</p>
+
 - **Pose clustering** — GPU-accelerated pairwise RMSD with hierarchical clustering and consensus pose extraction
 - **Energy decomposition** — Per-term breakdown across all scoring components
 - **Interaction detection** — 10+ interaction types with color-coded 3D visualization and 2D interaction diagrams
+
+<p align="center">
+  <img src="img/diagram.png" alt="2D interaction diagram" width="600">
+</p>
+
 - **Explicit atom rescoring** — Top clusters re-scored against explicit receptor atoms with basin hopping refinement
 - **Strain filtering** — MMFF94 torsion strain penalty to flag unrealistic conformations
 - **GFN2-xTB refinement** — Optional semi-empirical QM post-docking optimization with D4 dispersion and ALPB solvation
@@ -120,8 +192,8 @@ Four scoring functions, each with different strengths:
 Batch-dock up to 100,000 molecules with shared grid reuse and parallel 3D generation.
 
 - **Pre-filtering** — Rotatable bond cutoff, rapid pre-scoring for fast rejection
-- **ADMET filtering** — Lipinski Rule of Five, Veber rules, hERG cardiotoxicity risk, CYP2D6/CYP3A4 inhibition, aqueous solubility (ESOL)
-- **ML re-ranking** — DruseScore, DruseAF v4, or PIGNet2 rescoring of top hits
+- **ADMET filtering** — Lipinski Rule of Five, Veber rules
+- **Multiple scoring functions** — Vina, Drusina, DruseAF v4, or PIGNet2 as the primary scorer
 - **Ranked export** — CSV with full metrics and SDF with posed geometries
 
 <br>
@@ -137,7 +209,7 @@ Generate and evaluate analogs directly inside Druse.
 - **Analog generation** — 18+ curated substitution rules: halogen swaps, alkyl extensions, heteroatom substitutions, aromatic replacements, functional group interchanges, ring size modifications
 - **Property sliders** — Dial in polarity, rigidity, lipophilicity, and size to bias generation toward desired property space
 - **Mini-docking** — Sub-second per-analog docking with RMSD tracking against the parent compound
-- **ADMET gating** — Real-time Lipinski, Veber, hERG, CYP, and solubility checks on every analog
+- **ADMET gating** — Real-time Lipinski and Veber checks on every analog
 - **Trade-off analysis** — Binding affinity vs. ADMET property landscape with Pareto frontier identification
 
 <br>
@@ -205,6 +277,24 @@ Druse runs 20+ specialized Metal compute kernels on Apple Silicon:
 - Impostor sphere/cylinder rendering with depth-correct post-processing
 
 Half-precision grid storage, shared memory tiling, and on-demand rendering keep memory usage low and battery life long.
+
+<br>
+
+---
+
+<br>
+
+## Benchmark
+
+Redocking accuracy on the CASF-2016 benchmark set (Vina scoring, standard preset, ligand-guided pocket):
+
+| Metric | Druse Vina | AutoDock Vina 1.2.7 |
+|---|---|---|
+| Docking power (RMSD < 2.0 A) | 19/26 (73%) | 25/26 (96%) |
+| Scoring power (Pearson r vs pKd) | -0.59 | -0.56 |
+| Avg time / complex | ~14s | ~67s |
+
+Compared on 26 common CASF-2016 complexes (4 failed in AutoDock Vina preparation), Apple M-series chip. Full benchmark scripts in `Benchmark/`.
 
 <br>
 

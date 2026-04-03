@@ -21,6 +21,7 @@ final class DockingEngine {
     var mcPerturbPipeline: MTLComputePipelineState!
     var metropolisAcceptPipeline: MTLComputePipelineState!
     var explicitScorePipeline: MTLComputePipelineState!
+    var decomposeVinaEnergyPipeline: MTLComputePipelineState!
     var localSearchAnalyticalPipeline: MTLComputePipelineState!
     var localSearchAnalyticalSIMDPipeline: MTLComputePipelineState!
     var drusinaScorePipeline: MTLComputePipelineState?
@@ -202,6 +203,7 @@ final class DockingEngine {
             mcPerturbPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "mcPerturb")!)
             metropolisAcceptPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "metropolisAccept")!)
             explicitScorePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "scorePosesExplicit")!)
+            decomposeVinaEnergyPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "decomposeVinaEnergy")!)
             if let drusinaFunc = library.makeFunction(name: "scorePosesDrusina") {
                 drusinaScorePipeline = try device.makeComputePipelineState(function: drusinaFunc)
             }
@@ -296,29 +298,61 @@ final class DockingEngine {
     func vinaProteinAtomType(for atomIndex: Int, in molecule: Molecule) -> Int32 {
         let atom = molecule.atoms[atomIndex]
         let name = atom.name.trimmingCharacters(in: .whitespaces)
-        let res = atom.residueName
-        let donor = hasAttachedHydrogen(atomIndex: atomIndex, in: molecule) ||
-            name == "N" || name == "NZ" || name == "NE" || name == "NH1" || name == "NH2" ||
-            name == "ND2" || name == "NE2"
+        let res = atom.residueName.trimmingCharacters(in: .whitespaces)
+
+        // Vina-aligned atom typing: acceptor/donor from AD type logic.
+        // acceptor = AD_TYPE_OA or AD_TYPE_NA (has lone pair for H-bonding)
+        // donor    = bonded_to_HD (has attached hydrogen)
+        let bondedToH = hasAttachedHydrogen(atomIndex: atomIndex, in: molecule)
 
         switch atom.element {
         case .C:
             return isBondedToHeteroatom(atomIndex: atomIndex, in: molecule) ? vinaTypeID(VINA_C_P) : vinaTypeID(VINA_C_H)
 
         case .N:
-            let acceptor = res == "HIS" && (name == "ND1" || name == "NE2")
-            if donor && acceptor { return vinaTypeID(VINA_N_DA) }
-            if acceptor { return vinaTypeID(VINA_N_A) }
-            if donor { return vinaTypeID(VINA_N_D) }
+            // Vina-aligned: acceptor = has lone pair (AD_TYPE_NA), donor = bonded to H (AD_TYPE_HD).
+            // Use connectivity when bonds are available, fall back to atom name heuristics otherwise.
+            let nAcceptor: Bool
+            if atom.formalCharge > 0 {
+                nAcceptor = false
+            } else {
+                let neighbors = molecule.neighbors(of: atomIndex)
+                if !neighbors.isEmpty {
+                    // Bonds available: acceptor if < 3 heavy neighbors (has lone pair)
+                    let heavyNeighbors = neighbors.filter { molecule.atoms[$0].element != .H }.count
+                    nAcceptor = heavyNeighbors < 3
+                } else {
+                    // No bonds (e.g., PDB without CONECT): use residue-specific rules
+                    // HIS ring N can be acceptor; backbone N and charged sidechains are not
+                    nAcceptor = res == "HIS" && (name == "ND1" || name == "NE2")
+                }
+            }
+            let nDonor: Bool
+            if molecule.bonds.isEmpty {
+                // No bonds: use atom name heuristics for donor status
+                nDonor = name == "N" || name == "NZ" || name == "NE" ||
+                    name == "NH1" || name == "NH2" || name == "ND2" || name == "NE2"
+            } else {
+                nDonor = bondedToH
+            }
+            if nDonor && nAcceptor { return vinaTypeID(VINA_N_DA) }
+            if nAcceptor { return vinaTypeID(VINA_N_A) }
+            if nDonor { return vinaTypeID(VINA_N_D) }
             return vinaTypeID(VINA_N_P)
 
         case .O:
-            let donorO = hasAttachedHydrogen(atomIndex: atomIndex, in: molecule) ||
-                name == "OG" || name == "OG1" || name == "OH"
-            let acceptor = atom.formalCharge <= 0 || name == "O" || name.hasPrefix("OD") || name.hasPrefix("OE")
-            if donorO && acceptor { return vinaTypeID(VINA_O_DA) }
-            if acceptor { return vinaTypeID(VINA_O_A) }
-            if donorO { return vinaTypeID(VINA_O_D) }
+            // AD_TYPE_OA: nearly all oxygens are acceptors (lone pairs).
+            let oAcceptor = atom.formalCharge <= 0
+            let oDonor: Bool
+            if molecule.bonds.isEmpty {
+                // No bonds: use atom name heuristics (hydroxyl groups)
+                oDonor = name == "OG" || name == "OG1" || name == "OH" || name == "OXT"
+            } else {
+                oDonor = bondedToH
+            }
+            if oDonor && oAcceptor { return vinaTypeID(VINA_O_DA) }
+            if oAcceptor { return vinaTypeID(VINA_O_A) }
+            if oDonor { return vinaTypeID(VINA_O_D) }
             return vinaTypeID(VINA_O_P)
 
         case .S:  return vinaTypeID(VINA_S_P)
@@ -326,6 +360,7 @@ final class DockingEngine {
         case .F:  return vinaTypeID(VINA_F_H)
         case .Cl: return vinaTypeID(VINA_Cl_H)
         case .Br: return vinaTypeID(VINA_Br_H)
+
         case .Na, .Mg, .Ca, .Sc, .Ti, .V, .Cr, .Mn, .Fe, .Co, .Ni, .Cu, .Zn:
             return vinaTypeID(VINA_MET_D)
         default:  return vinaTypeID(VINA_OTHER)
@@ -334,38 +369,33 @@ final class DockingEngine {
 
     func fallbackLigandVinaAtomType(for atomIndex: Int, in molecule: Molecule) -> Int32 {
         let atom = molecule.atoms[atomIndex]
-        let donor = hasAttachedHydrogen(atomIndex: atomIndex, in: molecule) ||
-            (atom.element == .N && atom.formalCharge > 0)
-        let acceptor: Bool
-
-        switch atom.element {
-        case .N:
-            let heavyNeighborCount = molecule.neighbors(of: atomIndex).filter { molecule.atoms[$0].element != .H }.count
-            acceptor = atom.formalCharge <= 0 && !donor && heavyNeighborCount < 4
-        case .O:
-            acceptor = atom.formalCharge <= 0
-        default:
-            acceptor = false
-        }
+        let bondedToH = hasAttachedHydrogen(atomIndex: atomIndex, in: molecule)
 
         switch atom.element {
         case .C:
             return isBondedToHeteroatom(atomIndex: atomIndex, in: molecule) ? vinaTypeID(VINA_C_P) : vinaTypeID(VINA_C_H)
         case .N:
-            if donor && acceptor { return vinaTypeID(VINA_N_DA) }
-            if acceptor { return vinaTypeID(VINA_N_A) }
-            if donor { return vinaTypeID(VINA_N_D) }
+            // Vina-aligned: acceptor if has lone pair (< 3 heavy neighbors and not positive)
+            let heavyNeighborCount = molecule.neighbors(of: atomIndex).filter { molecule.atoms[$0].element != .H }.count
+            let nAcceptor = atom.formalCharge <= 0 && heavyNeighborCount < 3
+            let nDonor = bondedToH
+            if nDonor && nAcceptor { return vinaTypeID(VINA_N_DA) }
+            if nAcceptor { return vinaTypeID(VINA_N_A) }
+            if nDonor { return vinaTypeID(VINA_N_D) }
             return vinaTypeID(VINA_N_P)
         case .O:
-            if donor && acceptor { return vinaTypeID(VINA_O_DA) }
-            if acceptor { return vinaTypeID(VINA_O_A) }
-            if donor { return vinaTypeID(VINA_O_D) }
+            let oAcceptor = atom.formalCharge <= 0
+            let oDonor = bondedToH
+            if oDonor && oAcceptor { return vinaTypeID(VINA_O_DA) }
+            if oAcceptor { return vinaTypeID(VINA_O_A) }
+            if oDonor { return vinaTypeID(VINA_O_D) }
             return vinaTypeID(VINA_O_P)
         case .S:  return vinaTypeID(VINA_S_P)
         case .P:  return vinaTypeID(VINA_P_P)
         case .F:  return vinaTypeID(VINA_F_H)
         case .Cl: return vinaTypeID(VINA_Cl_H)
         case .Br: return vinaTypeID(VINA_Br_H)
+
         case .Na, .Mg, .Ca, .Sc, .Ti, .V, .Cr, .Mn, .Fe, .Co, .Ni, .Cu, .Zn:
             return vinaTypeID(VINA_MET_D)
         default:  return vinaTypeID(VINA_OTHER)

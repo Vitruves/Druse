@@ -17,7 +17,7 @@ struct DockingConfig: Sendable {
     var translationStep: Float = 2.0 // Angstroms, aligned with Vina mutation amplitude
     var rotationStep: Float = 0.3    // radians (~17°)
     var torsionStep: Float = 0.8     // radians (~46°) — large enough to escape tangled conformers
-    var mcTemperature: Float = 1.5   // kcal/mol, matches Vina's default Metropolis temperature
+    var mcTemperature: Float = 1.2   // kcal/mol, matches Vina's default Metropolis temperature (RT at ~600K)
     var explicitRerankTopClusters: Int = 12 // top basin representatives rescored against explicit receptor atoms
     var explicitRerankVariantsPerCluster: Int = 4 // seeded local refinement around each top basin representative
     var explicitRerankLocalSearchSteps: Int = 20 // short second-pass refinement on rerank seeds
@@ -49,7 +49,7 @@ struct DockingConfig: Sendable {
     var explorationTranslationStep: Float = 5.0  // wider initial translation (vs 2.0 during refinement)
     var explorationRotationStep: Float = 0.8     // wider initial rotation (vs 0.3)
     var explorationMutationRate: Float = 0.25    // higher mutation during exploration
-    var explorationLocalSearchFrequency: Int = 3  // during exploration, LS every 3rd gen (Lamarckian evolution needs frequent LS)
+    var explorationLocalSearchFrequency: Int = 3  // during exploration, LS every 3rd gen
 
     // Post-docking refinement
     var gfn2Refinement: GFN2RefinementConfig = GFN2RefinementConfig()

@@ -289,6 +289,26 @@ extension AppViewModel {
         // amidinium↔Asp189 ionic interaction that drives binding
         docking.scoringMethod = .drusina
 
+        // Pharmacophore constraint: Nafamostat must form a salt bridge with Asp189
+        // (the S1 specificity pocket floor). This guides the GA toward the correct
+        // binding mode where an amidinium/guanidinium cation contacts the carboxylate.
+        if let protein = molecules.protein,
+           let asp189Idx = protein.residues.firstIndex(where: {
+               $0.name == "ASP" && $0.sequenceNumber == 189
+           }) {
+            let constraint = PharmacophoreConstraintDef(
+                targetScope: .residue,
+                interactionType: .saltBridge,
+                strength: .soft(kcalPerAngstromSq: 5.0),
+                distanceThreshold: 4.0,
+                sourceType: .receptor,
+                residueIndex: asp189Idx,
+                residueName: "ASP 189"
+            )
+            docking.pharmacophoreConstraints = [constraint]
+            log.info("Demo: Added salt bridge constraint → ASP 189 (residue index \(asp189Idx))", category: .dock)
+        }
+
         // Configure docking for VISUAL DEMO — dramatic exploration that still converges.
         // Exploration phase: large jumps for visual movement.
         // Refinement phase: full-strength local search so the ligand reaches the pocket floor.

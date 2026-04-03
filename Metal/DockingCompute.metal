@@ -1039,23 +1039,21 @@ kernel void scorePoses(
     float cPen = evaluateConstraintPenalty(
         positions, ligandAtoms, nA, pharmaConstraints, pharmaParams);
 
-    // Upstream Vina applies the conf-independent torsion term as a smooth divisor:
-    // e / (1 + w_rot * N_tors / 5)
+    // Vina conf-independent: total = (inter + intra_delta) / (1 + w_rot * N_tors / 5)
+    // Intramolecular delta is INSIDE the normalization scope (Vina: conf_independent(inter + intra - ref)).
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
-    float normalizedE = totalIntermolecular * normFactor;
+    float normalizedE = (totalIntermolecular + intraDelta) * normFactor;
 
-    // Store compatibility fields. The typed affinity map contains the full
-    // intermolecular Vina energy before the conf-independent torsion scaling.
     pose.stericEnergy      = totalIntermolecular;
     pose.hydrophobicEnergy = 0.0f;
     pose.hbondEnergy       = 0.0f;
-    pose.torsionPenalty    = normalizedE - totalIntermolecular;
-    pose.clashPenalty      = wPenalty * penalty + intraDelta;
+    pose.torsionPenalty    = normalizedE - totalIntermolecular - intraDelta;
+    pose.clashPenalty      = wPenalty * penalty;
     pose.constraintPenalty = cPen;
 
-    // Total Vina score = normalized intermolecular + boundary penalty + internal + constraint
-    pose.energy = normalizedE + pose.clashPenalty + cPen;
+    // Total Vina score = normalized(inter + intra_delta) + boundary penalty + constraint
+    pose.energy = normalizedE + wPenalty * penalty + cPen;
 }
 
 /// Rescore poses against explicit receptor atoms instead of interpolated affinity maps.
@@ -1137,15 +1135,71 @@ kernel void scorePosesExplicit(
 
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
-    float normalizedE = totalIntermolecular * normFactor;
+    float normalizedE = (totalIntermolecular + intraDelta) * normFactor;
 
     pose.stericEnergy      = totalSteric;
     pose.hydrophobicEnergy = totalHydrophobic;
     pose.hbondEnergy       = totalHBond;
-    pose.torsionPenalty    = normalizedE - totalIntermolecular;
-    pose.clashPenalty      = wPenalty * penalty + intraDelta;
+    pose.torsionPenalty    = normalizedE - totalIntermolecular - intraDelta;
+    pose.clashPenalty      = wPenalty * penalty;
     pose.constraintPenalty = cPen;
-    pose.energy            = normalizedE + pose.clashPenalty + cPen;
+    pose.energy            = normalizedE + wPenalty * penalty + cPen;
+}
+
+/// Decompose the Vina intermolecular energy of scored poses into steric, hydrophobic,
+/// and H-bond components via explicit pair evaluation.  Only writes the three
+/// decomposition fields — total energy and all other fields are left untouched.
+/// Intended to run once on the final population after grid-based scoring.
+kernel void decomposeVinaEnergy(
+    device DockPose            *poses         [[buffer(0)]],
+    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
+    constant GridProteinAtom   *proteinAtoms  [[buffer(2)]],
+    constant GridParams        &gridParams    [[buffer(3)]],
+    constant GAParams          &gaParams      [[buffer(4)]],
+    constant TorsionEdge       *torsionEdges  [[buffer(5)]],
+    constant int32_t           *movingIndices [[buffer(6)]],
+    uint                        tid           [[thread_position_in_grid]],
+    uint                        simdLane      [[thread_index_in_simdgroup]])
+{
+    uint simdSize = 32u;
+    uint poseIdx = tid / simdSize;
+    if (poseIdx >= gaParams.populationSize) return;
+
+    device DockPose &pose = poses[poseIdx];
+    uint nAtoms = min(gaParams.numLigandAtoms, 128u);
+    uint nTorsions = min(gaParams.numTorsions, 32u);
+
+    float3 positions[128];
+    transformAtoms(positions, ligandAtoms, nAtoms, pose, torsionEdges, movingIndices, nTorsions);
+
+    float totalSteric = 0.0f;
+    float totalHydrophobic = 0.0f;
+    float totalHBond = 0.0f;
+
+    for (uint a = 0; a < nAtoms; a++) {
+        float3 r = positions[a];
+        float laneSteric = 0.0f;
+        float laneHydrophobic = 0.0f;
+        float laneHBond = 0.0f;
+        for (uint p = simdLane; p < gridParams.numProteinAtoms; p += simdSize) {
+            float dist = distance(r, proteinAtoms[p].position);
+            if (dist < 8.0f) {
+                VinaTerms terms = vinaPairEnergyDecomposed(ligandAtoms[a].vinaType, proteinAtoms[p].vinaType, dist);
+                laneSteric += terms.steric;
+                laneHydrophobic += terms.hydrophobic;
+                laneHBond += terms.hbond;
+            }
+        }
+        totalSteric += simd_sum(laneSteric);
+        totalHydrophobic += simd_sum(laneHydrophobic);
+        totalHBond += simd_sum(laneHBond);
+    }
+
+    if (simdLane != 0) return;
+
+    pose.stericEnergy      = totalSteric;
+    pose.hydrophobicEnergy = totalHydrophobic;
+    pose.hbondEnergy       = totalHBond;
 }
 
 // ============================================================================
@@ -1794,7 +1848,7 @@ kernel void scorePosesDrusina(
         - gaParams.referenceIntraEnergy;
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
-    float normalizedE = totalIntermolecular * normFactor;
+    float normalizedE = (totalIntermolecular + intraDelta) * normFactor;
 
     // --- Drusina corrections (soft gate: only attenuates for clashing poses) ---
     DrusinaDecomposition decomp = computeDrusinaCorrections(
@@ -1808,15 +1862,15 @@ kernel void scorePosesDrusina(
     pose.stericEnergy      = totalIntermolecular;
     pose.hydrophobicEnergy = 0.0f;
     pose.hbondEnergy       = 0.0f;
-    pose.torsionPenalty    = normalizedE - totalIntermolecular;
-    pose.clashPenalty      = wPenalty * penalty + intraDelta;
+    pose.torsionPenalty    = normalizedE - totalIntermolecular - intraDelta;
+    pose.clashPenalty      = wPenalty * penalty;
 
     // Soft gate: full contribution for vinaE < 0, attenuated for clashing poses
     float vinaQuality = drusinaVinaQuality(normalizedE, drusinaParams);
     float drusinaE = decomp.total * vinaQuality;
 
     pose.drusinaCorrection = drusinaE;
-    pose.energy = normalizedE + pose.clashPenalty + drusinaE;
+    pose.energy = normalizedE + wPenalty * penalty + drusinaE;
 }
 
 /// Apply Drusina corrections to already-scored poses (e.g., after explicit Vina rescoring).
@@ -2072,18 +2126,21 @@ kernel void initializePopulation(
 {
     if (tid >= gaParams.populationSize) return;
 
-    uint seed = tid * 747796405u + gaParams.generation * 2891336453u + 67890u;
+    // Per-run seed ensures truly independent MC trajectories.
+    uint seed = tid * 747796405u + gaParams.runSeed * 2891336453u + 67890u;
     uint popSize = gaParams.populationSize;
     float3 center = gridParams.searchCenter;
     float3 halfExtent = gridParams.searchHalfExtent;
 
     float3 searchSize = halfExtent * 2.0f;
     float minDim = min(searchSize.x, min(searchSize.y, searchSize.z));
-    float focusSpread = min(minDim * 0.5f, 12.0f);
+    float focusSpread = min(minDim * 0.45f, 10.0f);
 
-    // --- Translation: focused near pocket center for all tiers ---
+    // --- Translation: 60% focused near center, 40% full box ---
+    // GPU parallelism (200 poses) compensates for less steps per trajectory vs Vina,
+    // so we keep moderate focus but ensure broad coverage.
     float3 spread;
-    if (tid < popSize * 8 / 10) {
+    if (tid < popSize * 6 / 10) {
         spread = float3(focusSpread);
     } else {
         spread = halfExtent;
@@ -2095,7 +2152,7 @@ kernel void initializePopulation(
         (gpuRandom(seed, 2) * 2.0f - 1.0f) * spread.z
     );
 
-    // --- Rotation: uniform random quaternion (Shoemake method) for all tiers ---
+    // --- Rotation: uniform random quaternion (Shoemake method) ---
     float u1 = gpuRandom(seed, 3);
     float u2 = gpuRandom(seed, 4) * 2.0f * M_PI_F;
     float u3 = gpuRandom(seed, 5) * 2.0f * M_PI_F;
@@ -2103,28 +2160,16 @@ kernel void initializePopulation(
     float sq2 = sqrt(u1);
     poses[tid].rotation = float4(sq1 * sin(u2), sq1 * cos(u2), sq2 * sin(u3), sq2 * cos(u3));
 
-    // --- Torsions: three-tier seeding strategy ---
-    uint tier1End = popSize * 3 / 10;   // 30% reference conformer (torsions=0)
-    uint tier2End = popSize * 6 / 10;   // 30% near-reference (small noise)
+    // --- Torsions: two-tier strategy ---
+    // Tier 1 (20%): reference conformer (torsions=0) for fast convergence near input geometry
+    // Tier 2 (80%): fully random for broad exploration (Vina-aligned)
+    uint tier1End = popSize / 5;   // 20% reference conformer
 
     if (tid < tier1End) {
-        // Tier 1: Exact RDKit reference conformer — torsions = 0
         for (uint t = 0; t < gaParams.numTorsions; t++) {
             poses[tid].torsions[t] = 0.0f;
         }
-    } else if (tid < tier2End) {
-        // Tier 2: Reference torsions + Gaussian noise (σ ≈ 30° = 0.52 rad)
-        // Box-Muller for approximate Gaussian from uniform random
-        for (uint t = 0; t < gaParams.numTorsions; t++) {
-            float u = max(gpuRandom(seed, 40 + t * 2), 1e-6f);
-            float v = gpuRandom(seed, 41 + t * 2) * 2.0f * M_PI_F;
-            float noise = sqrt(-2.0f * log(u)) * cos(v) * 0.52f;
-            poses[tid].torsions[t] = noise;
-            if (poses[tid].torsions[t] > M_PI_F) poses[tid].torsions[t] -= 2.0f * M_PI_F;
-            if (poses[tid].torsions[t] < -M_PI_F) poses[tid].torsions[t] += 2.0f * M_PI_F;
-        }
     } else {
-        // Tier 3: Fully random torsions for exploration
         for (uint t = 0; t < gaParams.numTorsions; t++) {
             poses[tid].torsions[t] = gpuRandom(seed, 6 + t) * 2.0f * M_PI_F - M_PI_F;
         }
@@ -2159,7 +2204,7 @@ kernel void gaEvolve(
 {
     if (tid >= gaParams.populationSize) return;
 
-    uint seed = tid * 31337u + gaParams.generation * 99991u;
+    uint seed = tid * 31337u + gaParams.generation * 99991u + gaParams.runSeed * 777767u;
     uint popSize = gaParams.populationSize;
 
     // Tournament selection (k=3) for two parents
@@ -2216,9 +2261,9 @@ kernel void gaEvolve(
     float3 searchMin = searchCenter - searchHalfExtent;
     float3 searchMax = searchCenter + searchHalfExtent;
 
-    // Diversity injection: reinitialize bottom 10% with random poses every 8 generations.
-    bool doInject = (gaParams.generation % 8 == 0) && (gaParams.generation > 0);
-    uint injectThreshold = popSize - max(popSize / 10, 3u);  // bottom 10%
+    // Diversity injection: reinitialize bottom 20% with random poses every 5 generations.
+    bool doInject = (gaParams.generation % 5 == 0) && (gaParams.generation > 0);
+    uint injectThreshold = popSize - max(popSize / 5, 6u);  // bottom 20%
     if (doInject && tid >= injectThreshold) {
         child.translation = searchCenter + float3(
             (gpuRandom(seed, 80) * 2.0f - 1.0f) * searchHalfExtent.x,
@@ -2336,7 +2381,7 @@ inline float vinaScorePositions(
 
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
-    return totalIntermolecular * normFactor + wPenalty * penalty + intraDelta;
+    return (totalIntermolecular + intraDelta) * normFactor + wPenalty * penalty;
 }
 
 /// Steepest descent local search (Lamarckian refinement).
@@ -2396,7 +2441,7 @@ inline float evaluatePose(
 
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
-    return totalIntermolecular * normFactor + wPenalty * boundaryPenalty + intraDelta;
+    return (totalIntermolecular + intraDelta) * normFactor + wPenalty * boundaryPenalty;
 }
 
 /// Constrained version of evaluatePose: includes pharmacophore penalty.
@@ -2452,7 +2497,7 @@ inline float evaluatePoseConstrained(
 
     float nRotF = float(nTorsions);
     float normFactor = 1.0f / (1.0f + wRotEntropy * nRotF / 5.0f);
-    return totalIntermolecular * normFactor + wPenalty * boundaryPenalty + intraDelta + constraintPen;
+    return (totalIntermolecular + intraDelta) * normFactor + wPenalty * boundaryPenalty + constraintPen;
 }
 
 /// Monte Carlo perturbation: randomly perturb translation, rotation, and torsions.
@@ -2466,7 +2511,7 @@ kernel void mcPerturb(
 {
     if (tid >= gaParams.populationSize) return;
 
-    uint seed = tid * 314159u + gaParams.generation * 271828u + 42u;
+    uint seed = tid * 314159u + gaParams.generation * 271828u + gaParams.runSeed * 999983u + 42u;
     device const DockPose &src = current[tid];
     device DockPose &dst = perturbed[tid];
 
@@ -2540,7 +2585,7 @@ kernel void metropolisAccept(
         } else {
             float temperature = max(gaParams.mcTemperature, 1e-4f);
             float acceptance = exp((cur.energy - cand.energy) / temperature);
-            uint seed = tid * 92837111u + gaParams.generation * 689287499u + 17u;
+            uint seed = tid * 92837111u + gaParams.generation * 689287499u + gaParams.runSeed * 1299827u + 17u;
             accept = gpuRandom(seed, 0) < min(acceptance, 1.0f);
         }
     }
@@ -2825,7 +2870,7 @@ inline float evaluatePoseWithGradient(
         for (uint a = 0; a < nA; a++) forces[a] -= intraGrad[a];  // force = -gradient
     }
     float intraDelta = intraE - referenceIntraEnergy;
-    float totalEnergy = totalIntermolecular * normFactor + intraDelta;
+    float totalEnergy = (totalIntermolecular + intraDelta) * normFactor;
 
     // --- Torsion derivatives via force/torque accumulation (Vina algorithm) ---
     // Process torsions leaf→root. For each torsion:
@@ -3155,7 +3200,7 @@ kernel void localSearchAnalyticalSIMD(
         intraE = simd_broadcast_first(intraE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float totalEnergy = totalIntermolecular * normFactor + intraE - gaParams.referenceIntraEnergy;
+        float totalEnergy = (totalIntermolecular + intraE - gaParams.referenceIntraEnergy) * normFactor;
 
         // === Torsion gradients (parallel per torsion's moving atoms) ===
         float gradTor[32];
