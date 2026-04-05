@@ -39,6 +39,14 @@ struct PharmacophoreEditorView: View {
     @State private var isDetecting: Bool = false
     @State private var featureOverlays: [FeatureOverlay] = []
 
+    // Draw mode
+    @State private var showDrawer: Bool = false
+    @State private var drawnSmarts: String = ""
+    @State private var drawValidated: Bool = false
+
+    // Multi-select
+    @State private var pendingMultiSelect: [Int] = []
+
     // View state
     @State private var hoveredAtom: Int? = nil
 
@@ -46,6 +54,7 @@ struct PharmacophoreEditorView: View {
         case singleLigand = "Single Ligand"
         case commonScaffold = "Common Scaffold"
         case smiles = "SMILES"
+        case draw = "Draw"
     }
 
     struct PharmaFeature: Identifiable {
@@ -131,7 +140,17 @@ struct PharmacophoreEditorView: View {
         ZStack {
             Color(nsColor: .controlBackgroundColor)
 
-            if let coords = coords2D {
+            if sourceMode == .draw && !drawValidated {
+                ChemDrawerView(
+                    initialSmiles: activeSmiles.isEmpty ? nil : activeSmiles,
+                    mode: .scaffold
+                ) { smiles, smarts in
+                    if !smiles.isEmpty {
+                        activeSmiles = smiles
+                        drawnSmarts = smarts
+                    }
+                }
+            } else if let coords = coords2D {
                 GeometryReader { geo in
                     let tx = StructureTransform(positions: coords.positions, viewSize: geo.size, padding: 44)
                     ZStack {
@@ -153,9 +172,31 @@ struct PharmacophoreEditorView: View {
                                     .fill(Color.clear)
                                     .frame(width: 34, height: 34)
                                     .contentShape(Circle())
-                                    .onTapGesture { handleAtomClick(idx) }
+                                    .onTapGesture {
+                                        let shiftHeld = NSEvent.modifierFlags.contains(.shift)
+                                        if shiftHeld {
+                                            handleShiftClick(idx)
+                                        } else {
+                                            if !pendingMultiSelect.isEmpty {
+                                                commitMultiSelect()
+                                            }
+                                            handleAtomClick(idx)
+                                        }
+                                    }
                                     .onHover { h in hoveredAtom = h ? idx : nil }
                                     .position(x: pos.x, y: pos.y)
+                            }
+                        }
+
+                        // Multi-select highlight
+                        ForEach(pendingMultiSelect, id: \.self) { idx in
+                            if idx < coords.positions.count {
+                                let pos = tx.toView(coords.positions[idx])
+                                Circle()
+                                    .stroke(Color.orange, lineWidth: 2.5)
+                                    .frame(width: 30, height: 30)
+                                    .position(x: pos.x, y: pos.y)
+                                    .allowsHitTesting(false)
                             }
                         }
 
@@ -163,8 +204,11 @@ struct PharmacophoreEditorView: View {
                         if let idx = hoveredAtom, idx < coords.positions.count {
                             let pos = tx.toView(coords.positions[idx])
                             let hasFeature = featureForAtom(idx) != nil
+                            let inMultiSelect = pendingMultiSelect.contains(idx)
                             Circle()
-                                .stroke(hasFeature ? Color.red.opacity(0.6) : Color.white.opacity(0.5), lineWidth: 2)
+                                .stroke(hasFeature ? Color.red.opacity(0.6)
+                                        : inMultiSelect ? Color.orange.opacity(0.8)
+                                        : Color.white.opacity(0.5), lineWidth: 2)
                                 .frame(width: 28, height: 28)
                                 .position(x: pos.x, y: pos.y)
                                 .allowsHitTesting(false)
@@ -201,7 +245,21 @@ struct PharmacophoreEditorView: View {
 
     @ViewBuilder
     private var statusBar: some View {
-        if let idx = hoveredAtom, let coords = coords2D, idx < coords.atomicNums.count {
+        if !pendingMultiSelect.isEmpty {
+            HStack(spacing: 10) {
+                Image(systemName: "rectangle.dashed.badge.record").foregroundStyle(.orange)
+                Text("\(pendingMultiSelect.count) atom\(pendingMultiSelect.count == 1 ? "" : "s") selected")
+                    .fontWeight(.medium).foregroundStyle(.orange)
+                Text("shift+click to add more, click to confirm group")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.system(size: 10))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .padding(.bottom, 8)
+        } else if let idx = hoveredAtom, let coords = coords2D, idx < coords.atomicNums.count {
             let elem = Element(rawValue: coords.atomicNums[idx]) ?? .C
             let existing = featureForAtom(idx)
             let isScaffold = mcsMatchedAtoms.isEmpty || mcsMatchedAtoms.contains(idx)
@@ -224,7 +282,7 @@ struct PharmacophoreEditorView: View {
                         Text("(click to remove)").foregroundStyle(.red)
                     }
                 } else {
-                    Text("click to add").foregroundStyle(.secondary)
+                    Text("click to add \u{2022} shift+click for group").foregroundStyle(.secondary)
                 }
             }
             .font(.system(size: 10))
@@ -261,6 +319,7 @@ struct PharmacophoreEditorView: View {
         case .singleLigand: singleLigandPanel
         case .commonScaffold: commonScaffoldPanel
         case .smiles: smilesPanel
+        case .draw: drawPanel
         }
     }
 
@@ -396,11 +455,118 @@ struct PharmacophoreEditorView: View {
         }
     }
 
+    @ViewBuilder
+    private var drawPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if drawValidated {
+                // After validation — show structure info and allow editing back
+                Label("Drawn Structure", systemImage: "pencil.and.outline")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
+                        Text("Structure validated").font(.caption.weight(.medium))
+                    }
+                    Text(activeSmiles)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                    if !drawnSmarts.isEmpty {
+                        HStack(spacing: 3) {
+                            Text("SMARTS:").font(.system(size: 9, weight: .semibold)).foregroundStyle(.purple)
+                            Text(drawnSmarts)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(2)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
+                Button {
+                    drawValidated = false
+                    features = []; featureOverlays = []; selectedFeatureID = nil
+                    pendingMultiSelect = []
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "pencil")
+                        Text("Edit in Drawer")
+                    }
+                    .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
+                }
+                .buttonStyle(.bordered).controlSize(.small)
+            } else {
+                // Before validation — drawing mode
+                Label("Draw Scaffold", systemImage: "pencil.and.outline")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+
+                Text("Draw a chemical scaffold in the editor.\nThe structure will be used as a SMARTS query for pharmacophore enforcement.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+
+                if !activeSmiles.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
+                            Text("Structure loaded").font(.caption.weight(.medium))
+                        }
+                        Text(activeSmiles)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Button {
+                    validateDrawnStructure()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "checkmark.shield")
+                        Text("Validate Structure")
+                    }
+                    .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
+                }
+                .buttonStyle(.borderedProminent).controlSize(.small)
+                .disabled(activeSmiles.isEmpty)
+            }
+        }
+    }
+
     // MARK: Tools
 
     @ViewBuilder
     private var toolsPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Multi-select confirmation bar
+            if !pendingMultiSelect.isEmpty {
+                HStack(spacing: 4) {
+                    Button {
+                        commitMultiSelect()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "checkmark.circle.fill")
+                            Text("Confirm Group (\(pendingMultiSelect.count))")
+                        }
+                        .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
+                    }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+                    .tint(.orange)
+
+                    Button {
+                        pendingMultiSelect = []
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "xmark")
+                            Text("Cancel")
+                        }
+                        .font(.system(size: 10)).padding(.vertical, 2)
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+
             HStack(spacing: 4) {
                 Button {
                     autoDetectFeatures()
@@ -417,11 +583,12 @@ struct PharmacophoreEditorView: View {
 
                 Button {
                     features.removeAll(); featureOverlays = []; selectedFeatureID = nil
+                    pendingMultiSelect = []
                 } label: {
                     HStack(spacing: 3) { Image(systemName: "trash"); Text("Clear All") }
                     .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
                 }
-                .buttonStyle(.bordered).controlSize(.small).disabled(features.isEmpty)
+                .buttonStyle(.bordered).controlSize(.small).disabled(features.isEmpty && pendingMultiSelect.isEmpty)
             }
 
             if !featureOverlays.isEmpty { featureLegend }
@@ -625,6 +792,7 @@ struct PharmacophoreEditorView: View {
     private func drawBonds(ctx: GraphicsContext, tx: StructureTransform) {
         guard let coords = coords2D else { return }
         let scaffoldDim = !mcsMatchedAtoms.isEmpty && showOnlyScaffold
+
         for (a1, a2, order) in coords.bonds {
             guard a1 < coords.positions.count, a2 < coords.positions.count else { continue }
             let p1 = tx.toView(coords.positions[a1])
@@ -656,12 +824,6 @@ struct PharmacophoreEditorView: View {
                 var p = Path()
                 p.move(to: p1); p.addLine(to: p2)
                 ctx.stroke(p, with: .color(color), lineWidth: 2.0)
-                if order == 4 {
-                    var d = Path()
-                    d.move(to: p1); d.addLine(to: p2)
-                    ctx.stroke(d, with: .color(color.opacity(0.4)),
-                               style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                }
             }
         }
     }
@@ -729,8 +891,11 @@ struct PharmacophoreEditorView: View {
     private func findAromaticRing(containing atomIdx: Int) -> [Int]? {
         guard let coords = coords2D else { return nil }
 
+        // Build adjacency from bonds between aromatic atoms
         var adj: [Int: Set<Int>] = [:]
-        for (a1, a2, order) in coords.bonds where order == 4 {
+        for (a1, a2, _) in coords.bonds {
+            guard a1 < coords.isAromatic.count, a2 < coords.isAromatic.count,
+                  coords.isAromatic[a1], coords.isAromatic[a2] else { continue }
             adj[a1, default: []].insert(a2)
             adj[a2, default: []].insert(a1)
         }
@@ -758,8 +923,8 @@ struct PharmacophoreEditorView: View {
     }
 
     private func atomHasAromaticBond(_ idx: Int) -> Bool {
-        guard let coords = coords2D else { return false }
-        return coords.bonds.contains { ($0.0 == idx || $0.1 == idx) && $0.2 == 4 }
+        guard let coords = coords2D, idx < coords.isAromatic.count else { return false }
+        return coords.isAromatic[idx]
     }
 
     // =========================================================================
@@ -770,6 +935,19 @@ struct PharmacophoreEditorView: View {
         coords2D = nil; features = []; featureOverlays = []
         mcsSmarts = nil; mcsMatchedAtoms = []; errorMessage = nil
         hoveredAtom = nil; selectedFeatureID = nil
+        drawValidated = false; pendingMultiSelect = []
+    }
+
+    private func validateDrawnStructure() {
+        guard !activeSmiles.isEmpty else { return }
+        guard let c = RDKitBridge.compute2DCoords(smiles: activeSmiles) else {
+            errorMessage = "Invalid structure — could not compute 2D layout"
+            return
+        }
+        coords2D = c
+        features = []; featureOverlays = []; selectedFeatureID = nil
+        pendingMultiSelect = []
+        drawValidated = true
     }
 
     private func loadStructure(smiles: String) {
@@ -807,6 +985,34 @@ struct PharmacophoreEditorView: View {
         let name = "F\(nextFeatureNumber())"
         features.append(PharmaFeature(name: name, expression: expressionLabel(type), type: type, atomIndices: [idx]))
         selectedFeatureID = features.last?.id
+    }
+
+    private func handleShiftClick(_ idx: Int) {
+        // Toggle atom in/out of pending multi-select group
+        if let existing = pendingMultiSelect.firstIndex(of: idx) {
+            pendingMultiSelect.remove(at: existing)
+        } else {
+            // Don't add atoms that already belong to a feature
+            guard !features.contains(where: { $0.atomIndices.contains(idx) }) else { return }
+            pendingMultiSelect.append(idx)
+        }
+    }
+
+    private func commitMultiSelect() {
+        guard pendingMultiSelect.count >= 1 else { return }
+        // Determine the best type for the group
+        let type: ConstraintInteractionType
+        if pendingMultiSelect.count == 1 {
+            type = suggestedType(for: pendingMultiSelect[0])
+        } else {
+            // Multi-atom: default to hydrophobic (common for multi-select use case)
+            type = .hydrophobic
+        }
+        let name = "F\(nextFeatureNumber())"
+        features.append(PharmaFeature(name: name, expression: expressionLabel(type), type: type,
+                                       atomIndices: pendingMultiSelect))
+        selectedFeatureID = features.last?.id
+        pendingMultiSelect = []
     }
 
     private func findMCS() {

@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/Platform-macOS_26+-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Chip-Apple_Silicon-333333?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/GPU-Metal_3-8A2BE2?style=flat-square" alt="Metal">
-  <img src="https://img.shields.io/badge/Version-0.1.16--beta-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-0.1.18--beta-blue?style=flat-square" alt="Version">
 </p>
 
 <p align="center">

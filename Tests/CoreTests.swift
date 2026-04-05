@@ -48,7 +48,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testGasteigerCharges() {
-        let (mol, _, err) = RDKitBridge.prepareLigand(
+        let (mol, _, _, err) = RDKitBridge.prepareLigand(
             smiles: "CC(=O)O", name: "AceticAcid", numConformers: 1, computeCharges: true)
         XCTAssertNil(err)
         guard let m = mol else { XCTFail("Prep failed"); return }

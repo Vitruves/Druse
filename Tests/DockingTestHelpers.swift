@@ -410,7 +410,7 @@ class DockingTestCase: XCTestCase {
 
         // Regenerate ligand from SMILES
         print("  [\(pdbID)] Regenerating \(ligandName) from SMILES: \(smiles.prefix(60))...")
-        let (regen, _, err) = RDKitBridge.prepareLigand(
+        let (regen, _, _, err) = RDKitBridge.prepareLigand(
             smiles: smiles, name: "\(ligandName)_regen",
             addHydrogens: false, minimize: true, computeCharges: true)
         if let err { print("  [\(pdbID)] RDKit error: \(err)") }

@@ -42,18 +42,40 @@ enum FileImportHandler {
 
     /// Open panel specifically for SMILES/CSV batch files.
     @MainActor
-    static func showBatchOpenPanel() -> URL? {
+    static func showBatchOpenPanel(fileType: ImportFileType? = nil) -> URL? {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [
-            UTType(filenameExtension: "smi"),
-            UTType(filenameExtension: "csv"),
-            UTType(filenameExtension: "tsv"),
-            UTType(filenameExtension: "txt"),
-            UTType(filenameExtension: "sdf"),
-        ].compactMap { $0 }
+        switch fileType {
+        case .smi:
+            panel.allowedContentTypes = [
+                UTType(filenameExtension: "smi"),
+                UTType(filenameExtension: "smiles"),
+            ].compactMap { $0 }
+            panel.message = "Select a SMILES file (.smi)"
+        case .csv:
+            panel.allowedContentTypes = [
+                UTType(filenameExtension: "csv"),
+                UTType(filenameExtension: "tsv"),
+                UTType(filenameExtension: "txt"),
+            ].compactMap { $0 }
+            panel.message = "Select a CSV or TSV file"
+        case .sdf:
+            panel.allowedContentTypes = [
+                UTType(filenameExtension: "sdf"),
+                UTType(filenameExtension: "sd"),
+            ].compactMap { $0 }
+            panel.message = "Select an SDF file (.sdf)"
+        case nil:
+            panel.allowedContentTypes = [
+                UTType(filenameExtension: "smi"),
+                UTType(filenameExtension: "csv"),
+                UTType(filenameExtension: "tsv"),
+                UTType(filenameExtension: "txt"),
+                UTType(filenameExtension: "sdf"),
+            ].compactMap { $0 }
+            panel.message = "Select a SMILES (.smi), CSV, or SDF file"
+        }
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.message = "Select a SMILES (.smi), CSV, or SDF file"
         panel.prompt = "Import"
 
         guard panel.runModal() == .OK else { return nil }

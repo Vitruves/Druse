@@ -40,13 +40,20 @@ Druse2DResult* druse_compute_2d_coords(const char *smiles) {
         res->atomCount = natoms;
         res->coords = new float[natoms * 2];   // flat [x0, y0, x1, y1, ...]
         res->atomicNums = new int32_t[natoms];
+        res->isAromatic = new bool[natoms];
 
+        // Capture aromaticity BEFORE Kekulization (which clears aromatic flags)
         for (int i = 0; i < natoms; i++) {
             const auto &pos = conf.getAtomPos(i);
             res->coords[i * 2]     = (float)pos.x;
             res->coords[i * 2 + 1] = (float)pos.y;
             res->atomicNums[i] = mol->getAtomWithIdx(i)->getAtomicNum();
+            res->isAromatic[i] = mol->getAtomWithIdx(i)->getIsAromatic();
         }
+
+        // Kekulize to get alternating single/double bonds for aromatic rings
+        // (standard chemistry depiction instead of bond order 4)
+        MolOps::Kekulize(*mol);
 
         // Bonds
         int nbonds = (int)mol->getNumBonds();
@@ -77,6 +84,7 @@ void druse_free_2d_result(Druse2DResult *result) {
     if (!result) return;
     delete[] result->coords;
     delete[] result->atomicNums;
+    delete[] result->isAromatic;
     delete[] result->bonds;
     delete result;
 }

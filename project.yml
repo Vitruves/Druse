@@ -38,6 +38,9 @@ targets:
       - path: Resources/Assets.xcassets
       - path: Resources/dun2010bbdep.bin
         buildPhase: resources
+      - path: Resources/Ketcher/standalone
+        buildPhase: resources
+        type: folder
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.druse.app

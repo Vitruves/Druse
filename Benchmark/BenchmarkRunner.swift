@@ -233,7 +233,7 @@ final class BenchmarkRunner: XCTestCase {
 
     @MainActor
     private func prepareBenchmarkLigand(from complex: CASFComplex) throws -> Molecule {
-        let (prepared, _, error) = RDKitBridge.prepareLigand(
+        let (prepared, _, _, error) = RDKitBridge.prepareLigand(
             smiles: complex.smiles,
             name: complex.pdbId,
             numConformers: 1,

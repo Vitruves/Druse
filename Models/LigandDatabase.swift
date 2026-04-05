@@ -143,6 +143,11 @@ final class LigandDatabase {
         return entries.filter { $0.parentName == pn && $0.id != entry.id }
     }
 
+    /// Whether this entry has enumerated children in the database.
+    func hasEnumeratedChildren(_ entry: LigandEntry) -> Bool {
+        entries.contains { $0.parentName == entry.name }
+    }
+
     /// Remove an entry and all its enumerated siblings (same parentName).
     func removeWithSiblings(parentName: String) {
         entries.removeAll { $0.parentName == parentName }
@@ -215,7 +220,7 @@ final class LigandDatabase {
         let name = entries[index].name
 
         Task {
-            let (mol, desc, error) = await Task.detached {
+            let (mol, desc, canonSMILES, error) = await Task.detached {
                 RDKitBridge.prepareLigand(smiles: smiles, name: name,
                                           addHydrogens: addH, minimize: minimize, computeCharges: charges)
             }.value
@@ -227,6 +232,7 @@ final class LigandDatabase {
                 entries[index].isPrepared = true
                 entries[index].preparationDate = Date()
                 entries[index].conformerCount = 1
+                if let canonSMILES { entries[index].originalSMILES = canonSMILES }
             }
             if let error {
                 ActivityLog.shared.error("Failed to prepare \(name): \(error)", category: .prep)

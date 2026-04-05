@@ -10,7 +10,7 @@ extension LigandDatabaseWindow {
     // MARK: - Import with Column Mapping
 
     func openImportWithMapping(_ fileType: ImportFileType) {
-        guard let url = FileImportHandler.showBatchOpenPanel() else { return }
+        guard let url = FileImportHandler.showBatchOpenPanel(fileType: fileType) else { return }
         do {
             let preview = try buildImportPreview(url: url, fileType: fileType)
             importPreview = preview

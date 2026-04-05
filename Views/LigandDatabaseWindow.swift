@@ -46,6 +46,10 @@ struct LigandDatabaseWindow: View {
     @State var isProcessing: Bool = false
     @State var processingMessage: String = ""
 
+    // Draw structure
+    @State var showChemDrawer: Bool = false
+    @State var editingEntryID: UUID? = nil
+
     // Sorting
     enum SortField: String { case name, smiles, mw, logP, hbd, hba, tpsa, rotB, atoms }
     @State var sortField: SortField? = nil
@@ -53,6 +57,10 @@ struct LigandDatabaseWindow: View {
 
     // Detail panel: selected entry for inspection
     @State var inspectedEntry: LigandEntry?
+
+    // Inline rename
+    @State var renamingEntryID: UUID? = nil
+    @State var renamingText: String = ""
 
     // Preparation options (used in detail panel)
     @State var prepAddHydrogens = true
@@ -167,6 +175,7 @@ struct LigandDatabaseWindow: View {
                             }
                         } else if let entry = inspectedEntry {
                             bottomDetailArea(entry)
+                                .id("\(entry.id)-\(entry.isPrepared)-\(entry.conformerCount)-\(entry.originalSMILES.hashValue)")
                         } else {
                             VStack {
                                 Spacer()
@@ -197,6 +206,34 @@ struct LigandDatabaseWindow: View {
                 performMappedImport(finalPreview)
             }
         }
+        .sheet(isPresented: $showChemDrawer) {
+            let editEntry = editingEntryID.flatMap { id in db.entries.first { $0.id == id } }
+            ChemDrawerSheet(
+                title: editEntry != nil ? "Edit Structure — \(editEntry!.name)" : "Draw Molecule",
+                initialSmiles: editEntry?.smiles ?? "",
+                mode: .molecule
+            ) { smiles, _ in
+                guard !smiles.isEmpty else { return }
+                if let id = editingEntryID,
+                   let idx = db.entries.firstIndex(where: { $0.id == id }) {
+                    // Update existing entry
+                    db.entries[idx].originalSMILES = smiles
+                    db.entries[idx].isPrepared = false
+                    db.entries[idx].atoms = []
+                    db.entries[idx].bonds = []
+                    db.entries[idx].conformers = []
+                    db.entries[idx].conformerCount = 0
+                    db.entries[idx].descriptors = nil
+                    prepareSingleEntry(db.entries[idx])
+                    if inspectedEntry?.id == id { inspectedEntry = db.entries[idx] }
+                } else {
+                    // New molecule
+                    let name = "Drawn_\(db.count + 1)"
+                    addAndPrepare(smiles: smiles, name: name)
+                }
+                editingEntryID = nil
+            }
+        }
         .onChange(of: selectedIDs) { _, newIDs in
             if newIDs.count == 1, let id = newIDs.first {
                 if let entry = db.entries.first(where: { $0.id == id }) {
@@ -222,6 +259,12 @@ struct LigandDatabaseWindow: View {
             }
             .controlSize(.small)
             .help("Add a molecule from SMILES string")
+
+            Button(action: { editingEntryID = nil; showChemDrawer = true }) {
+                Label("Draw", systemImage: "pencil.and.outline")
+            }
+            .controlSize(.small)
+            .help("Draw a molecule structure")
 
             // Import buttons (import raw molecules)
             Menu {
@@ -254,7 +297,10 @@ struct LigandDatabaseWindow: View {
                         runPopulateAndPrepare(entries: [entry])
                     }
                 }) {
-                    Label("Prepare", systemImage: "wand.and.stars")
+                    Label({
+                        let n = db.entries.filter { selectedIDs.contains($0.id) }.count
+                        return n > 1 ? "Prepare \(n) Selected" : "Prepare Selected"
+                    }(), systemImage: "wand.and.stars")
                 }
                 .controlSize(.small)
                 .disabled(selectedIDs.isEmpty || isProcessing)
@@ -270,7 +316,10 @@ struct LigandDatabaseWindow: View {
                         runEnumerate(entries: [entry])
                     }
                 }) {
-                    Label("Enumerate", systemImage: "arrow.triangle.branch")
+                    Label({
+                        let n = db.entries.filter { selectedIDs.contains($0.id) && !$0.isEnumerated }.count
+                        return n > 1 ? "Enumerate \(n) Selected" : "Enumerate Selected"
+                    }(), systemImage: "arrow.triangle.branch")
                 }
                 .controlSize(.small)
                 .disabled(selectedIDs.isEmpty || isProcessing)
@@ -291,8 +340,8 @@ struct LigandDatabaseWindow: View {
             Button(action: { useSelectedForDocking() }) {
                 let nPrepared = db.entries.filter { selectedIDs.contains($0.id) && $0.isPrepared }.count
                 Label(nPrepared > 1
-                      ? "Dock \(nPrepared)"
-                      : nPrepared == 1 ? "Use for Docking" : "No Prepared",
+                      ? "Send \(nPrepared) to Docking"
+                      : nPrepared == 1 ? "Send to Docking" : "No Prepared",
                       systemImage: "arrow.right.circle")
             }
             .controlSize(.small)
@@ -334,14 +383,6 @@ struct LigandDatabaseWindow: View {
             }
             .controlSize(.small)
 
-            // Select all / none
-            Button(action: { toggleSelectAll() }) {
-                Image(systemName: selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
-                      ? "checkmark.square.fill" : "square")
-                    .font(.callout)
-            }
-            .buttonStyle(.plain)
-            .help("Select all / none")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -413,7 +454,17 @@ struct LigandDatabaseWindow: View {
 
             // Table header — fixed columns, same for every row
             HStack(spacing: 0) {
-                headerCell("", width: 24, field: nil)            // checkbox
+                // Select all / none checkbox
+                Button(action: { toggleSelectAll() }) {
+                    Image(systemName: selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
+                          ? "checkmark.square.fill" : "square")
+                        .font(.subheadline)
+                        .foregroundStyle(selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
+                                         ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 24)
+                .help("Select all / none")
                 headerCell("Name", width: 170, field: .name)
                 headerCell("SMILES", width: nil, field: .smiles)
                 headerCell("Pop%", width: 48, field: nil, alignment: .trailing)
@@ -485,6 +536,7 @@ struct LigandDatabaseWindow: View {
         let isSelected = selectedIDs.contains(entry.id)
         let isInspected = inspectedEntry?.id == entry.id
         let isActive = viewModel.molecules.ligand?.name == entry.name
+        let isExpandedParent = db.hasEnumeratedChildren(entry)
         let kindColor: Color? = entry.formKind.map { kind in
             switch kind {
             case .parent: .green
@@ -512,6 +564,11 @@ struct LigandDatabaseWindow: View {
                 if isActive {
                     Circle().fill(.green).frame(width: 5, height: 5)
                 }
+                if entry.isEnumerated {
+                    Text("↳")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
                 if let kind = entry.formKind, let color = kindColor {
                     Text(kind.symbol)
                         .font(.caption2.weight(.bold))
@@ -519,16 +576,30 @@ struct LigandDatabaseWindow: View {
                         .frame(width: 16, height: 14)
                         .background(RoundedRectangle(cornerRadius: 3).fill(color))
                 }
-                Text(entry.name)
-                    .font(.footnote.weight(isActive ? .semibold : .regular))
-                    .lineLimit(1)
+                if renamingEntryID == entry.id {
+                    TextField("Name", text: $renamingText, onCommit: {
+                        commitRename(entryID: entry.id)
+                    })
+                    .textFieldStyle(.roundedBorder)
+                    .font(.footnote)
+                    .onExitCommand { renamingEntryID = nil }
+                } else {
+                    Text(entry.name)
+                        .font(.footnote.weight(isActive ? .semibold : .regular))
+                        .foregroundStyle(isExpandedParent ? .tertiary : .primary)
+                        .lineLimit(1)
+                        .onTapGesture(count: 2) {
+                            renamingEntryID = entry.id
+                            renamingText = entry.name
+                        }
+                }
             }
             .frame(width: 170, alignment: .leading)
 
             // SMILES
             Text(entry.originalSMILES)
                 .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(isExpandedParent ? .tertiary : .secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .help(entry.originalSMILES)
@@ -597,6 +668,7 @@ struct LigandDatabaseWindow: View {
         .background(isInspected ? Color.accentColor.opacity(0.2) :
                      isSelected ? Color.accentColor.opacity(0.1) :
                      isActive ? Color.green.opacity(0.05) :
+                     isExpandedParent ? Color.secondary.opacity(0.06) :
                      entry.isEnumerated ? Color.secondary.opacity(0.03) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
@@ -612,10 +684,19 @@ struct LigandDatabaseWindow: View {
             }
         }
         .contextMenu {
-            Button("Use for Docking") { useEntryForDocking(entry) }
-                .disabled(entry.atoms.isEmpty)
+            Button("Send to Docking") { useEntryForDocking(entry) }
+                .disabled(entry.atoms.isEmpty || isExpandedParent)
             Button("Prepare") { prepareSingleEntry(entry) }
                 .disabled(entry.smiles.isEmpty)
+            Button("Edit Structure") {
+                editingEntryID = entry.id
+                showChemDrawer = true
+            }
+            .disabled(entry.smiles.isEmpty)
+            Button("Rename") {
+                renamingEntryID = entry.id
+                renamingText = entry.name
+            }
             Divider()
             if entry.isEnumerated, let pn = entry.parentName {
                 Button("Delete All \(pn) Forms", role: .destructive) {
@@ -789,7 +870,7 @@ struct LigandDatabaseWindow: View {
                     let smi = candidate.smiles
                     let nm = candidate.name
                     let ah = prepAddHydrogens, mn = prepMinimize, cc = prepComputeCharges
-                    let (mol, desc, _) = await Task.detached { @Sendable in
+                    let (mol, desc, canonSMILES, _) = await Task.detached { @Sendable in
                         RDKitBridge.prepareLigand(smiles: smi, name: nm,
                                                   numConformers: 1, addHydrogens: ah,
                                                   minimize: mn, computeCharges: cc)
@@ -806,6 +887,7 @@ struct LigandDatabaseWindow: View {
                         updated.descriptors = desc
                         updated.isPrepared = true
                         updated.conformerCount = 1
+                        if let canonSMILES { updated.originalSMILES = canonSMILES }
                         db.update(updated)
                         successCount += 1
                         prepared = true
@@ -820,8 +902,13 @@ struct LigandDatabaseWindow: View {
             isProcessing = false
             processingMessage = ""
             // Refresh inspected entry if it was prepared
-            if let inspID = inspectedEntry?.id {
-                inspectedEntry = db.entries.first { $0.id == inspID }
+            if let inspID = inspectedEntry?.id,
+               let refreshed = db.entries.first(where: { $0.id == inspID }) {
+                inspectedEntry = refreshed
+                compute2DPreview(smiles: refreshed.originalSMILES)
+                if show3DPreview, !refreshed.atoms.isEmpty {
+                    updateMiniRenderer(atoms: refreshed.atoms, bonds: refreshed.bonds)
+                }
             }
             if successCount > 0 {
                 viewModel.log.success("Prepared \(successCount)/\(toProcess.count) ligands", category: .molecule)
@@ -848,7 +935,10 @@ struct LigandDatabaseWindow: View {
     }
 
     func useSelectedForDocking() {
-        let selected = db.entries.filter { selectedIDs.contains($0.id) && $0.isPrepared }
+        // Exclude parent entries that have enumerated children (would duplicate docking)
+        let selected = db.entries.filter {
+            selectedIDs.contains($0.id) && $0.isPrepared && !db.hasEnumeratedChildren($0)
+        }
         guard !selected.isEmpty else {
             viewModel.log.warn("No prepared entries in selection — prepare them first", category: .dock)
             return
@@ -883,7 +973,7 @@ struct LigandDatabaseWindow: View {
             for candidate in candidates {
                 let smi = candidate.smiles
                 let nm = candidate.name
-                let (mol, desc, _) = await Task.detached { @Sendable in
+                let (mol, desc, _, _) = await Task.detached { @Sendable in
                     RDKitBridge.prepareLigand(smiles: smi, name: nm,
                                               numConformers: 1, addHydrogens: ah,
                                               minimize: mn, computeCharges: cc)
@@ -938,6 +1028,18 @@ struct LigandDatabaseWindow: View {
         let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds,
                            title: entry.smiles, smiles: entry.smiles)
         viewModel.setLigandForDocking(mol, entryID: entry.id)
+    }
+
+    private func commitRename(entryID: UUID) {
+        let newName = renamingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        renamingEntryID = nil
+        guard !newName.isEmpty,
+              let idx = db.entries.firstIndex(where: { $0.id == entryID }),
+              db.entries[idx].name != newName else { return }
+        db.entries[idx].name = newName
+        if inspectedEntry?.id == entryID {
+            inspectedEntry?.name = newName
+        }
     }
 
     private func addAndPrepare(smiles: String, name: String) {

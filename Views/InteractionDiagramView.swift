@@ -364,8 +364,31 @@ struct InteractionDiagramView: View {
         func ligandContactPoint(for ixn: MolecularInteraction) -> CGPoint? {
             let idx = ixn.ligandAtomIndex
             guard idx < projectedPositions.count else { return nil }
-            if piTypes.contains(ixn.type), let centroid = ringCentroidForAtom[idx] {
-                return centroid
+            if piTypes.contains(ixn.type) {
+                // Direct lookup
+                if let centroid = ringCentroidForAtom[idx] {
+                    return centroid
+                }
+                // Fallback: find the nearest aromatic ring to this atom's 2D position
+                // (handles cases where 3D and 2D ring detection find different first atoms)
+                let atomPos = projectedPositions[idx]
+                var bestDist: CGFloat = .greatestFiniteMagnitude
+                var bestCentroid: CGPoint?
+                for ring in aromaticRings {
+                    let ringPts = ring.compactMap { $0 < projectedPositions.count ? projectedPositions[$0] : nil }
+                    guard ringPts.count == ring.count, !ringPts.isEmpty else { continue }
+                    let cx = ringPts.map(\.x).reduce(0, +) / CGFloat(ringPts.count)
+                    let cy = ringPts.map(\.y).reduce(0, +) / CGFloat(ringPts.count)
+                    let d = hypot(atomPos.x - cx, atomPos.y - cy)
+                    if d < bestDist {
+                        bestDist = d
+                        bestCentroid = CGPoint(x: cx, y: cy)
+                    }
+                }
+                // Use ring centroid if atom is reasonably close to a ring
+                if let centroid = bestCentroid, bestDist < 40 {
+                    return centroid
+                }
             }
             return projectedPositions[idx]
         }
@@ -527,36 +550,67 @@ struct InteractionDiagramView: View {
             let hydrophobic = dd.interactions.filter { $0.type == .hydrophobic }
             let directional = dd.interactions.filter { $0.type != .hydrophobic }
 
-            // Hydrophobic: green arc at contact zone + dashed connector
+            // Hydrophobic: green arc on the exterior of the ligand contact zone,
+            // facing toward the residue, with spokes and a dashed connector.
             if !hydrophobic.isEmpty {
                 let arcColor = interactionColor(.hydrophobic)
-                let avgLig = dd.avgLigandContact
-                let dirAngle = atan2(dd.center.y - avgLig.y, dd.center.x - avgLig.x)
-                let arcRadius: CGFloat = 18
-                let arcSpan: CGFloat = max(0.8, min(CGFloat(hydrophobic.count) * 0.35, 1.6))
 
+                // Gather all ligand-side contact points for hydrophobic interactions
+                let hydroContactPts: [CGPoint] = hydrophobic.compactMap { ligandContactPoint(for: $0) }
+                guard !hydroContactPts.isEmpty else { continue }
+
+                // Centroid of hydrophobic contacts on the ligand
+                let hCentX = hydroContactPts.map(\.x).reduce(0, +) / CGFloat(hydroContactPts.count)
+                let hCentY = hydroContactPts.map(\.y).reduce(0, +) / CGFloat(hydroContactPts.count)
+
+                // Compute spread: max distance from centroid to any contact point
+                let spread = hydroContactPts.map { hypot($0.x - hCentX, $0.y - hCentY) }.max() ?? 0
+
+                // Direction from ligand contact centroid toward the residue
+                let dirAngle = atan2(dd.center.y - hCentY, dd.center.x - hCentX)
+
+                // Place the arc CENTER outside the ligand, offset along the direction toward the residue.
+                // The arc opens perpendicular to that direction, cradling the contact zone exterior.
+                let arcOffset: CGFloat = spread + 18  // push arc center outside ligand atoms
+                let arcCenter = CGPoint(x: hCentX + cos(dirAngle) * arcOffset,
+                                        y: hCentY + sin(dirAngle) * arcOffset)
+
+                // Arc radius and span adapt to the hydrophobic zone extent
+                let arcRadius: CGFloat = max(14, spread + 8)
+                let arcSpan: CGFloat = max(0.6, min(CGFloat(hydrophobic.count) * 0.3 + spread * 0.015, 2.0))
+
+                // The arc faces back toward the ligand (opening = dirAngle + π)
+                let openAngle = dirAngle + .pi
                 var arcPath = Path()
-                arcPath.addArc(center: avgLig, radius: arcRadius,
-                               startAngle: .radians(dirAngle - arcSpan / 2),
-                               endAngle: .radians(dirAngle + arcSpan / 2), clockwise: false)
+                arcPath.addArc(center: arcCenter, radius: arcRadius,
+                               startAngle: .radians(openAngle - arcSpan / 2),
+                               endAngle: .radians(openAngle + arcSpan / 2), clockwise: false)
                 ctx.stroke(arcPath, with: .color(arcColor),
                            style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
 
-                let nSpokes = min(hydrophobic.count, 5)
+                // Spokes (tick marks on the arc, pointing outward from the arc center)
+                let nSpokes = min(hydrophobic.count, 7)
                 for i in 0..<nSpokes {
                     let t = nSpokes == 1 ? 0.5 : CGFloat(i) / CGFloat(nSpokes - 1)
-                    let a = dirAngle - arcSpan / 2 + arcSpan * t
-                    let inner = CGPoint(x: avgLig.x + (arcRadius - 4) * cos(a), y: avgLig.y + (arcRadius - 4) * sin(a))
-                    let outer = CGPoint(x: avgLig.x + (arcRadius + 4) * cos(a), y: avgLig.y + (arcRadius + 4) * sin(a))
+                    let a = openAngle - arcSpan / 2 + arcSpan * t
+                    let inner = CGPoint(x: arcCenter.x + (arcRadius - 4) * cos(a),
+                                        y: arcCenter.y + (arcRadius - 4) * sin(a))
+                    let outer = CGPoint(x: arcCenter.x + (arcRadius + 4) * cos(a),
+                                        y: arcCenter.y + (arcRadius + 4) * sin(a))
                     var sp = Path(); sp.move(to: inner); sp.addLine(to: outer)
                     ctx.stroke(sp, with: .color(arcColor.opacity(0.6)), lineWidth: 1.5)
                 }
 
-                let arcTip = CGPoint(x: avgLig.x + (arcRadius + 6) * cos(dirAngle),
-                                     y: avgLig.y + (arcRadius + 6) * sin(dirAngle))
-                let conn = shorten(from: arcTip, to: dd.center, fromInset: 0, toInset: 40)
-                drawDashedLine(ctx: ctx, from: conn.0, to: conn.1,
-                               color: arcColor.opacity(0.5), dashLen: 4, lineWidth: 1.2)
+                // Dashed connector from arc to residue bubble
+                let arcTip = CGPoint(x: arcCenter.x + cos(dirAngle) * (arcRadius + 6),
+                                     y: arcCenter.y + sin(dirAngle) * (arcRadius + 6))
+                // Only draw connector if there's meaningful distance to the residue
+                let distToRes = hypot(arcTip.x - dd.center.x, arcTip.y - dd.center.y)
+                if distToRes > 20 {
+                    let conn = shorten(from: arcTip, to: dd.center, fromInset: 0, toInset: 40)
+                    drawDashedLine(ctx: ctx, from: conn.0, to: conn.1,
+                                   color: arcColor.opacity(0.5), dashLen: 4, lineWidth: 1.2)
+                }
             }
 
             // Directional interactions: connect to specific side chain atom
@@ -625,6 +679,21 @@ struct InteractionDiagramView: View {
                                style: ixn.type == .hbond || ixn.type == .saltBridge
                                    ? StrokeStyle(lineWidth: 2, dash: [6, 4.2])
                                    : StrokeStyle(lineWidth: 2))
+                    // Distance label at quadratic bezier midpoint (t=0.5)
+                    let curveMid = CGPoint(
+                        x: 0.25 * shortened.0.x + 0.5 * ctrl.x + 0.25 * shortened.1.x,
+                        y: 0.25 * shortened.0.y + 0.5 * ctrl.y + 0.25 * shortened.1.y)
+                    let distStr = String(format: "%.1f", ixn.distance)
+                    let distSz = NSAttributedString(string: distStr,
+                        attributes: [.font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)]).size()
+                    let pill = CGRect(x: curveMid.x - distSz.width / 2 - 4,
+                                      y: curveMid.y - distSz.height / 2 - 2,
+                                      width: distSz.width + 8, height: distSz.height + 4)
+                    ctx.fill(Path(roundedRect: pill, cornerRadius: 4),
+                             with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.9)))
+                    ctx.draw(ctx.resolve(
+                        Text(distStr).font(.footnote.monospaced().weight(.medium))
+                            .foregroundColor(.secondary)), at: curveMid, anchor: .center)
                 } else {
                     drawInteractionLine(context: ctx, from: shortened.0, to: shortened.1,
                                         type: ixn.type, distance: ixn.distance)
@@ -635,7 +704,8 @@ struct InteractionDiagramView: View {
         // 5. Side chains + residue bubbles (on top of lines)
         for dd in drawData {
             drawResidueBubble(context: ctx, at: dd.center, key: dd.key, interactions: dd.interactions,
-                              scPositions: dd.scPositions, template: dd.template)
+                              scPositions: dd.scPositions, template: dd.template,
+                              piTypes: piTypes, ligandContactPointFn: ligandContactPoint)
         }
     }
 
@@ -711,12 +781,34 @@ struct InteractionDiagramView: View {
         var label: String { "\(name)\(seq)" }
     }
 
+    /// Residues whose aliphatic linker carbons should not be shown as hydrophobic
+    /// contacts in the diagram (the contacts are real but visually misleading).
+    private static let diagramHydroExcluded: Set<String> = ["ASP", "GLU", "ASN", "GLN", "SER", "THR", "CYS"]
+    /// For ARG/LYS the aliphatic chain is long enough that CB/CG are genuine hydrophobic patches.
+    private static let diagramHydroAllowed: [String: Set<String>] = [
+        "ARG": ["CB", "CG"],
+        "LYS": ["CB", "CG", "CD"],
+    ]
+
     private func groupInteractionsByResidue() -> [ResidueKey: [MolecularInteraction]] {
         var groups: [ResidueKey: [MolecularInteraction]] = [:]
         for ixn in interactions {
             let pIdx = ixn.proteinAtomIndex
             guard pIdx < proteinAtoms.count else { continue }
             let atom = proteinAtoms[pIdx]
+
+            // Filter out misleading hydrophobic contacts on charged/polar residues for display
+            if ixn.type == .hydrophobic {
+                let resName = atom.residueName
+                let atomName = atom.name.trimmingCharacters(in: .whitespaces)
+                if Self.diagramHydroExcluded.contains(resName) {
+                    continue
+                }
+                if let allowed = Self.diagramHydroAllowed[resName], !allowed.contains(atomName) {
+                    continue
+                }
+            }
+
             let key = ResidueKey(name: atom.residueName, seq: atom.residueSeq, chain: atom.chainID)
             groups[key, default: []].append(ixn)
         }
@@ -839,7 +931,9 @@ struct InteractionDiagramView: View {
 
     private func drawResidueBubble(context: GraphicsContext, at center: CGPoint,
                                     key: ResidueKey, interactions: [MolecularInteraction],
-                                    scPositions: [CGPoint], template: SideChainTemplate?) {
+                                    scPositions: [CGPoint], template: SideChainTemplate?,
+                                    piTypes: Set<MolecularInteraction.InteractionType> = [],
+                                    ligandContactPointFn: ((MolecularInteraction) -> CGPoint?)? = nil) {
         let dominantType = dominantInteractionType(interactions)
         let (fillColor, borderColor) = residuePropertyColors(key.name)
 
@@ -879,6 +973,54 @@ struct InteractionDiagramView: View {
                 }
             }
 
+            // Detect aromatic rings in the side chain template for ring centroid rendering
+            let scRingAtomNames: Set<String> = {
+                switch key.name {
+                case "PHE": return ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]
+                case "TYR": return ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]
+                case "HIS": return ["CG", "ND1", "CD2", "CE1", "NE2"]
+                default:    return []
+                }
+            }()
+            // For TRP, two fused rings
+            let scRingAtomNames2: Set<String> = key.name == "TRP"
+                ? ["CG", "CD1", "NE1", "CE2", "CD2"]  // 5-ring
+                : []
+            let scRingAtomNames3: Set<String> = key.name == "TRP"
+                ? ["CD2", "CE2", "CE3", "CZ3", "CH2", "CZ2"]  // 6-ring
+                : []
+            let allScRingNames = key.name == "TRP"
+                ? scRingAtomNames2.union(scRingAtomNames3)
+                : scRingAtomNames
+
+            // Check if this residue has a π-interaction — if so, draw ring centroid marker
+            let hasPiInteraction = interactions.contains { piTypes.contains($0.type) }
+            if hasPiInteraction && !allScRingNames.isEmpty {
+                // Compute ring centroid(s) from side chain positions
+                func drawRingCentroid(ringNames: Set<String>) {
+                    var rX: CGFloat = 0, rY: CGFloat = 0, rN: CGFloat = 0
+                    for (tIdx, tAtom) in tmpl.atoms.enumerated() where tIdx < scPositions.count {
+                        if ringNames.contains(tAtom.name) {
+                            rX += scPositions[tIdx].x; rY += scPositions[tIdx].y; rN += 1
+                        }
+                    }
+                    guard rN > 0 else { return }
+                    let cx = rX / rN, cy = rY / rN
+                    // Draw a filled circle at ring centroid
+                    let cr: CGFloat = 5
+                    context.fill(Path(ellipseIn: CGRect(x: cx - cr, y: cy - cr, width: cr * 2, height: cr * 2)),
+                                 with: .color(interactionColor(dominantType).opacity(0.5)))
+                    context.stroke(Path(ellipseIn: CGRect(x: cx - cr, y: cy - cr, width: cr * 2, height: cr * 2)),
+                                   with: .color(interactionColor(dominantType)), lineWidth: 1.5)
+                }
+                if key.name == "TRP" {
+                    drawRingCentroid(ringNames: scRingAtomNames2)
+                    drawRingCentroid(ringNames: scRingAtomNames3)
+                } else {
+                    drawRingCentroid(ringNames: scRingAtomNames)
+                }
+            }
+
             // Atoms
             for (i, atom) in tmpl.atoms.enumerated() {
                 guard i < scPositions.count else { continue }
@@ -886,25 +1028,90 @@ struct InteractionDiagramView: View {
                 let isInteracting = atomNames.contains(atom.name)
 
                 if atom.element == .C {
-                    let r: CGFloat = 2.5
+                    let r: CGFloat = isInteracting ? 4.0 : 2.5
                     context.fill(Path(ellipseIn: CGRect(x: pos.x - r, y: pos.y - r, width: r * 2, height: r * 2)),
-                                 with: .color(borderColor.opacity(0.4)))
+                                 with: .color(borderColor.opacity(isInteracting ? 0.6 : 0.4)))
                 } else {
-                    let r: CGFloat = 7.5
+                    let r: CGFloat = isInteracting ? 10.0 : 7.5
                     let elemColor: Color = atom.element == .N ? .blue : atom.element == .O ? .red :
                         atom.element == .S ? .yellow : .gray
                     context.fill(Path(ellipseIn: CGRect(x: pos.x - r, y: pos.y - r, width: r * 2, height: r * 2)),
                                  with: .color(Color(nsColor: .controlBackgroundColor)))
                     context.stroke(Path(ellipseIn: CGRect(x: pos.x - r, y: pos.y - r, width: r * 2, height: r * 2)),
-                                   with: .color(elemColor), lineWidth: 1.5)
+                                   with: .color(elemColor), lineWidth: isInteracting ? 2.5 : 1.5)
+                    let fontSize: CGFloat = isInteracting ? 13 : 11
                     context.draw(context.resolve(
-                        Text(atom.element.symbol).font(.footnote.monospaced().weight(.bold))
+                        Text(atom.element.symbol).font(.system(size: fontSize, weight: .bold, design: .monospaced))
                             .foregroundColor(elemColor)), at: pos, anchor: .center)
+                }
+
+                // Show formal charge on deprotonated carboxylate oxygens (ASP/GLU at pH 7.4)
+                let isDeprotonatedO: Bool = {
+                    switch (key.name, atom.name) {
+                    case ("ASP", "OD1"), ("ASP", "OD2"), ("GLU", "OE1"), ("GLU", "OE2"):
+                        return true
+                    default:
+                        return false
+                    }
+                }()
+                if isDeprotonatedO {
+                    context.draw(context.resolve(
+                        Text("−").font(.system(size: 12, weight: .heavy, design: .rounded))
+                            .foregroundColor(.red)),
+                        at: CGPoint(x: pos.x + 9, y: pos.y - 9), anchor: .center)
+                }
+
+                // For H-bond interactions, draw the implicit hydrogen on donor atoms
+                // (O-H on SER/THR/TYR, N-H on amides/amines, etc.)
+                if isInteracting {
+                    let hbondIxns = interactions.filter { ixn in
+                        ixn.type == .hbond &&
+                        ixn.proteinAtomIndex < proteinAtoms.count &&
+                        proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces) == atom.name
+                    }
+                    // Draw H if this atom is a known donor (OH or NH group)
+                    let isDonor: Bool = {
+                        switch (key.name, atom.name) {
+                        case ("SER", "OG"), ("THR", "OG1"), ("TYR", "OH"), ("CYS", "SG"):
+                            return true
+                        case ("ASN", "ND2"), ("GLN", "NE2"), ("LYS", "NZ"),
+                             ("ARG", "NH1"), ("ARG", "NH2"), ("ARG", "NE"),
+                             ("TRP", "NE1"), ("HIS", "ND1"), ("HIS", "NE2"):
+                            return true
+                        default:
+                            return false
+                        }
+                    }()
+
+                    if !hbondIxns.isEmpty && isDonor {
+                        // Place H atom on the side facing the ligand contact
+                        let contactDir: CGPoint = {
+                            if let ixn = hbondIxns.first, let lp = ligandContactPointFn?(ixn) {
+                                let dx = lp.x - pos.x, dy = lp.y - pos.y
+                                let len = max(hypot(dx, dy), 1)
+                                return CGPoint(x: dx / len, y: dy / len)
+                            }
+                            return CGPoint(x: 0, y: -1)
+                        }()
+                        let hDist: CGFloat = 12
+                        let hPos = CGPoint(x: pos.x + contactDir.x * hDist, y: pos.y + contactDir.y * hDist)
+                        // Draw H-bond line from atom to H
+                        var hBondPath = Path()
+                        hBondPath.move(to: pos); hBondPath.addLine(to: hPos)
+                        context.stroke(hBondPath, with: .color(borderColor.opacity(0.4)), lineWidth: 1.0)
+                        // Draw H label
+                        let hR: CGFloat = 5
+                        context.fill(Path(ellipseIn: CGRect(x: hPos.x - hR, y: hPos.y - hR, width: hR * 2, height: hR * 2)),
+                                     with: .color(Color(nsColor: .controlBackgroundColor)))
+                        context.draw(context.resolve(
+                            Text("H").font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .foregroundColor(.gray)), at: hPos, anchor: .center)
+                    }
                 }
 
                 // Highlight interacting atoms with colored ring
                 if isInteracting {
-                    let hr: CGFloat = atom.element == .C ? 7 : 12
+                    let hr: CGFloat = atom.element == .C ? 8 : 14
                     context.stroke(
                         Path(ellipseIn: CGRect(x: pos.x - hr, y: pos.y - hr, width: hr * 2, height: hr * 2)),
                         with: .color(interactionColor(dominantType)), lineWidth: 2)
@@ -1019,18 +1226,11 @@ struct InteractionDiagramView: View {
             drawArrowhead(context: context, at: to, from: from, color: color, size: 6)
         }
 
-        // Distance label — offset perpendicular to line with background pill
+        // Distance label — centered on the interaction line with background pill
         if type != .hydrophobic && type != .chPi {
             let lineLen = hypot(to.x - from.x, to.y - from.y)
             guard lineLen > 30 else { return } // skip labels on very short lines
-            let t: CGFloat = 0.40
-            let lp = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
-            let dx = to.x - from.x, dy = to.y - from.y
-            let len = max(lineLen, 1)
-            // Alternate offset side based on line angle to reduce overlaps
-            let side: CGFloat = (from.x + from.y).truncatingRemainder(dividingBy: 2) < 1 ? 1 : -1
-            let ox = -dy / len * 10 * side, oy = dx / len * 10 * side
-            let labelPt = CGPoint(x: lp.x + ox, y: lp.y + oy)
+            let labelPt = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
             let distStr = String(format: "%.1f", distance)
             let distText = Text(distStr)
                 .font(.footnote.monospaced().weight(.medium))
@@ -1038,10 +1238,10 @@ struct InteractionDiagramView: View {
             // Background pill for readability
             let sz = NSAttributedString(string: distStr,
                                         attributes: [.font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)]).size()
-            let pill = CGRect(x: labelPt.x - sz.width / 2 - 3, y: labelPt.y - sz.height / 2 - 1,
-                              width: sz.width + 6, height: sz.height + 2)
+            let pill = CGRect(x: labelPt.x - sz.width / 2 - 4, y: labelPt.y - sz.height / 2 - 2,
+                              width: sz.width + 8, height: sz.height + 4)
             context.fill(Path(roundedRect: pill, cornerRadius: 4),
-                         with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.85)))
+                         with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.9)))
             context.draw(context.resolve(distText), at: labelPt, anchor: .center)
         }
     }

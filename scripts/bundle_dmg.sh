@@ -45,7 +45,32 @@ fi
 echo "==> Using app: $APP_PATH"
 FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
 MAIN_EXEC="$APP_PATH/Contents/MacOS/Druse"
+RESOURCES_DIR="$APP_PATH/Contents/Resources"
 mkdir -p "$FRAMEWORKS_DIR"
+
+# ── Verify required bundled resources ────────────────────────
+echo "==> Checking bundled resources..."
+MISSING=0
+if [ ! -f "$RESOURCES_DIR/dun2010bbdep.bin" ]; then
+    echo "  MISSING: dun2010bbdep.bin (Dunbrack rotamer library)"
+    MISSING=1
+fi
+if [ ! -f "$RESOURCES_DIR/standalone/index.html" ]; then
+    echo "  MISSING: standalone/index.html (Ketcher chemical editor)"
+    MISSING=1
+fi
+if [ ! -d "$RESOURCES_DIR/standalone/static/js" ]; then
+    echo "  MISSING: standalone/static/js/ (Ketcher JS bundles)"
+    MISSING=1
+fi
+if [ "$MISSING" -eq 1 ]; then
+    echo ""
+    echo "  ERROR: Required resources are missing from the app bundle."
+    echo "  Ensure Resources/dun2010bbdep.bin and Resources/Ketcher/standalone/ exist"
+    echo "  in the source tree before building. See README.md for details."
+    exit 1
+fi
+echo "  OK — all required resources present"
 
 # ── Helper: resolve a path to its real file ───────────────────
 
@@ -363,7 +388,14 @@ for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
     [ -L "$dylib" ] && continue
     codesign --force --sign "$CODESIGN_IDENTITY" "$dylib" 2>/dev/null || true
 done
-codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH" 2>/dev/null || true
+
+# Sign CoreML model if present
+if [ -d "$RESOURCES_DIR/PocketDetector.mlmodelc" ]; then
+    codesign --force --sign "$CODESIGN_IDENTITY" "$RESOURCES_DIR/PocketDetector.mlmodelc" 2>/dev/null || true
+fi
+
+# Sign the app (not --deep; Ketcher WASM/JS resources are data, not code)
+codesign --force --sign "$CODESIGN_IDENTITY" "$APP_PATH" 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────
 # 6. Final verification
@@ -425,7 +457,9 @@ echo ""
 echo "==> Done! DMG created:"
 echo "    $DMG_PATH ($DMG_SIZE)"
 FWCOUNT=$(ls -1 "$FRAMEWORKS_DIR"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+RESSIZE=$(du -sh "$RESOURCES_DIR" 2>/dev/null | awk '{print $1}')
 echo "    Bundled $FWCOUNT dylibs in Frameworks/"
+echo "    Resources: $RESSIZE (Ketcher, rotamer library, ML models)"
 echo ""
 echo "    To notarize (requires Developer ID):"
 echo "    xcrun notarytool submit $DMG_PATH --apple-id YOU --team-id TEAM --password APP_PWD --wait"

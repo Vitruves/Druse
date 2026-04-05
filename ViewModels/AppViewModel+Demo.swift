@@ -218,7 +218,7 @@ extension AppViewModel {
         let smiles = Self.demoLigandSMILES
         let name = Self.demoLigandName
 
-        let (molData, _, error) = await Task.detached {
+        let (molData, _, _, error) = await Task.detached {
             RDKitBridge.prepareLigand(
                 smiles: smiles,
                 name: name,

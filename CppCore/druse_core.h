@@ -652,8 +652,9 @@ typedef struct {
     float *coords;          // flat array: [x0, y0, x1, y1, ...] (heavy atoms only)
     int32_t *atomicNums;    // atomic number per heavy atom
     int32_t atomCount;
-    DruseBond *bonds;       // bonds between heavy atoms
+    DruseBond *bonds;       // bonds between heavy atoms (Kekulized: no order 4)
     int32_t bondCount;
+    bool *isAromatic;       // per-atom aromaticity flag (set before Kekulization)
 } Druse2DResult;
 
 /// Compute 2D depiction coordinates for a molecule from SMILES.

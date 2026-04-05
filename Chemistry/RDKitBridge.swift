@@ -29,9 +29,9 @@ enum RDKitBridge {
         addHydrogens: Bool = true,
         minimize: Bool = true,
         computeCharges: Bool = true
-    ) -> (molecule: MoleculeData?, descriptors: LigandDescriptors?, error: String?) {
+    ) -> (molecule: MoleculeData?, descriptors: LigandDescriptors?, canonicalSMILES: String?, error: String?) {
         guard let result = druse_prepare_ligand(smiles, name, Int32(numConformers), addHydrogens, minimize, computeCharges) else {
-            return (nil, nil, "RDKit call returned nil")
+            return (nil, nil, nil, "RDKit call returned nil")
         }
         defer { druse_free_molecule_result(result) }
 
@@ -39,15 +39,16 @@ enum RDKitBridge {
             let errBuf = withUnsafePointer(to: result.pointee.errorMessage) {
                 $0.withMemoryRebound(to: CChar.self, capacity: 512) { String(cString: $0) }
             }
-            return (nil, nil, errBuf)
+            return (nil, nil, nil, errBuf)
         }
 
         let mol = convertResult(result.pointee)
+        let canonSMILES = fixedCString(result.pointee.smiles)
 
         // Compute descriptors separately for full property set
-        let desc = computeDescriptors(smiles: smiles)
+        let desc = computeDescriptors(smiles: canonSMILES.isEmpty ? smiles : canonSMILES)
 
-        return (mol, desc, nil)
+        return (mol, desc, canonSMILES.isEmpty ? nil : canonSMILES, nil)
     }
 
     /// Compute molecular descriptors from SMILES.
@@ -93,9 +94,9 @@ enum RDKitBridge {
         }
 
         return entries.map { entry in
-            let (mol, _, err) = prepareLigand(smiles: entry.smiles, name: entry.name,
-                                               addHydrogens: addHydrogens, minimize: minimize,
-                                               computeCharges: computeCharges)
+            let (mol, _, _, err) = prepareLigand(smiles: entry.smiles, name: entry.name,
+                                                  addHydrogens: addHydrogens, minimize: minimize,
+                                                  computeCharges: computeCharges)
             return (mol, err)
         }
     }
@@ -711,7 +712,8 @@ enum RDKitBridge {
     struct Coords2D: Sendable {
         let positions: [CGPoint]     // one per heavy atom
         let atomicNums: [Int]        // atomic number per heavy atom
-        let bonds: [(Int, Int, Int)] // (atom1, atom2, order)
+        let bonds: [(Int, Int, Int)] // (atom1, atom2, order) — Kekulized: no order 4
+        let isAromatic: [Bool]       // per-atom aromaticity (from before Kekulization)
     }
 
     /// Compute 2D depiction coordinates from SMILES (heavy atoms only).
@@ -726,10 +728,14 @@ enum RDKitBridge {
         positions.reserveCapacity(n)
         var atomicNums: [Int] = []
         atomicNums.reserveCapacity(n)
+        var isAromatic: [Bool] = []
+        isAromatic.reserveCapacity(n)
 
+        let aroPtr = result.pointee.isAromatic
         for i in 0..<n {
             positions.append(CGPoint(x: CGFloat(coords[i * 2]), y: CGFloat(coords[i * 2 + 1])))
             atomicNums.append(Int(nums[i]))
+            isAromatic.append(aroPtr?[i] ?? false)
         }
 
         var bonds: [(Int, Int, Int)] = []
@@ -742,7 +748,7 @@ enum RDKitBridge {
             }
         }
 
-        return Coords2D(positions: positions, atomicNums: atomicNums, bonds: bonds)
+        return Coords2D(positions: positions, atomicNums: atomicNums, bonds: bonds, isAromatic: isAromatic)
     }
 
     // MARK: - Pharmacophore Feature Detection
