@@ -33,6 +33,12 @@ struct ChemDrawerView: NSViewRepresentable {
     /// Called when the drawn structure changes. Provides (smiles, smarts).
     var onStructureChanged: ((String, String) -> Void)?
 
+    /// Called when the drawn structure changes, with the raw mol block included.
+    /// Unlike `onStructureChanged`, this preserves R-group / attachment-point
+    /// information that is lost by Ketcher's `getSmiles()` on aromatic atoms.
+    /// Used by the scaffold analog generator.
+    var onScaffoldChanged: ((_ smiles: String, _ smarts: String, _ molfile: String) -> Void)?
+
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
@@ -63,6 +69,7 @@ struct ChemDrawerView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.mode = mode
         context.coordinator.onStructureChanged = onStructureChanged
+        context.coordinator.onScaffoldChanged = onScaffoldChanged
         // If initialSmiles changed after Ketcher is ready, reload
         if let smiles = initialSmiles, smiles != context.coordinator.lastLoadedSmiles,
            context.coordinator.isReady {
@@ -71,7 +78,9 @@ struct ChemDrawerView: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(initialSmiles: initialSmiles, mode: mode, onChanged: onStructureChanged)
+        let c = Coordinator(initialSmiles: initialSmiles, mode: mode, onChanged: onStructureChanged)
+        c.onScaffoldChanged = onScaffoldChanged
+        return c
     }
 
     // MARK: - Coordinator
@@ -81,6 +90,7 @@ struct ChemDrawerView: NSViewRepresentable {
         weak var webView: WKWebView?
         var mode: Mode
         var onStructureChanged: ((String, String) -> Void)?
+        var onScaffoldChanged: ((String, String, String) -> Void)?
         var isReady = false
         var lastLoadedSmiles: String?
         private let initialSmiles: String?
@@ -104,9 +114,11 @@ struct ChemDrawerView: NSViewRepresentable {
                 guard let body = message.body as? [String: String] else { return }
                 let smiles = body["smiles"] ?? ""
                 let smarts = body["smarts"] ?? ""
+                let molfile = body["molfile"] ?? ""
                 // Track what Ketcher reported so updateNSView won't echo it back via setMolecule()
                 lastLoadedSmiles = smiles
                 onStructureChanged?(smiles, smarts)
+                onScaffoldChanged?(smiles, smarts, molfile)
 
             default:
                 break
@@ -168,21 +180,28 @@ struct ChemDrawerView: NSViewRepresentable {
             }
         }, 200);
 
-        // Poll for changes every 800ms — Ketcher lacks an onChange callback
-        let lastSmiles = '';
+        // Poll for changes every 800ms — Ketcher lacks an onChange callback.
+        // We ratchet on (smiles + molfile) so R-group / attachment-point edits
+        // that don't alter the SMILES still fire a change event (needed by the
+        // scaffold analog generator, which relies on the molfile).
+        let lastKey = '';
         function startPolling() {
             clearInterval(initCheck);
             setInterval(async function() {
                 try {
                     if (!window.ketcher) return;
                     const smiles = await window.ketcher.getSmiles();
-                    if (smiles !== lastSmiles) {
-                        lastSmiles = smiles;
+                    let molfile = '';
+                    try { molfile = await window.ketcher.getMolfile(); } catch(e) {}
+                    const key = smiles + '\\u0001' + molfile;
+                    if (key !== lastKey) {
+                        lastKey = key;
                         let smarts = '';
                         try { smarts = await window.ketcher.getSmarts(); } catch(e) {}
                         window.webkit.messageHandlers.ketcherChanged.postMessage({
                             smiles: smiles,
-                            smarts: smarts
+                            smarts: smarts,
+                            molfile: molfile
                         });
                     }
                 } catch(e) {}

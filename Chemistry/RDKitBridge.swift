@@ -259,6 +259,19 @@ enum RDKitBridge {
         return Array(UnsafeBufferPointer(start: bits, count: count))
     }
 
+    /// Tanimoto similarity between two SMILES (Morgan radius=2, 2048 bits).
+    /// Returns 0 if either molecule is invalid.
+    static func tanimotoSimilarity(_ smilesA: String, _ smilesB: String) -> Float {
+        return druse_tanimoto_similarity(smilesA, smilesB)
+    }
+
+    /// Test whether `smiles` contains the SMARTS `pattern` as a substructure.
+    static func containsSubstructure(smiles: String, smarts: String) -> Bool {
+        guard let res = druse_match_scaffold(smiles, smarts) else { return false }
+        defer { druse_free_scaffold_match(res) }
+        return res.pointee.hasMatch
+    }
+
     /// Generate all conformers sorted by energy. Returns array of (molecule, energy).
     static func generateConformers(smiles: String, name: String = "", count: Int = 50, minimize: Bool = true) -> [(molecule: MoleculeData, energy: Double)] {
         guard let set = druse_generate_conformers(smiles, name, Int32(count), minimize) else { return [] }

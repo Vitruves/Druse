@@ -50,6 +50,9 @@ struct LigandDatabaseWindow: View {
     @State var showChemDrawer: Bool = false
     @State var editingEntryID: UUID? = nil
 
+    // Scaffold-based analog generator
+    @State var showScaffoldAnalogSheet: Bool = false
+
     // Sorting
     enum SortField: String { case name, smiles, mw, logP, hbd, hba, tpsa, rotB, atoms }
     @State var sortField: SortField? = nil
@@ -147,9 +150,9 @@ struct LigandDatabaseWindow: View {
         case populateAndPrepare = "Populate & Prepare"
     }
 
-    // 2D structure preview (RDKit SVG depiction)
+    // 2D structure preview (RDKit SVG depiction, pre-rasterized to NSImage)
     @State var ligand2DCoords: RDKitBridge.Coords2D?
-    @State var ligand2DSVG: String?
+    @State var ligand2DImage: NSImage?
     @State var isComputing2D = false
 
     var body: some View {
@@ -205,6 +208,10 @@ struct LigandDatabaseWindow: View {
             ImportMappingSheet(preview: $importPreview) { finalPreview in
                 performMappedImport(finalPreview)
             }
+        }
+        .sheet(isPresented: $showScaffoldAnalogSheet) {
+            ScaffoldAnalogSheet()
+                .environment(viewModel)
         }
         .sheet(isPresented: $showChemDrawer) {
             let editEntry = editingEntryID.flatMap { id in db.entries.first { $0.id == id } }
@@ -265,6 +272,12 @@ struct LigandDatabaseWindow: View {
             }
             .controlSize(.small)
             .help("Draw a molecule structure")
+
+            Button(action: { showScaffoldAnalogSheet = true }) {
+                Label("Generate", systemImage: "atom")
+            }
+            .controlSize(.small)
+            .help("Generate analogs from a drawn scaffold (R-group decoration or whole-molecule transforms)")
 
             // Import buttons (import raw molecules)
             Menu {

@@ -105,11 +105,10 @@ extension LigandDatabaseWindow {
                 if isComputing2D {
                     ProgressView("Computing 2D layout...")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let svg = ligand2DSVG,
-                          let svgData = svg.data(using: .utf8),
-                          let nsImage = NSImage(data: svgData) {
+                } else if let nsImage = ligand2DImage {
                     Image(nsImage: nsImage)
                         .resizable()
+                        .interpolation(.high)
                         .scaledToFit()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(nsColor: .textBackgroundColor))
@@ -828,8 +827,22 @@ extension LigandDatabaseWindow {
     /// Debounced 2D preview — cancels previous computation when a new row is selected.
     private static var preview2DTask: Task<Void, Never>?
 
+    /// LRU-ish cache of pre-rasterized 2D previews keyed by SMILES. Avoids re-running
+    /// the RDKit layout + SVG rasterization pipeline when revisiting a ligand.
+    private static var previewImageCache: [String: NSImage] = [:]
+    private static let previewImageCacheLimit = 128
+
     func compute2DPreview(smiles: String) {
-        guard !smiles.isEmpty else { ligand2DCoords = nil; ligand2DSVG = nil; return }
+        guard !smiles.isEmpty else { ligand2DCoords = nil; ligand2DImage = nil; return }
+
+        // Cache hit — display instantly, no RDKit work
+        if let cached = Self.previewImageCache[smiles] {
+            Self.preview2DTask?.cancel()
+            ligand2DImage = cached
+            ligand2DCoords = nil
+            isComputing2D = false
+            return
+        }
 
         // Cancel any in-flight computation
         Self.preview2DTask?.cancel()
@@ -841,13 +854,59 @@ extension LigandDatabaseWindow {
             guard !Task.isCancelled else { return }
 
             let smi = smiles
-            let (coords, svg) = await Task.detached { @Sendable in
-                (RDKitBridge.compute2DCoords(smiles: smi),
-                 RDKitBridge.moleculeToSVG(smiles: smi, width: 500, height: 400))
+            // Single RDKit call: SVG is the primary path. Coords are only needed
+            // as a fallback if SVG generation fails, so skip them on the happy path.
+            let svg: String? = await Task.detached { @Sendable in
+                RDKitBridge.moleculeToSVG(smiles: smi, width: 500, height: 400)
             }.value
             guard !Task.isCancelled else { return }
-            ligand2DCoords = coords
-            ligand2DSVG = svg
+
+            // Rasterize once to a bitmap NSImage. Without this, SwiftUI re-parses
+            // the SVG string and re-rasterizes CoreSVG on every view redraw, which
+            // is the dominant cost for this preview.
+            var image: NSImage? = nil
+            if let svg, let data = svg.data(using: .utf8), let raw = NSImage(data: data) {
+                let size = NSSize(width: 500, height: 400)
+                raw.size = size
+                if let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil,
+                    pixelsWide: 1000, pixelsHigh: 800,
+                    bitsPerSample: 8, samplesPerPixel: 4,
+                    hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB,
+                    bytesPerRow: 0, bitsPerPixel: 0
+                ) {
+                    rep.size = size
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                    raw.draw(in: NSRect(origin: .zero, size: size))
+                    NSGraphicsContext.restoreGraphicsState()
+                    let bitmap = NSImage(size: size)
+                    bitmap.addRepresentation(rep)
+                    image = bitmap
+                } else {
+                    image = raw
+                }
+            }
+            guard !Task.isCancelled else { return }
+
+            // Fallback to Canvas-drawn coords only if SVG pipeline failed
+            var fallbackCoords: RDKitBridge.Coords2D? = nil
+            if image == nil {
+                fallbackCoords = await Task.detached { @Sendable in
+                    RDKitBridge.compute2DCoords(smiles: smi)
+                }.value
+                guard !Task.isCancelled else { return }
+            }
+
+            if let image {
+                if Self.previewImageCache.count >= Self.previewImageCacheLimit {
+                    Self.previewImageCache.removeAll(keepingCapacity: true)
+                }
+                Self.previewImageCache[smi] = image
+            }
+            ligand2DImage = image
+            ligand2DCoords = fallbackCoords
             isComputing2D = false
         }
     }
