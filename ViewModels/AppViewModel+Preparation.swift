@@ -384,18 +384,22 @@ extension AppViewModel {
                 finalAtoms = ProteinPreparation.applyElectrostaticFallback(to: finalAtoms)
             }
 
+            let capturedFinalAtoms = finalAtoms
+            let capturedFinalBonds = finalBonds
+            let capturedHAdded = hAdded
+
             await MainActor.run {
-                let mol = Molecule(name: name, atoms: finalAtoms, bonds: finalBonds, title: title)
+                let mol = Molecule(name: name, atoms: capturedFinalAtoms, bonds: capturedFinalBonds, title: title)
                 mol.secondaryStructureAssignments = secondaryStructure
                 self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: finalAtoms, bonds: finalBonds)
+                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: capturedFinalAtoms, bonds: capturedFinalBonds)
                 self.pushToRenderer()
                 self.renderer?.fitToContent()
 
                 var messages: [String] = []
                 if capturedLoopsBuilt > 0 { messages.append("\(capturedLoopsBuilt) loop(s) built (\(capturedResiduesAdded) residues)") }
                 if atomsRebuilt > 0 { messages.append("\(atomsRebuilt) heavy atoms rebuilt") }
-                if hAdded > 0 { messages.append("re-protonated (\(hAdded) H)") }
+                if capturedHAdded > 0 { messages.append("re-protonated (\(capturedHAdded) H)") }
                 if messages.isEmpty {
                     self.log.success("Protein structure is complete — no missing residues or atoms", category: .prep)
                     self.workspace.statusMessage = "Structure complete"

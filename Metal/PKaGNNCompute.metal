@@ -90,7 +90,6 @@ kernel void pkaGNNInference(
     uint tid [[thread_position_in_grid]]
 ) {
     const uint N = params->numAtoms;
-    const uint E = params->numEdges;
     if (tid >= N) return;
 
     // Helper to get weight pointer
@@ -152,9 +151,8 @@ kernel void pkaGNNFull(
 
     #define W(idx) (weights + entries[(idx)].offset)
 
-    // Atom state buffers (ping-pong)
+    // Atom state buffer
     float h[PKA_MAXN][PKA_H];
-    float h_new[PKA_MAXN][PKA_H];
 
     // ---- Atom encoder ----
     for (uint a = 0; a < N; a++) {

@@ -607,7 +607,7 @@ enum ProteinPreparation {
         let phase23 = completePhase23(atoms: cleanup.atoms, bonds: cleanup.bonds, pH: pH, device: device)
         logT("Phase 2-4 reconstruct+H+network (\(cleanup.atoms.count) → \(phase23.atoms.count) atoms)", t)
         var workingAtoms = phase23.atoms
-        var workingBonds = phase23.bonds
+        let workingBonds = phase23.bonds
 
         report.missingHeavyAtomsAdded = phase23.report.heavyAtomsAdded
         report.hydrogensAdded = phase23.report.hydrogensAdded

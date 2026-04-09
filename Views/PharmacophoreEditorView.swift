@@ -1033,6 +1033,7 @@ struct PharmacophoreEditorView: View {
                     matchedSet = Set(m.matchedAtomIndices.map { Int($0) })
                 }
             }
+            let capturedMatchedSet = matchedSet
             await MainActor.run {
                 isFindingMCS = false
                 guard let mcs = result, !mcs.smartsPattern.isEmpty, mcs.numAtoms >= 2 else {
@@ -1040,7 +1041,7 @@ struct PharmacophoreEditorView: View {
                 }
                 mcsSmarts = mcs.smartsPattern
                 loadStructure(smiles: firstSmiles)
-                mcsMatchedAtoms = matchedSet
+                mcsMatchedAtoms = capturedMatchedSet
             }
         }
     }
@@ -1048,9 +1049,10 @@ struct PharmacophoreEditorView: View {
     private func autoDetectFeatures() {
         guard !activeSmiles.isEmpty else { return }
         isDetecting = true
+        let smiles = activeSmiles
 
         Task.detached {
-            let detected = RDKitBridge.detectPharmacophoreFeatures(smiles: activeSmiles)
+            let detected = RDKitBridge.detectPharmacophoreFeatures(smiles: smiles)
             await MainActor.run {
                 isDetecting = false
                 guard let detected, !detected.isEmpty, let coords = coords2D else { return }
@@ -1089,7 +1091,7 @@ struct PharmacophoreEditorView: View {
     }
 
     private func applyFeatures() {
-        guard let coords = coords2D else { return }
+        guard coords2D != nil else { return }
         let activeFeatures = features.filter { !$0.isIgnored }
         guard !activeFeatures.isEmpty else { return }
 

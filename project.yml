@@ -17,6 +17,7 @@ targets:
   Druse:
     type: application
     platform: macOS
+    supportedDestinations: [macOS]
     sources:
       - path: App
       - path: Models
@@ -43,6 +44,7 @@ targets:
         type: folder
     settings:
       base:
+        ARCHS: arm64
         PRODUCT_BUNDLE_IDENTIFIER: com.druse.app
         PRODUCT_NAME: Druse
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.medical"
@@ -100,8 +102,6 @@ targets:
           - "-ltbb"
           - "-lOpenMM"
           - "-lc++"
-          - "-rpath"
-          - "@executable_path/../Frameworks"
           - "-rpath"
           - "/opt/homebrew/lib"
           - "-rpath"

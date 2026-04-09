@@ -356,7 +356,6 @@ extension AppViewModel {
         setDemoStep(.dockingRun,
             narration: "Nafamostat is dancing in the active site — the molecule tries thousands of orientations and conformations. The scoring function evaluates steric fit, hydrogen bonds, hydrophobic contacts, and torsional strain at each step.")
 
-        var hasConverged = false
         while docking.isDocking {
             try await Task.sleep(for: .milliseconds(200))
 

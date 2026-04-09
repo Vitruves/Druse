@@ -694,64 +694,7 @@ final class LigandDatabase {
         }
     }
 
-    // MARK: - Encode Forms (v3)
-
-    private static func encodeForms(_ forms: [ChemicalForm]) -> [SerializableForm]? {
-        guard !forms.isEmpty else { return nil }
-        return forms.map { form in
-            let templateAtoms = form.bestConformer?.atoms ?? []
-            let atomElements = templateAtoms.map { $0.element.rawValue }
-            let atomNames = templateAtoms.map(\.name)
-            let bondData = encodeBonds(form.bestConformer?.bonds ?? [])
-
-            let conformers = form.conformers.map { conf in
-                SerializableConformer(
-                    positions: conf.atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] },
-                    energy: conf.energy
-                )
-            }
-            return SerializableForm(
-                smiles: form.smiles, kind: form.kind.rawValue, label: form.label,
-                boltzmannWeight: form.boltzmannWeight, relativeEnergy: form.relativeEnergy,
-                atomElements: atomElements.isEmpty ? nil : atomElements,
-                atomNames: atomNames.isEmpty ? nil : atomNames,
-                bondData: bondData, conformers: conformers
-            )
-        }
-    }
-
-    private static func decodeForms(_ serializedForms: [SerializableForm]?) -> [ChemicalForm] {
-        guard let sf = serializedForms, !sf.isEmpty else { return [] }
-        return sf.map { s in
-            let bonds = decodeBonds(data: s.bondData)
-            let conformers: [Conformer3D] = s.conformers.enumerated().map { idx, sc in
-                var atoms: [Atom] = []
-                if let elems = s.atomElements, let names = s.atomNames {
-                    for i in stride(from: 0, to: sc.positions.count - 2, by: 3) {
-                        let aIdx = i / 3
-                        guard aIdx < elems.count, aIdx < names.count else { break }
-                        atoms.append(Atom(
-                            id: aIdx, element: Element(rawValue: elems[aIdx]) ?? .C,
-                            position: SIMD3(sc.positions[i], sc.positions[i+1], sc.positions[i+2]),
-                            name: names[aIdx], residueName: "LIG", residueSeq: 1, chainID: "L",
-                            charge: 0, formalCharge: 0, isHetAtom: true
-                        ))
-                    }
-                }
-                return Conformer3D(id: idx, atoms: atoms, bonds: bonds, energy: sc.energy)
-            }
-            return ChemicalForm(
-                smiles: s.smiles,
-                kind: ChemicalFormKind(rawValue: s.kind) ?? .parent,
-                label: s.label,
-                boltzmannWeight: s.boltzmannWeight,
-                relativeEnergy: s.relativeEnergy,
-                conformers: conformers
-            )
-        }
-    }
-
-    // MARK: - Encode (v3 format)
+    // MARK: - Encode (v4 flat format)
 
     private func encodeToDisk() throws -> Data {
         // Only encode top-level entries (skip legacy children)
@@ -759,7 +702,6 @@ final class LigandDatabase {
         let serializable = topLevel.map { entry -> SerializableEntry in
             let (atomData, atomElements, atomNames) = Self.encodeAtoms(entry.atoms)
             let bondData = Self.encodeBonds(entry.bonds)
-            let forms = Self.encodeForms(entry.forms)
 
             // Encode per-entry conformers for the flat model
             let entryConfs: [SerializableConformer]? = entry.conformers.isEmpty ? nil :

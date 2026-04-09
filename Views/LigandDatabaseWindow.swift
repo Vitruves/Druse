@@ -1084,7 +1084,6 @@ struct LigandDatabaseWindow: View {
 
         populateTask = Task {
             var successCount = 0
-            var totalConformers = 0
             var completedCount = 0
 
             let maxConcurrency = max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
