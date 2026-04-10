@@ -39,6 +39,7 @@ extern const int kNumIonizableGroups;
 
 const std::vector<std::unique_ptr<ROMol>>& getCompiledPatterns();
 std::vector<std::tuple<int, int, bool, double>> detectIonSitesInternal(const ROMol &mol);
+unsigned neighborEnvironmentFingerprint(const ROMol &mol, int atomIdx);
 
 DruseMoleculeResult* make_error(const char *msg);
 void mmff_minimize_single(RWMol &mol, int confId = -1);

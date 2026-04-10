@@ -312,7 +312,7 @@ struct LigandDatabaseWindow: View {
                 }) {
                     Label({
                         let n = db.entries.filter { selectedIDs.contains($0.id) }.count
-                        return n > 1 ? "Prepare \(n) Selected" : "Prepare Selected"
+                        return n > 1 ? "Prepare (\(n))" : "Prepare"
                     }(), systemImage: "wand.and.stars")
                 }
                 .controlSize(.small)
@@ -331,7 +331,7 @@ struct LigandDatabaseWindow: View {
                 }) {
                     Label({
                         let n = db.entries.filter { selectedIDs.contains($0.id) && !$0.isEnumerated }.count
-                        return n > 1 ? "Enumerate \(n) Selected" : "Enumerate Selected"
+                        return n > 1 ? "Enumerate (\(n))" : "Enumerate"
                     }(), systemImage: "arrow.triangle.branch")
                 }
                 .controlSize(.small)
@@ -1135,8 +1135,13 @@ struct LigandDatabaseWindow: View {
             processingMessage = ""
             populateTask = nil
 
-            if let inspID = inspectedEntry?.id {
-                inspectedEntry = db.entries.first { $0.id == inspID }
+            if let inspID = inspectedEntry?.id,
+               let refreshed = db.entries.first(where: { $0.id == inspID }) {
+                inspectedEntry = refreshed
+                // Force 2D depiction refresh — SMILES may have changed
+                ligand2DCoords = nil
+                ligand2DImage = nil
+                compute2DPreview(smiles: refreshed.originalSMILES)
             }
 
             if !Task.isCancelled {
@@ -1259,8 +1264,13 @@ struct LigandDatabaseWindow: View {
             processingMessage = ""
             populateTask = nil
 
-            if let inspID = inspectedEntry?.id {
-                inspectedEntry = db.entries.first { $0.id == inspID }
+            if let inspID = inspectedEntry?.id,
+               let refreshed = db.entries.first(where: { $0.id == inspID }) {
+                inspectedEntry = refreshed
+                // Force 2D depiction refresh — SMILES may have changed
+                ligand2DCoords = nil
+                ligand2DImage = nil
+                compute2DPreview(smiles: refreshed.originalSMILES)
             }
 
             if !Task.isCancelled {

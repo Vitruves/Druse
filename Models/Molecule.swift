@@ -170,11 +170,13 @@ final class Molecule: Identifiable {
     }
 
     func residue(forAtom atomIndex: Int) -> Residue? {
+        guard atomIndex >= 0 && atomIndex < atoms.count else { return nil }
         let atom = atoms[atomIndex]
         return residues.first { $0.chainID == atom.chainID && $0.sequenceNumber == atom.residueSeq }
     }
 
     func residueIndex(forAtom atomIndex: Int) -> Int? {
+        guard atomIndex >= 0 && atomIndex < atoms.count else { return nil }
         let atom = atoms[atomIndex]
         return residues.firstIndex { $0.chainID == atom.chainID && $0.sequenceNumber == atom.residueSeq }
     }

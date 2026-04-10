@@ -162,70 +162,124 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
         // to catch systematic mispredictions (e.g. aminopyridazine vs piperazine).
         // No proximity depression is applied (GNN already accounts for environment).
         auto smartsSites = detectIonSitesInternal(*parentMol);
-        std::map<int, double> smartsPKa;
+        struct SmartsHit { double pKa; bool isAcid; };
+        std::map<int, SmartsHit> smartsLookup;
         for (const auto &[aIdx, gIdx, isA, pk] : smartsSites) {
-            smartsPKa[aIdx] = pk;
+            smartsLookup[aIdx] = {pk, isA};
         }
 
         // Build corrected site list: use GNN pKa but clamp against SMARTS
         // when they disagree by more than 3 pKa units.
         struct CorrectedSite { int atomIdx; bool isAcid; double pKa; };
         std::vector<CorrectedSite> correctedSites;
+        std::set<int> gnnAtomIdx;
         for (int32_t i = 0; i < nSites; i++) {
             int atomIdx = sites[i].atomIdx;
             if (atomIdx < 0 || atomIdx >= (int)parentMol->getNumAtoms()) continue;
             double gnnPKa = sites[i].pKa;
             bool isAcid = sites[i].isAcid;
 
-            auto it = smartsPKa.find(atomIdx);
-            if (it != smartsPKa.end()) {
-                double smartsPk = it->second;
+            auto it = smartsLookup.find(atomIdx);
+            if (it != smartsLookup.end()) {
+                double smartsPk = it->second.pKa;
+                bool smartsIsAcid = it->second.isAcid;
                 double diff = gnnPKa - smartsPk;
-                if (std::abs(diff) > 3.0) {
-                    // GNN prediction disagrees strongly with SMARTS table —
-                    // use weighted blend biased toward SMARTS for large errors
-                    double blend = 0.3 * gnnPKa + 0.7 * smartsPk;
-                    fprintf(stderr, "[druse] pKa sanity: atom %d GNN=%.1f SMARTS=%.1f → %.1f\n",
-                            atomIdx, gnnPKa, smartsPk, blend);
-                    gnnPKa = blend;
+                if (smartsIsAcid != isAcid) {
+                    // GNN and SMARTS disagree on acid/base classification —
+                    // SMARTS is chemically grounded, override.
+                    fprintf(stderr, "[druse] pKa class override: atom %d GNN=%s/%.1f → SMARTS=%s/%.1f\n",
+                            atomIdx, isAcid ? "acid" : "base", gnnPKa,
+                            smartsIsAcid ? "acid" : "base", smartsPk);
+                    gnnPKa = smartsPk;
+                    isAcid = smartsIsAcid;
+                } else if (std::abs(diff) > 1.5) {
+                    // Strong disagreement: SMARTS is the curated reference for
+                    // drug-like functional groups (piperazines, anilines,
+                    // carboxylic acids, etc). GNN underprediction on common
+                    // motifs would otherwise drop legitimate ionizable sites
+                    // from enumeration. Snap to SMARTS for these cases.
+                    fprintf(stderr, "[druse] pKa override: atom %d GNN=%.1f → SMARTS=%.1f\n",
+                            atomIdx, gnnPKa, smartsPk);
+                    gnnPKa = smartsPk;
                 }
             }
             correctedSites.push_back({atomIdx, isAcid, gnnPKa});
+            gnnAtomIdx.insert(atomIdx);
         }
 
-        auto washedMol = std::make_unique<RWMol>(*parentMol);
+        // Backfill: GNN's ionizable-probability threshold can drop legitimate
+        // basic sites (e.g. tertiary piperazine N next to an aminopyridazine
+        // distractor). For any SMARTS hit GNN did not predict, add it at its
+        // tabulated pKa so it still participates in protomer enumeration.
+        for (const auto &[aIdx, gIdx, isA, pk] : smartsSites) {
+            if (gnnAtomIdx.count(aIdx)) continue;
+            correctedSites.push_back({aIdx, isA, pk});
+            fprintf(stderr, "[druse] SMARTS backfill: atom %d pKa=%.1f %s (missed by GNN)\n",
+                    aIdx, pk, isA ? "(acid)" : "(base)");
+        }
 
         struct AmbSite { int atomIdx; bool isAcid; double pKa; };
         std::vector<AmbSite> ambSites;
-
         for (size_t i = 0; i < correctedSites.size(); i++) {
-            int atomIdx = correctedSites[i].atomIdx;
-            bool isAcid = correctedSites[i].isAcid;
-            double pKa = correctedSites[i].pKa;
-            double deltaPH = pH - pKa;
-
-            if (isAcid && deltaPH > pkaThreshold) {
-                // Clearly deprotonated at this pH
-                Atom *atom = washedMol->getAtomWithIdx(atomIdx);
-                int nH = atom->getTotalNumHs();
-                if (nH > 0) {
-                    atom->setNumExplicitHs(nH - 1);
-                    atom->setFormalCharge(atom->getFormalCharge() - 1);
-                }
-            } else if (!isAcid && deltaPH < -pkaThreshold) {
-                // Clearly protonated at this pH
-                Atom *atom = washedMol->getAtomWithIdx(atomIdx);
-                int nH = atom->getTotalNumHs();
-                atom->setNumExplicitHs(nH + 1);
-                atom->setFormalCharge(atom->getFormalCharge() + 1);
-            } else if (std::abs(deltaPH) <= pkaThreshold) {
-                // Ambiguous — enumerate both states
-                ambSites.push_back({atomIdx, isAcid, pKa});
+            double deltaPH = pH - correctedSites[i].pKa;
+            if (std::abs(deltaPH) <= pkaThreshold) {
+                ambSites.push_back({correctedSites[i].atomIdx,
+                                    correctedSites[i].isAcid,
+                                    correctedSites[i].pKa});
             }
         }
-        try { MolOps::sanitizeMol(*washedMol); } catch (...) {
-            washedMol = std::make_unique<RWMol>(*parentMol);
+
+        // Helper: apply "clearly protonated/deprotonated" sites to a molecule.
+        // Skips atoms whose H count differs from the parent — those have been
+        // moved by tautomerization and the protonation rule no longer applies.
+        auto applyClearProtonation = [&](RWMol &mol) {
+            for (const auto &cs : correctedSites) {
+                double deltaPH = pH - cs.pKa;
+                Atom *parentAtom = parentMol->getAtomWithIdx(cs.atomIdx);
+                Atom *atom = mol.getAtomWithIdx(cs.atomIdx);
+                if (parentAtom->getTotalNumHs() != atom->getTotalNumHs()) continue;
+                if (cs.isAcid && deltaPH > pkaThreshold) {
+                    int nH = atom->getTotalNumHs();
+                    if (nH > 0) {
+                        atom->setNumExplicitHs(nH - 1);
+                        atom->setFormalCharge(atom->getFormalCharge() - 1);
+                    }
+                } else if (!cs.isAcid && deltaPH < -pkaThreshold) {
+                    int nH = atom->getTotalNumHs();
+                    atom->setNumExplicitHs(nH + 1);
+                    atom->setFormalCharge(atom->getFormalCharge() + 1);
+                }
+            }
+        };
+
+        // === Tautomer-first enumeration ===
+        // Run tautomer enumeration on the *unprotonated* parent so that ring
+        // NH ↔ ring N=C rearrangements (e.g. aminopyridazine ↔ pyridazinone)
+        // aren't blocked by adjacent charged sites. Atom indices are preserved
+        // by RDKit's TautomerEnumerator transformations, so the same site list
+        // can be applied to each tautomer.
+        std::vector<std::unique_ptr<RWMol>> baseTautomers;
+        {
+            auto rw = std::make_unique<RWMol>(*parentMol);
+            baseTautomers.push_back(std::move(rw));
         }
+        std::set<std::string> tautSeen;
+        tautSeen.insert(MolToSmiles(*parentMol));
+        try {
+            MolStandardize::TautomerEnumerator tautEnum;
+            tautEnum.setMaxTautomers(std::max(maxTautomers, 2));
+            tautEnum.setMaxTransforms(200);
+            auto tres = tautEnum.enumerate(*parentMol);
+            for (const auto &t : tres) {
+                if ((int)baseTautomers.size() >= maxTautomers) break;
+                auto rw = std::make_unique<RWMol>(*t);
+                try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+                std::string tSmi = MolToSmiles(*rw);
+                if (tautSeen.count(tSmi)) continue;
+                tautSeen.insert(tSmi);
+                baseTautomers.push_back(std::move(rw));
+            }
+        } catch (...) {}
 
         struct ChemicalForm {
             std::string smi;
@@ -237,6 +291,8 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
         std::vector<ChemicalForm> allForms;
         std::set<std::string> seenSMILES;
 
+        // Combo enumeration is shared across tautomers — same ambiguous sites,
+        // same Henderson-Hasselbalch populations.
         int nAmb = std::min((int)ambSites.size(), 10);
         int nTotalCombos = 1 << nAmb;
 
@@ -259,107 +315,83 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
             [](const ComboPop &a, const ComboPop &b) { return a.population > b.population; });
         int nCombos = std::min((int)combosByPop.size(), (int)maxProtomers);
 
-        struct ProtomerForm {
-            std::string smi;
-            std::unique_ptr<RWMol> mol;
-            std::string label;
-            double hhPopulation;
-        };
-        std::vector<ProtomerForm> protomers;
-
-        for (int ci = 0; ci < nCombos; ci++) {
-            int combo = combosByPop[ci].combo;
-            auto rw = std::make_unique<RWMol>(*washedMol);
-            std::string comboLabel;
-            double hhPop = 1.0;
-
-            for (int s = 0; s < nAmb; s++) {
-                const auto &site = ambSites[s];
-                double fracProt = 1.0 / (1.0 + std::pow(10.0, pH - site.pKa));
-                double fracDeprot = 1.0 - fracProt;
-
-                bool toggle = (combo >> s) & 1;
-                if (!toggle) {
-                    hhPop *= site.isAcid ? fracProt : fracDeprot;
-                    continue;
-                }
-
-                Atom *atom = rw->getAtomWithIdx(site.atomIdx);
-                if (site.isAcid) {
-                    int nH = atom->getTotalNumHs();
-                    if (nH > 0) {
-                        atom->setNumExplicitHs(nH - 1);
-                        atom->setFormalCharge(atom->getFormalCharge() - 1);
-                    }
-                    hhPop *= fracDeprot;
-                } else {
-                    int nH = atom->getTotalNumHs();
-                    atom->setNumExplicitHs(nH + 1);
-                    atom->setFormalCharge(atom->getFormalCharge() + 1);
-                    hhPop *= fracProt;
-                }
-                if (!comboLabel.empty()) comboLabel += "+";
-                comboLabel += site.isAcid ? "deprot" : "prot";
-                comboLabel += "_atom" + std::to_string(site.atomIdx);
-            }
-
-            try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
-            std::string pSmi = MolToSmiles(*rw);
-            if (seenSMILES.count(pSmi)) continue;
-            seenSMILES.insert(pSmi);
-
-            if (comboLabel.empty()) comboLabel = "Parent";
-            protomers.push_back({pSmi, std::move(rw), comboLabel, hhPop});
-        }
-
-        if (protomers.empty()) {
-            auto rw = std::make_unique<RWMol>(*washedMol);
-            std::string wSmi = MolToSmiles(*rw);
-            seenSMILES.insert(wSmi);
-            protomers.push_back({wSmi, std::move(rw), "Parent", 1.0});
-        }
-
         int maxTotalForms = maxProtomers * maxTautomers;
         if (maxTotalForms > 200) maxTotalForms = 200;
 
-        for (auto &prot : protomers) {
+        // For each tautomer × each protomer combo, generate one form
+        for (size_t ti = 0; ti < baseTautomers.size(); ti++) {
             if ((int)allForms.size() >= maxTotalForms) break;
 
-            if (!seenSMILES.count(prot.smi)) seenSMILES.insert(prot.smi);
-            {
-                auto rw = std::make_unique<RWMol>(*prot.mol);
-                int kind = (prot.label != "Parent") ? 2 : 0;
-                allForms.push_back({prot.smi, std::move(rw), prot.label, kind, prot.hhPopulation});
+            auto washedTaut = std::make_unique<RWMol>(*baseTautomers[ti]);
+            applyClearProtonation(*washedTaut);
+            try { MolOps::sanitizeMol(*washedTaut); } catch (...) {
+                washedTaut = std::make_unique<RWMol>(*baseTautomers[ti]);
             }
 
-            try {
-                MolStandardize::TautomerEnumerator enumerator;
-                enumerator.setMaxTautomers(std::max(maxTautomers, 2));
-                enumerator.setMaxTransforms(200);
-                auto tautResult = enumerator.enumerate(*prot.mol);
+            std::string tautPrefix = (ti == 0) ? "" : ("Taut" + std::to_string(ti) + "_");
 
-                int tautCount = 0;
-                for (const auto &taut : tautResult) {
-                    if (tautCount >= maxTautomers || (int)allForms.size() >= maxTotalForms) break;
-                    auto rw = std::make_unique<RWMol>(*taut);
-                    try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
-                    std::string tSmi = MolToSmiles(*rw);
-                    if (seenSMILES.count(tSmi)) continue;
-                    seenSMILES.insert(tSmi);
+            for (int ci = 0; ci < nCombos; ci++) {
+                if ((int)allForms.size() >= maxTotalForms) break;
 
-                    bool isFromProtomer = (prot.label != "Parent");
-                    int kind = isFromProtomer ? 3 : 1;
+                int combo = combosByPop[ci].combo;
+                auto rw = std::make_unique<RWMol>(*washedTaut);
+                std::string comboLabel;
+                double hhPop = 1.0;
 
-                    std::string label = prot.label;
-                    if (label != "Parent") label += "_";
-                    else label = "";
-                    label += "Taut" + std::to_string(tautCount + 1);
+                for (int s = 0; s < nAmb; s++) {
+                    const auto &site = ambSites[s];
+                    double fracProt = 1.0 / (1.0 + std::pow(10.0, pH - site.pKa));
+                    double fracDeprot = 1.0 - fracProt;
 
-                    allForms.push_back({tSmi, std::move(rw), label, kind, prot.hhPopulation});
-                    tautCount++;
+                    bool toggle = (combo >> s) & 1;
+                    if (!toggle) {
+                        hhPop *= site.isAcid ? fracProt : fracDeprot;
+                        continue;
+                    }
+
+                    Atom *atom = rw->getAtomWithIdx(site.atomIdx);
+                    // Skip if tautomerization moved the H away from this atom
+                    Atom *parentAtom = parentMol->getAtomWithIdx(site.atomIdx);
+                    if (parentAtom->getTotalNumHs() != atom->getTotalNumHs()) {
+                        hhPop *= site.isAcid ? fracProt : fracDeprot;
+                        continue;
+                    }
+                    if (site.isAcid) {
+                        int nH = atom->getTotalNumHs();
+                        if (nH > 0) {
+                            atom->setNumExplicitHs(nH - 1);
+                            atom->setFormalCharge(atom->getFormalCharge() - 1);
+                        }
+                        hhPop *= fracDeprot;
+                    } else {
+                        int nH = atom->getTotalNumHs();
+                        atom->setNumExplicitHs(nH + 1);
+                        atom->setFormalCharge(atom->getFormalCharge() + 1);
+                        hhPop *= fracProt;
+                    }
+                    if (!comboLabel.empty()) comboLabel += "+";
+                    comboLabel += site.isAcid ? "deprot" : "prot";
+                    comboLabel += "_atom" + std::to_string(site.atomIdx);
                 }
-            } catch (...) {
+
+                try { MolOps::sanitizeMol(*rw); } catch (...) { continue; }
+                std::string pSmi = MolToSmiles(*rw);
+                if (seenSMILES.count(pSmi)) continue;
+                seenSMILES.insert(pSmi);
+
+                std::string label = tautPrefix + (comboLabel.empty() ? "Parent" : comboLabel);
+                int kind = (ti == 0)
+                    ? (comboLabel.empty() ? 0 : 2)   // 0=parent, 2=protomer
+                    : (comboLabel.empty() ? 1 : 3); // 1=tautomer, 3=both
+                allForms.push_back({pSmi, std::move(rw), label, kind, hhPop});
             }
+        }
+
+        if (allForms.empty()) {
+            // Fallback: at least output the parent
+            auto rw = std::make_unique<RWMol>(*parentMol);
+            std::string wSmi = MolToSmiles(*rw);
+            allForms.push_back({wSmi, std::move(rw), "Parent", 0, 1.0});
         }
 
         if (allForms.empty()) {

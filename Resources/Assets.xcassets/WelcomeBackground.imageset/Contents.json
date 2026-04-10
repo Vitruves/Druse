@@ -1,0 +1,12 @@
+{
+  "images" : [
+    {
+      "filename" : "bkg_blurred.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

@@ -539,6 +539,39 @@ const std::vector<std::unique_ptr<ROMol>>& getCompiledPatterns() {
     return patterns;
 }
 
+/// First-shell environment fingerprint used to gate symmetry expansion of ring
+/// matches. Distinguishes atoms whose SMARTS-defined substituent class differs
+/// (aryl vs acyl vs sulfonyl), so we do NOT propagate a basic-amine pKa onto
+/// an amide N when a single asymmetric pattern like "Piperaz NR,N-acyl" matches
+/// two ring nitrogens with different roles.
+unsigned neighborEnvironmentFingerprint(const ROMol &mol, int atomIdx) {
+    const Atom *a = mol.getAtomWithIdx(atomIdx);
+    unsigned fp = 0;
+    for (const auto bond : mol.atomBonds(a)) {
+        const Atom *nb = bond->getOtherAtom(a);
+        int an = nb->getAtomicNum();
+        if (an == 6) {
+            if (nb->getIsAromatic()) fp |= 1;  // aryl carbon neighbor
+            for (const auto b2 : mol.atomBonds(nb)) {
+                const Atom *n2 = b2->getOtherAtom(nb);
+                int n2an = n2->getAtomicNum();
+                if ((n2an == 8 || n2an == 16) && b2->getBondType() == Bond::DOUBLE) {
+                    fp |= 2;  // acyl/thioacyl carbon neighbor (C=O, C=S)
+                    break;
+                }
+            }
+        } else if (an == 16) {
+            int oxo = 0;
+            for (const auto b2 : mol.atomBonds(nb)) {
+                const Atom *n2 = b2->getOtherAtom(nb);
+                if (n2->getAtomicNum() == 8 && b2->getBondType() == Bond::DOUBLE) oxo++;
+            }
+            if (oxo >= 2) fp |= 4;  // sulfonyl neighbor
+        }
+    }
+    return fp;
+}
+
 /// Detect all ionizable sites in a molecule (dedup by atom index, first match wins).
 std::vector<std::tuple<int, int, bool, double>> detectIonSitesInternal(const ROMol &mol) {
     const auto &patterns = getCompiledPatterns();
@@ -563,6 +596,7 @@ std::vector<std::tuple<int, int, bool, double>> detectIonSitesInternal(const ROM
                 bool pArom = primary->getIsAromatic();
                 unsigned pDeg = primary->getDegree();
                 unsigned pH = primary->getTotalNumHs();
+                unsigned pFP = neighborEnvironmentFingerprint(mol, aIdx);
                 for (size_t mi = 1; mi < m.size(); mi++) {
                     int otherIdx = m[mi].second;
                     if (seen.count(otherIdx)) continue;
@@ -571,7 +605,8 @@ std::vector<std::tuple<int, int, bool, double>> detectIonSitesInternal(const ROM
                         ri->numAtomRings(otherIdx) > 0 &&
                         other->getIsAromatic() == pArom &&
                         other->getDegree() == pDeg &&
-                        other->getTotalNumHs() == pH) {
+                        other->getTotalNumHs() == pH &&
+                        neighborEnvironmentFingerprint(mol, otherIdx) == pFP) {
                         seen.insert(otherIdx);
                         sites.emplace_back(otherIdx, g, kIonizableGroups[g].isAcid,
                                            kIonizableGroups[g].pKa);

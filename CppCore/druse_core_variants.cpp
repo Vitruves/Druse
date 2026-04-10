@@ -330,6 +330,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
                         bool primaryArom = primaryAtom->getIsAromatic();
                         unsigned primaryDeg = primaryAtom->getDegree();
                         unsigned primaryH = primaryAtom->getTotalNumHs();
+                        unsigned primaryFP = neighborEnvironmentFingerprint(*parentMol, aIdx);
                         for (size_t mi = 1; mi < m.size(); mi++) {
                             int otherIdx = m[mi].second;
                             if (seenAtomIdx.count(otherIdx)) continue;
@@ -338,7 +339,8 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
                                 ri->numAtomRings(otherIdx) > 0 &&
                                 other->getIsAromatic() == primaryArom &&
                                 other->getDegree() == primaryDeg &&
-                                other->getTotalNumHs() == primaryH) {
+                                other->getTotalNumHs() == primaryH &&
+                                neighborEnvironmentFingerprint(*parentMol, otherIdx) == primaryFP) {
                                 seenAtomIdx.insert(otherIdx);
                                 allSites.push_back({g, otherIdx, kIonizableGroups[g].isAcid,
                                                     kIonizableGroups[g].pKa});

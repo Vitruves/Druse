@@ -13,7 +13,14 @@ struct WelcomeScreen: View {
     @State private var appeared = false
 
     var body: some View {
+        let updateChecker = UpdateChecker.shared
         VStack(spacing: 0) {
+            // Update banner
+            if updateChecker.updateAvailable, let version = updateChecker.latestVersion {
+                UpdateBanner(version: version, url: updateChecker.downloadURL)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
             Spacer()
 
             // App identity
@@ -131,16 +138,58 @@ struct WelcomeScreen: View {
         .background {
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
-                WelcomeRibbonBackground()
+                Image("WelcomeBackground")
+                    .resizable()
+                    .scaledToFill()
                     .opacity(0.4)
-                    .blur(radius: 6)
             }
         }
         .onAppear {
             withAnimation(.easeOut(duration: 0.6).delay(0.1)) {
                 appeared = true
             }
+            updateChecker.checkIfNeeded()
         }
+    }
+}
+
+// MARK: - Update Banner
+
+private struct UpdateBanner: View {
+    let version: String
+    let url: URL?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle.fill")
+                .foregroundStyle(.cyan)
+
+            Text("Druse \(version) is available")
+                .font(.subheadline.weight(.medium))
+
+            if let url {
+                Link(destination: url) {
+                    Text("Download")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.cyan)
+                }
+                .onHover { inside in
+                    if inside { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.cyan.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.cyan.opacity(0.2), lineWidth: 0.5)
+                )
+        )
+        .padding(.top, 16)
     }
 }
 

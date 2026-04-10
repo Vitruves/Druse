@@ -29,6 +29,8 @@ targets:
       - path: Renderer
       - path: Metal
         buildPhase: sources
+        excludes:
+          - "*.bak"
       - path: Views
       - path: ViewModels
       - path: Chemistry
