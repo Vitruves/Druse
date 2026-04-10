@@ -5,7 +5,10 @@
 #include <GraphMol/MolStandardize/Tautomer.h>
 #include <GraphMol/Substruct/SubstructMatch.h>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <set>
+#include <tbb/parallel_for.h>
 
 /// Helper: generate 3D for a molecule and return MMFF energy, or NaN on failure.
 static double embed_and_minimize(RWMol &mol) {
@@ -621,8 +624,11 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             double hhPopulation;
         };
         std::vector<PreparedConformer> allConformers;
+        std::mutex allConformersMutex;
 
-        for (int fi = 0; fi < (int)allForms.size(); fi++) {
+        // Parallelize across forms (see druse_core_protonation_tools.cpp for
+        // rationale). Inner numThreads=1 to avoid nested-parallelism oversubscription.
+        tbb::parallel_for(0, (int)allForms.size(), [&](int fi) {
             auto &form = allForms[fi];
             auto mol = std::make_unique<RWMol>(*form.mol);
             MolOps::addHs(*mol, false, true);
@@ -630,7 +636,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             DGeomHelpers::EmbedParameters embedParams = DGeomHelpers::ETKDGv3;
             embedParams.randomSeed = 42;
             embedParams.pruneRmsThresh = 0.25;
-            embedParams.numThreads = 0;
+            embedParams.numThreads = 1;
             auto cids = DGeomHelpers::EmbedMultipleConfs(*mol, conformersPerForm, embedParams);
             if (cids.empty()) {
                 int cid = DGeomHelpers::EmbedMolecule(*mol, embedParams);
@@ -644,13 +650,13 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             if (cids.empty()) {
                 fprintf(stderr, "[druse] conformer generation failed for form %d (%s), skipping\n",
                         fi, form.smi.c_str());
-                continue;
+                return;
             }
 
             std::vector<std::pair<int, double>> mmffResults;
             try {
                 MMFF::MMFFOptimizeMoleculeConfs(
-                    *mol, mmffResults, /*numThreads=*/0, /*maxIters=*/1000, /*mmffVariant=*/"MMFF94"
+                    *mol, mmffResults, /*numThreads=*/1, /*maxIters=*/1000, /*mmffVariant=*/"MMFF94"
                 );
             } catch (...) {
             }
@@ -702,6 +708,8 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             std::sort(indexed.begin(), indexed.end(),
                       [](const auto &a, const auto &b) { return a.second < b.second; });
 
+            std::vector<PreparedConformer> localConformers;
+            localConformers.reserve(indexed.size());
             for (int ri = 0; ri < (int)indexed.size(); ri++) {
                 int confId = cids[indexed[ri].first];
                 double energy = indexed[ri].second;
@@ -724,46 +732,75 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
                     confLabel += "_Conf" + std::to_string(ri + 1);
                 }
 
-                allConformers.push_back({
+                localConformers.push_back({
                     std::move(confMol), energy, fi, ri,
                     confLabel, form.smi, form.kind, form.hhPopulation
                 });
             }
-        }
 
+            std::lock_guard<std::mutex> lock(allConformersMutex);
+            for (auto &c : localConformers) allConformers.push_back(std::move(c));
+        });
+
+        // Per-form energy cutoff (see druse_core_protonation_tools.cpp for rationale).
         if (energyCutoff > 0 && !allConformers.empty()) {
-            double bestE = 1e30;
+            std::map<int, double> bestEPerForm;
             for (const auto &c : allConformers) {
-                if (!std::isnan(c.energy) && c.energy < bestE) bestE = c.energy;
+                if (std::isnan(c.energy)) continue;
+                auto it = bestEPerForm.find(c.formIdx);
+                if (it == bestEPerForm.end() || c.energy < it->second) {
+                    bestEPerForm[c.formIdx] = c.energy;
+                }
             }
             allConformers.erase(
                 std::remove_if(allConformers.begin(), allConformers.end(),
                     [&](const PreparedConformer &c) {
-                        return !std::isnan(c.energy) && c.energy > bestE + energyCutoff;
+                        if (std::isnan(c.energy)) return false;
+                        auto it = bestEPerForm.find(c.formIdx);
+                        if (it == bestEPerForm.end()) return false;
+                        return c.energy > it->second + energyCutoff;
                     }),
                 allConformers.end()
             );
         }
 
+        // Per-form Boltzmann weighting (see druse_core_protonation_tools.cpp).
         double kBT = 0.001987204 * temperature;
         if (kBT < 1e-10) kBT = 0.593;
 
-        double minE = 1e30;
+        std::map<int, double> minEPerForm;
         for (const auto &c : allConformers) {
-            if (!std::isnan(c.energy) && c.energy < minE) minE = c.energy;
+            if (std::isnan(c.energy)) continue;
+            auto it = minEPerForm.find(c.formIdx);
+            if (it == minEPerForm.end() || c.energy < it->second) {
+                minEPerForm[c.formIdx] = c.energy;
+            }
+        }
+
+        std::map<int, double> partitionPerForm;
+        std::vector<double> withinFormBoltz(allConformers.size(), 0.0);
+        for (size_t i = 0; i < allConformers.size(); i++) {
+            const auto &c = allConformers[i];
+            auto it = minEPerForm.find(c.formIdx);
+            if (it == minEPerForm.end()) continue;
+            double dE = std::isnan(c.energy) ? 50.0 : (c.energy - it->second);
+            double boltz = std::exp(-dE / kBT);
+            withinFormBoltz[i] = boltz;
+            partitionPerForm[c.formIdx] += boltz;
         }
 
         std::vector<double> boltzWeights(allConformers.size(), 0.0);
-        double partitionZ = 0.0;
+        double totalWeight = 0.0;
         for (size_t i = 0; i < allConformers.size(); i++) {
-            double dE = std::isnan(allConformers[i].energy) ? 50.0 : (allConformers[i].energy - minE);
-            double boltzFactor = std::exp(-dE / kBT);
-            double hhFactor = allConformers[i].hhPopulation;
-            boltzWeights[i] = hhFactor * boltzFactor;
-            partitionZ += boltzWeights[i];
+            const auto &c = allConformers[i];
+            auto it = partitionPerForm.find(c.formIdx);
+            if (it == partitionPerForm.end() || it->second <= 0) continue;
+            double withinFormFraction = withinFormBoltz[i] / it->second;
+            boltzWeights[i] = withinFormFraction * c.hhPopulation;
+            totalWeight += boltzWeights[i];
         }
-        if (partitionZ > 0) {
-            for (auto &w : boltzWeights) w /= partitionZ;
+        if (totalWeight > 0) {
+            for (auto &w : boltzWeights) w /= totalWeight;
         }
 
         int count = (int)allConformers.size();

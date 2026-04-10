@@ -69,11 +69,15 @@ struct LigandDatabaseWindow: View {
     @State var prepAddHydrogens = true
     @State var prepMinimize = true
     @State var prepComputeCharges = true
-    @State var prepNumConformers = 50
+    @State var prepNumConformers = 10
 
     // Import mapping sheet
     @State var importPreview: ImportPreview?
     @State var showImportMapping: Bool = false
+
+    // Enumeration sheet
+    @State var showEnumerationSheet: Bool = false
+    @State var enumerationSheetEntries: [LigandEntry] = []
 
     // Conformer state
     @State var conformers: [ConformerEntry] = []
@@ -93,9 +97,7 @@ struct LigandDatabaseWindow: View {
     @State var variantMinPopulation: Double = 1.0
     @State var pkaMethod: PKaMethod = .gnn
 
-    // 2D/3D preview toggle
-    @State var show3DPreview: Bool = false
-    @State var miniRenderer: Renderer? = nil
+    // (3D mini renderer is owned by LigandMini3DView, not the window)
 
     struct ConformerEntry: Identifiable {
         let id: Int
@@ -143,13 +145,6 @@ struct LigandDatabaseWindow: View {
         return entries
     }
 
-    // Tab for the bottom options panel
-    @State var bottomTab: BottomTab = .properties
-    enum BottomTab: String, CaseIterable {
-        case properties = "Properties"
-        case populateAndPrepare = "Populate & Prepare"
-    }
-
     // 2D structure preview (RDKit SVG depiction, pre-rasterized to NSImage)
     @State var ligand2DCoords: RDKitBridge.Coords2D?
     @State var ligand2DImage: NSImage?
@@ -177,8 +172,11 @@ struct LigandDatabaseWindow: View {
                                 batchActionPanel
                             }
                         } else if let entry = inspectedEntry {
+                            // Stable identity per entry — only recreate when the
+                            // user picks a different ligand. Conformer/atom mutations
+                            // within the same entry must NOT tear down the MetalView.
                             bottomDetailArea(entry)
-                                .id("\(entry.id)-\(entry.isPrepared)-\(entry.conformerCount)-\(entry.originalSMILES.hashValue)")
+                                .id(entry.id)
                         } else {
                             VStack {
                                 Spacer()
@@ -208,6 +206,29 @@ struct LigandDatabaseWindow: View {
             ImportMappingSheet(preview: $importPreview) { finalPreview in
                 performMappedImport(finalPreview)
             }
+        }
+        .sheet(isPresented: $showEnumerationSheet) {
+            EnumerationSheet(
+                ph: $variantPH,
+                pkaMethod: $pkaMethod,
+                pkaThreshold: $variantPkaThreshold,
+                numConformers: $prepNumConformers,
+                maxTautomers: $variantMaxTautomers,
+                maxProtomers: $variantMaxProtomers,
+                energyCutoff: $variantEnergyCutoff,
+                minPopulation: $variantMinPopulation,
+                entryCount: enumerationSheetEntries.count,
+                isProcessing: isProcessing,
+                progressMessage: processingMessage,
+                progressCurrent: batchProgress.current,
+                progressTotal: batchProgress.total,
+                onRun: {
+                    runEnumerate(entries: enumerationSheetEntries)
+                },
+                onCancelRun: {
+                    cancelPopulateAndPrepare()
+                }
+            )
         }
         .sheet(isPresented: $showScaffoldAnalogSheet) {
             ScaffoldAnalogSheet()
@@ -246,11 +267,17 @@ struct LigandDatabaseWindow: View {
                 if let entry = db.entries.first(where: { $0.id == id }) {
                     inspectedEntry = entry
                     selectedConformerIndex = 0
-                    conformers = []
-                    compute2DPreview(smiles: entry.originalSMILES)
-                    if show3DPreview, !entry.atoms.isEmpty {
-                        updateMiniRenderer(atoms: entry.atoms, bonds: entry.bonds)
+                    conformers = entry.conformers.map { c in
+                        ConformerEntry(
+                            id: c.id,
+                            molecule: MoleculeData(name: entry.name, title: entry.smiles,
+                                                   atoms: c.atoms, bonds: c.bonds),
+                            energy: c.energy
+                        )
                     }
+                    compute2DPreview(smiles: entry.originalSMILES)
+                    // 3D renderer updates itself via .onChange(of: atoms.count)
+                    // inside LigandMini3DView — no manual call needed here.
                 }
             }
         }
@@ -302,7 +329,6 @@ struct LigandDatabaseWindow: View {
                 .help("Cancel preparation")
             } else {
                 Button(action: {
-                    bottomTab = .populateAndPrepare
                     let selected = db.entries.filter { selectedIDs.contains($0.id) }
                     if !selected.isEmpty {
                         runPopulateAndPrepare(entries: selected)
@@ -319,15 +345,17 @@ struct LigandDatabaseWindow: View {
                 .disabled(selectedIDs.isEmpty || isProcessing)
                 .help("Prepare dominant form: add H → minimize → charges → conformers")
 
-                // Enumerate — expand to all tautomers/protomers as separate rows
+                // Enumerate — opens config sheet, runs full pipeline
                 Button(action: {
-                    bottomTab = .populateAndPrepare
                     let selected = db.entries.filter { selectedIDs.contains($0.id) && !$0.isEnumerated }
                     if !selected.isEmpty {
-                        runEnumerate(entries: selected)
+                        enumerationSheetEntries = selected
                     } else if let entry = inspectedEntry, !entry.isEnumerated {
-                        runEnumerate(entries: [entry])
+                        enumerationSheetEntries = [entry]
+                    } else {
+                        enumerationSheetEntries = []
                     }
+                    showEnumerationSheet = !enumerationSheetEntries.isEmpty
                 }) {
                     Label({
                         let n = db.entries.filter { selectedIDs.contains($0.id) && !$0.isEnumerated }.count
@@ -336,7 +364,7 @@ struct LigandDatabaseWindow: View {
                 }
                 .controlSize(.small)
                 .disabled(selectedIDs.isEmpty || isProcessing)
-                .help("Enumerate all tautomers & protomers as separate entries")
+                .help("Configure & run tautomer/protomer enumeration pipeline")
             }
 
             Button(action: { deleteSelected() }) {
@@ -685,16 +713,12 @@ struct LigandDatabaseWindow: View {
                      entry.isEnumerated ? Color.secondary.opacity(0.03) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
+            // Selection update only — the .onChange(of: selectedIDs) handler
+            // is the single source of truth for inspectedEntry, conformers,
+            // 2D preview, and renderer updates. Avoids double-work and
+            // double-fitToContent on every click.
             handleRowClick(entry.id, shiftKey: NSEvent.modifierFlags.contains(.shift),
                           cmdKey: NSEvent.modifierFlags.contains(.command))
-            inspectedEntry = entry
-            selectedConformerIndex = 0
-            // Defer conformer building — only needed when bottom panel is visible
-            conformers = []
-            compute2DPreview(smiles: entry.originalSMILES)
-            if show3DPreview, !entry.atoms.isEmpty {
-                updateMiniRenderer(atoms: entry.atoms, bonds: entry.bonds)
-            }
         }
         .contextMenu {
             Button("Send to Docking") { useEntryForDocking(entry) }
@@ -852,84 +876,6 @@ struct LigandDatabaseWindow: View {
     }
 
     // MARK: - Actions
-
-    private func prepareSelected() {
-        let selected = db.entries.filter { selectedIDs.contains($0.id) }
-        guard !selected.isEmpty else { return }
-
-        let toProcess = selected.filter { !$0.smiles.isEmpty || !$0.name.isEmpty }
-        guard !toProcess.isEmpty else { return }
-
-        isProcessing = true
-        processingMessage = "Preparing \(toProcess.count) ligands..."
-
-        Task {
-            var successCount = 0
-            for (i, entry) in toProcess.enumerated() {
-                processingMessage = "Preparing \(i+1)/\(toProcess.count): \(entry.name)"
-
-                let candidates: [(smiles: String, name: String)]
-                if !entry.smiles.isEmpty {
-                    candidates = [
-                        (entry.smiles, entry.name),
-                        (entry.name, entry.smiles)
-                    ]
-                } else {
-                    candidates = [(entry.name, "Ligand_\(i+1)")]
-                }
-
-                var prepared = false
-                for candidate in candidates {
-                    let smi = candidate.smiles
-                    let nm = candidate.name
-                    let ah = prepAddHydrogens, mn = prepMinimize, cc = prepComputeCharges
-                    let (mol, desc, canonSMILES, _) = await Task.detached { @Sendable in
-                        RDKitBridge.prepareLigand(smiles: smi, name: nm,
-                                                  numConformers: 1, addHydrogens: ah,
-                                                  minimize: mn, computeCharges: cc)
-                    }.value
-
-                    if let mol {
-                        var updated = entry
-                        if smi == entry.name && !entry.smiles.isEmpty {
-                            updated.smiles = entry.name
-                            updated.name = entry.smiles
-                        }
-                        updated.atoms = mol.atoms
-                        updated.bonds = mol.bonds
-                        updated.descriptors = desc
-                        updated.isPrepared = true
-                        updated.conformerCount = 1
-                        if let canonSMILES { updated.originalSMILES = canonSMILES }
-                        db.update(updated)
-                        successCount += 1
-                        prepared = true
-                        break
-                    }
-                }
-
-                if !prepared {
-                    viewModel.log.error("Failed to prepare \(entry.name): invalid SMILES", category: .molecule)
-                }
-            }
-            isProcessing = false
-            processingMessage = ""
-            // Refresh inspected entry if it was prepared
-            if let inspID = inspectedEntry?.id,
-               let refreshed = db.entries.first(where: { $0.id == inspID }) {
-                inspectedEntry = refreshed
-                compute2DPreview(smiles: refreshed.originalSMILES)
-                if show3DPreview, !refreshed.atoms.isEmpty {
-                    updateMiniRenderer(atoms: refreshed.atoms, bonds: refreshed.bonds)
-                }
-            }
-            if successCount > 0 {
-                viewModel.log.success("Prepared \(successCount)/\(toProcess.count) ligands", category: .molecule)
-            } else {
-                viewModel.log.error("All \(toProcess.count) preparations failed — check SMILES validity", category: .molecule)
-            }
-        }
-    }
 
     func deleteSelected() {
         let toDelete = selectedIDs
@@ -1278,6 +1224,12 @@ struct LigandDatabaseWindow: View {
                     "Enumerate: \(toProcess.count) molecules → \(totalNewEntries) new entries, \(totalConformers) conformers",
                     category: .molecule
                 )
+            }
+
+            // Auto-dismiss the enumeration sheet on completion
+            if showEnumerationSheet {
+                showEnumerationSheet = false
+                enumerationSheetEntries = []
             }
         }
     }

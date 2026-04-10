@@ -4,7 +4,9 @@
 
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
+#include <tbb/parallel_for.h>
 
 DruseIonSiteResult* druse_detect_ionizable_sites(const char *smiles) {
     auto *result = new DruseIonSiteResult();
@@ -412,8 +414,13 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
             double hhPopulation;
         };
         std::vector<PreparedConformer> allConformers;
+        std::mutex allConformersMutex;
 
-        for (int fi = 0; fi < (int)allForms.size(); fi++) {
+        // Parallelize across forms. Each form gets its own RWMol so they don't
+        // share state. EmbedMultipleConfs / MMFFOptimizeMoleculeConfs use
+        // numThreads=1 internally to avoid nested-parallelism oversubscription;
+        // TBB handles the outer loop instead.
+        tbb::parallel_for(0, (int)allForms.size(), [&](int fi) {
             auto &form = allForms[fi];
             auto mol = std::make_unique<RWMol>(*form.mol);
             MolOps::addHs(*mol, false, true);
@@ -421,7 +428,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
             DGeomHelpers::EmbedParameters ep = DGeomHelpers::ETKDGv3;
             ep.randomSeed = 42;
             ep.pruneRmsThresh = 0.25;
-            ep.numThreads = 0;
+            ep.numThreads = 1;
             auto cids = DGeomHelpers::EmbedMultipleConfs(*mol, conformersPerForm, ep);
             if (cids.empty()) {
                 int cid = DGeomHelpers::EmbedMolecule(*mol, ep);
@@ -431,10 +438,10 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
                     if (cid >= 0) cids.push_back(cid);
                 }
             }
-            if (cids.empty()) continue;
+            if (cids.empty()) return;
 
             std::vector<std::pair<int, double>> mmffResults;
-            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults, 0, 1000, "MMFF94"); } catch (...) {}
+            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults, 1, 1000, "MMFF94"); } catch (...) {}
             try { computeGasteigerCharges(*mol); } catch (...) {}
 
             std::vector<std::pair<int, double>> indexed;
@@ -477,6 +484,8 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
             std::sort(indexed.begin(), indexed.end(),
                       [](const auto &a, const auto &b) { return a.second < b.second; });
 
+            std::vector<PreparedConformer> localConformers;
+            localConformers.reserve(indexed.size());
             for (int ri = 0; ri < (int)indexed.size(); ri++) {
                 int confId = cids[indexed[ri].first];
                 double energy = indexed[ri].second;
@@ -493,41 +502,84 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
                 std::string confLabel = form.label;
                 if (indexed.size() > 1) confLabel += "_Conf" + std::to_string(ri + 1);
 
-                allConformers.push_back({
+                localConformers.push_back({
                     std::move(confMol), energy, fi, ri, confLabel, form.smi, form.kind, form.hhPopulation
                 });
             }
-        }
 
+            std::lock_guard<std::mutex> lock(allConformersMutex);
+            for (auto &c : localConformers) allConformers.push_back(std::move(c));
+        });
+
+        // Energy cutoff is applied PER FORM, not globally. Different tautomer/
+        // protomer forms have wildly different MMFF baselines (e.g. amino vs
+        // imino aminopyridazine differs by 20+ kcal/mol from RDKit's MMFF).
+        // A global cutoff would silently drop entire chemical forms.
         if (energyCutoff > 0 && !allConformers.empty()) {
-            double bestE = 1e30;
-            for (const auto &c : allConformers)
-                if (!std::isnan(c.energy) && c.energy < bestE) bestE = c.energy;
+            std::map<int, double> bestEPerForm;
+            for (const auto &c : allConformers) {
+                if (std::isnan(c.energy)) continue;
+                auto it = bestEPerForm.find(c.formIdx);
+                if (it == bestEPerForm.end() || c.energy < it->second) {
+                    bestEPerForm[c.formIdx] = c.energy;
+                }
+            }
             allConformers.erase(
                 std::remove_if(allConformers.begin(), allConformers.end(),
                     [&](const PreparedConformer &c) {
-                        return !std::isnan(c.energy) && c.energy > bestE + energyCutoff;
+                        if (std::isnan(c.energy)) return false;
+                        auto it = bestEPerForm.find(c.formIdx);
+                        if (it == bestEPerForm.end()) return false;
+                        return c.energy > it->second + energyCutoff;
                     }),
                 allConformers.end());
         }
 
+        // Per-form Boltzmann weighting. MMFF energies are NOT comparable across
+        // different chemical species (tautomers, protomers) — their baselines
+        // can differ by 20+ kcal/mol, which makes a global Boltzmann factor
+        // collapse all but the global-minimum form to ~0. Instead:
+        //   1. Conformers within a single form get Boltzmann weights from
+        //      that form's own energy minimum.
+        //   2. Each form's contribution is scaled by its Henderson-Hasselbalch
+        //      population (already computed during protomer enumeration).
+        //   3. All weights are then normalized to sum to 1.0.
         double kBT = 0.001987204 * temperature;
         if (kBT < 1e-10) kBT = 0.593;
-        double minE = 1e30;
-        for (const auto &c : allConformers)
-            if (!std::isnan(c.energy) && c.energy < minE) minE = c.energy;
+
+        std::map<int, double> minEPerForm;
+        for (const auto &c : allConformers) {
+            if (std::isnan(c.energy)) continue;
+            auto it = minEPerForm.find(c.formIdx);
+            if (it == minEPerForm.end() || c.energy < it->second) {
+                minEPerForm[c.formIdx] = c.energy;
+            }
+        }
+
+        std::map<int, double> partitionPerForm;
+        std::vector<double> withinFormBoltz(allConformers.size(), 0.0);
+        for (size_t i = 0; i < allConformers.size(); i++) {
+            const auto &c = allConformers[i];
+            auto it = minEPerForm.find(c.formIdx);
+            if (it == minEPerForm.end()) continue;
+            double dE = std::isnan(c.energy) ? 50.0 : (c.energy - it->second);
+            double boltz = std::exp(-dE / kBT);
+            withinFormBoltz[i] = boltz;
+            partitionPerForm[c.formIdx] += boltz;
+        }
 
         std::vector<double> boltzWeights(allConformers.size(), 0.0);
-        double partitionZ = 0.0;
+        double totalWeight = 0.0;
         for (size_t i = 0; i < allConformers.size(); i++) {
-            double dE = std::isnan(allConformers[i].energy) ? 50.0 : (allConformers[i].energy - minE);
-            double boltzFactor = std::exp(-dE / kBT);
-            double hhFactor = allConformers[i].hhPopulation;
-            boltzWeights[i] = hhFactor * boltzFactor;
-            partitionZ += boltzWeights[i];
+            const auto &c = allConformers[i];
+            auto it = partitionPerForm.find(c.formIdx);
+            if (it == partitionPerForm.end() || it->second <= 0) continue;
+            double withinFormFraction = withinFormBoltz[i] / it->second;
+            boltzWeights[i] = withinFormFraction * c.hhPopulation;
+            totalWeight += boltzWeights[i];
         }
-        if (partitionZ > 0) {
-            for (auto &w : boltzWeights) w /= partitionZ;
+        if (totalWeight > 0) {
+            for (auto &w : boltzWeights) w /= totalWeight;
         }
 
         int count = (int)allConformers.size();

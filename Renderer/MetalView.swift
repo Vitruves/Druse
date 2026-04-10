@@ -371,8 +371,13 @@ class MetalMTKView: MTKView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     /// Request a redraw after any user interaction that changes the scene.
+    /// Calls `draw()` directly instead of `needsDisplay = true` so the frame
+    /// is rendered immediately on the main thread, bypassing the per-window
+    /// display link. CADisplayLink in secondary `Window` scenes (e.g. the
+    /// Ligand Database window) is sometimes throttled or slow to fire,
+    /// causing multi-second drag latency in on-demand mode.
     private func requestRedraw() {
-        needsDisplay = true
+        draw()
     }
 
     override func mouseDown(with event: NSEvent) {
