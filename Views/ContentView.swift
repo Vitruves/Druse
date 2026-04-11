@@ -644,6 +644,20 @@ struct ContentView: View {
             .nativeTooltip("Center on ligand")
             .plainButtonAccessibility(AccessibilityID.renderFitToLigand)
 
+            Button(action: { viewModel.fitToProtein() }) {
+                Image(systemName: "atom")
+                    .font(.callout)
+                    .frame(width: 28, height: 28)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .disabled(viewModel.molecules.protein == nil)
+            .nativeTooltip("Center on protein")
+            .plainButtonAccessibility(AccessibilityID.renderFitToProtein)
+
             Button(action: { viewModel.renderer?.camera.reset(); viewModel.pushToRenderer() }) {
                 Image(systemName: "arrow.counterclockwise")
                     .font(.callout)

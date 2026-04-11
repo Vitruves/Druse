@@ -526,6 +526,7 @@ struct LigandDatabaseWindow: View {
             // every row reserves).
             GeometryReader { geo in
                 let widths = computeColumnWidths(viewportWidth: geo.size.width - 16 - 24)
+                let viewportHeight = geo.size.height
                 ScrollView([.horizontal, .vertical], showsIndicators: true) {
                     LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                         Section {
@@ -537,6 +538,13 @@ struct LigandDatabaseWindow: View {
                             tableHeaderRow(widths: widths)
                         }
                     }
+                    // Force the LazyVStack to claim at least the viewport
+                    // height with top alignment. Without this, ScrollView lets
+                    // the content float vertically when it's shorter than the
+                    // viewport, which leaves a giant gap above the table when
+                    // there's only one or two entries (e.g. after adding a
+                    // single SMILES via the inline bar).
+                    .frame(minHeight: viewportHeight, alignment: .topLeading)
                     .background(alignment: .topLeading) {
                         columnSeparatorOverlay(widths: widths)
                     }
@@ -562,11 +570,13 @@ struct LigandDatabaseWindow: View {
         VStack(spacing: 0) {
             // Sticky header checkbox (matches the table's pinned section header)
             Button(action: { toggleSelectAll() }) {
-                Image(systemName: selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
-                      ? "checkmark.square.fill" : "square")
+                let selectableIDs = Set(filteredEntries.lazy
+                    .filter { !db.hasEnumeratedChildren($0) }
+                    .map(\.id))
+                let allSelected = !selectableIDs.isEmpty && selectableIDs.isSubset(of: selectedIDs)
+                Image(systemName: allSelected ? "checkmark.square.fill" : "square")
                     .font(.subheadline)
-                    .foregroundStyle(selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
-                                     ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(allSelected ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.plain)
             .frame(width: 24)
@@ -603,7 +613,14 @@ struct LigandDatabaseWindow: View {
         }
         .frame(width: 40)
         .overlay(alignment: .trailing) {
-            Divider()
+            // Vertical separator on the right edge of the sticky column.
+            // `Divider()` here defaults to horizontal orientation and gets
+            // centered vertically inside the (viewport-tall) column, which
+            // draws a stray horizontal line across the middle of the table.
+            // An explicit thin Rectangle is unambiguous.
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 0.5)
         }
     }
 
@@ -1146,11 +1163,14 @@ struct LigandDatabaseWindow: View {
     }
 
     private func toggleSelectAll() {
-        let entries = filteredEntries
-        if selectedIDs.count == entries.count && !entries.isEmpty {
-            selectedIDs.removeAll()
+        // Exclude grayed-out parent rows that have enumerated children — those
+        // would duplicate downstream work, and the table grays them visually.
+        let selectable = filteredEntries.filter { !db.hasEnumeratedChildren($0) }
+        let selectableIDs = Set(selectable.map(\.id))
+        if selectableIDs.isSubset(of: selectedIDs) && !selectableIDs.isEmpty {
+            selectedIDs.subtract(selectableIDs)
         } else {
-            selectedIDs = Set(entries.map(\.id))
+            selectedIDs.formUnion(selectableIDs)
         }
     }
 

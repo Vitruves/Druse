@@ -466,6 +466,7 @@ struct ResultsDatabaseWindow: View {
 
                         Button(action: {
                             viewModel.showDockingPose(at: index)
+                            bringMainViewportToFront()
                         }) {
                             Label("Show in 3D Viewport", systemImage: "cube")
                                 .frame(maxWidth: .infinity)
@@ -940,6 +941,32 @@ struct ResultsDatabaseWindow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    // MARK: - Window Helpers
+
+    /// Brings the main 3D viewport window (the one hosting the Metal renderer)
+    /// to the front. The Results Database window is opened as a separate window
+    /// so updating the renderer's pose otherwise has no visible effect for the
+    /// user — they need the main window raised above this one.
+    private func bringMainViewportToFront() {
+        for window in NSApp.windows {
+            guard window.isVisible else { continue }
+            if containsMTKView(window.contentView) {
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                return
+            }
+        }
+    }
+
+    private func containsMTKView(_ view: NSView?) -> Bool {
+        guard let view else { return false }
+        if String(describing: type(of: view)).contains("MTKView") { return true }
+        for subview in view.subviews {
+            if containsMTKView(subview) { return true }
+        }
+        return false
     }
 
     // MARK: - Data Helpers

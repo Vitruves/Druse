@@ -754,6 +754,12 @@ extension AppViewModel {
         renderer.fitToPositions(lig.atoms.map(\.position))
     }
 
+    func fitToProtein() {
+        guard let renderer else { return }
+        guard let prot = molecules.protein, !prot.atoms.isEmpty else { return }
+        renderer.fitToPositions(prot.atoms.map(\.position))
+    }
+
     // MARK: - Context Menu Builder
 
     func showContextMenu(event: NSEvent, view: NSView) {

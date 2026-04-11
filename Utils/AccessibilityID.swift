@@ -153,6 +153,7 @@ enum AccessibilityID {
     static let renderClipping = "render_clipping"
     static let renderFitToView = "render_fitToView"
     static let renderFitToLigand = "render_fitToLigand"
+    static let renderFitToProtein = "render_fitToProtein"
     static let renderResetCamera = "render_resetCamera"
     static let renderColorScheme = "render_colorScheme"
     static let renderSurfaceColor = "render_surfaceColor"
