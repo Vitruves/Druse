@@ -1741,21 +1741,25 @@ final class DockingEngine {
         return feat
     }
 
-    func pignet2AtomAux(_ atom: Atom, degree: Int, neighbors: [Atom]) -> PIGNet2AtomAux {
+    func pignet2AtomAux(_ atom: Atom,
+                        degree: Int,
+                        neighbors: [Atom],
+                        isHBondDonor: Bool,
+                        isHBondAcceptor: Bool) -> PIGNet2AtomAux {
         let atomicNum = atom.element.rawValue
         let vdwRadius = Self.pigVDWRadii[atomicNum] ?? atom.element.vdwRadius
 
         var flags: UInt32 = 0
         // is_metal
         if Self.metalAtomicNumbers.contains(atomicNum) { flags |= 0x1 }
-        // is_h_donor: simplified — N, O, S atoms with attached H (or capable)
-        if atom.element == .N || atom.element == .O || atom.element == .S {
-            flags |= 0x2
-        }
-        // is_h_acceptor: N, O, S, F
-        if atom.element == .N || atom.element == .O || atom.element == .S || atom.element == .F {
-            flags |= 0x4
-        }
+        // is_h_donor / is_h_acceptor — chemistry-aware classification computed
+        // upfront to match the original PIGNet2 SMARTS:
+        //   donor:    [!$([#6,H0,-,-2,-3])]
+        //   acceptor: [!$([#6,F,Cl,Br,I,o,s,nX3,#7v5,#15v5,#16v4,#16v6,*+1,*+2,*+3])]
+        // The Druse PIGNet2 weights were exported from a checkpoint trained
+        // with these features, so element-only flags would mismatch training.
+        if isHBondDonor    { flags |= 0x2 }
+        if isHBondAcceptor { flags |= 0x4 }
         // is_hydrophobic: atom in {C,S,F,Cl,Br,I} with all neighbors also in that set
         if Self.hydrophobicElements.contains(atom.element) {
             let allNeighborsHydrophobic = neighbors.allSatisfy { Self.hydrophobicElements.contains($0.element) }
@@ -1820,6 +1824,11 @@ final class DockingEngine {
             "HIS": ["CG", "ND1", "CD2", "CE1", "NE2"],
         ]
 
+        // Pocket atom donor/acceptor flags via residue+atom-name lookup —
+        // matches the chemistry-aware behaviour of the original PIGNet2 SMARTS.
+        let pocketDonorFlags  = pocketAtoms.prefix(P).map { Self.proteinHBondDonorFlag($0) }
+        let pocketAcceptorFlags = pocketAtoms.prefix(P).map { Self.proteinHBondAcceptorFlag($0) }
+
         for i in 0..<P {
             let atom = pocketAtoms[i]
             let neighbors = protNeighborMap[atom.id] ?? []
@@ -1828,7 +1837,10 @@ final class DockingEngine {
             let hyb = isAromatic ? 2 : 3
             let f = pignet2AtomFeatures(atom, degree: degree, isAromatic: isAromatic, hybridization: hyb)
             for j in 0..<47 { protFeats[i * 47 + j] = f[j] }
-            protAuxArray[i] = pignet2AtomAux(atom, degree: degree, neighbors: neighbors)
+            protAuxArray[i] = pignet2AtomAux(
+                atom, degree: degree, neighbors: neighbors,
+                isHBondDonor: pocketDonorFlags[i],
+                isHBondAcceptor: pocketAcceptorFlags[i])
         }
         pignet2ProtFeatBuffer = device.makeBuffer(bytes: &protFeats, length: protFeats.count * 4, options: .storageModeShared)
         pignet2ProtAuxBuffer = device.makeBuffer(bytes: &protAuxArray, length: protAuxArray.count * MemoryLayout<PIGNet2AtomAux>.stride, options: .storageModeShared)
@@ -1836,6 +1848,10 @@ final class DockingEngine {
         // Build ligand features
         var ligFeats = [Float](repeating: 0, count: Int(PIG_MAX_LIG) * 47)
         var ligAuxArray = [PIGNet2AtomAux](repeating: PIGNet2AtomAux(vdwRadius: 0, flags: 0, formalCharge: 0, _pad: 0), count: Int(PIG_MAX_LIG))
+        // Chemistry-aware donor/acceptor flags from the bond graph (matches
+        // the SMARTS the original PIGNet2 was trained with).
+        let ligDonorFlags    = Self.computeLigandHBondDonorFlags(atoms: ligandAtoms, bonds: ligandBonds)
+        let ligAcceptorFlags = Self.computeLigandHBondAcceptorFlags(atoms: ligandAtoms, bonds: ligandBonds)
         for i in 0..<L {
             let atom = ligandAtoms[i]
             let neighbors = ligNeighborMap[atom.id] ?? []
@@ -1848,7 +1864,10 @@ final class DockingEngine {
             let hyb = isAromatic ? 2 : 3
             let f = pignet2AtomFeatures(atom, degree: degree, isAromatic: isAromatic, hybridization: hyb)
             for j in 0..<47 { ligFeats[i * 47 + j] = f[j] }
-            ligAuxArray[i] = pignet2AtomAux(atom, degree: degree, neighbors: neighbors)
+            ligAuxArray[i] = pignet2AtomAux(
+                atom, degree: degree, neighbors: neighbors,
+                isHBondDonor: i < ligDonorFlags.count && ligDonorFlags[i],
+                isHBondAcceptor: i < ligAcceptorFlags.count && ligAcceptorFlags[i])
         }
         pignet2LigFeatBuffer = device.makeBuffer(bytes: &ligFeats, length: ligFeats.count * 4, options: .storageModeShared)
         pignet2LigAuxBuffer = device.makeBuffer(bytes: &ligAuxArray, length: ligAuxArray.count * MemoryLayout<PIGNet2AtomAux>.stride, options: .storageModeShared)

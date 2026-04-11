@@ -548,6 +548,179 @@ enum InteractionDetector {
         }
     }
 
+    // MARK: - H-bond Donor Detection
+    //
+    // An atom can DONATE in an H-bond only if it actually has a hydrogen
+    // attached. The interaction detector previously checked elements only
+    // (any N or O within 2.2-3.5 Å of another N or O = "H-bond"), which
+    // produced false positives for pure acceptors like a neutral tertiary
+    // amine (3 bonds, 0 H) sitting next to a deprotonated carboxylate
+    // (1 bond, charge -1, 0 H). Both have lone pairs but no H to share.
+    //
+    // For ligand atoms we compute implicit-H counts from the bond graph and
+    // formal charge. For protein atoms we use a residue+atom-name lookup —
+    // explicit bonds are not always present on protein Atoms, but the
+    // protonation pipeline (Chemistry/Protonation.swift) has already set
+    // formal charges so the donor list below is unambiguous.
+
+    /// Default valence used by the implicit-H formula.
+    private static func defaultValence(_ element: Element) -> Int {
+        switch element {
+        case .H:                      return 1
+        case .C:                      return 4
+        case .N:                      return 3
+        case .O:                      return 2
+        case .F, .Cl, .Br:            return 1
+        case .P:                      return 3
+        case .S:                      return 2
+        default:                      return 0
+        }
+    }
+
+    /// Adjusted valence given the formal charge.
+    /// For pnictogens/chalcogens (N, O, P, S) a positive charge increases the
+    /// valence by 1 (e.g. NH4+ has 4 bonds), a negative charge decreases it.
+    /// For carbon, |charge| reduces the valence (carbocations and carbanions
+    /// both have one fewer bond than neutral C).
+    private static func adjustedValence(_ element: Element, formalCharge: Int) -> Int {
+        let v = defaultValence(element)
+        switch element {
+        case .N, .O, .P, .S:  return v + formalCharge
+        case .C:              return v - abs(formalCharge)
+        default:              return v
+        }
+    }
+
+    /// Boolean per ligand atom: true iff the atom has at least one implicit
+    /// hydrogen attached (i.e. it could donate an H-bond). Only N/O/S atoms
+    /// can be H-bond donors so other elements always return false.
+    static func computeLigandHBondDonorFlags(atoms: [Atom], bonds: [Bond]) -> [Bool] {
+        let n = atoms.count
+        var bondOrderSum = Array<Float>(repeating: 0, count: n)
+        for bond in bonds {
+            let order: Float
+            switch bond.order {
+            case .single:    order = 1
+            case .double:    order = 2
+            case .triple:    order = 3
+            case .aromatic:  order = 1.5
+            }
+            if bond.atomIndex1 < n { bondOrderSum[bond.atomIndex1] += order }
+            if bond.atomIndex2 < n { bondOrderSum[bond.atomIndex2] += order }
+        }
+        return atoms.enumerated().map { (i, atom) in
+            // Only N/O/S are donor candidates
+            switch atom.element {
+            case .N, .O, .S: break
+            default: return false
+            }
+            let valence = adjustedValence(atom.element, formalCharge: atom.formalCharge)
+            let implicitH = Int((Float(valence) - bondOrderSum[i]).rounded())
+            return implicitH > 0
+        }
+    }
+
+    /// True if a protein atom has at least one attached H — uses a residue+atom
+    /// name lookup table. Backbone N (except PRO) always has 1 H. Side-chain
+    /// donors are listed explicitly; everything else is treated as no-H.
+    static func proteinHBondDonorFlag(_ atom: Atom) -> Bool {
+        let resName = atom.residueName
+        let atomName = atom.name.trimmingCharacters(in: .whitespaces)
+        // Backbone amide N — has 1 H, except in proline where it's part of the ring
+        if atomName == "N" && resName != "PRO" { return true }
+        switch (resName, atomName) {
+        case ("SER", "OG"),  ("THR", "OG1"), ("TYR", "OH"),
+             ("CYS", "SG"),
+             ("ASN", "ND2"), ("GLN", "NE2"),
+             ("LYS", "NZ"),
+             ("ARG", "NE"),  ("ARG", "NH1"), ("ARG", "NH2"),
+             ("TRP", "NE1"),
+             ("HIS", "ND1"), ("HIS", "NE2"):
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Boolean per ligand atom: true iff the atom can ACCEPT an H-bond
+    /// (has a lone pair available). Mirrors PIGNet2's chemistry-aware SMARTS:
+    /// `[!$([#6,F,Cl,Br,I,o,s,nX3,#7v5,#15v5,#16v4,#16v6,*+1,*+2,*+3])]`
+    /// — i.e. N/O/S that are not aromatic O/S, not pyrrole-like aromatic N,
+    /// not pentavalent N/P, not tetra/hexavalent S, and not positively charged.
+    static func computeLigandHBondAcceptorFlags(atoms: [Atom], bonds: [Bond]) -> [Bool] {
+        let n = atoms.count
+        var bondOrderSum = Array<Float>(repeating: 0, count: n)
+        var inAromaticBond = Array<Bool>(repeating: false, count: n)
+        for bond in bonds {
+            let order: Float
+            switch bond.order {
+            case .single:    order = 1
+            case .double:    order = 2
+            case .triple:    order = 3
+            case .aromatic:  order = 1.5
+            }
+            if bond.atomIndex1 < n {
+                bondOrderSum[bond.atomIndex1] += order
+                if bond.order == .aromatic { inAromaticBond[bond.atomIndex1] = true }
+            }
+            if bond.atomIndex2 < n {
+                bondOrderSum[bond.atomIndex2] += order
+                if bond.order == .aromatic { inAromaticBond[bond.atomIndex2] = true }
+            }
+        }
+        return atoms.enumerated().map { (i, atom) in
+            switch atom.element {
+            case .N, .O, .S: break
+            default: return false
+            }
+            // No positive formal charge (excludes ammonium, oxocarbenium, etc.)
+            if atom.formalCharge > 0 { return false }
+            // Aromatic O / S (furan, thiophene) — lone pair in π system
+            if inAromaticBond[i] && (atom.element == .O || atom.element == .S) {
+                return false
+            }
+            // Pyrrole-like aromatic N: aromatic N with degree 3 (CG-N(H)-Cdelta)
+            // or any aromatic N that has implicit H (lone pair in ring).
+            let valence = adjustedValence(atom.element, formalCharge: atom.formalCharge)
+            let bondOrder = Int(bondOrderSum[i].rounded())
+            if inAromaticBond[i] && atom.element == .N {
+                let implicitH = max(0, valence - bondOrder)
+                if implicitH > 0 { return false }
+            }
+            // Pentavalent N (#7v5) or P (#15v5) — no lone pair
+            if (atom.element == .N || atom.element == .P) && bondOrder >= 5 {
+                return false
+            }
+            // Tetra-/hexavalent S — sulfoxide, sulfone
+            if atom.element == .S && (bondOrder == 4 || bondOrder == 6) {
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Protein-side H-bond acceptor lookup. Returns true for atoms whose
+    /// chemistry permits accepting an H. Mirrors the standard biochem rules.
+    static func proteinHBondAcceptorFlag(_ atom: Atom) -> Bool {
+        let resName = atom.residueName
+        let atomName = atom.name.trimmingCharacters(in: .whitespaces)
+        // Backbone carbonyl O — always an acceptor
+        if atomName == "O" || atomName == "OXT" { return true }
+        switch (resName, atomName) {
+        case ("ASP", "OD1"), ("ASP", "OD2"),
+             ("GLU", "OE1"), ("GLU", "OE2"),
+             ("ASN", "OD1"),
+             ("GLN", "OE1"),
+             ("SER", "OG"),  ("THR", "OG1"), ("TYR", "OH"),
+             ("CYS", "SG"),
+             ("MET", "SD"),
+             ("HIS", "ND1"), ("HIS", "NE2"):
+            return true
+        default:
+            return false
+        }
+    }
+
     // MARK: - Full Interaction Detection
 
     static func detect(
@@ -563,11 +736,22 @@ enum InteractionDetector {
         let negativeResAtoms: Set<String> = ["OD1", "OD2", "OE1", "OE2"]
         let metals: Set<Element> = [.Fe, .Zn, .Ca, .Mg, .Mn, .Cu]
 
+        // Donor flags: an atom can DONATE to an H-bond only if it has at
+        // least one attached hydrogen. For ligand atoms we derive this from
+        // the bond graph (bond order sum + formal charge → implicit H count).
+        // For protein atoms we use a residue-name lookup since explicit
+        // bonds are not always available on the Atom struct.
+        let ligandHasH: [Bool] = computeLigandHBondDonorFlags(
+            atoms: ligandAtoms, bonds: ligandBonds)
+        let proteinHasH: [Bool] = proteinAtoms.map(proteinHBondDonorFlag)
+
         if let gpu = InteractionDetectorGPU.shared {
             let gpuResults = gpu.detect(
                 ligandAtoms: ligandAtoms,
                 ligandPositions: ligandPositions,
                 proteinAtoms: proteinAtoms,
+                ligandHasH: ligandHasH,
+                proteinHasH: proteinHasH,
                 positiveResAtoms: positiveResAtoms,
                 negativeResAtoms: negativeResAtoms,
                 metals: metals
@@ -642,7 +826,13 @@ enum InteractionDetector {
                     if d >= 2.2 && d <= 3.5 {
                         let ligDA = ligAtom.element == .N || ligAtom.element == .O
                         let proDA = protAtom.element == .N || protAtom.element == .O
-                        if ligDA && proDA {
+                        // At least one side must carry an explicit/implicit H
+                        // to actually donate. Two pure acceptors (e.g. neutral
+                        // tertiary amine + deprotonated carboxylate) cannot
+                        // form an H-bond.
+                        let donor = (li < ligandHasH.count && ligandHasH[li])
+                                 || (pi < proteinHasH.count && proteinHasH[pi])
+                        if ligDA && proDA && donor {
                             result.append(MolecularInteraction(
                                 id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
                                 type: .hbond, distance: d,
@@ -788,7 +978,11 @@ final class InteractionDetectorGPU {
         self.pipeline = pipeline
     }
 
-    private func atomFlags(for atom: Atom, positiveResAtoms: Set<String>, negativeResAtoms: Set<String>, metals: Set<Element>) -> UInt32 {
+    private func atomFlags(for atom: Atom,
+                           hasHBondDonor: Bool,
+                           positiveResAtoms: Set<String>,
+                           negativeResAtoms: Set<String>,
+                           metals: Set<Element>) -> UInt32 {
         var flags: UInt32 = 0
         switch atom.element {
         case .N:  flags |= UInt32(IDET_FLAG_N)
@@ -804,6 +998,7 @@ final class InteractionDetectorGPU {
         let name = atom.name.trimmingCharacters(in: .whitespaces)
         if positiveResAtoms.contains(name) { flags |= UInt32(IDET_FLAG_POS_RES) }
         if negativeResAtoms.contains(name) { flags |= UInt32(IDET_FLAG_NEG_RES) }
+        if hasHBondDonor { flags |= UInt32(IDET_FLAG_HB_DONOR) }
         return flags
     }
 
@@ -811,6 +1006,8 @@ final class InteractionDetectorGPU {
         ligandAtoms: [Atom],
         ligandPositions: [SIMD3<Float>],
         proteinAtoms: [Atom],
+        ligandHasH: [Bool],
+        proteinHasH: [Bool],
         positiveResAtoms: Set<String>,
         negativeResAtoms: Set<String>,
         metals: Set<Element>
@@ -819,19 +1016,25 @@ final class InteractionDetectorGPU {
         let nProt = proteinAtoms.count
         guard nLig > 0, nProt > 0, ligandPositions.count >= nLig else { return [] }
 
-        var protGPU = proteinAtoms.map { atom -> InteractionAtomGPU in
+        var protGPU = proteinAtoms.enumerated().map { (i, atom) -> InteractionAtomGPU in
             InteractionAtomGPU(
                 position: atom.position,
-                flags: atomFlags(for: atom, positiveResAtoms: positiveResAtoms, negativeResAtoms: negativeResAtoms, metals: metals),
+                flags: atomFlags(for: atom,
+                                 hasHBondDonor: i < proteinHasH.count && proteinHasH[i],
+                                 positiveResAtoms: positiveResAtoms,
+                                 negativeResAtoms: negativeResAtoms, metals: metals),
                 formalCharge: Int32(atom.formalCharge),
                 _pad0: 0, _pad1: 0, _pad2: 0
             )
         }
 
-        var ligGPU = ligandAtoms.map { atom -> InteractionAtomGPU in
+        var ligGPU = ligandAtoms.enumerated().map { (i, atom) -> InteractionAtomGPU in
             InteractionAtomGPU(
                 position: atom.position,
-                flags: atomFlags(for: atom, positiveResAtoms: positiveResAtoms, negativeResAtoms: negativeResAtoms, metals: metals),
+                flags: atomFlags(for: atom,
+                                 hasHBondDonor: i < ligandHasH.count && ligandHasH[i],
+                                 positiveResAtoms: positiveResAtoms,
+                                 negativeResAtoms: negativeResAtoms, metals: metals),
                 formalCharge: Int32(atom.formalCharge),
                 _pad0: 0, _pad1: 0, _pad2: 0
             )

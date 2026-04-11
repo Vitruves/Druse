@@ -25,7 +25,7 @@ struct DiagramScene {
     let ligandRings: [[Int]]                                  // aromatic rings (atom indices)
     let ligandAABB: CGRect
     let ligandCenter: CGPoint                                 // geometric center for outward normals
-    let pharmacophoreColors: [Int: Color]                     // ligand atom index → halo color
+    let pharmacophoreColors: [Int: Color]                     // ligand atom index → halo color (non-π)
 
     // --- Residues ---
     let residues: [ResidueDraw]
@@ -39,7 +39,6 @@ struct DiagramScene {
         let propertyBorder: Color
         let dominantType: MolecularInteraction.InteractionType
         let interactions: [MolecularInteraction]
-        let donorHydrogens: [(pos: CGPoint, atomPos: CGPoint)]   // explicit H atoms for H-bond donors
     }
 
     // --- Connectors ---
@@ -53,9 +52,11 @@ struct DiagramScene {
     }
     let hydrophobicMarks: [HydrophobicMark]
     struct HydrophobicMark {
-        let anchor: CGPoint                                   // ligand atom (or ring centroid) position
-        let outwardNormal: CGPoint                            // unit vector from ligand center → anchor
-        let connectors: [CGPoint]                             // residue bubble centers to connect to
+        let anchor: CGPoint                                   // group centroid (or ring centroid)
+        let baseline: CGPoint                                 // eyelash arc center, outside the ligand
+        let outwardNormal: CGPoint                            // unit vector anchor → baseline
+        let span: CGFloat                                     // tangent span across the eyelash
+        let residueCenter: CGPoint                            // single residue this mark connects to
     }
 }
 
@@ -153,7 +154,7 @@ func buildDiagramScene(
 
     // --- Place residues on an orbit around the ligand ---
     let ligandHalfDiag = hypot(ligandAABB.width, ligandAABB.height) / 2
-    let orbitRadius = ligandHalfDiag + 130
+    let orbitRadius = ligandHalfDiag + 180   // CB at edge-50, accommodates long chains
 
     var placements: [(key: ResidueKey, angle: CGFloat,
                       center: CGPoint, ixns: [MolecularInteraction])] = []
@@ -197,127 +198,48 @@ func buildDiagramScene(
         var scPositions: [CGPoint] = []
 
         if let tmpl = template, !tmpl.atoms.isEmpty {
-            // Determine the pivot: prefer ring centroid for π-interactions,
-            // else the named interacting atom, else the outermost atom.
-            let piIxn = ixns.first { kPiTypes.contains($0.type) }
-            let nonHydroIxn = ixns.first { $0.type != .hydrophobic }
-
-            if let pi = piIxn, !tmpl.aromaticRings.isEmpty,
-               pi.proteinAtomIndex < proteinAtoms.count {
-                // Pick the ring whose atom names match the protein atom name
-                let resName = proteinAtoms[pi.proteinAtomIndex].residueName
-                let ringNames = sideChainRingAtomNames(for: resName)
-                if let chosenRing = pickRing(template: tmpl, ringNames: ringNames) {
-                    scPositions = transformSideChainRingPivot(
-                        template: tmpl, bubbleCenter: center,
-                        ringAtomIndices: chosenRing, towardLigand: avgContact)
-                }
-            }
-            if scPositions.isEmpty, let ix = nonHydroIxn,
-               ix.proteinAtomIndex < proteinAtoms.count {
-                let aName = proteinAtoms[ix.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
-                if tmpl.atoms.contains(where: { $0.name == aName }) {
-                    scPositions = transformSideChain(template: tmpl, bubbleCenter: center,
-                                                      interactingAtomName: aName,
-                                                      towardLigand: avgContact)
-                }
-            }
-            if scPositions.isEmpty {
-                // Default: pivot on the outermost atom
-                let lastName = tmpl.atoms.last!.name
-                scPositions = transformSideChain(template: tmpl, bubbleCenter: center,
-                                                  interactingAtomName: lastName,
-                                                  towardLigand: avgContact)
-            }
+            // Centroid-pivot transform: every branch of the side chain stays
+            // visible (no atoms hidden behind the bubble).
+            scPositions = transformSideChain(template: tmpl,
+                                              bubbleCenter: center,
+                                              towardLigand: avgContact)
         }
 
+        // Per-atom highlights are for directional interactions only —
+        // hydrophobic contacts are visualized as eyelashes on the ligand side,
+        // not as colored dots on side chain carbons.
         let interactingAtomNames = Set(ixns.compactMap { ixn -> String? in
+            guard ixn.type != .hydrophobic else { return nil }
             guard ixn.proteinAtomIndex < proteinAtoms.count else { return nil }
             return proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
         })
         let (fill, border) = residuePropertyColors(key.name)
         let dominant = dominantInteractionType(ixns)
 
-        // Pre-compute donor hydrogens (for H-bond donors that need an explicit H)
-        var donorHs: [(pos: CGPoint, atomPos: CGPoint)] = []
-        if let tmpl = template, scPositions.count == tmpl.atoms.count {
-            for (i, atom) in tmpl.atoms.enumerated() {
-                guard interactingAtomNames.contains(atom.name) else { continue }
-                let isDonor: Bool = {
-                    switch (key.name, atom.name) {
-                    case ("SER", "OG"), ("THR", "OG1"), ("TYR", "OH"), ("CYS", "SG"),
-                         ("ASN", "ND2"), ("GLN", "NE2"), ("LYS", "NZ"),
-                         ("ARG", "NH1"), ("ARG", "NH2"), ("ARG", "NE"),
-                         ("TRP", "NE1"), ("HIS", "ND1"), ("HIS", "NE2"):
-                        return true
-                    default: return false
-                    }
-                }()
-                let hbondIxn = ixns.first { ixn in
-                    ixn.type == .hbond &&
-                    ixn.proteinAtomIndex < proteinAtoms.count &&
-                    proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces) == atom.name
-                }
-                guard isDonor, let hbond = hbondIxn,
-                      let lp = ligandContactPoint(for: hbond) else { continue }
-                let pos = scPositions[i]
-                let dx = lp.x - pos.x, dy = lp.y - pos.y
-                let len = max(hypot(dx, dy), 1)
-                let hPos = CGPoint(x: pos.x + dx / len * 12, y: pos.y + dy / len * 12)
-                donorHs.append((pos: hPos, atomPos: pos))
-            }
-        }
-
         residues.append(DiagramScene.ResidueDraw(
             key: key, center: center, template: template,
             scPositions: scPositions,
             interactingAtomNames: interactingAtomNames,
             propertyFill: fill, propertyBorder: border,
-            dominantType: dominant, interactions: ixns,
-            donorHydrogens: donorHs))
+            dominantType: dominant, interactions: ixns))
     }
 
-    // --- Build directional lines + hydrophobic marks ---
+    // --- Build directional (non-hydrophobic) lines ---
     var directionalLines: [DiagramScene.DirectionalLine] = []
-    var hydroByAnchor: [Int: (anchor: CGPoint, normal: CGPoint, connectors: [CGPoint])] = [:]
-
     for residue in residues {
-        for ixn in residue.interactions {
+        for ixn in residue.interactions where ixn.type != .hydrophobic {
             guard let ligPos = ligandContactPoint(for: ixn) else { continue }
-
-            if ixn.type == .hydrophobic {
-                // Anchor: prefer ring centroid if the ligand atom is in an
-                // aromatic ring, else the atom position.
-                let anchor = ligPos
-                // Outward normal from ligand center
-                let dx = anchor.x - ligandCenter.x
-                let dy = anchor.y - ligandCenter.y
-                let len = max(hypot(dx, dy), 1)
-                let normal = CGPoint(x: dx / len, y: dy / len)
-                // Use ligand atom index as anchor key (or ring centroid pseudo-key)
-                let key = ixn.ligandAtomIndex
-                if var entry = hydroByAnchor[key] {
-                    entry.connectors.append(residue.center)
-                    hydroByAnchor[key] = entry
-                } else {
-                    hydroByAnchor[key] = (anchor: anchor, normal: normal,
-                                          connectors: [residue.center])
-                }
-                continue
-            }
 
             // Directional: target = side-chain atom or ring centroid
             var targetPos = residue.center
             if let tmpl = residue.template, !residue.scPositions.isEmpty,
                ixn.proteinAtomIndex < proteinAtoms.count {
                 if kPiTypes.contains(ixn.type) {
-                    // Target the side-chain ring centroid
-                    let resName = proteinAtoms[ixn.proteinAtomIndex].residueName
-                    let ringNames = sideChainRingAtomNames(for: resName)
-                    if !ringNames.isEmpty,
-                       let centroid = pickRingCentroid(template: tmpl,
-                                                       scPositions: residue.scPositions,
-                                                       ringNames: ringNames) {
+                    let aName = proteinAtoms[ixn.proteinAtomIndex].name
+                        .trimmingCharacters(in: .whitespaces)
+                    if let centroid = sideChainRingCentroid(template: tmpl,
+                                                            scPositions: residue.scPositions,
+                                                            matchingAtomName: aName) {
                         targetPos = centroid
                     }
                 } else {
@@ -330,12 +252,10 @@ func buildDiagramScene(
                 }
             }
 
-            // Inset endpoints so the line stops short of atoms/labels
             let toInset: CGFloat = (targetPos == residue.center) ? 40 : 8
             let shortened = shortenSegment(from: ligPos, to: targetPos,
                                             fromInset: 8, toInset: toInset)
 
-            // Route around the ligand AABB if the line crosses through it
             var routed: CGPoint? = nil
             if lineCrossesRect(from: shortened.0, to: shortened.1, rect: ligandAABB),
                !ligandAABB.contains(shortened.1) {
@@ -358,13 +278,98 @@ func buildDiagramScene(
         }
     }
 
-    let hydrophobicMarks = hydroByAnchor.values.map {
-        DiagramScene.HydrophobicMark(anchor: $0.anchor,
-                                     outwardNormal: $0.normal,
-                                     connectors: $0.connectors)
+    // --- Hydrophobic clustering ---
+    //
+    // A residue's hydrophobic contacts are grouped by ligand connectivity:
+    // contiguous contact atoms become one cluster (so an entire phenyl ring or
+    // an alkyl segment becomes ONE eyelash, not one per atom). When every
+    // cluster atom belongs to the same aromatic ring, the anchor is the ring
+    // centroid; otherwise the cluster centroid. Each (residue, cluster) pair
+    // produces its own eyelash, oriented toward that residue and pushed past
+    // the ligand AABB so it never overlaps the molecule.
+    var ligandAdj: [[Int]] = Array(repeating: [], count: projected.count)
+    for bond in coords.bonds where bond.0 < projected.count && bond.1 < projected.count {
+        ligandAdj[bond.0].append(bond.1)
+        ligandAdj[bond.1].append(bond.0)
+    }
+    var ringIdxForAtom: [Int: Int] = [:]
+    for (rIdx, ring) in rings.enumerated() {
+        for a in ring { ringIdxForAtom[a] = rIdx }
     }
 
-    // --- Pharmacophore halo colors per ligand atom ---
+    var hydrophobicMarks: [DiagramScene.HydrophobicMark] = []
+    for residue in residues {
+        let contactAtoms = Set(residue.interactions
+            .filter { $0.type == .hydrophobic }
+            .map(\.ligandAtomIndex)
+            .filter { $0 < projected.count })
+        guard !contactAtoms.isEmpty else { continue }
+
+        var visited = Set<Int>()
+        for start in contactAtoms where !visited.contains(start) {
+            var component: [Int] = []
+            var queue = [start]
+            visited.insert(start)
+            while !queue.isEmpty {
+                let n = queue.removeFirst()
+                component.append(n)
+                for nb in ligandAdj[n]
+                where contactAtoms.contains(nb) && !visited.contains(nb) {
+                    visited.insert(nb)
+                    queue.append(nb)
+                }
+            }
+
+            // Anchor: full ring centroid if all atoms share one aromatic ring,
+            // otherwise centroid of the contact atoms themselves.
+            let anchor: CGPoint
+            let radius: CGFloat
+            let ringIdxs = Set(component.compactMap { ringIdxForAtom[$0] })
+            if ringIdxs.count == 1, let rIdx = ringIdxs.first {
+                let ringPts = rings[rIdx].compactMap {
+                    $0 < projected.count ? projected[$0] : nil
+                }
+                let cx = ringPts.map(\.x).reduce(0, +) / CGFloat(ringPts.count)
+                let cy = ringPts.map(\.y).reduce(0, +) / CGFloat(ringPts.count)
+                anchor = CGPoint(x: cx, y: cy)
+                radius = ringPts.map { hypot($0.x - cx, $0.y - cy) }.max() ?? 0
+            } else {
+                let pts = component.map { projected[$0] }
+                let cx = pts.map(\.x).reduce(0, +) / CGFloat(pts.count)
+                let cy = pts.map(\.y).reduce(0, +) / CGFloat(pts.count)
+                anchor = CGPoint(x: cx, y: cy)
+                radius = pts.map { hypot($0.x - cx, $0.y - cy) }.max() ?? 0
+            }
+
+            // Direction toward the residue (not the ligand center) — guarantees
+            // the eyelash sits on the residue side of the cluster.
+            let rdx = residue.center.x - anchor.x
+            let rdy = residue.center.y - anchor.y
+            let rlen = max(hypot(rdx, rdy), 1)
+            let normal = CGPoint(x: rdx / rlen, y: rdy / rlen)
+
+            // Push the baseline past whichever is further: cluster radius or
+            // the ligand AABB exit point along the normal.
+            let aabbExit = rayBoxExitDistance(origin: anchor,
+                                               direction: normal, box: ligandAABB)
+            // Just outside the cluster (radius + 14) OR just past the AABB
+            // exit (+ 10), whichever is larger. Capped to prevent runaway
+            // distances when the residue is very far from the ligand.
+            let baseDist = min(max(radius + 14, aabbExit + 10), radius + 30)
+            let baseline = CGPoint(x: anchor.x + normal.x * baseDist,
+                                   y: anchor.y + normal.y * baseDist)
+            let span = max(18, radius * 1.4)
+
+            hydrophobicMarks.append(DiagramScene.HydrophobicMark(
+                anchor: anchor, baseline: baseline,
+                outwardNormal: normal, span: span,
+                residueCenter: residue.center))
+        }
+    }
+
+    // --- Pharmacophore halo colors per ligand atom (excluding π types) ---
+    // π interactions are now visualized as a translucent fill on the whole
+    // aromatic ring, so we don't add per-atom halos for them.
     var pharmaColors: [Int: Color] = [:]
     for i in 0..<projected.count {
         if let c = pharmacophoreColor(forLigandAtomIndex: i,
@@ -450,28 +455,18 @@ private func relaxAnglesAndPlace(
     }
 }
 
-private func sideChainRingAtomNames(for residueName: String) -> Set<String> {
-    switch residueName {
-    case "PHE": return ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]
-    case "TYR": return ["CG", "CD1", "CD2", "CE1", "CE2", "CZ"]
-    case "TRP": return ["CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"]
-    case "HIS": return ["CG", "ND1", "CD2", "CE1", "NE2"]
-    default:    return []
-    }
-}
-
-private func pickRing(template: SideChainTemplate, ringNames: Set<String>) -> [Int]? {
-    template.aromaticRings.first { ring in
-        ring.allSatisfy { idx in
-            idx < template.atoms.count && ringNames.contains(template.atoms[idx].name)
-        }
-    } ?? template.aromaticRings.first
-}
-
-private func pickRingCentroid(template: SideChainTemplate,
-                               scPositions: [CGPoint],
-                               ringNames: Set<String>) -> CGPoint? {
-    guard let ring = pickRing(template: template, ringNames: ringNames) else { return nil }
+/// Centroid of a side-chain aromatic ring in screen space. For TRP (two
+/// fused rings) picks whichever ring contains the named protein atom; falls
+/// back to the first ring otherwise.
+private func sideChainRingCentroid(template: SideChainTemplate,
+                                   scPositions: [CGPoint],
+                                   matchingAtomName: String) -> CGPoint? {
+    guard !template.aromaticRings.isEmpty else { return nil }
+    let ring = template.aromaticRings.first { ring in
+        ring.contains(where: { idx in
+            idx < template.atoms.count && template.atoms[idx].name == matchingAtomName
+        })
+    } ?? template.aromaticRings[0]
     var rx: CGFloat = 0, ry: CGFloat = 0, rn: CGFloat = 0
     for idx in ring where idx < scPositions.count {
         rx += scPositions[idx].x; ry += scPositions[idx].y; rn += 1
@@ -499,17 +494,13 @@ struct SkeletalStyle {
 }
 
 extension SkeletalStyle {
-    static let ligand = SkeletalStyle(
-        bondWidth: 2.2, bondColor: Color.primary.opacity(0.8),
+    /// Unified RDKit-style skeletal rendering used for both the ligand and the
+    /// side chains so they look visually consistent.
+    static let classic = SkeletalStyle(
+        bondWidth: 2.2, bondColor: Color.primary.opacity(0.85),
         heteroatomFontSize: 13,
         backgroundColor: Color(nsColor: .controlBackgroundColor),
         aromaticCircleScale: 0.55, heteroatomLabelInset: 9)
-
-    static let sideChain = SkeletalStyle(
-        bondWidth: 1.9, bondColor: Color.primary.opacity(0.7),
-        heteroatomFontSize: 11,
-        backgroundColor: Color(nsColor: .controlBackgroundColor),
-        aromaticCircleScale: 0.55, heteroatomLabelInset: 7.5)
 }
 
 func drawSkeletal(
@@ -520,18 +511,27 @@ func drawSkeletal(
     rings: [[Int]],
     formalCharges: [Int],
     style: SkeletalStyle,
-    halos: [Int: Color] = [:]
+    halos: [Int: Color] = [:],
+    labelOverrides: [Int: String] = [:]    // explicit labels (e.g. "NH", "OH")
 ) {
-    // Build a per-atom set of ring memberships for orientation of double-bond inner lines
-    var ringCentroids: [(ring: Set<Int>, centroid: CGPoint)] = []
-    for ring in rings {
-        var cx: CGFloat = 0, cy: CGFloat = 0
-        var n: CGFloat = 0
+    // Per-ring info, kept 1:1 with `rings` so callers can index by position.
+    struct RingInfo {
+        let atoms: Set<Int>
+        let centroid: CGPoint
+        let avgRadius: CGFloat
+    }
+    let ringInfos: [RingInfo?] = rings.map { ring in
+        var cx: CGFloat = 0, cy: CGFloat = 0, n: CGFloat = 0
         for idx in ring where idx < positions.count {
             cx += positions[idx].x; cy += positions[idx].y; n += 1
         }
-        guard n > 0 else { continue }
-        ringCentroids.append((ring: Set(ring), centroid: CGPoint(x: cx / n, y: cy / n)))
+        guard n > 0 else { return nil }
+        let centroid = CGPoint(x: cx / n, y: cy / n)
+        let avgR = ring
+            .compactMap { $0 < positions.count ? positions[$0] : nil }
+            .map { hypot($0.x - centroid.x, $0.y - centroid.y) }
+            .reduce(0, +) / n
+        return RingInfo(atoms: Set(ring), centroid: centroid, avgRadius: avgR)
     }
 
     // Helper: shrink a bond's endpoints if either atom is a heteroatom (so
@@ -577,7 +577,7 @@ func drawSkeletal(
             // Inner offset direction: toward ring centroid if both atoms in
             // a ring, else perpendicular toward +y.
             var nx = -dy / len, ny = dx / len
-            if let entry = ringCentroids.first(where: { $0.ring.contains(bond.a) && $0.ring.contains(bond.b) }) {
+            if let entry = ringInfos.compactMap({ $0 }).first(where: { $0.atoms.contains(bond.a) && $0.atoms.contains(bond.b) }) {
                 let mid = CGPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
                 let toC = CGPoint(x: entry.centroid.x - mid.x, y: entry.centroid.y - mid.y)
                 if nx * toC.x + ny * toC.y < 0 { nx = -nx; ny = -ny }
@@ -614,15 +614,12 @@ func drawSkeletal(
     }
 
     // --- Aromatic ring inscribed circles ---
-    for entry in ringCentroids {
-        let pts = entry.ring.compactMap { idx in idx < positions.count ? positions[idx] : nil }
-        guard pts.count >= 3 else { continue }
-        let avgR = pts.map { hypot($0.x - entry.centroid.x, $0.y - entry.centroid.y) }
-            .reduce(0, +) / CGFloat(pts.count)
-        let r = avgR * style.aromaticCircleScale
-        context.stroke(Path(ellipseIn: CGRect(x: entry.centroid.x - r,
-                                               y: entry.centroid.y - r,
-                                               width: r * 2, height: r * 2)),
+    for info in ringInfos {
+        guard let info else { continue }
+        let r = info.avgRadius * style.aromaticCircleScale
+        let rect = CGRect(x: info.centroid.x - r, y: info.centroid.y - r,
+                          width: r * 2, height: r * 2)
+        context.stroke(Path(ellipseIn: rect),
                        with: .color(style.bondColor.opacity(0.6)),
                        lineWidth: style.bondWidth * 0.7)
     }
@@ -632,13 +629,17 @@ func drawSkeletal(
         let z = i < atomicNums.count ? atomicNums[i] : 6
         // Carbon: bare vertex (skeletal style)
         if z == 6 { continue }
-        let (symbol, color) = atomDisplay(z)
-        // Background pill so bonds visually stop at the letter
-        let labelW: CGFloat = symbol.count > 1 ? 18 : 13
-        let labelH: CGFloat = 14
-        context.fill(Path(ellipseIn: CGRect(x: pos.x - labelW / 2,
-                                             y: pos.y - labelH / 2,
-                                             width: labelW, height: labelH)),
+        let (defaultSymbol, color) = atomDisplay(z)
+        let symbol = labelOverrides[i] ?? defaultSymbol
+        // Background pill sized to the actual rendered text
+        let nsFont = NSFont.monospacedSystemFont(ofSize: style.heteroatomFontSize, weight: .bold)
+        let textSize = NSAttributedString(string: symbol, attributes: [.font: nsFont]).size()
+        let labelW = textSize.width + 6
+        let labelH = textSize.height + 2
+        context.fill(Path(roundedRect: CGRect(x: pos.x - labelW / 2,
+                                              y: pos.y - labelH / 2,
+                                              width: labelW, height: labelH),
+                                       cornerRadius: labelH / 2),
                      with: .color(style.backgroundColor))
         let text = Text(symbol)
             .font(.system(size: style.heteroatomFontSize, weight: .bold, design: .monospaced))
@@ -678,10 +679,13 @@ func drawScene(_ scene: DiagramScene, in context: GraphicsContext, size: CGSize)
         }
     }
     for mark in scene.hydrophobicMarks {
-        let tipX = mark.anchor.x + mark.outwardNormal.x * 18
-        let tipY = mark.anchor.y + mark.outwardNormal.y * 18
-        allPoints.append(CGPoint(x: tipX - 6, y: tipY - 6))
-        allPoints.append(CGPoint(x: tipX + 6, y: tipY + 6))
+        let outDist: CGFloat = mark.span * 0.12 + 12      // bulge + tooth
+        let tipX = mark.baseline.x + mark.outwardNormal.x * outDist
+        let tipY = mark.baseline.y + mark.outwardNormal.y * outDist
+        let tx = -mark.outwardNormal.y * mark.span / 2
+        let ty = mark.outwardNormal.x * mark.span / 2
+        allPoints.append(CGPoint(x: tipX + tx, y: tipY + ty))
+        allPoints.append(CGPoint(x: tipX - tx, y: tipY - ty))
     }
 
     let xs = allPoints.map(\.x), ys = allPoints.map(\.y)
@@ -707,7 +711,7 @@ func drawScene(_ scene: DiagramScene, in context: GraphicsContext, size: CGSize)
                  atomicNums: scene.ligandAtomicNums,
                  rings: scene.ligandRings,
                  formalCharges: scene.ligandFormalCharges,
-                 style: .ligand,
+                 style: .classic,
                  halos: scene.pharmacophoreColors)
 
     // --- Layer 2: hydrophobic eyelashes (LigPlot+ style) ---
@@ -740,50 +744,49 @@ func drawScene(_ scene: DiagramScene, in context: GraphicsContext, size: CGSize)
 private func drawHydrophobicEyelash(
     context: GraphicsContext, mark: DiagramScene.HydrophobicMark, color: Color
 ) {
-    // Place eyelash anchor 14 px outside the ligand atom along the outward normal
-    let baseDist: CGFloat = 14
-    let baseX = mark.anchor.x + mark.outwardNormal.x * baseDist
-    let baseY = mark.anchor.y + mark.outwardNormal.y * baseDist
-    let base = CGPoint(x: baseX, y: baseY)
-
-    // Tangent direction (perpendicular to normal)
+    // Tangent direction (perpendicular to outward normal toward the residue)
     let tx = -mark.outwardNormal.y
     let ty = mark.outwardNormal.x
 
-    // Draw 3 short eyelash arcs across a 16 px tangent span
-    let span: CGFloat = 16
-    let arcCount = 3
-    for i in 0..<arcCount {
-        let t = arcCount == 1 ? 0.5 : CGFloat(i) / CGFloat(arcCount - 1) - 0.5
-        let cx = base.x + tx * span * t
-        let cy = base.y + ty * span * t
-        let inner = CGPoint(x: cx, y: cy)
-        let outer = CGPoint(x: cx + mark.outwardNormal.x * 6,
-                            y: cy + mark.outwardNormal.y * 6)
-        var p = Path(); p.move(to: inner); p.addLine(to: outer)
-        context.stroke(p, with: .color(color),
-                       style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
-    }
-    // Arc connecting the eyelash bases
+    let span = mark.span
+    let teethCount = max(3, min(7, Int(span / 6)))
+    let toothLen: CGFloat = 6
+    let bulge: CGFloat = max(4, span * 0.12)
+
+    // Quad-curve baseline cradling the cluster, opening toward the residue
+    let arcLeft = CGPoint(x: mark.baseline.x - tx * span / 2,
+                          y: mark.baseline.y - ty * span / 2)
+    let arcRight = CGPoint(x: mark.baseline.x + tx * span / 2,
+                           y: mark.baseline.y + ty * span / 2)
+    let ctrl = CGPoint(x: mark.baseline.x + mark.outwardNormal.x * bulge,
+                       y: mark.baseline.y + mark.outwardNormal.y * bulge)
     var arc = Path()
-    let arcLeft = CGPoint(x: base.x - tx * span / 2, y: base.y - ty * span / 2)
-    let arcRight = CGPoint(x: base.x + tx * span / 2, y: base.y + ty * span / 2)
-    let ctrl = CGPoint(x: base.x + mark.outwardNormal.x * 4,
-                       y: base.y + mark.outwardNormal.y * 4)
     arc.move(to: arcLeft)
     arc.addQuadCurve(to: arcRight, control: ctrl)
     context.stroke(arc, with: .color(color),
                    style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
 
-    // Dashed connector to each residue bubble
-    for connector in mark.connectors {
-        let tip = CGPoint(x: base.x + mark.outwardNormal.x * 8,
-                          y: base.y + mark.outwardNormal.y * 8)
-        let shortened = shortenSegment(from: tip, to: connector, fromInset: 0, toInset: 42)
-        var path = Path(); path.move(to: shortened.0); path.addLine(to: shortened.1)
-        context.stroke(path, with: .color(color.opacity(0.55)),
-                       style: StrokeStyle(lineWidth: 1.4, dash: [4, 3]))
+    // Teeth pointing outward from the baseline along the normal
+    for i in 0..<teethCount {
+        let t = teethCount == 1 ? CGFloat(0.5) : CGFloat(i) / CGFloat(teethCount - 1)
+        let mt = 1 - t
+        let bx = mt * mt * arcLeft.x + 2 * mt * t * ctrl.x + t * t * arcRight.x
+        let by = mt * mt * arcLeft.y + 2 * mt * t * ctrl.y + t * t * arcRight.y
+        let outer = CGPoint(x: bx + mark.outwardNormal.x * toothLen,
+                            y: by + mark.outwardNormal.y * toothLen)
+        var p = Path(); p.move(to: CGPoint(x: bx, y: by)); p.addLine(to: outer)
+        context.stroke(p, with: .color(color),
+                       style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
     }
+
+    // Dashed connector from the outer tip of the eyelash bulge to the residue
+    let tip = CGPoint(x: mark.baseline.x + mark.outwardNormal.x * (bulge + toothLen),
+                      y: mark.baseline.y + mark.outwardNormal.y * (bulge + toothLen))
+    let shortened = shortenSegment(from: tip, to: mark.residueCenter,
+                                    fromInset: 0, toInset: 42)
+    var path = Path(); path.move(to: shortened.0); path.addLine(to: shortened.1)
+    context.stroke(path, with: .color(color.opacity(0.55)),
+                   style: StrokeStyle(lineWidth: 1.4, dash: [4, 3]))
 }
 
 // MARK: - Directional line
@@ -842,9 +845,14 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
         let bonds: [(a: Int, b: Int, order: Int, isAromatic: Bool)] =
             tmpl.bonds.map { (a: $0.from, b: $0.to, order: $0.order, isAromatic: $0.isAromatic) }
         let atomicNums = tmpl.atoms.map { $0.element.rawValue }
+        // Carboxylate: only the *deprotonated* oxygen carries the formal
+        // charge. The double-bonded oxygen (OD1 / OE1 in our kekulized
+        // template) stays neutral. This matches Druse's protonation model in
+        // [Chemistry/Protonation.swift](Chemistry/Protonation.swift) which
+        // assigns -1 to a single carboxylate oxygen at pH 7.4.
         let formalCharges: [Int] = tmpl.atoms.map { atom in
             switch (residue.key.name, atom.name) {
-            case ("ASP", "OD1"), ("ASP", "OD2"), ("GLU", "OE1"), ("GLU", "OE2"):
+            case ("ASP", "OD2"), ("GLU", "OE2"):
                 return -1
             case ("LYS", "NZ"), ("ARG", "NH1"), ("ARG", "NH2"):
                 return +1
@@ -852,18 +860,46 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
             }
         }
 
+        // Explicit hydrogen-count labels for heteroatoms (RDKit convention).
+        // We list every donor/charged-N/S-H/O-H atom by name; everything else
+        // falls back to the bare element symbol.
+        var labelOverrides: [Int: String] = [:]
+        for (i, atom) in tmpl.atoms.enumerated() {
+            let label: String?
+            switch (residue.key.name, atom.name) {
+            case ("SER", "OG"), ("THR", "OG1"), ("TYR", "OH"):    label = "OH"
+            case ("CYS", "SG"):                                    label = "SH"
+            case ("LYS", "NZ"):                                    label = "NH\u{2083}"      // NH3 (charged)
+            case ("ARG", "NH1"), ("ARG", "NH2"):                   label = "NH\u{2082}"      // NH2 (charged)
+            case ("ARG", "NE"):                                    label = "NH"
+            case ("ASN", "ND2"), ("GLN", "NE2"):                   label = "NH\u{2082}"      // amide
+            case ("HIS", "ND1"), ("HIS", "NE2"):                   label = "NH"              // tautomer
+            case ("TRP", "NE1"):                                   label = "NH"
+            default:                                                label = nil
+            }
+            if let label { labelOverrides[i] = label }
+        }
+
+        // Atom-index set covered by any aromatic ring (used to skip per-atom
+        // highlight rings on aromatic carbons — the π line already targets
+        // the ring centroid, no need for a per-atom dot).
+        let aromaticAtomIdx: Set<Int> = Set(tmpl.aromaticRings.flatMap { $0 })
+
         drawSkeletal(context: context,
                      positions: residue.scPositions,
                      bonds: bonds,
                      atomicNums: atomicNums,
                      rings: tmpl.aromaticRings,
                      formalCharges: formalCharges,
-                     style: .sideChain)
+                     style: .classic,
+                     labelOverrides: labelOverrides)
 
-        // Highlight interacting atoms with a colored ring
+        // Per-atom highlight ring for interacting atoms — but skip aromatic
+        // ring carbons (the π line shows the ring interaction by itself).
         let dominantColor = interactionColor(residue.dominantType)
         for (i, atom) in tmpl.atoms.enumerated() where i < residue.scPositions.count {
             guard residue.interactingAtomNames.contains(atom.name) else { continue }
+            if aromaticAtomIdx.contains(i) { continue }
             let pos = residue.scPositions[i]
             let r: CGFloat = atom.element == .C ? 7 : 11
             context.stroke(
@@ -871,21 +907,23 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
                 with: .color(dominantColor), lineWidth: 1.8)
         }
 
-        // Donor hydrogens
-        for (hPos, atomPos) in residue.donorHydrogens {
-            var p = Path(); p.move(to: atomPos); p.addLine(to: hPos)
-            context.stroke(p, with: .color(residue.propertyBorder.opacity(0.5)), lineWidth: 1.0)
-            let hr: CGFloat = 5
-            context.fill(Path(ellipseIn: CGRect(x: hPos.x - hr, y: hPos.y - hr,
-                                                 width: hr * 2, height: hr * 2)),
-                         with: .color(Color(nsColor: .controlBackgroundColor)))
-            context.draw(context.resolve(
-                Text("H").font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundColor(.gray)), at: hPos, anchor: .center)
-        }
+        // (Donor hydrogens are now part of the heteroatom label itself —
+        // the "OH"/"NH"/"NH2" text already shows the explicit H atoms.)
+
+        // Connector line: bubble edge → CB. The bubble itself is drawn next
+        // and will cover the inner end of this line.
+        let cb = residue.scPositions[0]
+        let cdx = cb.x - residue.center.x
+        let cdy = cb.y - residue.center.y
+        let clen = max(hypot(cdx, cdy), 1)
+        var connector = Path()
+        connector.move(to: residue.center)
+        connector.addLine(to: CGPoint(x: residue.center.x + cdx / clen * (clen - 2),
+                                      y: residue.center.y + cdy / clen * (clen - 2)))
+        context.stroke(connector, with: .color(Color.primary.opacity(0.85)), lineWidth: 2.2)
     }
 
-    // Core bubble (residue label) drawn on top of side chain
+    // Core bubble (residue label) drawn on top of side chain + connector
     let nameSize = NSAttributedString(string: residue.key.label,
         attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .bold)]).size()
     let bubbleW: CGFloat = max(nameSize.width + 24, 72)
@@ -914,14 +952,13 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
 private func pharmacophoreColor(forLigandAtomIndex index: Int,
                                 interactions: [MolecularInteraction],
                                 rings: [[Int]]) -> Color? {
-    var types = interactions.filter { $0.ligandAtomIndex == index }.map(\.type)
-    if types.isEmpty {
-        for ring in rings where ring.contains(index) {
-            for ixn in interactions where kPiTypes.contains(ixn.type) {
-                if ring.contains(ixn.ligandAtomIndex) { types.append(ixn.type) }
-            }
-        }
-    }
+    // Per-atom halos for directional interactions only.
+    // - π types are visualized via the line targeting the ring centroid.
+    // - hydrophobic is visualized via the eyelash on the ligand side.
+    let excluded = kPiTypes.union([.hydrophobic, .chPi])
+    let types = interactions
+        .filter { $0.ligandAtomIndex == index && !excluded.contains($0.type) }
+        .map(\.type)
     guard !types.isEmpty else { return nil }
     if types.contains(.hbond) || types.contains(.halogen) {
         return Color(red: 0.2, green: 0.6, blue: 1.0)
@@ -929,17 +966,11 @@ private func pharmacophoreColor(forLigandAtomIndex index: Int,
     if types.contains(.saltBridge) {
         return Color(red: 1.0, green: 0.5, blue: 0.1)
     }
-    if types.contains(.piStack) || types.contains(.piCation) || types.contains(.amideStack) {
-        return Color(red: 0.6, green: 0.3, blue: 0.9)
-    }
     if types.contains(.metalCoord) {
         return Color(red: 1.0, green: 0.85, blue: 0.0)
     }
     if types.contains(.chalcogen) {
         return Color(red: 0.5, green: 0.8, blue: 0.2)
-    }
-    if types.contains(.hydrophobic) || types.contains(.chPi) {
-        return Color(red: 0.9, green: 0.8, blue: 0.2)
     }
     return Color.gray.opacity(0.5)
 }
@@ -1005,6 +1036,25 @@ func shortenSegment(from p1: CGPoint, to p2: CGPoint,
     let ux = dx / len, uy = dy / len
     return (CGPoint(x: p1.x + ux * fromInset, y: p1.y + uy * fromInset),
             CGPoint(x: p2.x - ux * toInset, y: p2.y - uy * toInset))
+}
+
+/// Distance from `origin` along unit `direction` at which the ray first exits
+/// `box`. If origin is inside the box, this is the distance to the closest
+/// boundary along the direction. Returns 0 if the direction is degenerate.
+func rayBoxExitDistance(origin: CGPoint, direction: CGPoint, box: CGRect) -> CGFloat {
+    var tx = CGFloat.greatestFiniteMagnitude
+    var ty = CGFloat.greatestFiniteMagnitude
+    if direction.x > 1e-6 {
+        tx = (box.maxX - origin.x) / direction.x
+    } else if direction.x < -1e-6 {
+        tx = (box.minX - origin.x) / direction.x
+    }
+    if direction.y > 1e-6 {
+        ty = (box.maxY - origin.y) / direction.y
+    } else if direction.y < -1e-6 {
+        ty = (box.minY - origin.y) / direction.y
+    }
+    return max(0, min(tx, ty))
 }
 
 func lineCrossesRect(from p1: CGPoint, to p2: CGPoint, rect: CGRect) -> Bool {

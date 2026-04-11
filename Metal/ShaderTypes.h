@@ -689,6 +689,7 @@ struct PocketProbe {
 #define IDET_FLAG_POS_RES   (1u << 8)   // positive residue atoms (NZ, NH1, NH2, NE)
 #define IDET_FLAG_NEG_RES   (1u << 9)   // negative residue atoms (OD1, OD2, OE1, OE2)
 #define IDET_FLAG_HALOGEN   (1u << 10)  // F, Cl, or Br
+#define IDET_FLAG_HB_DONOR  (1u << 11)  // atom has at least one attached H (can donate to H-bond)
 
 // Packed atom for GPU interaction detection
 struct InteractionAtomGPU {

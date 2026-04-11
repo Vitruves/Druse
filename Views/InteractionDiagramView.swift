@@ -195,7 +195,9 @@ struct InteractionDiagramView: View {
     private var legend: some View {
         let presentTypes = Set(interactions.map(\.type))
         let types = MolecularInteraction.InteractionType.allCases.filter { presentTypes.contains($0) }
-        return VStack(spacing: 8) {
+        let presentHaloTypes = haloTypesPresent(in: interactions)
+        return VStack(alignment: .leading, spacing: 6) {
+            // Row 1 — interaction line styles + counts
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(types, id: \.rawValue) { type in
@@ -210,6 +212,25 @@ struct InteractionDiagramView: View {
                     }
                 }
             }
+
+            // Row 2 — ligand atom halos (only types present in this pose)
+            if !presentHaloTypes.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        ForEach(presentHaloTypes, id: \.label) { halo in
+                            HStack(spacing: 4) {
+                                haloLegendDot(color: halo.color)
+                                Text(halo.label)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize()
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Row 3 — residue colors + total count
             HStack(spacing: 0) {
                 HStack(spacing: 12) {
                     residueLegendDot("polar", Color(red: 0.2, green: 0.6, blue: 0.7))
@@ -225,6 +246,40 @@ struct InteractionDiagramView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
+    }
+
+    /// Halo color entries to surface in the legend, derived from
+    /// `pharmacophoreColor` in the renderer. Mirrors the same color choices.
+    private func haloTypesPresent(in interactions: [MolecularInteraction])
+        -> [(label: String, color: Color)]
+    {
+        var entries: [(label: String, color: Color)] = []
+        let types = Set(interactions.map(\.type))
+        if types.contains(.hbond) || types.contains(.halogen) {
+            entries.append((label: "H-bond donor/acceptor",
+                            color: Color(red: 0.2, green: 0.6, blue: 1.0)))
+        }
+        if types.contains(.saltBridge) {
+            entries.append((label: "salt bridge",
+                            color: Color(red: 1.0, green: 0.5, blue: 0.1)))
+        }
+        if types.contains(.metalCoord) {
+            entries.append((label: "metal coord",
+                            color: Color(red: 1.0, green: 0.85, blue: 0.0)))
+        }
+        if types.contains(.chalcogen) {
+            entries.append((label: "chalcogen",
+                            color: Color(red: 0.5, green: 0.8, blue: 0.2)))
+        }
+        return entries
+    }
+
+    @ViewBuilder
+    private func haloLegendDot(color: Color) -> some View {
+        ZStack {
+            Circle().fill(color.opacity(0.18)).frame(width: 14, height: 14)
+            Circle().stroke(color.opacity(0.7), lineWidth: 1.5).frame(width: 14, height: 14)
+        }
     }
 
     @ViewBuilder

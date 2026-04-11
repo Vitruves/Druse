@@ -78,10 +78,16 @@ kernel void detectInteractions(
             }
 
             // ---- H-bond: 2.2-3.5 Angstrom between donor/acceptor (N/O) ----
+            // At least one side must have an attached H to donate, otherwise
+            // there is no hydrogen to share. A neutral tertiary amine (N with
+            // 3 bonds, no H) and a deprotonated carboxylate O (1 bond, charge
+            // -1) are both pure acceptors and cannot form an H-bond together.
             if (type == 0xFFFFFFFF && d >= 2.2f && d <= 3.5f) {
                 bool ligDA  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
                 bool protDA = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
-                if (ligDA && protDA) {
+                bool ligDonor  = (ligFlags  & IDET_FLAG_HB_DONOR) != 0;
+                bool protDonor = (protFlags & IDET_FLAG_HB_DONOR) != 0;
+                if (ligDA && protDA && (ligDonor || protDonor)) {
                     type = 0; // hbond
                 }
             }

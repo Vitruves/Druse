@@ -35,8 +35,8 @@ struct SideChainTemplate {
 let sideChainTemplates: [String: SideChainTemplate] = {
     typealias A = SideChainAtom
     typealias B = SideChainBond
-    let s: CGFloat = 18  // bond length in local coords (matches ligand baseScale)
-    let h: CGFloat = s * 0.866  // sin(60°) for hexagon geometry
+    let s: CGFloat = 26  // bond length in local coords — close to ligand baseScale (30)
+    let h: CGFloat = s * 0.866  // sin(60°) — used for both hexagons and zigzag y-offsets
 
     var t: [String: SideChainTemplate] = [:]
 
@@ -49,30 +49,31 @@ let sideChainTemplates: [String: SideChainTemplate] = {
         bonds: [],
         aromaticRings: [])
 
-    // Branching aliphatics
+    // Branching aliphatics — proper Y at CB with 120° bond angles.
     t["VAL"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG1", offset: CGPoint(x: s * 2, y: -s * 0.6), element: .C),
-                A(name: "CG2", offset: CGPoint(x: s * 2, y: s * 0.6), element: .C)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG1", offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CG2", offset: CGPoint(x: s * 1.5, y:  h), element: .C)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 0, to: 2, order: 1, isAromatic: false)],
         aromaticRings: [])
 
     t["LEU"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "CD1", offset: CGPoint(x: s * 3, y: -s * 0.6), element: .C),
-                A(name: "CD2", offset: CGPoint(x: s * 3, y: s * 0.6), element: .C)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG",  offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CD1", offset: CGPoint(x: s * 2.5, y: -h), element: .C),
+                A(name: "CD2", offset: CGPoint(x: s, y: -h * 2), element: .C)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 1, isAromatic: false),
                 B(from: 1, to: 3, order: 1, isAromatic: false)],
         aromaticRings: [])
 
+    // ILE — Y at CB (CG1 upper, CG2 lower); CG1-CD1 zigzag right.
     t["ILE"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG1", offset: CGPoint(x: s * 2, y: -s * 0.5), element: .C),
-                A(name: "CG2", offset: CGPoint(x: s, y: s), element: .C),
-                A(name: "CD1", offset: CGPoint(x: s * 3, y: -s * 0.5), element: .C)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG1", offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CG2", offset: CGPoint(x: s * 1.5, y:  h), element: .C),
+                A(name: "CD1", offset: CGPoint(x: s * 2.5, y: -h), element: .C)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 0, to: 2, order: 1, isAromatic: false),
                 B(from: 1, to: 3, order: 1, isAromatic: false)],
@@ -86,54 +87,55 @@ let sideChainTemplates: [String: SideChainTemplate] = {
                 B(from: 1, to: 2, order: 1, isAromatic: false)],
         aromaticRings: [])
 
-    // Hydroxyl / thiol
+    // Hydroxyl / thiol — slight zigzag for visual variety.
     t["SER"] = SideChainTemplate(
         atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "OG", offset: CGPoint(x: s * 2, y: 0), element: .O)],
+                A(name: "OG", offset: CGPoint(x: s * 1.5, y: -h), element: .O)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false)],
         aromaticRings: [])
 
     t["THR"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "OG1", offset: CGPoint(x: s * 2, y: -s * 0.6), element: .O),
-                A(name: "CG2", offset: CGPoint(x: s * 2, y: s * 0.6), element: .C)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "OG1", offset: CGPoint(x: s * 1.5, y: -h), element: .O),
+                A(name: "CG2", offset: CGPoint(x: s * 1.5, y:  h), element: .C)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 0, to: 2, order: 1, isAromatic: false)],
         aromaticRings: [])
 
     t["CYS"] = SideChainTemplate(
         atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "SG", offset: CGPoint(x: s * 2, y: 0), element: .S)],
+                A(name: "SG", offset: CGPoint(x: s * 1.5, y: -h), element: .S)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false)],
         aromaticRings: [])
 
+    // MET — proper zigzag CB-CG-SD-CE with 120° angles at every vertex.
     t["MET"] = SideChainTemplate(
         atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "SD", offset: CGPoint(x: s * 3, y: 0), element: .S),
-                A(name: "CE", offset: CGPoint(x: s * 4, y: 0), element: .C)],
+                A(name: "CG", offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "SD", offset: CGPoint(x: s * 2.5, y: -h), element: .S),
+                A(name: "CE", offset: CGPoint(x: s * 3, y: 0), element: .C)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 1, isAromatic: false),
                 B(from: 2, to: 3, order: 1, isAromatic: false)],
         aromaticRings: [])
 
-    // Carboxylate / amide
+    // Carboxylate / amide — sp2 Y at CG (or CD) with both heteroatoms at 120°.
     t["ASP"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "OD1", offset: CGPoint(x: s * 3, y: -s * 0.6), element: .O),
-                A(name: "OD2", offset: CGPoint(x: s * 3, y: s * 0.6), element: .O)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG",  offset: CGPoint(x: s * 2, y: 0), element: .C),
+                A(name: "OD1", offset: CGPoint(x: s * 2.5, y: -h), element: .O),
+                A(name: "OD2", offset: CGPoint(x: s * 2.5, y:  h), element: .O)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 2, isAromatic: false),
                 B(from: 1, to: 3, order: 1, isAromatic: false)],
         aromaticRings: [])
 
     t["GLU"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "CD", offset: CGPoint(x: s * 3, y: 0), element: .C),
-                A(name: "OE1", offset: CGPoint(x: s * 4, y: -s * 0.6), element: .O),
-                A(name: "OE2", offset: CGPoint(x: s * 4, y: s * 0.6), element: .O)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG",  offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CD",  offset: CGPoint(x: s * 2.5, y: -h), element: .C),
+                A(name: "OE1", offset: CGPoint(x: s * 3, y: 0), element: .O),
+                A(name: "OE2", offset: CGPoint(x: s * 3, y: -h * 2), element: .O)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 1, isAromatic: false),
                 B(from: 2, to: 3, order: 2, isAromatic: false),
@@ -141,34 +143,34 @@ let sideChainTemplates: [String: SideChainTemplate] = {
         aromaticRings: [])
 
     t["ASN"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "OD1", offset: CGPoint(x: s * 3, y: -s * 0.6), element: .O),
-                A(name: "ND2", offset: CGPoint(x: s * 3, y: s * 0.6), element: .N)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG",  offset: CGPoint(x: s * 2, y: 0), element: .C),
+                A(name: "OD1", offset: CGPoint(x: s * 2.5, y: -h), element: .O),
+                A(name: "ND2", offset: CGPoint(x: s * 2.5, y:  h), element: .N)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 2, isAromatic: false),
                 B(from: 1, to: 3, order: 1, isAromatic: false)],
         aromaticRings: [])
 
     t["GLN"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "CD", offset: CGPoint(x: s * 3, y: 0), element: .C),
-                A(name: "OE1", offset: CGPoint(x: s * 4, y: -s * 0.6), element: .O),
-                A(name: "NE2", offset: CGPoint(x: s * 4, y: s * 0.6), element: .N)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG",  offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CD",  offset: CGPoint(x: s * 2.5, y: -h), element: .C),
+                A(name: "OE1", offset: CGPoint(x: s * 3, y: 0), element: .O),
+                A(name: "NE2", offset: CGPoint(x: s * 3, y: -h * 2), element: .N)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 1, isAromatic: false),
                 B(from: 2, to: 3, order: 2, isAromatic: false),
                 B(from: 2, to: 4, order: 1, isAromatic: false)],
         aromaticRings: [])
 
-    // Charged
+    // Charged — long zigzag chains.
     t["LYS"] = SideChainTemplate(
         atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "CD", offset: CGPoint(x: s * 3, y: 0), element: .C),
-                A(name: "CE", offset: CGPoint(x: s * 4, y: 0), element: .C),
-                A(name: "NZ", offset: CGPoint(x: s * 5, y: 0), element: .N)],
+                A(name: "CG", offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CD", offset: CGPoint(x: s * 2.5, y: -h), element: .C),
+                A(name: "CE", offset: CGPoint(x: s * 3, y: 0), element: .C),
+                A(name: "NZ", offset: CGPoint(x: s * 4, y: 0), element: .N)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 1, isAromatic: false),
                 B(from: 2, to: 3, order: 1, isAromatic: false),
@@ -176,13 +178,13 @@ let sideChainTemplates: [String: SideChainTemplate] = {
         aromaticRings: [])
 
     t["ARG"] = SideChainTemplate(
-        atoms: [A(name: "CB", offset: CGPoint(x: s, y: 0), element: .C),
-                A(name: "CG", offset: CGPoint(x: s * 2, y: 0), element: .C),
-                A(name: "CD", offset: CGPoint(x: s * 3, y: 0), element: .C),
-                A(name: "NE", offset: CGPoint(x: s * 4, y: 0), element: .N),
-                A(name: "CZ", offset: CGPoint(x: s * 5, y: 0), element: .C),
-                A(name: "NH1", offset: CGPoint(x: s * 6, y: -s * 0.6), element: .N),
-                A(name: "NH2", offset: CGPoint(x: s * 6, y: s * 0.6), element: .N)],
+        atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
+                A(name: "CG",  offset: CGPoint(x: s * 1.5, y: -h), element: .C),
+                A(name: "CD",  offset: CGPoint(x: s * 2.5, y: -h), element: .C),
+                A(name: "NE",  offset: CGPoint(x: s * 3, y: 0), element: .N),
+                A(name: "CZ",  offset: CGPoint(x: s * 4, y: 0), element: .C),
+                A(name: "NH1", offset: CGPoint(x: s * 4.5, y: -h), element: .N),
+                A(name: "NH2", offset: CGPoint(x: s * 4.5, y:  h), element: .N)],
         bonds: [B(from: 0, to: 1, order: 1, isAromatic: false),
                 B(from: 1, to: 2, order: 1, isAromatic: false),
                 B(from: 2, to: 3, order: 1, isAromatic: false),
@@ -254,49 +256,28 @@ let sideChainTemplates: [String: SideChainTemplate] = {
             aromaticRings: [[1, 2, 3, 4, 5]])
     }()
 
-    // TRP — indole: pyrrole (5-ring) fused to benzene (6-ring) sharing the
-    // CD2-CE2 edge. Lay out the benzene as a regular hexagon and attach the
-    // pentagon vertices CG/CD1/NE1 on the left side of the shared edge.
+    // TRP — proper indole: pyrrole (5-ring) fused to benzene (6-ring) along
+    // the CD2-CE2 edge. CG attaches to CB on the left of the pyrrole; the
+    // benzene extends to the lower right. All bonds length s, all angles 108°
+    // (pentagon) or 120° (hexagon).
     t["TRP"] = {
-        // Benzene center at (cx_b, 0). Benzene vertices (bond length s):
-        //   CD2 (top-left)  ─ CE2 (top-right)
-        //   CE3            CZ2
-        //   CZ3            CH2
-        // Place CD2 and CE2 horizontally so their edge points "up" (negative y).
-        // Choose: CD2 = (cx_b - 0.5s, -h), CE2 = (cx_b + 0.5s, -h),
-        //         CE3 = (cx_b - s, 0), CZ3 = (cx_b - 0.5s, h),
-        //         CH2 = (cx_b + 0.5s, h), CZ2 = (cx_b + s, 0)
-        // Then attach pyrrole on the upper-left side of the CD2-CE2 edge so the
-        // pyrrole ring extends upward.
-        let cxB: CGFloat = s * 4
-        let CD2 = CGPoint(x: cxB - 0.5 * s, y: h)
-        let CE2 = CGPoint(x: cxB + 0.5 * s, y: h)
-        let CE3 = CGPoint(x: cxB - s,       y: 0)
-        let CZ3 = CGPoint(x: cxB - 0.5 * s, y: -h)
-        let CH2 = CGPoint(x: cxB + 0.5 * s, y: -h)
-        let CZ2 = CGPoint(x: cxB + s,       y: 0)
+        // Pyrrole pentagon: CG at (2s, 0), pentagon vertices derived from the
+        // regular pentagon centered at (2s + r5, 0) where r5 = s/(2 sin 36°).
+        // Coefficients precomputed for clarity.
+        let CG  = CGPoint(x: s * 2, y: 0)
+        let CD1 = CGPoint(x: s * 2.588, y: -s * 0.809)
+        let NE1 = CGPoint(x: s * 3.539, y: -s * 0.500)
+        let CE2 = CGPoint(x: s * 3.539, y:  s * 0.500)
+        let CD2 = CGPoint(x: s * 2.588, y:  s * 0.809)
 
-        // Pyrrole on the lower-left side of the CD2-CE2 edge (extends downward
-        // in screen space). Pentagon shares the CE2-CD2 edge with benzene.
-        // Pentagon circumradius r5 = s / (2*sin(36°))
-        let r5 = s / (2 * sin(.pi / 5))
-        // Midpoint of shared edge
-        let midX = (CD2.x + CE2.x) / 2
-        let midY = (CD2.y + CE2.y) / 2
-        // Pentagon center is offset perpendicular to CD2->CE2 by apothem
-        let apothem = r5 * cos(.pi / 5)
-        // CD2->CE2 unit vector = (1, 0); perpendicular toward +y (downward) = (0, 1)
-        let pcx = midX + 0 * apothem
-        let pcy = midY + 1 * apothem
-        // Pentagon vertices: shared edge endpoints (CD2 at angle 180°-36°=144°,
-        // CE2 at 36°), then NE1 (-36°), CD1 (-108°), CG (-180°)
-        func pv(_ deg: CGFloat) -> CGPoint {
-            CGPoint(x: pcx + r5 * cos(deg * .pi / 180),
-                    y: pcy + r5 * sin(deg * .pi / 180))
-        }
-        let NE1 = pv(-36 + 360)   // angle below shared edge, right side
-        let CD1 = pv(-108 + 360)
-        let CG  = pv(180)
+        // Benzene hexagon: shares the CD2-CE2 edge. Hexagon center is offset
+        // from the edge midpoint by hexagon apothem (s*sqrt(3)/2) toward +y
+        // (away from the pentagon center which is on -y from the edge).
+        // Vertices in cycle order: CD2 → CE3 → CZ3 → CH2 → CZ2 → CE2 → CD2.
+        let CE3 = CGPoint(x: s * 2.380, y: s * 1.785)
+        let CZ3 = CGPoint(x: s * 3.123, y: s * 2.455)
+        let CH2 = CGPoint(x: s * 4.073, y: s * 2.146)
+        let CZ2 = CGPoint(x: s * 4.281, y: s * 1.169)
 
         return SideChainTemplate(
             atoms: [A(name: "CB",  offset: CGPoint(x: s, y: 0), element: .C),
@@ -316,7 +297,7 @@ let sideChainTemplates: [String: SideChainTemplate] = {
                     B(from: 3, to: 4, order: 1, isAromatic: true),   // NE1-CE2
                     B(from: 4, to: 5, order: 1, isAromatic: true),   // CE2-CD2 (fused)
                     B(from: 5, to: 1, order: 1, isAromatic: true),   // CD2-CG
-                    // Benzene
+                    // Benzene (CD2 → CE3 → CZ3 → CH2 → CZ2 → CE2)
                     B(from: 5, to: 6, order: 1, isAromatic: true),   // CD2-CE3
                     B(from: 6, to: 7, order: 1, isAromatic: true),   // CE3-CZ3
                     B(from: 7, to: 8, order: 1, isAromatic: true),   // CZ3-CH2
@@ -391,59 +372,65 @@ private func canonRing(_ ring: [Int]) -> [Int] {
 
 // MARK: - Side Chain Transform
 
-/// Transform a side chain template so the interacting atom (or ring centroid)
-/// faces toward the ligand. Returns screen-space positions for each template
-/// atom.
-func transformSideChain(template: SideChainTemplate, bubbleCenter: CGPoint,
-                         pivotPoint: CGPoint, towardLigand: CGPoint) -> [CGPoint] {
+/// Distance from the residue bubble center at which CB (the side chain
+/// attachment point) sits — places CB just outside the bubble edge.
+let kCBAnchorDistance: CGFloat = 50
+
+/// Extra rotation applied AFTER the centroid alignment so that CB→CG is
+/// never parallel to the bubble→ligand axis. Without this, Y-branch residues
+/// (TYR/PHE/ASP/LEU/VAL/THR/...) end up with a horizontal CB→CG bond,
+/// because for any sp2/sp3 atom with three 120°-spaced substituents the
+/// centroid of those substituents lies exactly on the CB→CG line.
+/// −30° (math, CCW) tilts the chain so CB→CG sits at +30° above the chain
+/// axis, restoring the conventional zigzag appearance.
+let kSideChainZigzagTilt: CGFloat = -.pi / 6
+
+/// Transform a side chain template so:
+///   - CB (atoms[0]) sits at `kCBAnchorDistance` from the bubble center
+///   - the chain extends outward toward the ligand contact
+///   - the rotation aligns the CB→(centroid of all other atoms) vector with
+///     the bubble→ligand vector. Using the centroid (not a single atom) keeps
+///     every branch of the side chain visible — Y-branches like THR/VAL/ILE
+///     no longer hide a CH3 behind the bubble.
+///
+/// Returns screen-space positions for each template atom.
+func transformSideChain(template: SideChainTemplate,
+                         bubbleCenter: CGPoint,
+                         towardLigand: CGPoint) -> [CGPoint] {
     guard !template.atoms.isEmpty else { return [] }
+
+    let cb = template.atoms[0].offset
+
+    // Reference direction = from CB to centroid of all other side-chain atoms
+    var refX: CGFloat = 0, refY: CGFloat = 0, n: CGFloat = 0
+    for atom in template.atoms.dropFirst() {
+        refX += atom.offset.x - cb.x
+        refY += atom.offset.y - cb.y
+        n += 1
+    }
+    if n > 0 { refX /= n; refY /= n }
+    if hypot(refX, refY) < 1e-3 { refX = 1; refY = 0 }
+    let templateAngle = atan2(refY, refX)
 
     // Direction from bubble center toward ligand contact
     let dx = towardLigand.x - bubbleCenter.x
     let dy = towardLigand.y - bubbleCenter.y
-    let angle = atan2(dy, dx)
-    let cosA = cos(angle), sinA = sin(angle)
+    let len = max(hypot(dx, dy), 1)
+    let ux = dx / len, uy = dy / len
+    let screenAngle = atan2(uy, ux)
 
-    let dist = max(hypot(dx, dy), 1)
-    let ux = dx / dist, uy = dy / dist
-    // Place pivot atom outside the bubble (half-width ~40px + clearance)
-    let anchorDist: CGFloat = 70
+    let rotateBy = screenAngle - templateAngle + kSideChainZigzagTilt
+    let cosA = cos(rotateBy), sinA = sin(rotateBy)
+
+    // CB position in screen space (just outside the bubble along bubble→ligand)
+    let cbX = bubbleCenter.x + ux * kCBAnchorDistance
+    let cbY = bubbleCenter.y + uy * kCBAnchorDistance
 
     return template.atoms.map { atom in
-        let lx = atom.offset.x - pivotPoint.x
-        let ly = atom.offset.y - pivotPoint.y
+        let lx = atom.offset.x - cb.x
+        let ly = atom.offset.y - cb.y
         let rx = lx * cosA - ly * sinA
         let ry = lx * sinA + ly * cosA
-        return CGPoint(x: bubbleCenter.x + ux * anchorDist + rx,
-                       y: bubbleCenter.y + uy * anchorDist + ry)
+        return CGPoint(x: cbX + rx, y: cbY + ry)
     }
-}
-
-/// Convenience: pivot on a named atom in the template.
-func transformSideChain(template: SideChainTemplate, bubbleCenter: CGPoint,
-                         interactingAtomName: String, towardLigand: CGPoint) -> [CGPoint] {
-    let targetIdx = template.atoms.firstIndex(where: { $0.name == interactingAtomName })
-        ?? template.atoms.count - 1
-    return transformSideChain(template: template, bubbleCenter: bubbleCenter,
-                              pivotPoint: template.atoms[targetIdx].offset,
-                              towardLigand: towardLigand)
-}
-
-/// Convenience: pivot on the centroid of a ring (atom indices into the
-/// template). Used for π-interactions where the line should connect to the
-/// ring center, not a single atom.
-func transformSideChainRingPivot(template: SideChainTemplate, bubbleCenter: CGPoint,
-                                  ringAtomIndices: [Int], towardLigand: CGPoint) -> [CGPoint] {
-    var px: CGFloat = 0, py: CGFloat = 0
-    var n: CGFloat = 0
-    for idx in ringAtomIndices where idx < template.atoms.count {
-        px += template.atoms[idx].offset.x
-        py += template.atoms[idx].offset.y
-        n += 1
-    }
-    guard n > 0 else { return transformSideChain(template: template, bubbleCenter: bubbleCenter,
-                                                 interactingAtomName: "", towardLigand: towardLigand) }
-    return transformSideChain(template: template, bubbleCenter: bubbleCenter,
-                              pivotPoint: CGPoint(x: px / n, y: py / n),
-                              towardLigand: towardLigand)
 }
