@@ -35,6 +35,12 @@ struct LigandEntry: Identifiable, Sendable {
     /// Source chain ID from the protein (for co-crystallized ligands).
     var sourceChainID: String?
 
+    /// Arbitrary user-imported properties — extra columns from CSV/SMI/SDF imports
+    /// that don't map to a built-in field. Keys are user-chosen column names
+    /// (defaulted to the source CSV header). Values are stored as raw strings;
+    /// the table renderer parses them on display when shown as numeric columns.
+    var userProperties: [String: String] = [:]
+
     // --- Enumeration metadata (set when Enumerate expands a molecule into forms) ---
 
     /// Parent molecule name. Nil for standalone/raw/dominant entries.
@@ -533,7 +539,7 @@ final class LigandDatabase {
     // MARK: - Codable Helpers
 
     /// Current on-disk format version.
-    private static let currentFormatVersion = 3
+    private static let currentFormatVersion = 5
 
     /// v3: Serialized conformer within a chemical form.
     private struct SerializableConformer: Codable {
@@ -608,6 +614,10 @@ final class LigandDatabase {
         let formKind: Int?          // ChemicalFormKind.rawValue
         let formRelativeEnergy: Double?
         let entryConformers: [SerializableConformer]?
+        // --- v5 fields ---
+        /// User-imported custom properties from CSV/SMI/SDF columns that don't
+        /// map to a built-in field. Optional for backward compat with v3/v4.
+        let userProperties: [String: String]?
     }
 
     /// Top-level wrapper for versioned on-disk format.
@@ -728,7 +738,8 @@ final class LigandDatabase {
                 populationWeight: entry.populationWeight,
                 formKind: entry.formKind?.rawValue,
                 formRelativeEnergy: entry.relativeEnergy,
-                entryConformers: entryConfs
+                entryConformers: entryConfs,
+                userProperties: entry.userProperties.isEmpty ? nil : entry.userProperties
             )
         }
         let wrapper = DatabaseWrapper(version: Self.currentFormatVersion, entries: serializable)
@@ -771,6 +782,9 @@ final class LigandDatabase {
             entry.populationWeight = s.populationWeight
             entry.formKind = s.formKind.flatMap { ChemicalFormKind(rawValue: $0) }
             entry.relativeEnergy = s.formRelativeEnergy
+
+            // v5 user-imported properties (empty for v3/v4 entries)
+            entry.userProperties = s.userProperties ?? [:]
 
             // Decode per-entry conformers
             if let serConfs = s.entryConformers, !serConfs.isEmpty {

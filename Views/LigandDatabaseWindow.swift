@@ -58,6 +58,19 @@ struct LigandDatabaseWindow: View {
     @State var sortField: SortField? = nil
     @State var sortAscending: Bool = true
 
+    /// Dynamic column manifest (built-in + user-imported). Persists order and
+    /// visibility via @AppStorage.
+    @State var columnState = LigandColumnState()
+
+    /// Column id currently being dragged (header → header reorder).
+    @State var draggedColumnID: String? = nil
+    /// Column id the user is hovering over while dragging — used to draw a
+    /// vertical insertion indicator on its leading edge.
+    @State var dropTargetColumnID: String? = nil
+    /// Vertical scroll offset of the table — used to keep the sticky leading
+    /// checkbox column in sync with the scrolling rows.
+    @State var tableVerticalOffset: CGFloat = 0
+
     // Detail panel: selected entry for inspection
     @State var inspectedEntry: LigandEntry?
 
@@ -195,6 +208,13 @@ struct LigandDatabaseWindow: View {
                     if selectedIDs.isEmpty, let first = filteredEntries.first {
                         selectedIDs = [first.id]
                     }
+                    // Discover any user-imported columns from the loaded DB
+                    columnState.discoverUserColumns(from: db.entries)
+                }
+                .onChange(of: db.entries.count) { _, _ in
+                    // New entries (e.g. from an import) may carry new
+                    // userProperties keys — register them as columns.
+                    columnState.discoverUserColumns(from: db.entries)
                 }
             }
 
@@ -480,11 +500,15 @@ struct LigandDatabaseWindow: View {
         VStack(spacing: 0) {
             smilesEntryBar
 
-            // Processing indicator
-            if isProcessing {
+            // Processing indicator — covers both window-driven jobs (Prepare,
+            // Enumerate) and database-driven jobs (file imports). Both push
+            // their state independently; the bar shows whichever is active.
+            if isProcessing || db.isProcessing {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(processingMessage)
+                    Text(db.isProcessing && !db.processingMessage.isEmpty
+                         ? db.processingMessage
+                         : processingMessage)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -493,216 +517,289 @@ struct LigandDatabaseWindow: View {
                 .background(Color.accentColor.opacity(0.05))
             }
 
-            // Table header — fixed columns, same for every row
-            HStack(spacing: 0) {
-                // Select all / none checkbox
-                Button(action: { toggleSelectAll() }) {
-                    Image(systemName: selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
-                          ? "checkmark.square.fill" : "square")
-                        .font(.subheadline)
-                        .foregroundStyle(selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
-                                         ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .frame(width: 24)
-                .help("Select all / none")
-                headerCell("Name", width: 170, field: .name)
-                headerCell("SMILES", width: nil, field: .smiles)
-                headerCell("Pop%", width: 48, field: nil, alignment: .trailing)
-                headerCell("ΔE", width: 44, field: nil, alignment: .trailing)
-                headerCell("Conf", width: 38, field: nil, alignment: .trailing)
-                headerCell("MW", width: 52, field: .mw, alignment: .trailing)
-                headerCell("LogP", width: 42, field: .logP, alignment: .trailing)
-                headerCell("HBD", width: 30, field: .hbd, alignment: .trailing)
-                headerCell("HBA", width: 30, field: .hba, alignment: .trailing)
-                headerCell("TPSA", width: 42, field: .tpsa, alignment: .trailing)
-                headerCell("RotB", width: 30, field: .rotB, alignment: .trailing)
-                headerCell("Lip.", width: 26, field: nil, alignment: .center)
-                headerCell("Atoms", width: 38, field: .atoms, alignment: .trailing)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color(nsColor: .controlBackgroundColor))
-
-            Divider()
-
-            // Table body — flat: one row per entry, no hierarchy
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(filteredEntries) { entry in
-                        tableRow(entry)
-                        Divider().opacity(0.3)
+            // 2D scrolling table: horizontal for column overflow, vertical for
+            // row overflow. Header is pinned via Section so it stays visible
+            // while rows scroll vertically and tracks the rows when they
+            // scroll horizontally. The leading checkbox column is drawn as a
+            // sticky overlay on the leading edge so it stays put during
+            // horizontal scrolling (overlaid on the empty 24pt leading gutter
+            // every row reserves).
+            GeometryReader { geo in
+                let widths = computeColumnWidths(viewportWidth: geo.size.width - 16 - 24)
+                ScrollView([.horizontal, .vertical], showsIndicators: true) {
+                    LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                        Section {
+                            ForEach(filteredEntries) { entry in
+                                tableRow(entry, widths: widths)
+                                Divider().opacity(0.3)
+                            }
+                        } header: {
+                            tableHeaderRow(widths: widths)
+                        }
                     }
+                    .background(alignment: .topLeading) {
+                        columnSeparatorOverlay(widths: widths)
+                    }
+                }
+                .onScrollGeometryChange(for: CGFloat.self) { geo in
+                    geo.contentOffset.y
+                } action: { _, newValue in
+                    tableVerticalOffset = newValue
+                }
+                .overlay(alignment: .topLeading) {
+                    stickyCheckboxColumn
                 }
             }
         }
     }
 
+    /// Leading sticky column rendered as an overlay on the table ScrollView.
+    /// Stays fixed horizontally (doesn't scroll with the table content), but
+    /// follows the vertical scroll via `.offset(y: -tableVerticalOffset)` on
+    /// the body checkboxes. The header checkbox is pinned to the very top.
+    @ViewBuilder
+    private var stickyCheckboxColumn: some View {
+        VStack(spacing: 0) {
+            // Sticky header checkbox (matches the table's pinned section header)
+            Button(action: { toggleSelectAll() }) {
+                Image(systemName: selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
+                      ? "checkmark.square.fill" : "square")
+                    .font(.subheadline)
+                    .foregroundStyle(selectedIDs.count == filteredEntries.count && !filteredEntries.isEmpty
+                                     ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 24)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .help("Select all / none")
+
+            Divider()
+
+            // Body checkboxes — clipped, with vertical offset to track scroll.
+            ZStack(alignment: .topLeading) {
+                Color(nsColor: .windowBackgroundColor)
+                VStack(spacing: 0) {
+                    ForEach(filteredEntries) { entry in
+                        Button {
+                            if selectedIDs.contains(entry.id) { selectedIDs.remove(entry.id) }
+                            else { selectedIDs.insert(entry.id) }
+                        } label: {
+                            Image(systemName: selectedIDs.contains(entry.id) ? "checkmark.square.fill" : "square")
+                                .font(.subheadline)
+                                .foregroundStyle(selectedIDs.contains(entry.id) ? Color.accentColor : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 24)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        Divider().opacity(0.3)
+                    }
+                }
+                .offset(y: -tableVerticalOffset)
+            }
+            .clipped()
+        }
+        .frame(width: 40)
+        .overlay(alignment: .trailing) {
+            Divider()
+        }
+    }
+
+    /// Continuous vertical separator lines drawn at every column boundary,
+    /// from the top of the table to the bottom. Replaces the per-cell
+    /// `Divider`s which only spanned each cell's height and looked broken at
+    /// row boundaries.
+    @ViewBuilder
+    private func columnSeparatorOverlay(widths: [String: CGFloat]) -> some View {
+        Canvas { context, size in
+            // Leading edge: 8pt outer padding + 40pt sticky checkbox gutter
+            var x: CGFloat = 8 + 40
+            let lineColor = GraphicsContext.Shading.color(.gray.opacity(0.25))
+            for col in columnState.visibleColumns {
+                let w = widths[col.id] ?? 60
+                x += w
+                var path = Path()
+                path.move(to: CGPoint(x: x, y: 0))
+                path.addLine(to: CGPoint(x: x, y: size.height))
+                context.stroke(path, with: lineColor, lineWidth: 0.5)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Compute per-column display widths for the current viewport.
+    /// - Built-in columns with a fixed `defaultWidth` use that.
+    /// - Flexible columns (SMILES) split the leftover viewport space, with a
+    ///   minimum of `minFlex`. When the total exceeds the viewport, the table
+    ///   overflows horizontally and the user can scroll.
+    ///
+    /// `viewportWidth` should already exclude the sticky checkbox gutter
+    /// (caller subtracts 40pt + outer padding).
+    private func computeColumnWidths(viewportWidth: CGFloat) -> [String: CGFloat] {
+        let cols = columnState.visibleColumns
+        var widths: [String: CGFloat] = [:]
+        var fixedTotal: CGFloat = 0
+        var flexIDs: [String] = []
+        let minFlex: CGFloat = 240
+
+        for col in cols {
+            if let w = col.kind.defaultWidth {
+                widths[col.id] = w
+                fixedTotal += w
+            } else {
+                flexIDs.append(col.id)
+            }
+        }
+
+        if flexIDs.isEmpty { return widths }
+
+        let leftover = viewportWidth - fixedTotal
+        let perFlex = leftover / CGFloat(flexIDs.count)
+        for id in flexIDs {
+            widths[id] = max(minFlex, perFlex)
+        }
+        return widths
+    }
+
+    /// Header row — dynamic, driven by columnState.visibleColumns. Widths
+    /// match the row cells. Drag-and-drop reorder with a custom preview chip
+    /// and leading-edge insertion indicator while dragging. The leading 40pt
+    /// gutter (8pt padding + 24pt checkbox + 8pt padding) is reserved for the
+    /// sticky-overlay checkbox column drawn outside the scroll view.
+    @ViewBuilder
+    private func tableHeaderRow(widths: [String: CGFloat]) -> some View {
+        HStack(spacing: 0) {
+            // Reserved gutter under the sticky checkbox overlay
+            Color.clear.frame(width: 40)
+
+            ForEach(Array(columnState.visibleColumns.enumerated()), id: \.element.id) { idx, col in
+                headerCellWithDrag(col: col, width: widths[col.id], isLast: idx == columnState.visibleColumns.count - 1)
+            }
+        }
+        .coordinateSpace(name: "tableHeader")
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+
+    /// One header cell wrapped in drag/drop modifiers. The drag preview is a
+    /// colored chip showing the column name (replacing SwiftUI's default "+"
+    /// badge), and the drop indicator is a 2-pt accent-colored bar drawn on
+    /// the leading edge of the hovered column. Vertical column separators are
+    /// drawn at the table level via `columnSeparatorOverlay`.
+    @ViewBuilder
+    private func headerCellWithDrag(col: LigandColumn, width: CGFloat?, isLast: Bool) -> some View {
+        let _ = isLast  // (kept for API stability; column separators are global now)
+        let isDragSource = draggedColumnID == col.id
+        let isDropTarget = dropTargetColumnID == col.id && draggedColumnID != nil && draggedColumnID != col.id
+
+        headerCell(
+            col.kind.title,
+            width: width,
+            field: col.kind.sortField,
+            alignment: col.kind.alignment
+        )
+        .opacity(isDragSource ? 0.35 : 1.0)
+        .overlay(alignment: .leading) {
+            if isDropTarget {
+                Rectangle()
+                    .fill(Color.accentColor)
+                    .frame(width: 2)
+                    .frame(maxHeight: .infinity)
+                    .padding(.vertical, -4)
+            }
+        }
+        .contextMenu {
+            columnHeaderMenu(for: col)
+        }
+        .onDrag({
+            draggedColumnID = col.id
+            return NSItemProvider(object: col.id as NSString)
+        }, preview: {
+            // Custom drag preview — replaces SwiftUI's default "+" badge with
+            // a clear chip showing what's being dragged.
+            Text(col.kind.title)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.accentColor))
+        })
+        .onDrop(
+            of: [.text],
+            delegate: ColumnDropDelegate(
+                targetID: col.id,
+                columnState: columnState,
+                onDragEnter: { dropTargetColumnID = col.id },
+                onDragExit: { if dropTargetColumnID == col.id { dropTargetColumnID = nil } },
+                onDrop: {
+                    draggedColumnID = nil
+                    dropTargetColumnID = nil
+                }
+            )
+        )
+    }
+
     @ViewBuilder
     private func headerCell(_ title: String, width: CGFloat?, field: SortField?, alignment: Alignment = .leading) -> some View {
         let isSorted = field != nil && sortField == field
-        Group {
-            if let field {
-                Button(action: {
-                    if sortField == field {
-                        sortAscending.toggle()
-                    } else {
-                        sortField = field
-                        sortAscending = true
-                    }
-                }) {
-                    HStack(spacing: 2) {
-                        Text(title)
-                        if isSorted {
-                            Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                                .font(.footnote)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-            } else {
+        // Whole cell is hit-testable so drag works on empty space inside the
+        // cell, not just on the title text. Sort fires via tap on the whole
+        // frame. The ZStack with a Color.clear background ensures the content
+        // shape covers the entire allocated frame, including the Spacer space
+        // that exists when the cell is wider than its text content.
+        ZStack(alignment: alignment) {
+            Color.clear
+            HStack(spacing: 2) {
                 Text(title)
+                if isSorted {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.footnote)
+                }
             }
         }
         .font(.footnote.weight(isSorted ? .bold : .semibold))
         .foregroundStyle(isSorted ? .primary : .secondary)
         .frame(width: width, alignment: alignment)
         .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard let field else { return }
+            if sortField == field {
+                sortAscending.toggle()
+            } else {
+                sortField = field
+                sortAscending = true
+            }
+        }
     }
 
     // MARK: - Table Row (flat — one row per entry)
 
     @ViewBuilder
-    private func tableRow(_ entry: LigandEntry) -> some View {
+    private func tableRow(_ entry: LigandEntry, widths: [String: CGFloat]) -> some View {
         let isSelected = selectedIDs.contains(entry.id)
         let isInspected = inspectedEntry?.id == entry.id
         let isActive = viewModel.molecules.ligand?.name == entry.name
         let isExpandedParent = db.hasEnumeratedChildren(entry)
-        let kindColor: Color? = entry.formKind.map { kind in
-            switch kind {
-            case .parent: .green
-            case .tautomer: .cyan
-            case .protomer: .orange
-            case .tautomerProtomer: .purple
-            }
-        }
 
         HStack(spacing: 0) {
-            // Checkbox
-            Button {
-                if selectedIDs.contains(entry.id) { selectedIDs.remove(entry.id) }
-                else { selectedIDs.insert(entry.id) }
-            } label: {
-                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                    .font(.subheadline)
-                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            // Reserved gutter under the sticky checkbox overlay column.
+            Color.clear.frame(width: 40)
+
+            // Dynamic columns. Vertical separators between columns are drawn
+            // by the table-level column separator overlay (not per cell), so
+            // they form continuous lines from header to bottom of the table.
+            ForEach(columnState.visibleColumns) { col in
+                cellView(for: col, entry: entry,
+                         width: widths[col.id],
+                         isActive: isActive, isExpandedParent: isExpandedParent)
             }
-            .buttonStyle(.plain)
-            .frame(width: 24)
-
-            // Name (with optional form kind badge and active indicator)
-            HStack(spacing: 4) {
-                if isActive {
-                    Circle().fill(.green).frame(width: 5, height: 5)
-                }
-                if entry.isEnumerated {
-                    Text("↳")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
-                if let kind = entry.formKind, let color = kindColor {
-                    Text(kind.symbol)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 16, height: 14)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(color))
-                }
-                if renamingEntryID == entry.id {
-                    TextField("Name", text: $renamingText, onCommit: {
-                        commitRename(entryID: entry.id)
-                    })
-                    .textFieldStyle(.roundedBorder)
-                    .font(.footnote)
-                    .onExitCommand { renamingEntryID = nil }
-                } else {
-                    Text(entry.name)
-                        .font(.footnote.weight(isActive ? .semibold : .regular))
-                        .foregroundStyle(isExpandedParent ? .tertiary : .primary)
-                        .lineLimit(1)
-                        .onTapGesture(count: 2) {
-                            renamingEntryID = entry.id
-                            renamingText = entry.name
-                        }
-                }
-            }
-            .frame(width: 170, alignment: .leading)
-
-            // SMILES
-            Text(entry.originalSMILES)
-                .font(.footnote.monospaced())
-                .foregroundStyle(isExpandedParent ? .tertiary : .secondary)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(entry.originalSMILES)
-
-            // Pop% — nil = not enumerated (show —), value = Boltzmann weight
-            if let pop = entry.populationWeight {
-                Text(String(format: "%.1f%%", pop * 100))
-                    .font(.footnote.monospaced().weight(.medium))
-                    .foregroundStyle(pop > 0.3 ? .green : pop > 0.1 ? .yellow : .secondary)
-                    .frame(width: 48, alignment: .trailing)
-            } else {
-                Text("—").font(.footnote).foregroundStyle(.tertiary).frame(width: 48, alignment: .trailing)
-            }
-
-            // ΔE — nil = not enumerated
-            if let dE = entry.relativeEnergy {
-                if dE < 0.01 {
-                    Text("best").font(.caption.weight(.medium)).foregroundStyle(.green)
-                        .frame(width: 44, alignment: .trailing)
-                } else {
-                    Text(String(format: "+%.1f", dE))
-                        .font(.caption.monospaced()).foregroundStyle(.orange)
-                        .frame(width: 44, alignment: .trailing)
-                }
-            } else {
-                Text("—").font(.footnote).foregroundStyle(.tertiary).frame(width: 44, alignment: .trailing)
-            }
-
-            // Conf
-            if entry.conformerCount > 0 {
-                Text("\(entry.conformerCount)")
-                    .font(.footnote.monospaced())
-                    .frame(width: 38, alignment: .trailing)
-            } else {
-                Text("—").font(.footnote).foregroundStyle(.tertiary).frame(width: 38, alignment: .trailing)
-            }
-
-            // Descriptors (ADMET)
-            if let d = entry.descriptors {
-                Text(String(format: "%.0f", d.molecularWeight)).font(.footnote.monospaced()).frame(width: 52, alignment: .trailing)
-                Text(String(format: "%.1f", d.logP)).font(.footnote.monospaced()).frame(width: 42, alignment: .trailing)
-                Text("\(d.hbd)").font(.footnote.monospaced()).frame(width: 30, alignment: .trailing)
-                Text("\(d.hba)").font(.footnote.monospaced()).frame(width: 30, alignment: .trailing)
-                Text(String(format: "%.0f", d.tpsa)).font(.footnote.monospaced()).frame(width: 42, alignment: .trailing)
-                Text("\(d.rotatableBonds)").font(.footnote.monospaced()).frame(width: 30, alignment: .trailing)
-                Image(systemName: d.lipinski ? "checkmark" : "xmark")
-                    .font(.footnote).foregroundStyle(d.lipinski ? .green : .red.opacity(0.7)).frame(width: 26)
-            } else {
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
-                Text("—").font(.footnote).foregroundStyle(.secondary).frame(width: 26, alignment: .center)
-            }
-
-            // Atom count
-            Text(entry.atoms.isEmpty ? "—" : "\(entry.atoms.count)")
-                .font(.footnote.monospaced())
-                .foregroundStyle(entry.atoms.isEmpty ? .tertiary : .primary)
-                .frame(width: 38, alignment: .trailing)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -747,6 +844,188 @@ struct LigandDatabaseWindow: View {
                 db.removeWithChildren(id: entry.id)
                 selectedIDs.remove(entry.id)
             }
+        }
+    }
+
+    // MARK: - Cell Dispatch
+
+    /// Render a single cell for `entry` in column `col`. Width is supplied by
+    /// the caller (computed from viewport size); the contents are switched per
+    /// kind. The Name column has the special inline-rename + form-badge behavior.
+    @ViewBuilder
+    private func cellView(
+        for col: LigandColumn,
+        entry: LigandEntry,
+        width: CGFloat?,
+        isActive: Bool,
+        isExpandedParent: Bool
+    ) -> some View {
+        let alignment = col.kind.alignment
+
+        Group {
+            switch col.kind {
+            case .name:
+                nameCell(entry, isActive: isActive, isExpandedParent: isExpandedParent)
+            case .smiles:
+                Text(entry.originalSMILES)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(isExpandedParent ? .tertiary : .secondary)
+                    .lineLimit(1)
+                    .help(entry.originalSMILES)
+            case .popPercent:
+                if let pop = entry.populationWeight {
+                    Text(String(format: "%.1f%%", pop * 100))
+                        .font(.footnote.monospaced().weight(.medium))
+                        .foregroundStyle(pop > 0.3 ? .green : pop > 0.1 ? .yellow : .secondary)
+                } else {
+                    dashCell
+                }
+            case .deltaE:
+                if let dE = entry.relativeEnergy {
+                    if dE < 0.01 {
+                        Text("best").font(.caption.weight(.medium)).foregroundStyle(.green)
+                    } else {
+                        Text(String(format: "+%.1f", dE))
+                            .font(.caption.monospaced()).foregroundStyle(.orange)
+                    }
+                } else {
+                    dashCell
+                }
+            case .conf:
+                if entry.conformerCount > 0 {
+                    Text("\(entry.conformerCount)").font(.footnote.monospaced())
+                } else {
+                    dashCell
+                }
+            case .mw:
+                if let d = entry.descriptors {
+                    Text(String(format: "%.0f", d.molecularWeight)).font(.footnote.monospaced())
+                } else { dashCell }
+            case .logP:
+                if let d = entry.descriptors {
+                    Text(String(format: "%.1f", d.logP)).font(.footnote.monospaced())
+                } else { dashCell }
+            case .hbd:
+                if let d = entry.descriptors {
+                    Text("\(d.hbd)").font(.footnote.monospaced())
+                } else { dashCell }
+            case .hba:
+                if let d = entry.descriptors {
+                    Text("\(d.hba)").font(.footnote.monospaced())
+                } else { dashCell }
+            case .tpsa:
+                if let d = entry.descriptors {
+                    Text(String(format: "%.0f", d.tpsa)).font(.footnote.monospaced())
+                } else { dashCell }
+            case .rotB:
+                if let d = entry.descriptors {
+                    Text("\(d.rotatableBonds)").font(.footnote.monospaced())
+                } else { dashCell }
+            case .lipinski:
+                if let d = entry.descriptors {
+                    Image(systemName: d.lipinski ? "checkmark" : "xmark")
+                        .font(.footnote)
+                        .foregroundStyle(d.lipinski ? .green : .red.opacity(0.7))
+                } else { dashCell }
+            case .atoms:
+                Text(entry.atoms.isEmpty ? "—" : "\(entry.atoms.count)")
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(entry.atoms.isEmpty ? .tertiary : .primary)
+            case .userProperty(let key):
+                if let value = entry.userProperties[key], !value.isEmpty {
+                    Text(value)
+                        .font(.footnote.monospaced())
+                        .lineLimit(1)
+                        .help(value)
+                } else {
+                    dashCell
+                }
+            }
+        }
+        .frame(width: width, alignment: alignment)
+        .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
+    }
+
+    /// Em-dash placeholder used by every cell when its data is missing.
+    private var dashCell: some View {
+        Text("—").font(.footnote).foregroundStyle(.tertiary)
+    }
+
+    /// The Name column cell — inline rename + active marker + enumeration arrow + form-kind badge.
+    @ViewBuilder
+    private func nameCell(_ entry: LigandEntry, isActive: Bool, isExpandedParent: Bool) -> some View {
+        let kindColor: Color? = entry.formKind.map { kind in
+            switch kind {
+            case .parent: .green
+            case .tautomer: .cyan
+            case .protomer: .orange
+            case .tautomerProtomer: .purple
+            }
+        }
+        HStack(spacing: 4) {
+            if isActive {
+                Circle().fill(.green).frame(width: 5, height: 5)
+            }
+            if entry.isEnumerated {
+                Text("↳").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+            }
+            if let kind = entry.formKind, let color = kindColor {
+                Text(kind.symbol)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 16, height: 14)
+                    .background(RoundedRectangle(cornerRadius: 3).fill(color))
+            }
+            if renamingEntryID == entry.id {
+                TextField("Name", text: $renamingText, onCommit: {
+                    commitRename(entryID: entry.id)
+                })
+                .textFieldStyle(.roundedBorder)
+                .font(.footnote)
+                .onExitCommand { renamingEntryID = nil }
+            } else {
+                Text(entry.name)
+                    .font(.footnote.weight(isActive ? .semibold : .regular))
+                    .foregroundStyle(isExpandedParent ? .tertiary : .primary)
+                    .lineLimit(1)
+                    .onTapGesture(count: 2) {
+                        renamingEntryID = entry.id
+                        renamingText = entry.name
+                    }
+            }
+        }
+    }
+
+    // MARK: - Column Header Context Menu
+
+    /// Right-click menu on any column header: hide this column, toggle other
+    /// hideable columns, reset to defaults.
+    @ViewBuilder
+    private func columnHeaderMenu(for col: LigandColumn) -> some View {
+        if col.kind.isHideable {
+            Button("Hide \"\(col.kind.title)\"") {
+                columnState.setVisible(false, id: col.id)
+            }
+            Divider()
+        }
+
+        Menu("Show / Hide Columns") {
+            ForEach(columnState.hideableColumns) { hideable in
+                Button {
+                    columnState.toggleVisible(id: hideable.id)
+                } label: {
+                    Label(
+                        hideable.kind.title,
+                        systemImage: hideable.visible ? "checkmark" : ""
+                    )
+                }
+            }
+        }
+
+        Divider()
+
+        Button("Reset Columns to Defaults") {
+            columnState.resetToDefaults()
         }
     }
 

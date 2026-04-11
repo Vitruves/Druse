@@ -68,6 +68,7 @@ extension LigandDatabaseWindow {
             }
             var mapping = ImportColumnMapping(sourceHeader: header, sampleValues: samples)
             mapping.target = suggestTarget(for: header)
+            mapping.customColumnName = header
             columns.append(mapping)
         }
 
@@ -103,6 +104,7 @@ extension LigandDatabaseWindow {
             }
             let header = "Column \(i + 1)"
             var mapping = ImportColumnMapping(sourceHeader: header, sampleValues: samples)
+            mapping.customColumnName = header
             // Auto-suggest: first col with SMILES-like content → SMILES, other → Name
             if i == 0 && samples.first.map({ LigandDatabase.looksLikeSMILES($0) }) == true {
                 mapping.target = .smiles
@@ -144,13 +146,17 @@ extension LigandDatabaseWindow {
             let samples = Array((keySamples[key] ?? []).prefix(3))
             var mapping = ImportColumnMapping(sourceHeader: key, sampleValues: samples)
             mapping.target = suggestTarget(for: key)
+            mapping.customColumnName = key
             columns.append(mapping)
         }
 
         return ImportPreview(columns: columns, rowCount: mols.count, fileURL: url, fileType: .sdf)
     }
 
-    /// Suggest a target field based on a column header name.
+    /// Suggest a target field based on a column header name. Returns
+    /// `.customColumn` (preserving the column under its CSV header) when no
+    /// built-in field matches — this is the "preserve everything by default"
+    /// behavior the user asked for.
     func suggestTarget(for header: String) -> ImportTargetField {
         let h = header.lowercased().trimmingCharacters(in: .whitespaces)
         if h == "smiles" || h == "molecule" || h == "structure" || h == "canonical_smiles" { return .smiles }
@@ -158,7 +164,7 @@ extension LigandDatabaseWindow {
         if h == "ki" || h == "ki_nm" || h == "ki (nm)" || h == "ki_value" { return .ki }
         if h == "pki" || h == "p_ki" || h == "pki_value" { return .pKi }
         if h == "ic50" || h == "ic50_nm" || h == "ic50 (nm)" || h == "ic50_value" { return .ic50 }
-        return .none
+        return .customColumn
     }
 
     // MARK: - Execute Mapped Import
@@ -187,6 +193,17 @@ extension LigandDatabaseWindow {
         let kiIdx = columns.firstIndex { $0.target == .ki }
         let pKiIdx = columns.firstIndex { $0.target == .pKi }
         let ic50Idx = columns.firstIndex { $0.target == .ic50 }
+        // Custom columns: list of (sourceColumnIndex, userKey)
+        let customCols: [(Int, String)] = columns.enumerated().compactMap { idx, col in
+            guard col.target == .customColumn else { return nil }
+            let key = col.customColumnName.trimmingCharacters(in: .whitespaces)
+            return key.isEmpty ? nil : (idx, key)
+        }
+        // Dual-write keys: Ki/pKi/IC50 also go into userProperties so the
+        // table column auto-appears via discoverUserColumns.
+        let kiUserKey = "Ki (nM)"
+        let pKiUserKey = "pKi"
+        let ic50UserKey = "IC50 (nM)"
 
         db.isProcessing = true
         db.processingMessage = "Reading CSV file..."
@@ -216,7 +233,18 @@ extension LigandDatabaseWindow {
                     let ic50 = ic50Idx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
 
                     guard !smiles.isEmpty || !name.isEmpty else { continue }
-                    entries.append(LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50))
+                    var entry = LigandEntry(name: name, smiles: smiles, ki: ki, pKi: pKi, ic50: ic50)
+                    // Mirror Ki/pKi/IC50 into userProperties so the table column shows them
+                    if let k = ki { entry.userProperties[kiUserKey] = String(format: "%g", k) }
+                    if let pk = pKi { entry.userProperties[pKiUserKey] = String(format: "%g", pk) }
+                    if let ic = ic50 { entry.userProperties[ic50UserKey] = String(format: "%g", ic) }
+                    for (colIdx, key) in customCols where colIdx < cols.count {
+                        let value = cols[colIdx]
+                        if !value.isEmpty {
+                            entry.userProperties[key] = value
+                        }
+                    }
+                    entries.append(entry)
                 }
                 return entries
             }.value
@@ -242,6 +270,11 @@ extension LigandDatabaseWindow {
         let kiIdx = columns.firstIndex { $0.target == .ki }
         let pKiIdx = columns.firstIndex { $0.target == .pKi }
         let ic50Idx = columns.firstIndex { $0.target == .ic50 }
+        let customCols: [(Int, String)] = columns.enumerated().compactMap { idx, col in
+            guard col.target == .customColumn else { return nil }
+            let key = col.customColumnName.trimmingCharacters(in: .whitespaces)
+            return key.isEmpty ? nil : (idx, key)
+        }
 
         db.isProcessing = true
         db.processingMessage = "Reading SMI file..."
@@ -271,6 +304,15 @@ extension LigandDatabaseWindow {
                     if let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
                         entry.descriptors = desc
                     }
+                    if let k = ki { entry.userProperties["Ki (nM)"] = String(format: "%g", k) }
+                    if let pk = pKi { entry.userProperties["pKi"] = String(format: "%g", pk) }
+                    if let ic = ic50 { entry.userProperties["IC50 (nM)"] = String(format: "%g", ic) }
+                    for (colIdx, key) in customCols where colIdx < cols.count {
+                        let value = cols[colIdx]
+                        if !value.isEmpty {
+                            entry.userProperties[key] = value
+                        }
+                    }
                     entries.append(entry)
                 }
                 return entries
@@ -290,10 +332,19 @@ extension LigandDatabaseWindow {
     func performSDFImport(_ preview: ImportPreview) throws {
         let mols = try SDFParser.parse(url: preview.fileURL)
 
-        // Build mapping: SDF property key → target field
-        var propertyMapping: [String: ImportTargetField] = [:]
-        for col in preview.columns where col.target != .none {
-            propertyMapping[col.sourceHeader] = col.target
+        // Build mapping: SDF property key → target field, plus the user-chosen
+        // custom-column name for properties stored as userProperties.
+        struct SDFColumnSpec {
+            let target: ImportTargetField
+            let customKey: String?      // only set when target == .customColumn
+        }
+        var propertyMapping: [String: SDFColumnSpec] = [:]
+        for col in preview.columns where col.target != .doNotImport {
+            let key = col.customColumnName.trimmingCharacters(in: .whitespaces)
+            propertyMapping[col.sourceHeader] = SDFColumnSpec(
+                target: col.target,
+                customKey: col.target == .customColumn && !key.isEmpty ? key : nil
+            )
         }
 
         // Derive SMILES on background thread (RDKit can be slow + crash-prone on malformed data)
@@ -312,18 +363,24 @@ extension LigandDatabaseWindow {
                 var pKi: Float?
                 var ic50: Float?
                 var name = mol.name
+                var customProps: [String: String] = [:]
 
                 var smilesFromProperty: String?
                 for (key, value) in mol.properties {
-                    guard let target = mapping[key] else { continue }
+                    guard let spec = mapping[key] else { continue }
                     let trimmed = value.trimmingCharacters(in: .whitespaces)
-                    switch target {
+                    switch spec.target {
                     case .ki:     ki = Float(trimmed)
                     case .pKi:    pKi = Float(trimmed)
                     case .ic50:   ic50 = Float(trimmed)
                     case .name:   name = trimmed
                     case .smiles: smilesFromProperty = trimmed
-                    default: break
+                    case .customColumn:
+                        if let userKey = spec.customKey, !trimmed.isEmpty {
+                            customProps[userKey] = trimmed
+                        }
+                    case .doNotImport:
+                        break
                     }
                 }
 
@@ -350,6 +407,11 @@ extension LigandDatabaseWindow {
                 if !smiles.isEmpty, let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
                     entry.descriptors = desc
                 }
+                entry.userProperties = customProps
+                // Mirror Ki/pKi/IC50 into userProperties so the table column auto-appears
+                if let k = ki { entry.userProperties["Ki (nM)"] = String(format: "%g", k) }
+                if let pk = pKi { entry.userProperties["pKi"] = String(format: "%g", pk) }
+                if let ic = ic50 { entry.userProperties["IC50 (nM)"] = String(format: "%g", ic) }
                 parsed.append(entry)
             }
 
