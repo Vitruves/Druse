@@ -127,18 +127,20 @@ struct ContentView: View {
 
     private var mainContentArea: some View {
         HStack(spacing: 0) {
-            // Pipeline panel — takes its own space so Metal viewport shrinks naturally
+            // Pipeline panel — fixed width, takes priority over the viewport so
+            // it never gets compressed when the inspector opens.
             if pipelinePanelOpen {
                 PipelineContentPanel(
                     selectedTab: $pipelineTab,
                     panelOpen: $pipelinePanelOpen
                 )
+                .layoutPriority(1)
                 .transition(.move(edge: .leading).combined(with: .opacity))
 
                 Divider()
             }
 
-            // Metal viewport with overlays — auto-centers in remaining space
+            // Metal viewport with overlays — fills the remaining space
             ZStack {
                 metalViewport
 
@@ -160,6 +162,7 @@ struct ContentView: View {
             if showInspector {
                 Divider()
                 InspectorPanel(showInspector: $showInspector)
+                    .layoutPriority(1)
             }
         }
     }
