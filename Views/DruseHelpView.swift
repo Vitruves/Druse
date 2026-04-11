@@ -354,7 +354,7 @@ private let helpSections: [HelpSection] = [
                      "Use the dropdown at the top to rescore poses with a different function (Vina, Drusina, Druse AF, PIGNet2) without re-running the search. This lets you compare rankings across methods."),
             HelpItem.subtitle("Interaction Diagram"),
             HelpItem("2D Interaction Diagram",
-                     "A schematic (MOE-style) view of protein–ligand contacts. The ligand is centred with interacting residues arranged radially. Interactions are colour-coded: H-bonds (cyan), salt bridges (orange), π-stacking (purple), hydrophobic (grey), halogen bonds (green), metal coordination (gold). Residues are coloured by type: acidic (red), basic (blue), polar (green), hydrophobic (orange). Distances are labelled on connecting lines."),
+                     "A schematic view of protein–ligand contacts with the ligand centred and interacting residues arranged radially. Interactions are colour-coded: H-bonds (cyan), salt bridges (orange), π-stacking (purple), hydrophobic (grey), halogen bonds (green), metal coordination (gold). Residues are coloured by type: acidic (red), basic (blue), polar (green), hydrophobic (orange). Distances are labelled on connecting lines."),
             HelpItem.subtitle("Results Database"),
             HelpItem("Full Pose Analysis",
                      "The Results Database window (⌘⇧R) provides a comprehensive table of all poses with sortable columns, multi-column selection, energy bars, and a detail panel showing 2D interaction diagrams, pocket metrics, and per-atom energy contributions.", shortcut: "⌘⇧R"),

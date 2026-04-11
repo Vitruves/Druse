@@ -193,10 +193,12 @@ struct MetalView: NSViewRepresentable {
 
                     let addToExisting = event.modifierFlags.contains(.shift)
                     onBoxSelection?(atomIndices, addToExisting)
-                }
 
-                isDragging = false
-                return
+                    isDragging = false
+                    return
+                }
+                // Option+click without drag → fall through to single-pick logic
+                // so that option-click toggles selection in ribbon mode (and BAS).
             }
 
             if isShiftDrag {

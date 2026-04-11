@@ -536,7 +536,7 @@ extension AppViewModel {
         log.info("Centered on selection", category: .molecule)
     }
 
-    // MARK: - Residue Subsets (MOE-style)
+    // MARK: - Residue Subsets
 
     func createSubsetFromSelection(name: String? = nil) {
         guard let prot = molecules.protein, !workspace.selectedResidueIndices.isEmpty else {

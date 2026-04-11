@@ -5,7 +5,7 @@ import SwiftUI
 /// Pharmacophore query editor with interactive 2D structure view.
 ///
 /// Layout: large Canvas structure view (left) + control panel (right).
-/// Features are pharmacophoric points with MOE-style naming (Don, Acc, Hyd, Aro).
+/// Features are pharmacophoric points using short labels (Don, Acc, Hyd, Aro).
 ///
 /// Key interactions:
 /// - Click atom → create feature (auto-detects aromatic rings as groups)

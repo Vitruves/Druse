@@ -1075,17 +1075,17 @@ final class Renderer: NSObject {
         uniforms.bondRadiusScale = renderMode.bondRadiusScale
         uniforms.lightingMode = lightingMode
         if enableClipping {
-            if let center = slabCenter {
-                // Project pocket center into view space to get its Z depth
-                let viewPos = camera.viewMatrix * SIMD4<Float>(center.x, center.y, center.z, 1.0)
-                let centerZ = -viewPos.z  // camera looks down -Z, so negate
-                let offsetCenterZ = centerZ + slabOffset
-                uniforms.clipNearZ = max(offsetCenterZ - slabHalfThickness, 0.1)
-                uniforms.clipFarZ = offsetCenterZ + slabHalfThickness
-            } else {
-                uniforms.clipNearZ = clipNearZ
-                uniforms.clipFarZ = clipFarZ
-            }
+            // Anchor slab on the explicit slabCenter (set when focusing a pocket)
+            // or fall back to the camera's look-at point so the slab is always
+            // anchored to whatever the user is looking at — independent of any
+            // pocket selection. This makes thickness/offset sliders meaningful
+            // even when no pocket is set.
+            let center = slabCenter ?? camera.target
+            let viewPos = camera.viewMatrix * SIMD4<Float>(center.x, center.y, center.z, 1.0)
+            let centerZ = -viewPos.z  // camera looks down -Z, so negate
+            let offsetCenterZ = centerZ + slabOffset
+            uniforms.clipNearZ = max(offsetCenterZ - slabHalfThickness, 0.1)
+            uniforms.clipFarZ = offsetCenterZ + slabHalfThickness
             uniforms.enableClipping = 1
         } else {
             uniforms.enableClipping = 0
@@ -1227,6 +1227,8 @@ final class Renderer: NSObject {
 
     /// Find all atom IDs whose screen projection falls within a given rectangle.
     /// `rectMin` and `rectMax` are in screen-space pixel coordinates.
+    /// In ribbon mode, also includes CA control points so backbone residues
+    /// can be box-selected even though their atoms aren't in the live buffer.
     func atomsInRect(rectMin: SIMD2<Float>, rectMax: SIMD2<Float>, viewportSize: SIMD2<Float>) -> [Int] {
         var result: [Int] = []
         for atom in currentAtoms {
@@ -1234,6 +1236,16 @@ final class Renderer: NSObject {
             if sp.x >= rectMin.x && sp.x <= rectMax.x &&
                sp.y >= rectMin.y && sp.y <= rectMax.y {
                 result.append(atom.id)
+            }
+        }
+        // Ribbon mode: backbone atoms are not in currentAtoms, so also test
+        // CA control points. Their atomID is the original protein atom index,
+        // which is what `handleBoxSelection` / `selectAtom` expect.
+        for cp in ribbonCAControlPoints {
+            guard let sp = worldToScreen(cp.position, viewportSize: viewportSize) else { continue }
+            if sp.x >= rectMin.x && sp.x <= rectMax.x &&
+               sp.y >= rectMin.y && sp.y <= rectMax.y {
+                result.append(cp.atomID)
             }
         }
         return result

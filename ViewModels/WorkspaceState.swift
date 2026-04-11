@@ -16,11 +16,11 @@ struct WorkspaceState {
     /// Which residue side chains to show as ball-and-stick in ribbon mode.
     var sideChainDisplay: SideChainDisplay = .none
 
-    /// Uniform protein coloring (MOE-style): when set, all protein atoms use this color
+    /// Uniform protein coloring: when set, all protein atoms use this color
     /// so the ligand "pops" visually in the binding site.
     var uniformProteinColor: SIMD3<Float>? = nil
 
-    /// Ligand carbon color override. nil = standard CPK gray. Set to yellow for MOE-style.
+    /// Ligand carbon color override. nil = standard CPK gray. Set to yellow for the ligand-focus scheme.
     /// Only affects carbon atoms in the ligand, not heteroatoms.
     var ligandCarbonColor: SIMD3<Float>? = nil
 
@@ -88,7 +88,7 @@ struct WorkspaceState {
     var gridLineWidth: Float = 2.5       // screen-space pixels
     var gridColor: SIMD4<Float> = SIMD4<Float>(0.2, 1.0, 0.4, 0.8)
 
-    /// Per-chain display color mode (MOE-style). Default = `.chainDefault` (palette color).
+    /// Per-chain display color mode. Default = `.chainDefault` (palette color).
     enum ChainColorMode: Equatable {
         case cpk           // element colors (C=gray, N=blue, O=red, S=yellow)
         case chainDefault  // chain palette color (distinct per chain)
@@ -121,7 +121,7 @@ struct WorkspaceState {
     var selectedResidueIndices: Set<Int> = []
     var hiddenAtomIndices: Set<Int> = []
 
-    // Residue subsets (MOE-style user-defined groups)
+    // Residue subsets (user-defined groups)
     var residueSubsets: [ResidueSubset] = []
 
     // Ligand conformers (synced from database when available)

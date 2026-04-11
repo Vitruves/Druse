@@ -1,7 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// 2D Protein-Ligand Interaction Diagram (ProLig2D) — MOE-style.
+/// 2D Protein-Ligand Interaction Diagram (ProLig2D) with a radial schematic layout.
 /// Renders a flat schematic with the ligand centered and interacting residues
 /// arranged radially. Supports zoom/pan for exploration, and export to PNG.
 /// Residues colored by chemical property (acidic/basic/polar/greasy).
@@ -1136,7 +1136,7 @@ struct InteractionDiagramView: View {
             at: CGPoint(x: center.x, y: center.y + 11), anchor: .center)
     }
 
-    /// MOE-style: color by amino acid chemical property.
+    /// Colors residues by amino acid chemical property.
     private func residuePropertyColors(_ residueName: String) -> (fill: Color, border: Color) {
         let acidic = Set(["ASP", "GLU"])
         let basic = Set(["ARG", "LYS", "HIS"])

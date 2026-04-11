@@ -125,7 +125,7 @@ enum BondOrder: Int, Sendable {
 
     var displayRadius: Float {
         switch self {
-        case .single:   0.22   // thicker bonds (MOE-like)
+        case .single:   0.22   // slightly thicker single bonds for clarity
         case .double:   0.18
         case .triple:   0.15
         case .aromatic: 0.20
@@ -290,7 +290,7 @@ struct Chain: Identifiable, Sendable {
     }
 }
 
-// MARK: - Residue Subset (MOE-style grouping)
+// MARK: - Residue Subset
 
 /// A user-defined group of residues for operations like pocket definition, surface display, etc.
 struct ResidueSubset: Identifiable, Sendable {

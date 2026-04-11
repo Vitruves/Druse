@@ -665,6 +665,13 @@ struct ContentView: View {
         viewModel.renderer?.clipFarZ = viewModel.workspace.clipFarZ
         viewModel.renderer?.slabHalfThickness = viewModel.workspace.slabThickness / 2.0
         viewModel.renderer?.slabOffset = viewModel.workspace.slabOffset
+        // When the user toggles clipping from the central banner without a
+        // pocket focused, release any stale slab anchor so the slab follows
+        // the camera's look-at point (Renderer falls back to camera.target).
+        if !viewModel.workspace.enableClipping {
+            viewModel.renderer?.slabCenter = nil
+        }
+        viewModel.renderer?.setNeedsRedraw()
     }
 
     private func badge(_ name: String, icon: String, color: Color, count: Int) -> some View {

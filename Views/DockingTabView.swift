@@ -272,6 +272,15 @@ struct DockingTabView: View {
             Text("\(pocket.residueIndices.count) res")
                 .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
+
+            Button(action: { removePocket(pocket) }) {
+                Image(systemName: "trash")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Remove this pocket and its grid box")
         }
         .padding(4)
         .background(isSelected ? Color.green.opacity(0.06) : Color.clear)
@@ -281,6 +290,17 @@ struct DockingTabView: View {
             viewModel.docking.selectedPocket = pocket
         }
         .buttonStyle(.plain)
+    }
+
+    /// Remove a pocket from the detected list. If it was the selected pocket,
+    /// clear the selection (which clears the grid box via the onChange handler).
+    private func removePocket(_ pocket: BindingPocket) {
+        viewModel.docking.detectedPockets.removeAll { $0.id == pocket.id }
+        if viewModel.docking.selectedPocket?.id == pocket.id {
+            viewModel.docking.selectedPocket = nil
+            viewModel.renderer?.clearGridBox()
+            viewModel.renderer?.setNeedsRedraw()
+        }
     }
 
     @ViewBuilder
@@ -446,8 +466,12 @@ struct DockingTabView: View {
                             if vm.workspace.showSurface {
                                 viewModel.toggleSurface()
                             }
+                            // Release the slab anchor so the next enable starts
+                            // fresh from the camera's look-at point.
+                            vm.renderer?.slabCenter = nil
                             viewModel.fitToView()
                         }
+                        vm.renderer?.setNeedsRedraw()
                     }
                 ))
                 .toggleStyle(.switch)
@@ -468,6 +492,7 @@ struct DockingTabView: View {
                                 set: { newVal in
                                     vm.workspace.slabThickness = newVal
                                     vm.renderer?.slabHalfThickness = newVal / 2.0
+                                    vm.renderer?.setNeedsRedraw()
                                 }
                             ),
                             in: 2...40,
@@ -492,6 +517,7 @@ struct DockingTabView: View {
                                 set: { newVal in
                                     vm.workspace.slabOffset = newVal
                                     vm.renderer?.slabOffset = newVal
+                                    vm.renderer?.setNeedsRedraw()
                                 }
                             ),
                             in: -20...20,
@@ -1638,26 +1664,26 @@ struct DockingTabView: View {
     }
 
     private func detectFromLigand() {
-        guard let prot = viewModel.molecules.protein, let lig = viewModel.molecules.ligand else { return }
-        let excluded = viewModel.workspace.hiddenChainIDs
+        guard viewModel.molecules.protein != nil, viewModel.molecules.ligand != nil else { return }
         viewModel.log.info("Detecting pocket from ligand position...", category: .dock)
-
-        if let pocket = BindingSiteDetector.ligandGuidedPocket(protein: prot, ligand: lig, excludedChainIDs: excluded) {
-            viewModel.docking.detectedPockets = [pocket]
-            viewModel.docking.selectedPocket = pocket
-            viewModel.log.success("Ligand-guided pocket: \(pocket.residueIndices.count) residues, \(Int(pocket.volume)) A\u{00B3}", category: .dock)
-        } else {
-            viewModel.log.warn("Could not define pocket from ligand", category: .dock)
+        viewModel.detectLigandGuidedPocket()
+        if let pocket = viewModel.docking.selectedPocket {
+            syncGridFromPocket(pocket)
+            applyGridBoxFromSliders()
         }
     }
 
     private func pocketFromSelection() {
-        guard let prot = viewModel.molecules.protein else { return }
-        let resIndices = Array(viewModel.workspace.selectedResidueIndices)
-        let pocket = BindingSiteDetector.pocketFromResidues(protein: prot, residueIndices: resIndices)
-        viewModel.docking.detectedPockets = [pocket]
-        viewModel.docking.selectedPocket = pocket
-        viewModel.log.success("Manual pocket from \(resIndices.count) residues", category: .dock)
+        guard viewModel.molecules.protein != nil,
+              !viewModel.workspace.selectedResidueIndices.isEmpty else { return }
+        viewModel.pocketFromSelection()
+        if let pocket = viewModel.docking.selectedPocket {
+            // Sync the slider state and force a grid box update so the
+            // visualization appears even if `selectedPocket?.id` didn't
+            // change (pockets from selection always carry id=0).
+            syncGridFromPocket(pocket)
+            applyGridBoxFromSliders()
+        }
     }
 
     // MARK: - Grid Box Actions

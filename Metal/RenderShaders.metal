@@ -400,16 +400,20 @@ fragment BondFragmentOut bondFragment(
             float tc = dot(pa - ro, capNorm) / denom;
             float3 hitC = ro + rd * tc;
             if (length(hitC - pa) <= radius && tc > 0.0) {
+                // Apply slab clipping to hemisphere caps as well
+                if (uniforms.enableClipping) {
+                    float vz = -hitC.z;
+                    if (vz < uniforms.clipNearZ || vz > uniforms.clipFarZ)
+                        discard_fragment();
+                }
                 float4 clipPos = uniforms.projectionMatrix * float4(hitC, 1.0);
                 BondFragmentOut out;
-                out.color = in.colorA;
-                out.depth = clipPos.z / clipPos.w;
-
                 // Simple lighting on cap
                 float3 normal = capNorm;
                 float3 lightDir = normalize((uniforms.viewMatrix * float4(uniforms.lightDirection, 0.0)).xyz);
                 float NdotL = max(dot(normal, lightDir), 0.0);
                 out.color = float4(in.colorA.rgb * (uniforms.ambientIntensity + NdotL * uniforms.lightColor), 1.0);
+                out.depth = clipPos.z / clipPos.w;
                 return out;
             }
         }
@@ -420,6 +424,11 @@ fragment BondFragmentOut bondFragment(
             float tc = dot(pb - ro, capNorm) / denom;
             float3 hitC = ro + rd * tc;
             if (length(hitC - pb) <= radius && tc > 0.0) {
+                if (uniforms.enableClipping) {
+                    float vz = -hitC.z;
+                    if (vz < uniforms.clipNearZ || vz > uniforms.clipFarZ)
+                        discard_fragment();
+                }
                 float4 clipPos = uniforms.projectionMatrix * float4(hitC, 1.0);
                 BondFragmentOut out;
                 float3 normal = capNorm;
@@ -512,7 +521,9 @@ fragment float4 ribbonFragment(
     RibbonVertexOut in [[stage_in]],
     constant Uniforms &uniforms [[buffer(BufferIndexUniforms)]]
 ) {
-    // Z-slab clipping
+    // Z-slab clipping. Ribbons are thin tubes; in-shader cap promotion
+    // produces shimmering/pixelization because writing per-fragment depth
+    // disables sample-rate shading. Plain discard keeps MSAA edges crisp.
     if (uniforms.enableClipping) {
         float viewZ = -in.viewPos.z;
         if (viewZ < uniforms.clipNearZ || viewZ > uniforms.clipFarZ)
@@ -523,7 +534,6 @@ fragment float4 ribbonFragment(
     float3 viewDir = normalize(-in.viewPos);
 
     float3 color;
-
     if (uniforms.lightingMode == 0) {
         // Uniform lighting
         float NdotV = max(dot(normal, viewDir), 0.0);
@@ -713,7 +723,10 @@ fragment float4 surfaceFragment(
     SurfaceVertexOut in [[stage_in]],
     constant Uniforms &uniforms [[buffer(BufferIndexUniforms)]]
 ) {
-    // Z-slab clipping
+    // Z-slab clipping. Two-sided rendering means back-facing polygons
+    // inside the slab become naturally visible once the front polygons
+    // are clipped away — that's the "bowl" effect MOE shows when the
+    // slab is wide enough to expose the back wall of the molecule.
     if (uniforms.enableClipping) {
         float viewZ = -in.viewPos.z;
         if (viewZ < uniforms.clipNearZ || viewZ > uniforms.clipFarZ)
@@ -724,7 +737,6 @@ fragment float4 surfaceFragment(
     float3 viewDir = normalize(-in.viewPos);
 
     float3 color;
-
     if (uniforms.lightingMode == 0) {
         // Uniform lighting with soft shading
         float NdotV = max(dot(normal, viewDir), 0.0);
