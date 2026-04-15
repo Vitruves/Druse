@@ -29,13 +29,13 @@
 ## Download
 
 <p align="center">
-  <a href="https://github.com/vitruves/Druse/releases/latest">
-    <img src="https://img.shields.io/badge/Download-Druse.dmg-blue?style=for-the-badge&logo=apple&logoColor=white" alt="Download DMG">
+  <a href="https://github.com/Vitruves/Druse/releases/download/0.1.28-beta/Druse-0.1.28-beta.dmg">
+    <img src="https://img.shields.io/badge/%E2%AC%87%20Download%20Druse%200.1.28--beta-2DBA4E?style=for-the-badge&logo=apple&logoColor=white&labelColor=000000" alt="Download Druse 0.1.28-beta">
   </a>
 </p>
 
 > **Requirements** — macOS 26.0 or later, Apple Silicon (M1 or newer).
-> Download the `.dmg` from [Releases](https://github.com/vitruves/Druse/releases/latest), open it, and drag Druse into Applications.
+> Click the button above to download the `.dmg`, open it, and drag Druse into Applications.
 
 > **Note** — Druse is currently distributed unsigned. On first launch, macOS Gatekeeper will block the app.
 > Right-click (or Control-click) `Druse.app` and select **Open**, then click **Open** in the confirmation dialog.
