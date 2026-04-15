@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 // ============================================================================
 // druse_openmm.cpp — Native C++ OpenMM pocket refinement
 //

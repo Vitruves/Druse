@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 // PIGNet2Compute.metal — Physics-Informed Graph Neural Network scoring on Metal GPU
 //
 // Three-kernel architecture (mirrors DruseAF pattern):

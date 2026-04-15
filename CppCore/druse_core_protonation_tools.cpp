@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 #include "druse_core_internal.h"
 
 // Ionizable-site inspection, per-site protomer generation, and ensemble v2.

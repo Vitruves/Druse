@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 import SwiftUI
 
 // MARK: - Selection, Visibility, Context Menu, Subsets, Sequence Editing, Surface

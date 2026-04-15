@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 // FASPRSearch.swift
 // Translated from FASPR C++ (Search.h / Search.cpp)
 // Original: Copyright (c) 2020 Xiaoqiang Huang, MIT License

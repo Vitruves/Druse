@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 // ============================================================================
 // FASPREnergyCompute.metal — GPU kernels for FASPR sidechain packing energy
 //

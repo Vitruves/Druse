@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 @preconcurrency import CoreML
 import Metal
@@ -46,6 +49,12 @@ struct DruseScoreFeatureExtractor {
     struct AtomChemInfo {
         var hybridization: Hybridization
         var isAromatic: Bool
+        // Chemistry-aware H-bond donor / acceptor flags. Only populated for
+        // ligand atoms via `buildLigandChemInfo`. The protein branch of
+        // `atomFeatures` ignores these and uses residue+atom-name lookups
+        // instead, so the default `false` is harmless there.
+        var isHBD: Bool = false
+        var isHBA: Bool = false
     }
 
     static func buildHybridizationMap(atoms: [Atom], bonds: [Bond]) -> [Int: AtomChemInfo] {
@@ -76,6 +85,24 @@ struct DruseScoreFeatureExtractor {
         return result
     }
 
+    /// Like `buildHybridizationMap` but additionally populates the
+    /// chemistry-aware `isHBD` / `isHBA` flags using the same valence-model
+    /// helpers that the post-docking interaction analysis uses.
+    /// The Python training pipeline mirrors this exactly so the slot-12 /
+    /// slot-13 features are consistent at training and inference time.
+    static func buildLigandChemInfo(atoms: [Atom], bonds: [Bond]) -> [Int: AtomChemInfo] {
+        var result = buildHybridizationMap(atoms: atoms, bonds: bonds)
+        let donorFlags = HBondClassifier.computeLigandHBondDonorFlags(atoms: atoms, bonds: bonds)
+        let acceptorFlags = HBondClassifier.computeLigandHBondAcceptorFlags(atoms: atoms, bonds: bonds)
+        for (i, atom) in atoms.enumerated() {
+            guard var info = result[atom.id] else { continue }
+            info.isHBD = i < donorFlags.count ? donorFlags[i] : false
+            info.isHBA = i < acceptorFlags.count ? acceptorFlags[i] : false
+            result[atom.id] = info
+        }
+        return result
+    }
+
     /// Extract features from a docked protein-ligand complex.
     static func extract(
         proteinAtoms: [Atom],
@@ -91,7 +118,7 @@ struct DruseScoreFeatureExtractor {
         }
 
         let protHybrid = buildHybridizationMap(atoms: pocketAtoms, bonds: proteinBonds)
-        let ligHybrid = buildHybridizationMap(atoms: ligandAtoms, bonds: ligandBonds)
+        let ligHybrid = buildLigandChemInfo(atoms: ligandAtoms, bonds: ligandBonds)
 
         let protPositions = pocketAtoms.map(\.position)
         let ligPositions = ligandAtoms.map(\.position)
@@ -273,19 +300,14 @@ struct DruseScoreFeatureExtractor {
             // [11] Partial charge (Gasteiger — same as MOL2 training data)
             features[11] = atom.charge
 
-            // [12] H-bond donor — matches SYBYL subtype logic:
-            //   N: sp3 ("3"), sp3-positive ("4"), amide ("am"), planar ("pl3")
-            //   O: sp3 only; S: sp3 only
-            var isHBD = false
-            if atom.element == .N && (hyb == .sp3 || (hyb == .sp2 && !isAromatic)) { isHBD = true }
-            if atom.element == .O && hyb == .sp3 { isHBD = true }
-            if atom.element == .S && hyb == .sp3 { isHBD = true }
-            features[12] = isHBD ? 1.0 : 0.0
+            // [12] H-bond donor — chemistry-aware (formal charge + implicit H
+            // from bond order). Computed once per molecule by
+            // `buildLigandChemInfo` so this matches the training-time feature.
+            features[12] = info.isHBD ? 1.0 : 0.0
 
-            // [13] H-bond acceptor — N, O, S, F (training includes S!)
-            let isHBA = atom.element == .N || atom.element == .O
-                || atom.element == .S || atom.element == .F
-            features[13] = isHBA ? 1.0 : 0.0
+            // [13] H-bond acceptor — chemistry-aware (PIGNet2 SMARTS rules
+            // mirrored in HBondClassifier.computeLigandHBondAcceptorFlags).
+            features[13] = info.isHBA ? 1.0 : 0.0
 
             // [14-16] Hybridization
             switch hyb {

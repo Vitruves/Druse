@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 #include "druse_core_internal.h"
 
 // pKa GNN featurization — produces atom/bond feature matrices matching

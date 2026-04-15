@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 // Generated from RCSB CCD reference CIFs used during Phase 2/3 translation.

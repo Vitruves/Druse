@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 import SwiftUI
 
 /// Full side-by-side comparison of reference ligand vs selected analog.

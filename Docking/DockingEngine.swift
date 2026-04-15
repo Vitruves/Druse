@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 @preconcurrency import MetalKit
 import simd
@@ -1442,7 +1445,7 @@ final class DockingEngine {
 
         let protHybrid = DruseScoreFeatureExtractor.buildHybridizationMap(
             atoms: pocketAtoms, bonds: proteinStructure?.bonds ?? [])
-        let ligHybrid = DruseScoreFeatureExtractor.buildHybridizationMap(
+        let ligHybrid = DruseScoreFeatureExtractor.buildLigandChemInfo(
             atoms: ligandAtoms, bonds: ligandBonds)
 
         var protFeats = [Float](repeating: 0, count: 256 * 20)
@@ -1826,8 +1829,8 @@ final class DockingEngine {
 
         // Pocket atom donor/acceptor flags via residue+atom-name lookup —
         // matches the chemistry-aware behaviour of the original PIGNet2 SMARTS.
-        let pocketDonorFlags  = pocketAtoms.prefix(P).map { Self.proteinHBondDonorFlag($0) }
-        let pocketAcceptorFlags = pocketAtoms.prefix(P).map { Self.proteinHBondAcceptorFlag($0) }
+        let pocketDonorFlags  = pocketAtoms.prefix(P).map { HBondClassifier.proteinHBondDonorFlag($0) }
+        let pocketAcceptorFlags = pocketAtoms.prefix(P).map { HBondClassifier.proteinHBondAcceptorFlag($0) }
 
         for i in 0..<P {
             let atom = pocketAtoms[i]
@@ -1850,8 +1853,8 @@ final class DockingEngine {
         var ligAuxArray = [PIGNet2AtomAux](repeating: PIGNet2AtomAux(vdwRadius: 0, flags: 0, formalCharge: 0, _pad: 0), count: Int(PIG_MAX_LIG))
         // Chemistry-aware donor/acceptor flags from the bond graph (matches
         // the SMARTS the original PIGNet2 was trained with).
-        let ligDonorFlags    = Self.computeLigandHBondDonorFlags(atoms: ligandAtoms, bonds: ligandBonds)
-        let ligAcceptorFlags = Self.computeLigandHBondAcceptorFlags(atoms: ligandAtoms, bonds: ligandBonds)
+        let ligDonorFlags    = HBondClassifier.computeLigandHBondDonorFlags(atoms: ligandAtoms, bonds: ligandBonds)
+        let ligAcceptorFlags = HBondClassifier.computeLigandHBondAcceptorFlags(atoms: ligandAtoms, bonds: ligandBonds)
         for i in 0..<L {
             let atom = ligandAtoms[i]
             let neighbors = ligNeighborMap[atom.id] ?? []

@@ -1,0 +1,91 @@
+Druse — GPU-Accelerated Molecular Docking for macOS
+Copyright 2026 Johan H.G. Natter
+
+This product includes software developed by Johan H.G. Natter.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+Academic citation
+================================================================================
+
+If you use Druse in academic or published work, please cite:
+
+    Natter, J. H. G. (2026). Druse: GPU-Accelerated Molecular Docking for
+    macOS. https://github.com/vitruves/Druse
+
+================================================================================
+Third-party software
+================================================================================
+
+Druse incorporates or links against the following third-party components.
+Each retains its own copyright and license; see the linked references for
+full license text.
+
+--------------------------------------------------------------------------------
+RDKit — Open-source cheminformatics
+  Copyright (c) Greg Landrum and other RDKit contributors
+  License: BSD 3-Clause
+  https://github.com/rdkit/rdkit
+
+gemmi — Macromolecular crystallography library
+  Copyright (c) Global Phasing Ltd.
+  License: MPL-2.0
+  https://github.com/project-gemmi/gemmi
+
+OpenMM — Molecular simulation toolkit
+  Copyright (c) Stanford University and the Authors
+  License: MIT (Python wrappers under LGPL-3.0)
+  https://github.com/openmm/openmm
+
+Boost C++ Libraries
+  License: Boost Software License 1.0
+  https://www.boost.org
+
+Eigen — C++ template library for linear algebra
+  License: MPL-2.0
+  https://eigen.tuxfamily.org
+
+nanoflann — k-d tree nearest-neighbor search
+  Copyright (c) Jose Luis Blanco and contributors
+  License: BSD 2-Clause
+  https://github.com/jlblancoc/nanoflann
+
+oneTBB (Threading Building Blocks)
+  Copyright (c) Intel Corporation
+  License: Apache-2.0
+  https://github.com/oneapi-src/oneTBB
+
+LBFGSpp — Header-only L-BFGS implementation
+  Copyright (c) Yixuan Qiu
+  License: MIT
+  https://github.com/yixuan/LBFGSpp
+
+coordgen — 2D coordinate generation (via RDKit)
+  License: BSD 3-Clause
+  https://github.com/schrodinger/coordgenlibs
+
+--------------------------------------------------------------------------------
+Algorithms and parameter sets
+--------------------------------------------------------------------------------
+
+GFN2-xTB — Self-contained re-implementation of the GFN2-xTB semi-empirical
+  tight-binding method by Bannwarth, Ehlert, and Grimme (JCTC 2019, 15,
+  1652-1671). Parametrization derived from the tblite GFN2-xTB parameter
+  set (gfn2-molmom.toml). Original xTB/tblite software is licensed under
+  LGPL-3.0; Druse does not link against that software but implements the
+  method independently using Apple's Accelerate framework.
+
+FASPR sidechain packing — Derived from the FASPR algorithm
+  (Huang, Pearce, Zhang, Bioinformatics 2020).
+
+Dunbrack rotamer library (dun2010bbdep.bin) — Backbone-dependent rotamer
+  library by Shapovalov and Dunbrack (Structure 2011). Redistributed
+  with permission; see Resources/ for any accompanying notice.
+
+AutoDock Vina scoring function — Empirical scoring inspired by
+  Trott and Olson (J. Comput. Chem. 2010, 31, 455-461).

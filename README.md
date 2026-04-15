@@ -12,7 +12,8 @@
   <img src="https://img.shields.io/badge/Platform-macOS_26+-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Chip-Apple_Silicon-333333?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/GPU-Metal_3-8A2BE2?style=flat-square" alt="Metal">
-  <img src="https://img.shields.io/badge/Version-0.1.18--beta-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-0.1.28--beta-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/License-Apache_2.0-D22128?style=flat-square" alt="License: Apache 2.0">
 </p>
 
 <p align="center">
@@ -97,7 +98,7 @@ The built app will be in `build/Release/Druse.app` (or under `DerivedData/`).
 
 <br>
 
-## Why Druse
+## Overview
 
 Most docking software was designed for Linux clusters and command-line workflows. Druse takes a different approach — a fully native macOS application that puts the entire docking pipeline in a single window, accelerated by Metal on the GPU you already have.
 
@@ -204,6 +205,10 @@ Batch-dock up to 100,000 molecules with shared grid reuse and parallel 3D genera
 
 ## Lead Optimization
 
+<p align="center">
+  <img src="img/optimization.png" alt="Lead optimization with analog generation and property trade-offs" width="700">
+</p>
+
 Generate and evaluate analogs directly inside Druse.
 
 - **Analog generation** — 18+ curated substitution rules: halogen swaps, alkyl extensions, heteroatom substitutions, aromatic replacements, functional group interchanges, ring size modifications
@@ -219,6 +224,10 @@ Generate and evaluate analogs directly inside Druse.
 <br>
 
 ## Visualization
+
+<p align="center">
+  <img src="img/visualization.png" alt="Real-time 3D molecular visualization" width="700">
+</p>
 
 Real-time Metal-rendered 3D molecular graphics, triple-buffered for smooth interaction.
 
@@ -236,6 +245,10 @@ Real-time Metal-rendered 3D molecular graphics, triple-buffered for smooth inter
 <br>
 
 ## Ligand Library
+
+<p align="center">
+  <img src="img/library.png" alt="Ligand library with imported compounds" width="700">
+</p>
 
 A built-in molecular database for organizing your compounds.
 
@@ -263,6 +276,10 @@ New to molecular docking? Druse includes a fully interactive guided walkthrough 
 
 ## Metal Under the Hood
 
+<p align="center">
+  <img src="img/metal.png" alt="Metal compute pipeline" width="400">
+</p>
+
 Druse runs 20+ specialized Metal compute kernels on Apple Silicon:
 
 - Genetic algorithm evolution and selection
@@ -284,17 +301,9 @@ Half-precision grid storage, shared memory tiling, and on-demand rendering keep 
 
 <br>
 
-## Benchmark
-
-Redocking accuracy on the CASF-2016 benchmark set (Vina scoring, standard preset, ligand-guided pocket):
-
-| Metric | Druse Vina | AutoDock Vina 1.2.7 |
-|---|---|---|
-| Docking power (RMSD < 2.0 A) | 19/26 (73%) | 25/26 (96%) |
-| Scoring power (Pearson r vs pKd) | -0.59 | -0.56 |
-| Avg time / complex | ~14s | ~67s |
-
-Compared on 26 common CASF-2016 complexes (4 failed in AutoDock Vina preparation), Apple M-series chip. Full benchmark scripts in `Benchmark/`.
+<p align="center">
+  <strong>Druse</strong> — Molecular docking, native on your Mac.
+</p>
 
 <br>
 
@@ -302,10 +311,10 @@ Compared on 26 common CASF-2016 complexes (4 failed in AutoDock Vina preparation
 
 <br>
 
-<p align="center">
-  <strong>Druse</strong> — Molecular docking, native on your Mac.
-</p>
+## License
+
+Druse is released under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for third-party attributions and academic citation details.
 
 <p align="center">
-  <sub>All rights reserved.</sub>
+  <sub>Copyright © 2026 Johan H.G. Natter</sub>
 </p>

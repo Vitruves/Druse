@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+// SPDX-License-Identifier: Apache-2.0
+
 #ifndef DOCKING_COMMON_H
 #define DOCKING_COMMON_H
 
