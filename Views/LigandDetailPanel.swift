@@ -161,9 +161,7 @@ extension LigandDatabaseWindow {
             let smi = smiles
             // Single RDKit call: SVG is the primary path. Coords are only needed
             // as a fallback if SVG generation fails, so skip them on the happy path.
-            let svg: String? = await Task.detached { @Sendable in
-                RDKitBridge.moleculeToSVG(smiles: smi, width: 500, height: 400)
-            }.value
+            let svg: String? = await RDKitBridge.moleculeToSVG(smiles: smi, width: 500, height: 400)
             guard !Task.isCancelled else { return }
 
             // Rasterize once to a bitmap NSImage. Without this, SwiftUI re-parses

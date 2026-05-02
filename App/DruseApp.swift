@@ -83,6 +83,10 @@ struct DruseApp: App {
                     openWindow(id: "druse-help")
                 }
                 .keyboardShortcut("?", modifiers: .command)
+                Divider()
+                Button("Report Bug…") {
+                    openWindow(id: "bug-report")
+                }
             }
         }
 
@@ -110,6 +114,17 @@ struct DruseApp: App {
         }
         .defaultSize(width: 960, height: 750)
         .windowStyle(.titleBar)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        // Bug report window
+        Window("Report Bug", id: "bug-report") {
+            BugReportWindow()
+                .preferredColorScheme(selectedColorScheme)
+        }
+        .defaultSize(width: 600, height: 620)
+        .windowStyle(.titleBar)
+        .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 

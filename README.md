@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/Platform-macOS_26+-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Chip-Apple_Silicon-333333?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/GPU-Metal_3-8A2BE2?style=flat-square" alt="Metal">
-  <img src="https://img.shields.io/badge/Version-0.1.28--beta-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-0.1.29--beta-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/License-Apache_2.0-D22128?style=flat-square" alt="License: Apache 2.0">
 </p>
 
@@ -29,8 +29,8 @@
 ## Download
 
 <p align="center">
-  <a href="https://github.com/Vitruves/Druse/releases/download/0.1.28-beta/Druse-0.1.28-beta.dmg">
-    <img src="https://img.shields.io/badge/%E2%AC%87%20Download%20Druse%200.1.28--beta-2DBA4E?style=for-the-badge&logo=apple&logoColor=white&labelColor=000000" alt="Download Druse 0.1.28-beta">
+  <a href="https://github.com/Vitruves/Druse/releases/download/0.1.29-beta/Druse-0.1.29-beta.dmg">
+    <img src="https://img.shields.io/badge/%E2%AC%87%20Download%20Druse%200.1.29--beta-2DBA4E?style=for-the-badge&logo=apple&logoColor=white&labelColor=000000" alt="Download Druse 0.1.29-beta">
   </a>
 </p>
 
@@ -88,8 +88,10 @@ The built app will be in `build/Release/Druse.app` (or under `DerivedData/`).
 
 </details>
 
+<br>
+
 <p align="center">
-  <img src="img/menu.png" alt="Druse welcome screen" width="700">
+  <img src="img/druse_demo.gif" alt="Druse guided demo walkthrough" width="700">
 </p>
 
 <br>

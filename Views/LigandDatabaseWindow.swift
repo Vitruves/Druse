@@ -604,9 +604,8 @@ struct LigandDatabaseWindow: View {
                                 .foregroundStyle(selectedIDs.contains(entry.id) ? Color.accentColor : Color.secondary)
                         }
                         .buttonStyle(.plain)
-                        .frame(width: 24)
                         .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
+                        .frame(width: 40, height: 24)
                         Divider().opacity(0.3)
                     }
                 }
@@ -822,7 +821,7 @@ struct LigandDatabaseWindow: View {
             }
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .frame(height: 24)
         .background(isInspected ? Color.accentColor.opacity(0.2) :
                      isSelected ? Color.accentColor.opacity(0.1) :
                      isActive ? Color.green.opacity(0.05) :
@@ -891,6 +890,7 @@ struct LigandDatabaseWindow: View {
                     .font(.footnote.monospaced())
                     .foregroundStyle(isExpandedParent ? .tertiary : .secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                     .help(entry.originalSMILES)
             case .popPercent:
                 if let pop = entry.populationWeight {
@@ -964,6 +964,7 @@ struct LigandDatabaseWindow: View {
         }
         .frame(width: width, alignment: alignment)
         .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
+        .clipped()
     }
 
     /// Em-dash placeholder used by every cell when its data is missing.

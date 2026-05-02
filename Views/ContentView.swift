@@ -138,14 +138,19 @@ struct ContentView: View {
                     panelOpen: $pipelinePanelOpen
                 )
                 .layoutPriority(1)
+                .zIndex(2)
                 .transition(.move(edge: .leading).combined(with: .opacity))
 
                 Divider()
+                    .zIndex(2)
             }
 
-            // Metal viewport with overlays — fills the remaining space
+            // Metal viewport with overlays — fills the remaining space. The
+            // control shelf scrolls horizontally, so it does not impose a wide
+            // minimum that can push fixed side panels off-screen.
             ZStack {
                 metalViewport
+                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
 
                 if viewModel.molecules.protein == nil && !viewModel.isDemoRunning {
                     WelcomeScreen(
@@ -160,12 +165,15 @@ struct ContentView: View {
                 // Demo narration overlay (always on top when demo is active)
                 DemoOverlay()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+            .zIndex(0)
+            .clipped()
 
             if showInspector {
                 Divider()
                 InspectorPanel(showInspector: $showInspector)
                     .layoutPriority(1)
+                    .zIndex(1)
             }
         }
     }
@@ -191,9 +199,16 @@ struct ContentView: View {
 
             Spacer()
 
-            renderControls
+            renderControlShelf
                 .padding(12)
         }
+    }
+
+    private var renderControlShelf: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            renderControls
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Metal Viewport

@@ -103,43 +103,67 @@ void druse_free_2d_result(Druse2DResult *result) {
 
 char* druse_mol_to_svg(const char *smiles, int32_t width, int32_t height) {
     if (!smiles || !smiles[0]) return nullptr;
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return nullptr;
+
+    // Reject pathological inputs early. Lead-optimization analogs are produced
+    // by string substitution, which can yield very long or strange SMILES that
+    // make RDKit's drawer crash (not throw — a hardware fault we can't catch).
+    size_t smiLen = std::strlen(smiles);
+    if (smiLen == 0 || smiLen > 1024) return nullptr;
+    for (size_t i = 0; i < smiLen; ++i) {
+        unsigned char ch = static_cast<unsigned char>(smiles[i]);
+        if (ch < 0x20 || ch >= 0x7F) return nullptr;
+    }
+
+    std::unique_ptr<RWMol> mol;
+    try {
+        SmilesParserParams params;
+        params.sanitize = true;
+        params.removeHs = true;
+        mol.reset(SmilesToMol(std::string(smiles), params));
+    } catch (...) {
+        return nullptr;
+    }
+    if (!mol || mol->getNumAtoms() == 0) return nullptr;
+
+    // Re-sanitize defensively — string-substituted SMILES sometimes parse but
+    // leave atoms in inconsistent states that crash prepareMolForDrawing.
+    try {
+        unsigned int failedOp = 0;
+        MolOps::sanitizeMol(*mol, failedOp,
+            MolOps::SANITIZE_ALL ^ MolOps::SANITIZE_PROPERTIES);
+    } catch (...) {
+        return nullptr;
+    }
 
     try {
-        std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
-        if (!mol) return nullptr;
-
-        // Remove explicit H for cleaner depiction, but preserve stereo info
-        MolOps::removeAllHs(*mol);
-
-        // Generate 2D coordinates
         RDDepict::compute2DCoords(*mol);
+    } catch (...) {
+        return nullptr;
+    }
+    if (mol->getNumConformers() == 0) return nullptr;
 
-        // Assign stereo wedge/dash bonds from 3D/stereochemistry info
-        MolOps::Kekulize(*mol);
+    try {
         MolDraw2DUtils::prepareMolForDrawing(*mol);
+    } catch (...) {
+        return nullptr;
+    }
 
-        // Draw to SVG — classic RDKit publication style
+    try {
         MolDraw2DSVG drawer(width, height);
-
-        // White background for clean, readable depiction
         drawer.drawOptions().backgroundColour = DrawColour(1.0, 1.0, 1.0, 1.0);
-
-        // Thicker bonds and larger font for clarity
         drawer.drawOptions().bondLineWidth = 2.0;
         drawer.drawOptions().multipleBondOffset = 0.15;
         drawer.drawOptions().minFontSize = 14;
         drawer.drawOptions().annotationFontScale = 0.75;
 
-        // Use RDKit's default palette (CPK-style atom colors are already assigned)
-        // The default palette from assignDefaultPalette() already has:
-        // N=blue, O=red, F/Cl=green, S=dark yellow, Br=dark red, P=orange, etc.
-
         drawer.drawMolecule(*mol);
         drawer.finishDrawing();
 
         std::string svg = drawer.getDrawingText();
+        if (svg.empty()) return nullptr;
         char *result = new char[svg.size() + 1];
-        memcpy(result, svg.c_str(), svg.size() + 1);
+        std::memcpy(result, svg.c_str(), svg.size() + 1);
         return result;
     } catch (...) {
         return nullptr;

@@ -418,6 +418,7 @@ struct LeadOptimizationTabView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(viewModel.leadOpt.isDocking || viewModel.leadOpt.analogs.filter({ $0.status == .generated }).isEmpty)
+                .help("Mini-dock analogs in-place using the reference's grid maps (requires a reference dock first).")
                 .accessibilityIdentifier(AccessibilityID.leadDockAll)
 
                 if viewModel.leadOpt.isDocking {
@@ -427,6 +428,30 @@ struct LeadOptimizationTabView: View {
                         .tint(.red)
                         .accessibilityIdentifier(AccessibilityID.leadStop)
                 }
+            }
+
+            HStack {
+                Button {
+                    viewModel.addAnalogsToLigandDatabase()
+                } label: {
+                    Label("Add to Ligand Database", systemImage: "tray.and.arrow.down")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(viewModel.leadOpt.analogs.isEmpty || viewModel.leadOpt.isDocking)
+                .help("Copy these analogs into the main Ligand Database as new entries.")
+
+                Button {
+                    viewModel.sendAnalogsToDocking()
+                } label: {
+                    Label("Send to Docking Tab", systemImage: "arrow.right.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(viewModel.leadOpt.analogs.isEmpty || viewModel.leadOpt.isDocking)
+                .help("Add to Ligand Database and switch to Docking tab to set up a full run.")
             }
 
             if viewModel.leadOpt.isDocking {

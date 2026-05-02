@@ -172,33 +172,39 @@ extension AppViewModel {
     // MARK: - Visibility
 
     func toggleChainVisibility(_ chainID: String) {
-        if workspace.hiddenChainIDs.contains(chainID) {
-            workspace.hiddenChainIDs.remove(chainID)
-        } else {
+        let willHide = !workspace.hiddenChainIDs.contains(chainID)
+        if willHide {
             workspace.hiddenChainIDs.insert(chainID)
+        } else {
+            workspace.hiddenChainIDs.remove(chainID)
         }
         pushToRenderer()
+        log.info("Chain \(chainID) \(willHide ? "hidden" : "shown")", category: .selection)
     }
 
     func setRenderMode(_ mode: RenderMode) {
         workspace.renderMode = mode
         workspace.ligandRenderMode = nil
         pushToRenderer()
+        log.info("Render mode → \(mode.rawValue)", category: .render)
     }
 
     func setLigandRenderMode(_ mode: RenderMode) {
         workspace.ligandRenderMode = mode
         pushToRenderer()
+        log.info("Ligand render mode → \(mode.rawValue)", category: .render)
     }
 
     func toggleHydrogens() {
         workspace.showHydrogens.toggle()
         pushToRenderer()
+        log.info("Hydrogens \(workspace.showHydrogens ? "shown" : "hidden")", category: .render)
     }
 
     func toggleLighting() {
         workspace.useDirectionalLighting.toggle()
         renderer?.lightingMode = workspace.useDirectionalLighting ? 1 : 0
+        log.info("Directional lighting \(workspace.useDirectionalLighting ? "on" : "off")", category: .render)
     }
 
     // MARK: - Box Selection
@@ -249,6 +255,7 @@ extension AppViewModel {
 
     func toggleSurface() {
         workspace.showSurface.toggle()
+        log.info("Surface \(workspace.showSurface ? "enabled" : "disabled")", category: .render)
         if workspace.showSurface {
             generateSurface()
         } else {
@@ -259,6 +266,7 @@ extension AppViewModel {
 
     func setSurfaceColorMode(_ mode: SurfaceColorMode) {
         workspace.surfaceColorMode = mode
+        log.info("Surface color mode → \(mode.rawValue)", category: .render)
         if workspace.showSurface {
             generateSurface()
         }
@@ -267,6 +275,7 @@ extension AppViewModel {
     /// Regenerate the surface with current probe radius / grid spacing settings.
     func regenerateSurface() {
         if workspace.showSurface {
+            log.info("Regenerating surface", category: .render)
             generateSurface()
         }
     }
@@ -751,16 +760,19 @@ extension AppViewModel {
         // During docking, focus on the pocket center instead of the moving ligand
         if docking.isDocking, let pocket = docking.selectedPocket {
             renderer.fitToPositions([pocket.center])
+            log.info("Camera fit to pocket center (live docking)", category: .render)
             return
         }
         guard let lig = molecules.ligand, !lig.atoms.isEmpty else { return }
         renderer.fitToPositions(lig.atoms.map(\.position))
+        log.info("Camera fit to ligand (\(lig.name))", category: .render)
     }
 
     func fitToProtein() {
         guard let renderer else { return }
         guard let prot = molecules.protein, !prot.atoms.isEmpty else { return }
         renderer.fitToPositions(prot.atoms.map(\.position))
+        log.info("Camera fit to protein (\(prot.name))", category: .render)
     }
 
     // MARK: - Context Menu Builder

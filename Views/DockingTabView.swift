@@ -291,6 +291,7 @@ struct DockingTabView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             viewModel.docking.selectedPocket = pocket
+            ActivityLog.shared.info("Pocket #\(pocket.id) selected (vol \(String(format: "%.0f", pocket.volume)) Å³, druggability \(String(format: "%.2f", pocket.druggability)))", category: .dock)
         }
         .buttonStyle(.plain)
     }
@@ -304,6 +305,7 @@ struct DockingTabView: View {
             viewModel.renderer?.clearGridBox()
             viewModel.renderer?.setNeedsRedraw()
         }
+        ActivityLog.shared.info("Removed pocket #\(pocket.id)", category: .dock)
     }
 
     @ViewBuilder

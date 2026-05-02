@@ -399,6 +399,49 @@ extension AppViewModel {
         }
     }
 
+    /// Export a single docked pose (protein + transformed ligand) as a combined PDB file.
+    /// Works for newly-computed poses and for poses restored from a saved `.druse` project,
+    /// since `transformedAtomPositions` is persisted in the project file.
+    func exportDockingPosePDB(at index: Int) {
+        guard docking.dockingResults.indices.contains(index) else { return }
+        let result = docking.dockingResults[index]
+        let ligand = docking.originalDockingLigand ?? molecules.ligand
+        guard !result.transformedAtomPositions.isEmpty else {
+            log.warn("Cannot export pose #\(index + 1): missing transformed coordinates", category: .dock)
+            return
+        }
+        guard ligand != nil || molecules.protein != nil else {
+            log.warn("Cannot export pose #\(index + 1): no protein or ligand loaded", category: .dock)
+            return
+        }
+
+        let ligName = ligand?.name ?? "ligand"
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.init(filenameExtension: "pdb")].compactMap { $0 }
+        panel.nameFieldStringValue = "\(ligName)_pose\(index + 1).pdb"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let title = String(
+            format: "Druse pose %d  score=%.2f %@",
+            index + 1,
+            result.displayScore(method: docking.scoringMethod),
+            docking.scoringMethod.unitLabel
+        )
+        let pdb = PDBWriter.combinedPose(
+            protein: molecules.protein,
+            ligandTemplate: ligand,
+            ligandPositions: result.transformedAtomPositions,
+            title: title
+        )
+
+        do {
+            try PDBWriter.save(pdb, to: url)
+            log.success("Exported pose #\(index + 1) to \(url.lastPathComponent)", category: .dock)
+        } catch {
+            log.error("PDB export failed: \(error.localizedDescription)", category: .dock)
+        }
+    }
+
     func exportDockingResultsCSV() {
         guard !docking.dockingResults.isEmpty else { return }
         let panel = NSSavePanel()

@@ -143,6 +143,11 @@ struct WorkspaceState {
     // Status
     var statusMessage: String = "Ready"
 
+    /// Navigation request from view models to ContentView. Bumped to ask
+    /// the pipeline tab to switch (e.g. "Optimize" jumps to Lead Opt).
+    var requestedTab: SidebarTab? = nil
+    var requestedTabToken: Int = 0
+
     // Loading state
     var isLoading: Bool = false
     var loadingMessage: String = ""

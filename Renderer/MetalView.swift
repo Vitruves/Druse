@@ -88,8 +88,10 @@ struct MetalView: NSViewRepresentable {
         var onAtomDoubleClicked: ((Int) -> Void)?
 
         private var mouseDownLocation: NSPoint = .zero
+        private var lastDragLocation: NSPoint = .zero
         private var isDragging = false
         private var isShiftDrag = false
+        private var isCmdZoomDrag = false
         private let dragThreshold: CGFloat = 3.0
 
         // Box selection state
@@ -121,10 +123,14 @@ struct MetalView: NSViewRepresentable {
         func handleMouseDown(_ event: NSEvent, in view: NSView) {
             let loc = view.convert(event.locationInWindow, from: nil)
             mouseDownLocation = loc
+            lastDragLocation = loc
             isDragging = false
+            isCmdZoomDrag = false
 
             let hasShift = event.modifierFlags.contains(.shift)
             let hasOption = event.modifierFlags.contains(.option)
+            let hasControl = event.modifierFlags.contains(.control)
+            let hasCommand = event.modifierFlags.contains(.command)
             // Option+drag => box selection
             if hasOption {
                 isBoxSelecting = true
@@ -133,6 +139,27 @@ struct MetalView: NSViewRepresentable {
                 boxStartPoint = screenPt
                 boxCurrentPoint = screenPt
                 showSelectionOverlay(in: view, from: loc, to: loc)
+                return
+            }
+
+            // Ctrl+drag (with or without Shift) => Z-roll (spin around view axis).
+            // Checked before plain Shift so Ctrl+Shift+drag reaches the roll path
+            // instead of being swallowed by Shift-pan.
+            if hasControl {
+                isShiftDrag = false
+                isBoxSelecting = false
+                let screenPt = screenPoint(from: loc, in: view)
+                renderer.camera.beginRotation(at: screenPt, zRoll: true)
+                return
+            }
+
+            // Cmd+drag => dolly zoom (vertical drag scales camera distance,
+            // matching PyMOL/ChimeraX right-button drag). Checked before Shift
+            // so Cmd+Shift wins for the zoom modifier.
+            if hasCommand {
+                isCmdZoomDrag = true
+                isShiftDrag = false
+                isBoxSelecting = false
                 return
             }
 
@@ -145,12 +172,11 @@ struct MetalView: NSViewRepresentable {
                 return
             }
 
-            // Plain drag => orbit rotation, Ctrl+drag => Z-roll (spin around view axis)
-            let hasControl = event.modifierFlags.contains(.control)
+            // Plain drag => orbit rotation
             isShiftDrag = false
             isBoxSelecting = false
             let screenPt = screenPoint(from: loc, in: view)
-            renderer.camera.beginRotation(at: screenPt, zRoll: hasControl)
+            renderer.camera.beginRotation(at: screenPt, zRoll: false)
         }
 
         func handleMouseDragged(_ event: NSEvent, in view: NSView) {
@@ -162,6 +188,17 @@ struct MetalView: NSViewRepresentable {
                 let screenPt = screenPoint(from: loc, in: view)
                 boxCurrentPoint = screenPt
                 updateSelectionOverlay(in: view, from: mouseDownLocation, to: loc)
+                return
+            }
+
+            if isCmdZoomDrag {
+                // Vertical delta drives the dolly. View coords have +Y up on macOS,
+                // so dragging UP zooms IN (matches PyMOL's right-drag-up zoom).
+                let dy = Float(loc.y - lastDragLocation.y)
+                let vpSize = viewportSize(of: view)
+                let normalized = dy / max(vpSize.y, 1)
+                renderer.camera.zoom(by: normalized * 5.0)
+                lastDragLocation = loc
                 return
             }
 
@@ -202,6 +239,12 @@ struct MetalView: NSViewRepresentable {
                 }
                 // Option+click without drag → fall through to single-pick logic
                 // so that option-click toggles selection in ribbon mode (and BAS).
+            }
+
+            if isCmdZoomDrag {
+                isCmdZoomDrag = false
+                isDragging = false
+                return
             }
 
             if isShiftDrag {

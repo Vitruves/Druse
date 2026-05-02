@@ -17,6 +17,9 @@ extension AppViewModel {
         leadOpt.referenceName = ligand.name
         leadOpt.referenceSMILES = ligand.smiles ?? ligand.title
         leadOpt.referenceDescriptors = RDKitBridge.computeDescriptors(smiles: leadOpt.referenceSMILES)
+        workspace.requestedTab = .leadOptimization
+        workspace.requestedTabToken &+= 1
+        workspace.statusMessage = "Reference set: \(ligand.name) — opened Lead Opt"
         log.info("Reference for lead optimization: \(ligand.name)", category: .molecule)
     }
 
@@ -133,18 +136,14 @@ extension AppViewModel {
                 if generated.count >= count || Task.isCancelled { break }
 
                 let rep = entry.rep
-                // Case-insensitive pattern matching for SMILES (aromatic atoms are lowercase)
-                guard smiles.localizedCaseInsensitiveContains(rep.pattern) else { continue }
+                // Case-sensitive matching only: substituting an uppercase replacement
+                // (e.g. "CCC") into a lowercase aromatic context (e.g. "cc") produces
+                // malformed hybrid SMILES like "c1CCCccc1" that crash RDKit's drawer.
+                guard smiles.contains(rep.pattern) else { continue }
 
-                // Single substitution: find first case-sensitive match, then try case-insensitive
                 let ranges: [Range<String.Index>] = {
                     var found: [Range<String.Index>] = []
                     if let r = smiles.range(of: rep.pattern) { found.append(r) }
-                    // Also try lowercase pattern for aromatic SMILES (e.g., "C" → "c")
-                    let lowerPattern = rep.pattern.lowercased()
-                    if lowerPattern != rep.pattern, let r = smiles.range(of: lowerPattern) {
-                        found.append(r)
-                    }
                     return found
                 }()
 
@@ -255,14 +254,65 @@ extension AppViewModel {
         analog.deltaRotBonds = desc.rotatableBonds - ref.rotatableBonds
     }
 
+    // MARK: - Add to Ligand Database
+
+    /// Copy generated/passing analogs into the main ligand database so they can
+    /// be docked using the standard Docking tab pipeline (with full UI feedback,
+    /// per-ligand progress, ensemble preparation, etc.). Returns the count added.
+    @discardableResult
+    func addAnalogsToLigandDatabase(includeFiltered: Bool = false) -> Int {
+        let candidates = leadOpt.analogs.filter { analog in
+            switch analog.status {
+            case .generated, .prepared, .docked: return true
+            case .filtered: return includeFiltered
+            case .failed: return false
+            }
+        }
+        guard !candidates.isEmpty else {
+            workspace.statusMessage = "No analogs to add"
+            return 0
+        }
+
+        let existingSMILES = Set(ligandDB.entries.map { $0.smiles })
+        var added = 0
+        for analog in candidates where !existingSMILES.contains(analog.smiles) {
+            var entry = LigandEntry(name: analog.name, smiles: analog.smiles)
+            entry.descriptors = analog.descriptors
+            ligandDB.add(entry)
+            added += 1
+        }
+        let skipped = candidates.count - added
+        if added > 0 {
+            log.success("Added \(added) analog(s) to Ligand Database\(skipped > 0 ? " (\(skipped) duplicates skipped)" : "")", category: .molecule)
+            workspace.statusMessage = "Added \(added) analog(s) to Ligand Database"
+        } else {
+            workspace.statusMessage = "All analogs already in Ligand Database"
+        }
+        return added
+    }
+
+    /// Send all generated analogs to the Docking tab as queued ligand-DB entries
+    /// and switch the user there so they can launch a batch run.
+    func sendAnalogsToDocking() {
+        let added = addAnalogsToLigandDatabase()
+        guard added > 0 || !leadOpt.analogs.isEmpty else { return }
+        workspace.requestedTab = .dock
+        workspace.requestedTabToken &+= 1
+    }
+
     // MARK: - Mini-Docking
 
     /// Dock all generated analogs using the existing grid maps and a light config.
     func dockAnalogs() {
         let activeAnalogs = leadOpt.analogs.enumerated().filter { $0.element.status == .generated }
-        guard !activeAnalogs.isEmpty else { return }
+        guard !activeAnalogs.isEmpty else {
+            workspace.statusMessage = "No generated analogs to dock"
+            return
+        }
         guard let engine = docking.dockingEngine, let pocket = docking.selectedPocket else {
-            log.warn("Docking engine or pocket not available — dock a reference ligand first", category: .dock)
+            let msg = "Run docking on the reference ligand first — analog mini-docking reuses its grid maps"
+            log.warn(msg, category: .dock)
+            workspace.statusMessage = msg
             return
         }
 
@@ -388,5 +438,10 @@ extension AppViewModel {
 
         renderer?.updateGhostPose(atoms: ghostAtoms, bonds: ghostBonds)
         workspace.statusMessage = "Showing \(analog.name) overlay"
+        if let energy = analog.bestEnergy {
+            log.info(String(format: "Analog overlay → %@ (best %.2f kcal/mol)", analog.name, energy), category: .dock)
+        } else {
+            log.info("Analog overlay → \(analog.name)", category: .dock)
+        }
     }
 }

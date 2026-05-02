@@ -7,6 +7,20 @@ import simd
 /// Swift wrapper for the C druse_core RDKit bridge.
 enum RDKitBridge {
 
+    /// RDKit isn't fully thread-safe (shared aromaticity/depiction state, palette
+    /// initialization). Calls that may run concurrently from detached tasks (e.g.
+    /// the ligand-detail SVG preview firing back-to-back) must funnel through this
+    /// serial queue to avoid heap corruption / EXC_BAD_ACCESS.
+    static let serialQueue = DispatchQueue(label: "com.druse.rdkit.serial", qos: .userInitiated)
+
+    /// A dedicated background thread for RDKit drawing / depiction work.
+    /// We run depiction on a real `Thread` (8 MB stack) instead of the Swift
+    /// concurrency cooperative pool because RDKit's coord generation can recurse
+    /// deeply on complex inputs and overflow the small Swift-task stack — that's
+    /// the deterministic EXC_BAD_ACCESS we hit when the ligand database opens
+    /// alongside the detail panel's SVG preview.
+    private static let depictionWorker = RDKitDepictionWorker()
+
     /// Convert SMILES to a 3D Molecule with MMFF94 minimization.
     static func smilesToMolecule(smiles: String, name: String = "", numConformers: Int = 50, minimize: Bool = true) -> (molecule: MoleculeData?, error: String?) {
         guard let result = druse_smiles_to_3d_conformers(smiles, name, Int32(numConformers), minimize) else {
@@ -55,8 +69,15 @@ enum RDKitBridge {
     }
 
     /// Compute molecular descriptors from SMILES.
+    /// Returns `nil` when the SMILES is unparseable or sanitizes to an empty/zero-mass
+    /// molecule — RDKit's C bridge fills the struct with zeros in that case rather than
+    /// reporting failure, so callers (e.g. analog generation) need this to filter out
+    /// chemically-broken candidates that string substitution can produce.
     static func computeDescriptors(smiles: String) -> LigandDescriptors? {
-        let desc = druse_compute_descriptors(smiles)
+        let trimmed = smiles.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let desc = druse_compute_descriptors(trimmed)
+        guard desc.heavyAtomCount > 0, desc.molecularWeight > 0 else { return nil }
         return LigandDescriptors(
             molecularWeight: desc.molecularWeight,
             exactMW: desc.exactMW,
@@ -716,10 +737,14 @@ enum RDKitBridge {
     /// Generate a publication-quality SVG depiction of a molecule from SMILES.
     /// Uses RDKit MolDraw2DSVG with proper wedge/dash stereo bonds, aromatic notation,
     /// and element coloring. Returns nil on failure.
-    static func moleculeToSVG(smiles: String, width: Int = 400, height: Int = 300) -> String? {
-        guard let cStr = druse_mol_to_svg(smiles, Int32(width), Int32(height)) else { return nil }
-        defer { druse_free_string(cStr) }
-        return String(cString: cStr)
+    static func moleculeToSVG(smiles: String, width: Int = 400, height: Int = 300) async -> String? {
+        let trimmed = smiles.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return await depictionWorker.run {
+            guard let cStr = druse_mol_to_svg(trimmed, Int32(width), Int32(height)) else { return nil }
+            defer { druse_free_string(cStr) }
+            return String(cString: cStr)
+        }
     }
 
     // MARK: - 2D Coordinates (legacy, used by interaction diagram)
@@ -997,6 +1022,51 @@ enum RDKitBridge {
 
     private static func errorMessage(from result: DruseMoleculeResult) -> String {
         fixedCString(result.errorMessage)
+    }
+}
+
+// MARK: - RDKit Depiction Worker
+
+/// A single dedicated worker `Thread` with an 8 MB stack used to host RDKit
+/// drawing/depiction calls. Required because RDKit's `compute2DCoords` /
+/// `MolDraw2DSVG` can recurse deeply on complex inputs and exceed the
+/// ~512 KB cooperative-thread stack used by Swift concurrency (the
+/// deterministic EXC_BAD_ACCESS we observed). Calls are also serialized,
+/// which protects RDKit's shared depiction/palette state.
+final class RDKitDepictionWorker: NSObject, @unchecked Sendable {
+    private let queueLock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var pending: [() -> Void] = []
+
+    override init() {
+        super.init()
+        let t = Thread(target: self, selector: #selector(runLoop), object: nil)
+        t.stackSize = 8 * 1024 * 1024
+        t.qualityOfService = .userInitiated
+        t.name = "com.druse.rdkit.depiction"
+        t.start()
+    }
+
+    @objc private func runLoop() {
+        while true {
+            semaphore.wait()
+            queueLock.lock()
+            let work = pending.isEmpty ? nil : pending.removeFirst()
+            queueLock.unlock()
+            work?()
+        }
+    }
+
+    func run<T: Sendable>(_ block: @Sendable @escaping () -> T) async -> T {
+        await withCheckedContinuation { (cont: CheckedContinuation<T, Never>) in
+            queueLock.lock()
+            pending.append {
+                let value = block()
+                cont.resume(returning: value)
+            }
+            queueLock.unlock()
+            semaphore.signal()
+        }
     }
 }
 

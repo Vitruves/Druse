@@ -388,6 +388,17 @@ struct ResultsTabView: View {
                 .help("Show this pose in 3D viewport")
                 .accessibilityIdentifier(AccessibilityID.resultsViewPose(index))
 
+                Button {
+                    viewModel.exportDockingPosePDB(at: index)
+                } label: {
+                    Label("PDB", systemImage: "square.and.arrow.down")
+                        .font(.footnote)
+                }
+                .controlSize(.mini)
+                .buttonStyle(.bordered)
+                .help("Save this pose (protein + ligand) as a .pdb file")
+                .disabled(result.transformedAtomPositions.isEmpty)
+
                 if let lig = viewModel.docking.originalDockingLigand ?? viewModel.molecules.ligand {
                     Button {
                         viewModel.selectReferenceForOptimization(result: result, ligand: lig)

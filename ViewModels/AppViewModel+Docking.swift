@@ -84,6 +84,7 @@ extension AppViewModel {
         workspace.slabThickness = (renderer?.slabHalfThickness ?? 10.0) * 2.0
         workspace.slabOffset = renderer?.slabOffset ?? 0
         showGridBoxForPocket(pocket)
+        log.info("Focused on pocket #\(pocket.id) (vol \(String(format: "%.0f", pocket.volume)) Å³)", category: .dock)
     }
 
     func updateGridBoxVisualization(center: SIMD3<Float>, halfSize: SIMD3<Float>) {
@@ -477,6 +478,14 @@ extension AppViewModel {
     /// Remove all displayed poses and interaction lines from the 3D viewport.
     /// The docking results data is preserved for re-viewing later.
     func clearPosesFromView() {
+        // Preserve the ligand template so "View" on a pose card can rebuild it.
+        // After a `.druse` project load, `originalDockingLigand` is nil — without
+        // this snapshot, clearing the view would also strand any saved poses.
+        if docking.originalDockingLigand == nil, let lig = molecules.ligand {
+            docking.originalDockingLigand = Molecule(
+                name: lig.name, atoms: lig.atoms, bonds: lig.bonds, title: lig.title
+            )
+        }
         molecules.ligand = nil
         docking.currentInteractions = []
         docking.selectedPoseIndices = []
@@ -484,6 +493,7 @@ extension AppViewModel {
         renderer?.clearGhostPose()
         pushToRenderer()
         workspace.statusMessage = "Poses cleared from view"
+        log.info("Cleared poses from view (\(docking.dockingResults.count) results retained)", category: .dock)
     }
 
     func showDockingPose(at index: Int) {
@@ -510,14 +520,19 @@ extension AppViewModel {
 
         let method = docking.scoringMethod
         workspace.statusMessage = String(format: "Pose #%d: %.1f %@", index + 1, result.displayScore(method: method), method.unitLabel)
+        log.info(String(format: "Showed pose #%d (%.2f %@, %d interactions)", index + 1, result.displayScore(method: method), method.unitLabel, docking.currentInteractions.count), category: .dock)
     }
 
     func togglePoseSelection(at index: Int) {
+        let added: Bool
         if docking.selectedPoseIndices.contains(index) {
             docking.selectedPoseIndices.remove(index)
+            added = false
         } else {
             docking.selectedPoseIndices.insert(index)
+            added = true
         }
+        log.info("Pose #\(index + 1) \(added ? "added to" : "removed from") multi-select (\(docking.selectedPoseIndices.count) total)", category: .dock)
     }
 
     func showSelectedPoses() {
