@@ -537,7 +537,12 @@ enum RDKitBridge {
             }
         }
 
-        return forms
+        return forms.sorted {
+            if $0.boltzmannWeight != $1.boltzmannWeight {
+                return $0.boltzmannWeight > $1.boltzmannWeight
+            }
+            return $0.relativeEnergy < $1.relativeEnergy
+        }
     }
 
     // MARK: - Ionizable Site Detection (for GFN2-xTB pKa Prediction)

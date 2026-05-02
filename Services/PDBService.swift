@@ -13,6 +13,14 @@ struct PDBSearchResult: Identifiable, Sendable {
     var releaseDate: String?
 }
 
+// MARK: - Cache Entry
+
+struct CachedPDBEntry: Identifiable, Sendable {
+    let id: String
+    let fetchedAt: Date
+    let sizeBytes: Int
+}
+
 // MARK: - Service Errors
 
 enum PDBServiceError: LocalizedError {
@@ -48,6 +56,14 @@ actor PDBService {
             throw PDBServiceError.invalidPDBID(id)
         }
 
+        Self.purgeExpiredCache()
+
+        if let cached = Self.readCache(id: cleanID) {
+            await MainActor.run { ActivityLog.shared.debug("[PDB] Cache hit \(cleanID) (\(cached.count / 1024) KB)", category: .network) }
+            await ChemicalComponentStore.prefetchTemplates(referencedIn: cached)
+            return cached
+        }
+
         let url = URL(string: "https://files.rcsb.org/download/\(cleanID).pdb")!
         await MainActor.run { ActivityLog.shared.debug("[PDB] Fetching \(cleanID) from \(url.absoluteString)", category: .network) }
         let (data, response) = try await session.data(from: url)
@@ -74,11 +90,85 @@ actor PDBService {
 
         await MainActor.run { ActivityLog.shared.debug("[PDB] Fetched \(cleanID): \(data.count / 1024) KB", category: .network) }
 
+        Self.writeCache(id: cleanID, content: content)
+
         // Prefetch CCD templates for any non-water HET groups so downstream parsing
         // can restore chemically correct bond orders and formal charges.
         await ChemicalComponentStore.prefetchTemplates(referencedIn: content)
 
         return content
+    }
+
+    // MARK: - Cache
+
+    func cachedEntries() -> [CachedPDBEntry] {
+        Self.purgeExpiredCache()
+        let dir = Self.cacheDirectory
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]
+        ) else {
+            return []
+        }
+        return urls.compactMap { url -> CachedPDBEntry? in
+            guard url.pathExtension.lowercased() == "pdb" else { return nil }
+            let id = url.deletingPathExtension().lastPathComponent.uppercased()
+            guard id.count == 4 else { return nil }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let date = (attrs?[.modificationDate] as? Date) ?? .distantPast
+            let size = (attrs?[.size] as? Int) ?? 0
+            return CachedPDBEntry(id: id, fetchedAt: date, sizeBytes: size)
+        }
+        .sorted { $0.fetchedAt > $1.fetchedAt }
+    }
+
+    func removeCachedEntry(id: String) {
+        let url = Self.cacheFileURL(for: id.uppercased())
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private static let cacheRetention: TimeInterval = 7 * 24 * 3600
+
+    private static var cacheDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".druse/pdb_cache", isDirectory: true)
+    }
+
+    private static func cacheFileURL(for id: String) -> URL {
+        cacheDirectory.appendingPathComponent("\(id).pdb")
+    }
+
+    private static func readCache(id: String) -> String? {
+        let url = cacheFileURL(for: id)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let date = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(date) < cacheRetention else {
+            return nil
+        }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    private static func writeCache(id: String, content: String) {
+        let url = cacheFileURL(for: id)
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func purgeExpiredCache() {
+        let dir = cacheDirectory
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return }
+        let now = Date()
+        for url in urls {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let date = attrs[.modificationDate] as? Date else { continue }
+            if now.timeIntervalSince(date) >= cacheRetention {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
     }
 
     // MARK: - Text Search

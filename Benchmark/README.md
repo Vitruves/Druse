@@ -107,17 +107,17 @@ Each scoring method runs independently. Pick one or run all three:
 
 ```bash
 # Single scoring method (~55 min each)
-xcodebuild test -project Druse.xcodeproj -scheme Druse \
+DRUSE_RUN_BENCHMARKS=1 xcodebuild test -project Druse.xcodeproj -scheme Druse \
   -only-testing:DruseTests/BenchmarkRunner/testCASF_Vina
 
-xcodebuild test -project Druse.xcodeproj -scheme Druse \
+DRUSE_RUN_BENCHMARKS=1 xcodebuild test -project Druse.xcodeproj -scheme Druse \
   -only-testing:DruseTests/BenchmarkRunner/testCASF_Drusina
 
-xcodebuild test -project Druse.xcodeproj -scheme Druse \
+DRUSE_RUN_BENCHMARKS=1 xcodebuild test -project Druse.xcodeproj -scheme Druse \
   -only-testing:DruseTests/BenchmarkRunner/testCASF_DruseAF
 
 # All three sequentially (~2.5 hours)
-xcodebuild test -project Druse.xcodeproj -scheme Druse \
+DRUSE_RUN_BENCHMARKS=1 xcodebuild test -project Druse.xcodeproj -scheme Druse \
   -only-testing:DruseTests/BenchmarkRunner/testCASF_All
 ```
 

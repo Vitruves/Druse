@@ -225,6 +225,7 @@ final class LigandDatabase {
 
     func prepareEntry(at index: Int, addH: Bool = true, minimize: Bool = true, charges: Bool = true) {
         guard index < entries.count else { return }
+        let id = entries[index].id
         let smiles = entries[index].smiles
         let name = entries[index].name
 
@@ -234,14 +235,16 @@ final class LigandDatabase {
                                           addHydrogens: addH, minimize: minimize, computeCharges: charges)
             }.value
 
+            guard let currentIndex = entries.firstIndex(where: { $0.id == id }) else { return }
+
             if let mol {
-                entries[index].atoms = mol.atoms
-                entries[index].bonds = mol.bonds
-                entries[index].descriptors = desc
-                entries[index].isPrepared = true
-                entries[index].preparationDate = Date()
-                entries[index].conformerCount = 1
-                if let canonSMILES { entries[index].originalSMILES = canonSMILES }
+                entries[currentIndex].atoms = mol.atoms
+                entries[currentIndex].bonds = mol.bonds
+                entries[currentIndex].descriptors = desc
+                entries[currentIndex].isPrepared = true
+                entries[currentIndex].preparationDate = Date()
+                entries[currentIndex].conformerCount = 1
+                if let canonSMILES { entries[currentIndex].originalSMILES = canonSMILES }
             }
             if let error {
                 ActivityLog.shared.error("Failed to prepare \(name): \(error)", category: .prep)
@@ -355,14 +358,12 @@ final class LigandDatabase {
 
     func importCSV(url: URL, smilesColumn: Int? = nil, nameColumn: Int? = nil, prepare: Bool = true) throws {
         let content = try String(contentsOf: url, encoding: .utf8)
-        let rows = content.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        let rows = Self.parseDelimitedRows(content)
 
         guard !rows.isEmpty else { return }
 
         // Detect header and column indices
-        let header = rows[0].lowercased()
+        let header = rows[0].joined(separator: ",").lowercased()
         let hasHeader = header.contains("smiles") || header.contains("name") || header.contains("molecule")
             || header.contains("ki") || header.contains("ic50") || header.contains("pki")
         let dataRows = hasHeader ? Array(rows.dropFirst()) : rows
@@ -378,7 +379,7 @@ final class LigandDatabase {
             detectedSmilesCol = sc
             detectedNameCol = nameColumn ?? (sc == 0 ? 1 : 0)
         } else if hasHeader {
-            let headerCols = rows[0].components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            let headerCols = rows[0].map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
             detectedSmilesCol = headerCols.firstIndex(where: { $0.contains("smiles") || $0.contains("molecule") || $0.contains("structure") }) ?? 0
             detectedNameCol = nameColumn ?? headerCols.firstIndex(where: { $0.contains("name") || $0.contains("id") || $0.contains("title") }) ?? (detectedSmilesCol == 0 ? 1 : 0)
 
@@ -388,7 +389,7 @@ final class LigandDatabase {
             ic50Col = headerCols.firstIndex(where: { $0 == "ic50" || $0 == "ic50_nm" || $0 == "ic50 (nm)" })
         } else {
             // No header: auto-detect by checking which column looks like SMILES
-            let firstRow = dataRows.first.map { $0.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) } } ?? []
+            let firstRow = dataRows.first ?? []
             detectedSmilesCol = firstRow.firstIndex(where: { Self.looksLikeSMILES($0) }) ?? 0
             detectedNameCol = nameColumn ?? (detectedSmilesCol == 0 ? 1 : 0)
         }
@@ -397,7 +398,7 @@ final class LigandDatabase {
 
         let baseIndex = entries.count
         let lines = dataRows.enumerated().compactMap { offset, row -> (smiles: String, name: String)? in
-            let cols = row.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            let cols = row
             guard detectedSmilesCol < cols.count else { return nil }
             let smi = cols[detectedSmilesCol]
             let name = detectedNameCol < cols.count ? cols[detectedNameCol] : "Mol_\(baseIndex + offset + 1)"
@@ -408,7 +409,7 @@ final class LigandDatabase {
         var affinityMap: [String: (ki: Float?, pKi: Float?, ic50: Float?)] = [:]
         if hasAffinity {
             for (offset, row) in dataRows.enumerated() {
-                let cols = row.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                let cols = row
                 guard detectedSmilesCol < cols.count else { continue }
                 let name: String
                 if detectedNameCol < cols.count {
@@ -440,6 +441,65 @@ final class LigandDatabase {
             let affCount = affinityMap.count
             ActivityLog.shared.info("Imported affinity data for \(affCount) ligands (Ki/pKi/IC50)", category: .molecule)
         }
+    }
+
+    nonisolated static func parseDelimitedRows(_ content: String, separator explicitSeparator: Character? = nil) -> [[String]] {
+        let separator = explicitSeparator ?? detectDelimiter(in: content)
+        var rows: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var inQuotes = false
+        var index = content.startIndex
+
+        func finishField() {
+            row.append(field.trimmingCharacters(in: .whitespaces))
+            field.removeAll(keepingCapacity: true)
+        }
+
+        func finishRow() {
+            finishField()
+            if row.contains(where: { !$0.isEmpty }) {
+                rows.append(row)
+            }
+            row.removeAll(keepingCapacity: true)
+        }
+
+        while index < content.endIndex {
+            let ch = content[index]
+            let next = content.index(after: index)
+
+            if ch == "\"" {
+                if inQuotes, next < content.endIndex, content[next] == "\"" {
+                    field.append("\"")
+                    index = content.index(after: next)
+                    continue
+                }
+                inQuotes.toggle()
+            } else if ch == separator, !inQuotes {
+                finishField()
+            } else if (ch == "\n" || ch == "\r"), !inQuotes {
+                finishRow()
+                if ch == "\r", next < content.endIndex, content[next] == "\n" {
+                    index = content.index(after: next)
+                    continue
+                }
+            } else {
+                field.append(ch)
+            }
+
+            index = next
+        }
+
+        if !field.isEmpty || !row.isEmpty {
+            finishRow()
+        }
+
+        return rows
+    }
+
+    nonisolated private static func detectDelimiter(in content: String) -> Character {
+        let firstLine = content.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).first ?? ""
+        return firstLine.contains("\t") ? "\t" : ","
     }
 
     /// Heuristic: does this string look like a SMILES notation?

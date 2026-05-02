@@ -134,9 +134,11 @@ extension AppViewModel {
             do {
                 switch format {
                 case .pdb:
-                    let content = try String(contentsOf: url, encoding: .utf8)
+                    let (content, result) = try await Task.detached {
+                        let content = try String(contentsOf: url, encoding: .utf8)
+                        return (content, PDBParser.parse(content))
+                    }.value
                     molecules.rawPDBContent = content
-                    let result = await Task.detached { PDBParser.parse(content) }.value
 
                     if let protData = result.protein {
                         let mol = Molecule(name: protData.name, atoms: protData.atoms,
@@ -198,7 +200,9 @@ extension AppViewModel {
                     }
 
                 case .mmcif:
-                    let content = try String(contentsOf: url, encoding: .utf8)
+                    let content = try await Task.detached {
+                        try String(contentsOf: url, encoding: .utf8)
+                    }.value
                     do {
                         let mmcifResult = try await Task.detached { try MMCIFParser.parse(content: content) }.value
                         let mol = Molecule(name: mmcifResult.name, atoms: mmcifResult.atoms,

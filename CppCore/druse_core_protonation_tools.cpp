@@ -5,11 +5,35 @@
 
 // Ionizable-site inspection, per-site protomer generation, and ensemble v2.
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <set>
 #include <tbb/parallel_for.h>
+
+static std::vector<double> tautomer_population_weights_ex(const std::vector<int> &scores) {
+    std::vector<double> weights(scores.size(), 0.0);
+    if (scores.empty()) return weights;
+
+    int maxScore = *std::max_element(scores.begin(), scores.end());
+    double partition = 0.0;
+    constexpr double scoreScale = 2.302585092994046; // one score point ~= 10x population
+    for (size_t i = 0; i < scores.size(); i++) {
+        weights[i] = std::exp((scores[i] - maxScore) * scoreScale);
+        partition += weights[i];
+    }
+
+    if (partition <= 0.0 || !std::isfinite(partition)) {
+        double equal = 1.0 / (double)scores.size();
+        std::fill(weights.begin(), weights.end(), equal);
+        return weights;
+    }
+
+    for (double &w : weights) w /= partition;
+    return weights;
+}
 
 DruseIonSiteResult* druse_detect_ionizable_sites(const char *smiles) {
     auto *result = new DruseIonSiteResult();
@@ -263,10 +287,16 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
         // aren't blocked by adjacent charged sites. Atom indices are preserved
         // by RDKit's TautomerEnumerator transformations, so the same site list
         // can be applied to each tautomer.
-        std::vector<std::unique_ptr<RWMol>> baseTautomers;
+        struct BaseTautomer {
+            std::unique_ptr<RWMol> mol;
+            int score;
+        };
+        std::vector<BaseTautomer> baseTautomers;
         {
             auto rw = std::make_unique<RWMol>(*parentMol);
-            baseTautomers.push_back(std::move(rw));
+            int score = 0;
+            try { score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw); } catch (...) {}
+            baseTautomers.push_back({std::move(rw), score});
         }
         std::set<std::string> tautSeen;
         tautSeen.insert(MolToSmiles(*parentMol));
@@ -282,9 +312,16 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
                 std::string tSmi = MolToSmiles(*rw);
                 if (tautSeen.count(tSmi)) continue;
                 tautSeen.insert(tSmi);
-                baseTautomers.push_back(std::move(rw));
+                int score = 0;
+                try { score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw); } catch (...) {}
+                baseTautomers.push_back({std::move(rw), score});
             }
         } catch (...) {}
+
+        std::vector<int> tautomerScores;
+        tautomerScores.reserve(baseTautomers.size());
+        for (const auto &taut : baseTautomers) tautomerScores.push_back(taut.score);
+        auto tautomerWeights = tautomer_population_weights_ex(tautomerScores);
 
         struct ChemicalForm {
             std::string smi;
@@ -327,13 +364,14 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
         for (size_t ti = 0; ti < baseTautomers.size(); ti++) {
             if ((int)allForms.size() >= maxTotalForms) break;
 
-            auto washedTaut = std::make_unique<RWMol>(*baseTautomers[ti]);
+            auto washedTaut = std::make_unique<RWMol>(*baseTautomers[ti].mol);
             applyClearProtonation(*washedTaut);
             try { MolOps::sanitizeMol(*washedTaut); } catch (...) {
-                washedTaut = std::make_unique<RWMol>(*baseTautomers[ti]);
+                washedTaut = std::make_unique<RWMol>(*baseTautomers[ti].mol);
             }
 
             std::string tautPrefix = (ti == 0) ? "" : ("Taut" + std::to_string(ti) + "_");
+            double tautomerWeight = ti < tautomerWeights.size() ? tautomerWeights[ti] : 0.0;
 
             for (int ci = 0; ci < nCombos; ci++) {
                 if ((int)allForms.size() >= maxTotalForms) break;
@@ -388,7 +426,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
                 int kind = (ti == 0)
                     ? (comboLabel.empty() ? 0 : 2)   // 0=parent, 2=protomer
                     : (comboLabel.empty() ? 1 : 3); // 1=tautomer, 3=both
-                allForms.push_back({pSmi, std::move(rw), label, kind, hhPop});
+                allForms.push_back({pSmi, std::move(rw), label, kind, hhPop * tautomerWeight});
             }
         }
 

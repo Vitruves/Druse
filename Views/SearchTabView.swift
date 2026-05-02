@@ -7,6 +7,7 @@ struct SearchTabView: View {
     @Environment(AppViewModel.self) private var viewModel
     @State private var pdbID: String = ""
     @State private var searchQuery: String = ""
+    @State private var cachedEntries: [CachedPDBEntry] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -122,6 +123,19 @@ struct SearchTabView: View {
                 }
             }
 
+            if !cachedEntries.isEmpty {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Previously Fetched", systemImage: "clock.arrow.circlepath")
+                        .font(.callout.weight(.semibold))
+
+                    ForEach(cachedEntries) { entry in
+                        cachedEntryRow(entry)
+                    }
+                }
+            }
+
             // Loading indicators
             if viewModel.workspace.isLoading {
                 HStack(spacing: 8) {
@@ -155,6 +169,57 @@ struct SearchTabView: View {
             }
         }
         .padding(12)
+        .task { await refreshCachedEntries() }
+        .onChange(of: viewModel.workspace.isLoading) { _, loading in
+            if !loading { Task { await refreshCachedEntries() } }
+        }
+    }
+
+    private func refreshCachedEntries() async {
+        cachedEntries = await PDBService.shared.cachedEntries()
+    }
+
+    @ViewBuilder
+    private func cachedEntryRow(_ entry: CachedPDBEntry) -> some View {
+        HStack(spacing: 8) {
+            Button(action: { viewModel.loadFromPDB(id: entry.id) }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc")
+                        .foregroundStyle(.secondary)
+                    Text(entry.id)
+                        .font(.callout.monospaced().weight(.semibold))
+                    Text(entry.fetchedAt.formatted(.relative(presentation: .named)))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(entry.sizeBytes / 1024) KB")
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(viewModel.workspace.isLoading)
+
+            Button(action: {
+                Task {
+                    await PDBService.shared.removeCachedEntry(id: entry.id)
+                    await refreshCachedEntries()
+                }
+            }) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+        )
     }
 
     private func fetchPDB() {

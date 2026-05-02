@@ -1410,7 +1410,7 @@ struct LigandDatabaseWindow: View {
         }
 
         let forms = RDKitBridge.ensembleResultToForms(result)
-        guard let bestForm = forms.first else { return 0 }
+        guard let bestForm = forms.max(by: { $0.boltzmannWeight < $1.boltzmannWeight }) else { return 0 }
 
         var updated = entry
         updated.originalSMILES = bestForm.smiles
@@ -1446,8 +1446,8 @@ struct LigandDatabaseWindow: View {
         let maxProto = variantMaxProtomers
         let energyCutoff = variantEnergyCutoff
         let confsPerForm = prepNumConformers
-        let pkaThreshold = variantPkaThreshold
         let minPop = variantMinPopulation / 100.0
+        let pkaThreshold = minPop <= 0 ? 100.0 : variantPkaThreshold
         let useGNN = pkaMethod == .gnn
 
         populateTask = Task {
@@ -1559,7 +1559,7 @@ struct LigandDatabaseWindow: View {
         var forms = RDKitBridge.ensembleResultToForms(result)
         guard !forms.isEmpty else { return }
 
-        // Filter by minimum population (always keep best form)
+        // Filter by minimum population (always keep dominant form)
         if minPop > 0 && forms.count > 1 {
             forms = forms.enumerated().filter { idx, form in
                 idx == 0 || form.boltzmannWeight >= minPop

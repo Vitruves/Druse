@@ -50,24 +50,16 @@ extension LigandDatabaseWindow {
     }
 
     func buildCSVPreview(content: String, url: URL) -> ImportPreview {
-        let rows = content.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        let rows = LigandDatabase.parseDelimitedRows(content)
         guard !rows.isEmpty else { return ImportPreview(columns: [], rowCount: 0, fileURL: url, fileType: .csv) }
 
-        let separator: Character = rows[0].contains("\t") ? "\t" : ","
-        let headerCols = rows[0].split(separator: separator, omittingEmptySubsequences: false).map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }
+        let headerCols = rows[0]
         let dataRows = Array(rows.dropFirst())
 
         var columns: [ImportColumnMapping] = []
         for (i, header) in headerCols.enumerated() {
             let samples = dataRows.prefix(3).compactMap { row -> String? in
-                let cols = row.split(separator: separator, omittingEmptySubsequences: false).map {
-                    $0.trimmingCharacters(in: .whitespaces)
-                }
-                return i < cols.count ? cols[i] : nil
+                i < row.count ? row[i] : nil
             }
             var mapping = ImportColumnMapping(sourceHeader: header, sampleValues: samples)
             mapping.target = suggestTarget(for: header)
@@ -215,20 +207,15 @@ extension LigandDatabaseWindow {
             // Parse off main thread
             let parsed: [LigandEntry] = await Task.detached {
                 guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-                let rows = content.components(separatedBy: .newlines)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
+                let rows = LigandDatabase.parseDelimitedRows(content)
                 guard rows.count > 1 else { return [] }
 
-                let separator: Character = rows[0].contains("\t") ? "\t" : ","
                 let dataRows = rows.dropFirst()
 
                 var entries: [LigandEntry] = []
                 entries.reserveCapacity(dataRows.count)
                 for (offset, row) in dataRows.enumerated() {
-                    let cols = row.split(separator: separator, omittingEmptySubsequences: false).map {
-                        $0.trimmingCharacters(in: .whitespaces)
-                    }
+                    let cols = row
                     let smiles = smilesIdx.flatMap { $0 < cols.count ? cols[$0] : nil } ?? ""
                     let name = nameIdx.flatMap { $0 < cols.count && !cols[$0].isEmpty ? cols[$0] : nil } ?? "Mol_\(offset + 1)"
                     let ki = kiIdx.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }

@@ -50,6 +50,15 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(d2.lipinski)
     }
 
+    func testCSVParserHandlesQuotedFields() {
+        let csv = "smiles,name,note\n\"CC(=O)O\",\"Acetic acid, sodium-free\",\"quoted \"\"field\"\"\""
+        let rows = LigandDatabase.parseDelimitedRows(csv)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[1][0], "CC(=O)O")
+        XCTAssertEqual(rows[1][1], "Acetic acid, sodium-free")
+        XCTAssertEqual(rows[1][2], "quoted \"field\"")
+    }
+
     func testGasteigerCharges() {
         let (mol, _, _, err) = RDKitBridge.prepareLigand(
             smiles: "CC(=O)O", name: "AceticAcid", numConformers: 1, computeCharges: true)
@@ -552,6 +561,24 @@ final class CoreTests: XCTestCase {
             XCTAssertFalse(form.smiles.isEmpty)
             XCTAssertGreaterThan(form.atoms.count, 0)
         }
+    }
+
+    func testDoxepinTraceNeutralProtomerCanBeEnumerated() {
+        let doxepin = "CN(C)CC/C=C1/c2ccccc2COc2ccccc21"
+        let result = RDKitBridge.prepareEnsemble(
+            smiles: doxepin, name: "Doxepin",
+            pH: 7.4, pkaThreshold: 100.0,
+            maxTautomers: 1, maxProtomers: 2,
+            energyCutoff: 15.0, conformersPerForm: 1
+        )
+        XCTAssertTrue(result.success, "Doxepin ensemble should succeed: \(result.errorMessage)")
+
+        let forms = RDKitBridge.ensembleResultToForms(result)
+        let formalCharges = Set(forms.map { form in
+            form.atoms.reduce(0) { $0 + $1.formalCharge }
+        })
+        XCTAssertTrue(formalCharges.contains(0), "Neutral doxepin protomer should be present")
+        XCTAssertTrue(formalCharges.contains(1), "Protonated doxepin protomer should be present")
     }
 
     func testPiperazineDetection() {

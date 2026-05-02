@@ -24,6 +24,12 @@ import MetalKit
 //   python Benchmark/prepare.py
 
 final class BenchmarkRunner: XCTestCase {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        guard ProcessInfo.processInfo.environment["DRUSE_RUN_BENCHMARKS"] == "1" else {
+            throw XCTSkip("Set DRUSE_RUN_BENCHMARKS=1 to run CASF benchmark tests.")
+        }
+    }
 
     // MARK: - Shared Engine & DruseAF Scorer
 

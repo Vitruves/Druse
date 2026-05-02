@@ -198,18 +198,29 @@ extension AppViewModel {
         log.info("Running protein structure cleanup (protonation + charges)...", category: .prep)
         workspace.statusMessage = "Protein cleanup..."
 
-        Task {
-            let prepared = ProteinPreparation.prepareForDocking(
-                atoms: prot.atoms,
-                bonds: prot.bonds,
-                rawPDBContent: molecules.rawPDBContent,
-                pH: molecules.protonationPH,
-                chargeMethod: docking.chargeMethod,
-                device: MTLCreateSystemDefaultDevice()
-            )
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let name = prot.name
+        let title = prot.title
+        let secondaryStructure = prot.secondaryStructureAssignments
+        let rawPDBContent = molecules.rawPDBContent
+        let pH = molecules.protonationPH
+        let chargeMethod = docking.chargeMethod
 
-            let mol = Molecule(name: prot.name, atoms: prepared.atoms, bonds: prepared.bonds, title: prot.title)
-            mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        Task {
+            let prepared = await Task.detached(priority: .userInitiated) {
+                ProteinPreparation.prepareForDocking(
+                    atoms: atoms,
+                    bonds: bonds,
+                    rawPDBContent: rawPDBContent,
+                    pH: pH,
+                    chargeMethod: chargeMethod,
+                    device: MTLCreateSystemDefaultDevice()
+                )
+            }.value
+
+            let mol = Molecule(name: name, atoms: prepared.atoms, bonds: prepared.bonds, title: title)
+            mol.secondaryStructureAssignments = secondaryStructure
             molecules.protein = mol
             pushToRenderer()
             renderer?.fitToContent()

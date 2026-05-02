@@ -5,6 +5,8 @@
 
 // Tautomer, protomer, and ensemble preparation.
 
+#include <algorithm>
+#include <cmath>
 #include <GraphMol/MolStandardize/Tautomer.h>
 #include <GraphMol/Substruct/SubstructMatch.h>
 #include <limits>
@@ -12,6 +14,28 @@
 #include <mutex>
 #include <set>
 #include <tbb/parallel_for.h>
+
+static std::vector<double> tautomer_population_weights(const std::vector<int> &scores) {
+    std::vector<double> weights(scores.size(), 0.0);
+    if (scores.empty()) return weights;
+
+    int maxScore = *std::max_element(scores.begin(), scores.end());
+    double partition = 0.0;
+    constexpr double scoreScale = 2.302585092994046; // one score point ~= 10x population
+    for (size_t i = 0; i < scores.size(); i++) {
+        weights[i] = std::exp((scores[i] - maxScore) * scoreScale);
+        partition += weights[i];
+    }
+
+    if (partition <= 0.0 || !std::isfinite(partition)) {
+        double equal = 1.0 / (double)scores.size();
+        std::fill(weights.begin(), weights.end(), equal);
+        return weights;
+    }
+
+    for (double &w : weights) w /= partition;
+    return weights;
+}
 
 /// Helper: generate 3D for a molecule and return MMFF energy, or NaN on failure.
 static double embed_and_minimize(RWMol &mol) {
@@ -561,13 +585,27 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         for (auto &prot : protomers) {
             if ((int)allForms.size() >= maxTotalForms) break;
 
-            if (!seenSMILES.count(prot.smi)) {
-                seenSMILES.insert(prot.smi);
-            }
+            struct LocalForm {
+                std::string smi;
+                std::unique_ptr<RWMol> mol;
+                std::string label;
+                int kind;
+                int tautomerScore;
+            };
+            std::vector<LocalForm> localForms;
+
+            auto addLocalForm = [&](std::string smi, std::unique_ptr<RWMol> rw,
+                                    std::string label, int kind) {
+                int score = 0;
+                try { score = MolStandardize::TautomerScoringFunctions::scoreTautomer(*rw); } catch (...) {}
+                localForms.push_back({std::move(smi), std::move(rw), std::move(label), kind, score});
+            };
+
+            if (!seenSMILES.count(prot.smi)) seenSMILES.insert(prot.smi);
             {
                 auto rw = std::make_unique<RWMol>(*prot.mol);
                 int kind = (prot.label != "Parent") ? 2 : 0;
-                allForms.push_back({prot.smi, std::move(rw), prot.label, kind, prot.hhPopulation});
+                addLocalForm(prot.smi, std::move(rw), prot.label, kind);
             }
 
             try {
@@ -595,7 +633,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
                     else label = "";
                     label += "Taut" + std::to_string(tautCount + 1);
 
-                    allForms.push_back({tSmi, std::move(rw), label, kind, prot.hhPopulation});
+                    addLocalForm(tSmi, std::move(rw), label, kind);
                     tautCount++;
                 }
             } catch (const std::exception &e) {
@@ -605,6 +643,21 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
             } catch (...) {
                 fprintf(stderr, "[druse] tautomer enumeration failed for %s: unknown error\n",
                         prot.label.c_str());
+            }
+
+            std::vector<int> tautomerScores;
+            tautomerScores.reserve(localForms.size());
+            for (const auto &form : localForms) tautomerScores.push_back(form.tautomerScore);
+            auto tautomerWeights = tautomer_population_weights(tautomerScores);
+
+            for (size_t i = 0; i < localForms.size() && (int)allForms.size() < maxTotalForms; i++) {
+                auto &form = localForms[i];
+                double formPopulation = prot.hhPopulation *
+                    (i < tautomerWeights.size() ? tautomerWeights[i] : 0.0);
+                allForms.push_back({
+                    std::move(form.smi), std::move(form.mol), std::move(form.label),
+                    form.kind, formPopulation
+                });
             }
         }
 

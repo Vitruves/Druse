@@ -54,7 +54,8 @@ extension AppViewModel {
 
             // Prepare protein for scoring (uses cache — instant if protein/pH unchanged)
             let dockingPH = molecules.protonationPH
-            let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH)
+            let chargeMethod = docking.chargeMethod
+            let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH, chargeMethod: chargeMethod)
 
             engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
 

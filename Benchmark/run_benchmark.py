@@ -455,6 +455,7 @@ def run_xcodebuild(test_method: str, env: dict, verbose: bool,
                 path = all output to file (benchmark lines still shown on terminal).
     """
     test_id = f"DruseTests/BenchmarkRunner/{test_method}"
+    env["DRUSE_RUN_BENCHMARKS"] = "1"
     cmd = [
         "xcodebuild", "test",
         "-project", str(PROJECT),

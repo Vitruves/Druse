@@ -101,13 +101,33 @@ extension AppViewModel {
     /// the full preparation pipeline (H addition, H-bond network, Gasteiger charges)
     /// when the protein and pH haven't changed.
     func preparedProteinForDocking(
-        protein: Molecule, pH: Float
+        protein: Molecule, pH: Float, chargeMethod: ChargeMethod
     ) async -> (protein: Molecule, report: ProteinPreparation.DockingPreparationReport) {
-        // Build a lightweight cache key from atom count + name + pH
+        // Cache key must reflect all inputs that change the prepared receptor.
         var hasher = Hasher()
-        hasher.combine(protein.atoms.count)
         hasher.combine(protein.name)
         hasher.combine(pH)
+        hasher.combine(chargeMethod)
+        hasher.combine(molecules.rawPDBContent)
+        hasher.combine(protein.atoms.count)
+        for atom in protein.atoms {
+            hasher.combine(atom.id)
+            hasher.combine(atom.element.rawValue)
+            hasher.combine(atom.name)
+            hasher.combine(atom.residueName)
+            hasher.combine(atom.residueSeq)
+            hasher.combine(atom.chainID)
+            hasher.combine(atom.position.x)
+            hasher.combine(atom.position.y)
+            hasher.combine(atom.position.z)
+            hasher.combine(atom.formalCharge)
+        }
+        hasher.combine(protein.bonds.count)
+        for bond in protein.bonds {
+            hasher.combine(bond.atomIndex1)
+            hasher.combine(bond.atomIndex2)
+            hasher.combine(bond.order.rawValue)
+        }
         let key = hasher.finalize()
 
         if let cached = docking.preparedProteinCache, cached.key == key {
@@ -127,7 +147,8 @@ extension AppViewModel {
                 atoms: proteinAtoms,
                 bonds: proteinBonds,
                 rawPDBContent: pdbContent,
-                pH: pH
+                pH: pH,
+                chargeMethod: chargeMethod
             )
         }.value
         let elapsed = CFAbsoluteTimeGetCurrent() - t0
@@ -192,7 +213,8 @@ extension AppViewModel {
             }
 
             let dockingPH = molecules.protonationPH
-            let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH)
+            let chargeMethod = docking.chargeMethod
+            let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH, chargeMethod: chargeMethod)
 
             // Ensure grid box stays visible during docking; hide original ligand
             // (the live ghost pose renders the moving ligand in the pocket)

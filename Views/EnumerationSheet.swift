@@ -121,7 +121,9 @@ struct EnumerationSheet: View {
                 }
             }
 
-            Text("Forms with Boltzmann population below \(String(format: "%.1f%%", minPopulation)) are discarded.")
+            Text(minPopulation <= 0
+                 ? "All generated forms are kept; max protomers still limits trace states."
+                 : "Forms with Boltzmann population below \(String(format: "%.1f%%", minPopulation)) are discarded.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

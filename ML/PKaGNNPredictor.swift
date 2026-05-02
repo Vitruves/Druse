@@ -26,12 +26,16 @@ enum PKaGNNPredictor {
     private nonisolated(unsafe) static var device: MTLDevice?
     private nonisolated(unsafe) static var queue: MTLCommandQueue?
     private nonisolated(unsafe) static var initState: InitState = .pending
+    private static let initLock = NSLock()
 
     private enum InitState { case pending, initialized, failed }
 
     /// Lazy initialization — called automatically on first predict().
     @discardableResult
     private static func ensureInitialized() -> Bool {
+        initLock.lock()
+        defer { initLock.unlock() }
+
         guard initState == .pending else { return initState == .initialized }
 
         guard let dev = MTLCreateSystemDefaultDevice() else {
