@@ -116,10 +116,17 @@ final class DiffusionDockingEngine {
         }
     }
 
+    /// True when the v3 cross-attention score-with-gradient kernel is loaded.
     var isAvailable: Bool {
         diffInitNoisePipeline != nil
             && diffDenoisingStepPipeline != nil
             && druseAFScoreWithGradPipeline != nil
+    }
+
+    /// True when the diffusion init/denoise kernels are loaded (v4 path uses the parent
+    /// engine's `afv4ScoreWithGradPipeline` rather than this engine's score kernel).
+    var isAvailableV4: Bool {
+        diffInitNoisePipeline != nil && diffDenoisingStepPipeline != nil
     }
 
     /// Run diffusion-guided docking.
@@ -155,7 +162,9 @@ final class DiffusionDockingEngine {
         druseAFIntermediateBuffer: MTLBuffer,
         druseAFEncodePipeline: MTLComputePipelineState,
         // Population buffer (output)
-        populationBuffer: MTLBuffer
+        populationBuffer: MTLBuffer,
+        // Optional per-denoising-step progress callback: (stepIndex, totalSteps)
+        onStep: ((Int, Int) -> Void)? = nil
     ) async -> Int {
         guard let initPipe = diffInitNoisePipeline,
               let denoisePipe = diffDenoisingStepPipeline,
@@ -259,10 +268,164 @@ final class DiffusionDockingEngine {
             dispatchSync(pipeline: denoisePipe, buffers: denoiseBuffers,
                          threadGroups: tgCount, threadGroupSize: tgSize)
 
+            // Emit progress for live UI updates (in reverse order: T-1 → 0)
+            let stepsCompleted = T - t
+            onStep?(stepsCompleted, T)
+
             await Task.yield()
         }
 
         ActivityLog.shared.info("[DiffusionDocking] Diffusion completed, \(N) poses generated", category: .dock)
+        return N
+    }
+
+    /// Run diffusion-guided docking against a DruseAF v4 (PGN) target.
+    ///
+    /// Same outer loop as `runDiffusionDocking` (init from noise → reverse-step ×T) but
+    /// the per-step gradient comes from the v4 PGN scorer rather than v3 cross-attention.
+    /// Position transform reuses the shared `druseAFEncode` kernel; per-step scoring uses
+    /// the parent engine's `druseAFv4ScoreWithGradient` kernel which is layout-compatible
+    /// with v4's setup buffers (hidden states, pair projections).
+    ///
+    /// Caller is responsible for providing the v4 buffers prepared by `prepareDruseAFBuffers`.
+    func runDiffusionDockingV4(
+        numPoses: Int,
+        numLigandAtoms: Int,
+        numTorsions: Int,
+        config: DiffusionDockingConfig,
+        gaParamsBuffer: MTLBuffer,
+        gridParamsBuffer: MTLBuffer,
+        ligandAtomBuffer: MTLBuffer,
+        torsionEdgeBuffer: MTLBuffer,
+        movingIndicesBuffer: MTLBuffer,
+        // v4 buffers
+        afv4ParamsBuffer: MTLBuffer,
+        afv4EncodeCompatParamsBuffer: MTLBuffer,
+        afv4ProtPosBuffer: MTLBuffer,
+        afv4ProtPairProjBuffer: MTLBuffer,
+        afv4LigPairProjBuffer: MTLBuffer,
+        afv4LigHiddenBuffer: MTLBuffer,
+        druseAFWeightBuffer: MTLBuffer,
+        druseAFEntryBuffer: MTLBuffer,
+        druseAFIntermediateBuffer: MTLBuffer,
+        druseAFEncodePipeline: MTLComputePipelineState,
+        afv4ScoreWithGradPipeline: MTLComputePipelineState,
+        // Population buffer (output)
+        populationBuffer: MTLBuffer,
+        onStep: ((Int, Int) -> Void)? = nil
+    ) async -> Int {
+        guard let initPipe = diffInitNoisePipeline,
+              let denoisePipe = diffDenoisingStepPipeline
+        else {
+            ActivityLog.shared.error("[DiffusionDocking-v4] Init/denoise pipelines not available", category: .dock)
+            return 0
+        }
+
+        let T = config.numDenoisingSteps
+        let N = numPoses
+        let L = numLigandAtoms
+
+        let schedule: DiffusionSchedule
+        switch config.noiseSchedule {
+        case .cosine:    schedule = .cosine(steps: T)
+        case .linear:    schedule = .linear(steps: T)
+        case .quadratic: schedule = .quadratic(steps: T)
+        }
+
+        let gradBufSize = N * L * MemoryLayout<AttentionGradient>.stride
+        if attnGradientBuffer == nil || attnGradientBuffer!.length < gradBufSize {
+            attnGradientBuffer = device.makeBuffer(length: gradBufSize, options: .storageModeShared)
+        }
+        guard let gradBuf = attnGradientBuffer else { return 0 }
+
+        var diffParams = DiffusionParams(
+            numPoses: UInt32(N),
+            currentStep: UInt32(T),
+            totalSteps: UInt32(T),
+            noiseScale: schedule.sigmas.last ?? 1.0,
+            guidanceScale: config.guidanceScale,
+            numLigandAtoms: UInt32(L),
+            numTorsions: UInt32(numTorsions),
+            translationNoise: 1.0,
+            rotationNoise: 0.3,
+            torsionNoise: Float.pi,
+            _pad0: 0, _pad1: 0
+        )
+        if diffParamsBuffer == nil {
+            diffParamsBuffer = device.makeBuffer(length: MemoryLayout<DiffusionParams>.stride, options: .storageModeShared)
+        }
+        guard let diffBuf = diffParamsBuffer else { return 0 }
+
+        let tgSize = MTLSize(width: min(N, 256), height: 1, depth: 1)
+        let tgCount = MTLSize(width: (N + 255) / 256, height: 1, depth: 1)
+        // v4 score: 1 threadgroup per pose, 64 threads (one per ligand atom).
+        let scoreTgSize = MTLSize(width: 64, height: 1, depth: 1)
+        let scoreTgCount = MTLSize(width: N, height: 1, depth: 1)
+
+        // Step 1: noise init.
+        diffParams.noiseScale = 1.0
+        diffParams.translationNoise = 1.0
+        diffParams.rotationNoise = 0.3
+        diffParams.torsionNoise = .pi
+        diffBuf.contents().copyMemory(from: &diffParams, byteCount: MemoryLayout<DiffusionParams>.stride)
+
+        dispatchSync(pipeline: initPipe, buffers: [
+            (populationBuffer, 0), (gridParamsBuffer, 1), (diffBuf, 2), (gaParamsBuffer, 3)
+        ], threadGroups: tgCount, threadGroupSize: tgSize)
+
+        ActivityLog.shared.info(
+            "[DiffusionDocking-v4] Initialized \(N) noise poses, running \(T) denoising steps with PGN guidance",
+            category: .dock
+        )
+
+        // Step 2: reverse diffusion loop with v4 attention gradients.
+        for t in stride(from: T - 1, through: 0, by: -1) {
+            diffParams.currentStep = UInt32(t)
+            let sigma_t = schedule.sigmas[t]
+            let sigma_prev = t > 0 ? schedule.sigmas[t - 1] : 0.0
+            diffParams.noiseScale = sigma_prev
+            diffParams.translationNoise = sigma_t
+            diffParams.rotationNoise = sigma_t * 0.3
+            diffParams.torsionNoise = sigma_t * .pi
+            diffBuf.contents().copyMemory(from: &diffParams, byteCount: MemoryLayout<DiffusionParams>.stride)
+
+            // 2a: transform ligand positions for this pose (shared encode kernel).
+            let encodeBuffers: [(MTLBuffer, Int)] = [
+                (populationBuffer, 0), (ligandAtomBuffer, 1), (gaParamsBuffer, 2),
+                (torsionEdgeBuffer, 3), (movingIndicesBuffer, 4),
+                (afv4EncodeCompatParamsBuffer, 5), (druseAFIntermediateBuffer, 6), (gridParamsBuffer, 7)
+            ]
+            dispatchSync(pipeline: druseAFEncodePipeline, buffers: encodeBuffers,
+                         threadGroups: tgCount, threadGroupSize: tgSize)
+
+            // 2b: v4 score + per-ligand-atom attention gradient.
+            let scoreGradBuffers: [(MTLBuffer, Int)] = [
+                (populationBuffer, 0), (afv4ProtPosBuffer, 1),
+                (afv4ProtPairProjBuffer, 2), (afv4LigPairProjBuffer, 3),
+                (afv4LigHiddenBuffer, 4),
+                (druseAFWeightBuffer, 5), (druseAFEntryBuffer, 6),
+                (afv4ParamsBuffer, 7),
+                (druseAFIntermediateBuffer, 8), (gridParamsBuffer, 9),
+                (gradBuf, 10)
+            ]
+            dispatchSync(pipeline: afv4ScoreWithGradPipeline, buffers: scoreGradBuffers,
+                         threadGroups: scoreTgCount, threadGroupSize: scoreTgSize)
+
+            // 2c: denoising step (uses gradients to nudge poses).
+            let denoiseBuffers: [(MTLBuffer, Int)] = [
+                (populationBuffer, 0), (gradBuf, 1), (diffBuf, 2),
+                (gaParamsBuffer, 3), (gridParamsBuffer, 4), (ligandAtomBuffer, 5)
+            ]
+            dispatchSync(pipeline: denoisePipe, buffers: denoiseBuffers,
+                         threadGroups: tgCount, threadGroupSize: tgSize)
+
+            let stepsCompleted = T - t
+            onStep?(stepsCompleted, T)
+
+            await Task.yield()
+        }
+
+        ActivityLog.shared.info("[DiffusionDocking-v4] Diffusion completed, \(N) poses generated", category: .dock)
         return N
     }
 

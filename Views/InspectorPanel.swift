@@ -39,6 +39,7 @@ private struct ChainColorPicker: View {
     var paletteColor: SIMD3<Float>
     @Binding var mode: WorkspaceState.ChainColorMode
     @Binding var customColor: SIMD3<Float>?
+    @Binding var scope: WorkspaceState.ChainColorScope
     var onChange: () -> Void
 
     @State private var showPopover = false
@@ -96,9 +97,23 @@ private struct ChainColorPicker: View {
                         .buttonStyle(.plain)
                     }
                 }
+
+                Divider()
+
+                Toggle(isOn: Binding(
+                    get: { scope == .carbonsOnly },
+                    set: { scope = $0 ? .carbonsOnly : .allAtoms; onChange() }
+                )) {
+                    Text("Carbons only")
+                        .font(.footnote)
+                }
+                .toggleStyle(.checkbox)
+                .controlSize(.mini)
+                .disabled(mode == .cpk)
+                .help("Apply color only to carbon atoms; heteroatoms keep CPK colors")
             }
             .padding(8)
-            .frame(width: 120)
+            .frame(width: 140)
         }
     }
 
@@ -163,6 +178,7 @@ private struct InlineColorPicker: View {
     @Binding var color: Color
     var label: String = ""
     var size: CGFloat = 16
+    var carbonsOnly: Binding<Bool>? = nil
     var onReset: (() -> Void)? = nil
 
     @State private var showPopover = false
@@ -197,6 +213,16 @@ private struct InlineColorPicker: View {
                         }
                         .buttonStyle(.plain)
                     }
+                }
+                if let carbonsOnly {
+                    Divider()
+                    Toggle(isOn: carbonsOnly) {
+                        Text("Carbons only")
+                            .font(.footnote)
+                    }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.mini)
+                    .help("Apply color only to carbon atoms; heteroatoms keep CPK colors")
                 }
                 if let onReset {
                     Divider()
@@ -721,17 +747,26 @@ struct InspectorPanel: View {
                     let atomCount = chainAtomCount(chain)
                     let palette = WorkspaceState.MoleculeColorScheme.chainPalette
                     let paletteColor = palette[chainIndex % palette.count]
+                    // Default mode mirrors AppViewModel.pushToRenderer: only the
+                    // .chainColored scheme implies palette colors at startup;
+                    // every other scheme renders chains as CPK by default.
+                    let defaultMode: WorkspaceState.ChainColorMode =
+                        viewModel.workspace.colorScheme == .chainColored ? .chainDefault : .cpk
                     HStack(spacing: 6) {
                         ChainColorPicker(
                             chainID: chain.id,
                             paletteColor: paletteColor,
                             mode: Binding(
-                                get: { viewModel.workspace.chainColorModes[chain.id] ?? .chainDefault },
+                                get: { viewModel.workspace.chainColorModes[chain.id] ?? defaultMode },
                                 set: { viewModel.workspace.chainColorModes[chain.id] = $0 }
                             ),
                             customColor: Binding(
                                 get: { viewModel.workspace.chainColorOverrides[chain.id] },
                                 set: { viewModel.workspace.chainColorOverrides[chain.id] = $0 }
+                            ),
+                            scope: Binding(
+                                get: { viewModel.workspace.chainColorScopes[chain.id] ?? .carbonsOnly },
+                                set: { viewModel.workspace.chainColorScopes[chain.id] = $0 }
                             ),
                             onChange: { viewModel.pushToRenderer() }
                         )
@@ -798,10 +833,17 @@ struct InspectorPanel: View {
                             InlineColorPicker(
                                 color: Binding(
                                     get: {
-                                        if let lc = viewModel.workspace.ligandCarbonColor {
-                                            return Color(red: Double(lc.x), green: Double(lc.y), blue: Double(lc.z))
-                                        }
-                                        return Color.orange
+                                        // Reflect the effective rendered color: user override
+                                        // takes precedence, otherwise the scheme's ligand-carbon
+                                        // color, otherwise the CPK carbon gray.
+                                        let effective = viewModel.workspace.ligandCarbonColor
+                                            ?? viewModel.workspace.colorScheme.ligandCarbon
+                                            ?? SIMD3<Float>(0.56, 0.56, 0.56)
+                                        return Color(
+                                            red: Double(effective.x),
+                                            green: Double(effective.y),
+                                            blue: Double(effective.z)
+                                        )
                                     },
                                     set: { newColor in
                                         if let comps = NSColor(newColor).usingColorSpace(.deviceRGB) {
@@ -815,6 +857,13 @@ struct InspectorPanel: View {
                                     }
                                 ),
                                 label: "Set ligand carbon color",
+                                carbonsOnly: Binding(
+                                    get: { viewModel.workspace.ligandColorCarbonsOnly },
+                                    set: {
+                                        viewModel.workspace.ligandColorCarbonsOnly = $0
+                                        viewModel.pushToRenderer()
+                                    }
+                                ),
                                 onReset: {
                                     viewModel.workspace.ligandCarbonColor = nil
                                     viewModel.pushToRenderer()

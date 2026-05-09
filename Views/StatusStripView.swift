@@ -327,12 +327,16 @@ struct StatusStripView: View {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
+                    .onChange(of: filterLevel) { _, _ in
+                        scrollToLatest(proxy)
+                    }
                     .onChange(of: showConsole) { _, visible in
-                        if visible, let last = filteredEntries.last {
-                            DispatchQueue.main.async {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
+                        if visible {
+                            scrollToLatest(proxy)
                         }
+                    }
+                    .onAppear {
+                        scrollToLatest(proxy)
                     }
                     .onKeyPress(.escape) {
                         selectedEntryIDs.removeAll()
@@ -348,6 +352,13 @@ struct StatusStripView: View {
     }
 
     // MARK: - Status Bar Button
+
+    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+        guard let last = filteredEntries.last else { return }
+        DispatchQueue.main.async {
+            proxy.scrollTo(last.id, anchor: .bottom)
+        }
+    }
 
     private func statusBarButton(icon: String, help: String, accessibilityID: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {

@@ -859,6 +859,9 @@ struct PharmacophoreEditorView: View {
 
     private func drawFeatureSpheres(ctx: GraphicsContext, tx: StructureTransform) {
         guard let coords = coords2D else { return }
+        // Track label stacks for features sharing the same atom set (e.g. an
+        // aromatic ring assigned both Aro and Hyd) so labels don't superpose.
+        var stackIndexByKey: [String: Int] = [:]
         for f in features where !f.isIgnored {
             var cx: CGFloat = 0, cy: CGFloat = 0, count = 0
             for idx in f.atomIndices where idx < coords.positions.count {
@@ -880,10 +883,15 @@ struct PharmacophoreEditorView: View {
                            style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
             }
 
+            let stackKey = f.atomIndices.sorted().map(String.init).joined(separator: ",")
+            let stackIdx = stackIndexByKey[stackKey, default: 0]
+            stackIndexByKey[stackKey] = stackIdx + 1
+            let labelOffset: CGFloat = 5 + CGFloat(stackIdx) * 12
+
             let label = Text("\(f.name) \(f.expression)")
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundColor(color)
-            ctx.draw(ctx.resolve(label), at: CGPoint(x: vp.x, y: vp.y - ringR - 5), anchor: .bottom)
+            ctx.draw(ctx.resolve(label), at: CGPoint(x: vp.x, y: vp.y - ringR - labelOffset), anchor: .bottom)
         }
     }
 
@@ -1087,6 +1095,17 @@ struct PharmacophoreEditorView: View {
                         name: name, expression: expressionLabel(type),
                         type: type, atomIndices: filteredIndices
                     ))
+
+                    // Aromatic rings also satisfy hydrophobic contacts — pair them.
+                    if f.type == .aromatic {
+                        let hydName = "F\(nextFeatureNumber())"
+                        features.append(PharmaFeature(
+                            name: hydName, expression: expressionLabel(.hydrophobic),
+                            type: .hydrophobic, atomIndices: filteredIndices
+                        ))
+                        overlays.append(FeatureOverlay(type: .hydrophobic, atomIndices: filteredIndices,
+                                                       centroid: CGPoint(x: cx, y: cy)))
+                    }
                 }
                 featureOverlays = overlays
             }

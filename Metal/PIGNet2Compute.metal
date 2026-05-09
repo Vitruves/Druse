@@ -107,12 +107,10 @@ using namespace metal;
 #define PW_RAD_L2_W          59   // [1, 128]
 #define PW_RAD_L2_B          60   // [1]
 
-// Setup buffer layout: protein embeddings + cached InteractionNet W2*x
-// Section 0: PROT_EMBED [P × 128]
-// Section 1: INTER_W2X_0 [P × 128]
-// Section 2: INTER_W2X_1 [P × 128]
-// Section 3: INTER_W2X_2 [P × 128]
-#define PIG_SETUP_SECTIONS 4u
+// Setup buffer layout: protein embeddings after 3x intra-GatedGAT.
+// InteractionNet projections are recomputed in the score kernel because protein
+// embeddings change after each interaction layer.
+#define PIG_SETUP_SECTIONS 1u
 
 // Per-pose intermediate: 64 ligand atoms × 3 floats = 192 floats
 #define PIG_POSE_LIG_POS_FLOATS (PIG_MAX_LIG * 3u)
@@ -139,6 +137,9 @@ inline device const float* pigGetWeight(
 // Helper: Linear layer (thread → thread)
 // ============================================================================
 
+// Inlined: this is the hot inner loop for the InteractionNet phase. With D=128
+// constexpr at the call site the compiler unrolls and vectorises the matmul;
+// without inlining each call becomes a real function call with no FMA fusion.
 inline void pigLinear(
     thread float *out,
     thread const float *in_ptr,
@@ -155,7 +156,7 @@ inline void pigLinear(
     }
 }
 
-// Linear without bias
+// Linear without bias - inlined for the same hot-loop reason as `pigLinear`.
 inline void pigLinearNoBias(
     thread float *out,
     thread const float *in_ptr,
@@ -171,7 +172,7 @@ inline void pigLinearNoBias(
     }
 }
 
-// Linear from device memory input
+// Linear from device memory input - inlined (hot-loop helper).
 inline void pigLinearFromDevice(
     thread float *out,
     device const float *in_ptr,
@@ -237,6 +238,16 @@ inline void pigGatedGATAtom(
     float Wx_self[PIG_DIM];
     pigLinear(Wx_self, x_self, W1_w, W1_b, D, D);
 
+    // W2 * Wx_i is reused for every neighbor in the symmetrized attention term.
+    float W2_Wxi[PIG_DIM];
+    for (uint d = 0; d < D; d++) {
+        float sum = 0.0f;
+        for (uint k = 0; k < D; k++) {
+            sum += W2[d * D + k] * Wx_self[k];
+        }
+        W2_Wxi[d] = sum;
+    }
+
     // Collect neighbors: iterate edges where src or dst == atomIdx
     // Due to self-loops + bidirectional edges, we scan all edges that touch atomIdx.
     // For efficiency, only process edges where dst == atomIdx (target convention from PyG).
@@ -288,14 +299,6 @@ inline void pigGatedGATAtom(
             e_ij += Wx_self[d] * W2_Wxj[d];
         }
         // Symmetrize: + dot(Wx_j, W2*Wx_i)
-        float W2_Wxi[PIG_DIM];
-        for (uint d = 0; d < D; d++) {
-            float sum = 0.0f;
-            for (uint k = 0; k < D; k++) {
-                sum += W2[d * D + k] * Wx_self[k];
-            }
-            W2_Wxi[d] = sum;
-        }
         float e_ji = 0.0f;
         for (uint d = 0; d < D; d++) {
             e_ji += Wx_neighbors[n][d] * W2_Wxi[d];
@@ -358,6 +361,9 @@ inline void pigGatedGATAtom(
 // bias_ih is [384]: same layout
 // bias_hh is [384]: same layout
 
+// Inlined: called per-atom-per-InteractionNet-layer in the score kernel - keeping
+// it out-of-line was costing seconds per pose due to function-call overhead and
+// loss of constexpr unrolling on the 128-dim matvecs inside.
 inline void pigGRUCell(
     thread float *h_out,          // [128] new hidden state
     thread const float *input,    // [128]
@@ -470,10 +476,7 @@ inline void pigApplyTorsions(
 // embedding + 3 GatedGAT layers (with threadgroup barriers between layers).
 //
 // Output setup buffer layout (all in floats):
-//   [0                      .. P*128)           : protein embeddings after 3× GatedGAT
-//   [P*128                  .. 2*P*128)         : cached W2*x for InteractionNet layer 0
-//   [2*P*128                .. 3*P*128)         : cached W2*x for InteractionNet layer 1
-//   [3*P*128                .. 4*P*128)         : cached W2*x for InteractionNet layer 2
+//   [0 .. P*128) : protein embeddings after 3x GatedGAT
 
 kernel void pignet2Setup(
     constant float                 *protFeatures   [[buffer(0)]],   // [P, 47]
@@ -555,26 +558,6 @@ kernel void pignet2Setup(
     }
 
     threadgroup_barrier(mem_flags::mem_device);
-
-    // Now setupBuffer[0 .. P*128) has the final protein embeddings after 3× GatedGAT.
-    // Cache W2*x for each InteractionNet layer (used in score kernel).
-    for (uint layer = 0; layer < PIG_N_GNN; layer++) {
-        uint w2_idx = PW_INT0_W2_W + layer * 8;  // stride of 8 per InteractionNet layer
-        uint b2_idx = PW_INT0_W2_B + layer * 8;
-        device const float *W2_w = pigGetWeight(weights, weightEntries, w2_idx);
-        device const float *W2_b = pigGetWeight(weights, weightEntries, b2_idx);
-
-        float w2x[PIG_DIM];
-        float x_final[PIG_DIM];
-        device const float *myEmb = setupBuffer + tid * D;
-        for (uint d = 0; d < D; d++) x_final[d] = myEmb[d];
-
-        pigLinear(w2x, x_final, W2_w, W2_b, D, D);
-
-        // Store in section (1 + layer): offset = (1 + layer) * P * D
-        device float *w2xSlot = setupBuffer + (1 + layer) * P * D + tid * D;
-        for (uint d = 0; d < D; d++) w2xSlot[d] = w2x[d];
-    }
 }
 
 
@@ -650,6 +633,12 @@ kernel void pignet2Score(
     constant PIGNet2AtomAux        *ligAux          [[buffer(9)]],   // [L] ligand atom aux
     constant PIGNet2Edge           *ligEdges        [[buffer(10)]],  // ligand intra edges
     constant GAParams              &gaParams        [[buffer(11)]],
+    // Per-pose scratch for InteractionNet protein embeddings.
+    // Layout: [popSize, 2, numProteinAtoms, PIG_DIM] — section 0 = current (h), section 1 = next (new).
+    // Each pose's slice is 2 * numProteinAtoms * PIG_DIM floats. Moved off-stack so the
+    // Metal compiler doesn't choke on a 262 KB per-thread frame
+    // (XPC_ERROR_CONNECTION_INTERRUPTED).
+    device float                   *protScratch     [[buffer(12)]],
     uint                            tid             [[thread_position_in_grid]])
 {
     if (tid >= gaParams.populationSize) return;
@@ -702,6 +691,13 @@ kernel void pignet2Score(
             float Wx_self[PIG_DIM];
             pigLinear(Wx_self, lig_h[a], W1_w, W1_b, D, D);
 
+            float W2_Wxi[PIG_DIM];
+            for (uint d = 0; d < D; d++) {
+                float sum = 0.0f;
+                for (uint k = 0; k < D; k++) sum += W2_ptr[d * D + k] * Wx_self[k];
+                W2_Wxi[d] = sum;
+            }
+
             // Collect neighbors (self-loop + edges where dst == a)
             float attn_scores[32];
             float Wx_nbrs[32][PIG_DIM];
@@ -727,12 +723,11 @@ kernel void pignet2Score(
             for (uint n = 0; n < n_nbrs; n++) {
                 float e_ij = 0.0f;
                 for (uint d = 0; d < D; d++) {
-                    float w2_wxj = 0.0f, w2_wxi = 0.0f;
+                    float w2_wxj = 0.0f;
                     for (uint k = 0; k < D; k++) {
                         w2_wxj += W2_ptr[d * D + k] * Wx_nbrs[n][k];
-                        w2_wxi += W2_ptr[d * D + k] * Wx_self[k];
                     }
-                    e_ij += Wx_self[d] * w2_wxj + Wx_nbrs[n][d] * w2_wxi;
+                    e_ij += Wx_self[d] * w2_wxj + Wx_nbrs[n][d] * W2_Wxi[d];
                 }
                 attn_scores[n] = e_ij;
             }
@@ -785,13 +780,29 @@ kernel void pignet2Score(
     uint inter_lig[4096];
     uint inter_prot[4096];
     uint numInterEdges = 0;
+    float proteinClashPenalty = 0.0f;
 
     for (uint la = 0; la < L; la++) {
         float3 lpos = float3(myLigPos[la * 3], myLigPos[la * 3 + 1], myLigPos[la * 3 + 2]);
         for (uint pa = 0; pa < P; pa++) {
             float3 ppos = float3(protPositions[pa * 3], protPositions[pa * 3 + 1], protPositions[pa * 3 + 2]);
-            float dist = length(lpos - ppos);
-            if (dist >= PIG_INTERACT_MIN && dist <= PIG_INTER_CUTOFF && numInterEdges < 4096) {
+            float3 delta = lpos - ppos;
+            float dist2 = dot(delta, delta);
+
+            // Match PoseValidator's severe protein-clash threshold. The learned
+            // Morse term alone is too soft for GA search and sub-0.5 Å contacts
+            // are excluded from PIGNet2's interaction edge list, so add a hard
+            // positive bump before the normal interaction cutoff filter.
+            float dist = 0.0f;
+            if (dist2 < (2.0f * 2.0f)) {
+                dist = sqrt(max(dist2, 1e-8f));
+                float overlap = 2.0f - dist;
+                proteinClashPenalty += 50.0f * overlap * overlap;
+            }
+
+            if (dist2 >= (PIG_INTERACT_MIN * PIG_INTERACT_MIN) &&
+                dist2 <= (PIG_INTER_CUTOFF * PIG_INTER_CUTOFF) &&
+                numInterEdges < 4096) {
                 inter_lig[numInterEdges] = la;
                 inter_prot[numInterEdges] = pa;
                 numInterEdges++;
@@ -812,15 +823,17 @@ kernel void pignet2Score(
     // For ligand atoms: messages come FROM protein atoms via inter-edges.
     // Protein embeddings are loaded from setupBuffer; ligand from lig_h.
 
-    // Working copies of protein embeddings (only for atoms that have inter-edge neighbors)
-    // We only need the subset of protein atoms that have inter-edges.
-    // For simplicity, we store the full P embeddings.
-    float prot_h[PIG_MAX_PROT][PIG_DIM];
+    // Working copies of protein embeddings live in device memory (per-pose).
+    // Moving these off-stack is what lets the kernel JIT-compile reliably.
+    // Two sections per pose used as a ping-pong (no copy at end of each layer).
+    uint protSlice = max(P, 1u) * D;
+    device float *prot_curr = protScratch + tid * (2u * protSlice);
+    device float *prot_next = prot_curr + protSlice;
     {
         device const float *protEmb = setupBuffer;
         for (uint pa = 0; pa < P; pa++) {
             for (uint d = 0; d < D; d++) {
-                prot_h[pa][d] = protEmb[pa * D + d];
+                prot_curr[pa * D + d] = protEmb[pa * D + d];
             }
         }
     }
@@ -836,6 +849,24 @@ kernel void pignet2Score(
         device const float *rnn_bih = pigGetWeight(weights, weightEntries, base + 6);
         device const float *rnn_bhh = pigGetWeight(weights, weightEntries, base + 7);
 
+        // Cache W2*x_lig once per ligand atom for this layer. Protein aggregation
+        // reuses these vectors for every inter-edge instead of recomputing a 128x128
+        // matvec for each ligand-protein pair.
+        for (uint la = 0; la < L; la++) {
+            pigLinear(lig_scratch[la], lig_h[la], W2_w, W2_b, D, D);
+        }
+
+        // Cache W2*x_prot for the current protein embeddings. This must be
+        // recomputed each InteractionNet layer because protein nodes are updated
+        // by the previous layer in the reference PIGNet2 implementation.
+        for (uint pa = 0; pa < P; pa++) {
+            float ph_tl[PIG_DIM];
+            for (uint d = 0; d < D; d++) ph_tl[d] = prot_curr[pa * D + d];
+            float w2x[PIG_DIM];
+            pigLinear(w2x, ph_tl, W2_w, W2_b, D, D);
+            for (uint d = 0; d < D; d++) prot_next[pa * D + d] = w2x[d];
+        }
+
         // For ligand atoms: aggregate messages from protein neighbors (MAX)
         float lig_new[PIG_MAX_LIG][PIG_DIM];
         for (uint la = 0; la < L; la++) {
@@ -850,9 +881,8 @@ kernel void pignet2Score(
 
             for (uint e = 0; e < numInterEdges; e++) {
                 if (inter_lig[e] == la) {
-                    // Message from protein atom inter_prot[e]
-                    // Use cached W2*x from setupBuffer if available, else compute
-                    device const float *w2x_cached = setupBuffer + (1 + layer) * P * D + inter_prot[e] * D;
+                    // Message from the current protein embedding: cached W2*x_prot.
+                    device const float *w2x_cached = prot_next + inter_prot[e] * D;
                     for (uint d = 0; d < D; d++) {
                         max_msg[d] = max(max_msg[d], w2x_cached[d]);
                     }
@@ -874,11 +904,15 @@ kernel void pignet2Score(
             pigGRUCell(lig_new[la], x_prime, lig_h[la], rnn_wih, rnn_whh, rnn_bih, rnn_bhh);
         }
 
-        // For protein atoms: aggregate messages from ligand neighbors (MAX)
-        float prot_new[PIG_MAX_PROT][PIG_DIM];
+        // Protein atoms with no ligand neighbors still follow the reference
+        // InteractionNet update with a zero aggregate.
         for (uint pa = 0; pa < P; pa++) {
+            // Snapshot current hidden state into thread memory.
+            float ph_tl[PIG_DIM];
+            for (uint d = 0; d < D; d++) ph_tl[d] = prot_curr[pa * D + d];
+
             float w1x[PIG_DIM];
-            pigLinear(w1x, prot_h[pa], W1_w, W1_b, D, D);
+            pigLinear(w1x, ph_tl, W1_w, W1_b, D, D);
 
             float max_msg[PIG_DIM];
             bool has_nbr = false;
@@ -886,38 +920,40 @@ kernel void pignet2Score(
 
             for (uint e = 0; e < numInterEdges; e++) {
                 if (inter_prot[e] == pa) {
-                    // Message from ligand atom: compute W2 * lig_h[src]
+                    // Message from ligand atom: cached W2 * lig_h[src].
                     uint src = inter_lig[e];
-                    float w2x[PIG_DIM];
-                    pigLinear(w2x, lig_h[src], W2_w, W2_b, D, D);
                     for (uint d = 0; d < D; d++) {
-                        max_msg[d] = max(max_msg[d], w2x[d]);
+                        max_msg[d] = max(max_msg[d], lig_scratch[src][d]);
                     }
                     has_nbr = true;
                 }
             }
 
             if (!has_nbr) {
-                // No inter-edge neighbors: keep original embedding
-                for (uint d = 0; d < D; d++) prot_new[pa][d] = prot_h[pa][d];
-                continue;
+                for (uint d = 0; d < D; d++) max_msg[d] = 0.0f;
             }
 
             float x_prime[PIG_DIM];
             for (uint d = 0; d < D; d++) {
                 x_prime[d] = max(w1x[d] + max_msg[d], 0.0f);
             }
-            pigGRUCell(prot_new[pa], x_prime, prot_h[pa], rnn_wih, rnn_whh, rnn_bih, rnn_bhh);
+            float pn_tl[PIG_DIM];
+            pigGRUCell(pn_tl, x_prime, ph_tl, rnn_wih, rnn_whh, rnn_bih, rnn_bhh);
+            for (uint d = 0; d < D; d++) prot_next[pa * D + d] = pn_tl[d];
         }
 
-        // Update embeddings
+        // Update embeddings - ping-pong the protein pointers instead of copying.
         for (uint la = 0; la < L; la++) {
             for (uint d = 0; d < D; d++) lig_h[la][d] = lig_new[la][d];
         }
-        for (uint pa = 0; pa < P; pa++) {
-            for (uint d = 0; d < D; d++) prot_h[pa][d] = prot_new[pa][d];
-        }
+        device float *tmp = prot_curr;
+        prot_curr = prot_next;
+        prot_next = tmp;
     }
+
+    // After the layer loop, prot_curr holds the final protein embeddings.
+    // Alias `prot_h` for the rest of the kernel to keep the existing Phase D code path.
+    device float *prot_h = prot_curr;
 
     // -------------------------------------------------------------------
     // Phase D: Pairwise physics energy computation
@@ -954,7 +990,8 @@ kernel void pignet2Score(
     float E_metal = 0.0f;
     float E_hydrophobic = 0.0f;
 
-    // Iterate all ligand→protein pairs within interaction range
+    // PIGNet2 uses two distance ranges: 0.5-5 Å for InteractionNet graph edges,
+    // but 0.5-999 Å for the final physics energy head.
     for (uint la = 0; la < L; la++) {
         float3 lpos = float3(myLigPos[la * 3], myLigPos[la * 3 + 1], myLigPos[la * 3 + 2]);
         uint lig_flags = ligAux[la].flags;
@@ -966,9 +1003,9 @@ kernel void pignet2Score(
 
         for (uint pa = 0; pa < P; pa++) {
             float3 ppos = float3(protPositions[pa * 3], protPositions[pa * 3 + 1], protPositions[pa * 3 + 2]);
-            float dist = length(lpos - ppos);
-
-            if (dist < PIG_INTERACT_MIN || dist > 999.0f) continue;
+            float dist2 = dot(lpos - ppos, lpos - ppos);
+            if (dist2 < (PIG_INTERACT_MIN * PIG_INTERACT_MIN)) continue;
+            float dist = sqrt(dist2);
 
             uint prot_flags = protAux[pa].flags;
             float prot_vdw = protAux[pa].vdwRadius;
@@ -977,13 +1014,10 @@ kernel void pignet2Score(
             bool prot_hba = (prot_flags & PIG_FLAG_H_ACCEPTOR) != 0;
             bool prot_hydro = (prot_flags & PIG_FLAG_HYDROPHOBIC) != 0;
 
-            // Concatenate embeddings: [lig_h[la], prot_h[pa]] → 256 dim
             float concat[PIG_DIM * 2];
             for (uint d = 0; d < D; d++) concat[d] = lig_h[la][d];
-            for (uint d = 0; d < D; d++) concat[D + d] = prot_h[pa][d];
+            for (uint d = 0; d < D; d++) concat[D + d] = prot_h[pa * D + d];
 
-            // nn_dvdw: Linear(256→128) → ReLU → Linear(128→1) → Tanh → × dev_coeff
-            // Note: in Morse variant, dev_vdw_radii_coeff=0.0 so dvdw is effectively 0.
             float dvdw_h[PIG_DIM];
             pigLinear(dvdw_h, concat, dvdw_l0_w, dvdw_l0_b, D, D * 2);
             for (uint d = 0; d < D; d++) dvdw_h[d] = max(dvdw_h[d], 0.0f);
@@ -991,10 +1025,8 @@ kernel void pignet2Score(
             for (uint d = 0; d < D; d++) dvdw += dvdw_l2_w[d] * dvdw_h[d];
             dvdw = tanh(dvdw) * PIG_DEV_VDW_COEFF;
 
-            // Adjusted vdW radius
             float R = lig_vdw + prot_vdw + dvdw;
 
-            // nn_vdw_epsilon: Linear(256→128) → ReLU → Linear(128→1) → Sigmoid → scale
             float eps_h[PIG_DIM];
             pigLinear(eps_h, concat, eps_l0_w, eps_l0_b, D, D * 2);
             for (uint d = 0; d < D; d++) eps_h[d] = max(eps_h[d], 0.0f);
@@ -1002,7 +1034,6 @@ kernel void pignet2Score(
             for (uint d = 0; d < D; d++) eps_raw += eps_l2_w[d] * eps_h[d];
             float epsilon = (1.0f / (1.0f + exp(-eps_raw))) * (PIG_VDW_EPS_HI - PIG_VDW_EPS_LO) + PIG_VDW_EPS_LO;
 
-            // nn_vdw_width (Morse): Linear(256→128) → ReLU → Linear(128→1) → Sigmoid → scale [1.0, 2.0]
             float width_h[PIG_DIM];
             pigLinear(width_h, concat, width_l0_w, width_l0_b, D, D * 2);
             for (uint d = 0; d < D; d++) width_h[d] = max(width_h[d], 0.0f);
@@ -1010,12 +1041,10 @@ kernel void pignet2Score(
             for (uint d = 0; d < D; d++) width_raw += width_l2_w[d] * width_h[d];
             float morseWidth = (1.0f / (1.0f + exp(-width_raw))) * (PIG_VDW_WIDTH_HI - PIG_VDW_WIDTH_LO) + PIG_VDW_WIDTH_LO;
 
-            // --- vdW energy via Morse potential (mask: both non-metal) ---
             if (!lig_metal && !prot_metal) {
                 E_vdw += pigMorsePotential(dist, R, epsilon, morseWidth);
             }
 
-            // --- H-bond energy (mask: donor&~metal ↔ acceptor&~metal, bidirectional) ---
             bool hbond_mask = false;
             if ((lig_hbd && !lig_metal) && (prot_hba && !prot_metal)) hbond_mask = true;
             if ((prot_hbd && !prot_metal) && (lig_hba && !lig_metal)) hbond_mask = true;
@@ -1023,7 +1052,6 @@ kernel void pignet2Score(
                 E_hbond += pigLinearPotential(dist, R, -hbond_coeff2, PIG_HBOND_C1, PIG_HBOND_C2);
             }
 
-            // --- Metal-ligand energy (mask: metal ↔ acceptor&~metal, bidirectional) ---
             bool metal_mask = false;
             if (lig_metal && (prot_hba && !prot_metal)) metal_mask = true;
             if (prot_metal && (lig_hba && !lig_metal)) metal_mask = true;
@@ -1031,7 +1059,6 @@ kernel void pignet2Score(
                 E_metal += pigLinearPotential(dist, R, -metal_coeff2, PIG_METAL_C1, PIG_METAL_C2);
             }
 
-            // --- Hydrophobic energy (mask: both hydrophobic) ---
             if (lig_hydro && prot_hydro) {
                 E_hydrophobic += pigLinearPotential(dist, R, -hydro_coeff2, PIG_HYDRO_C1, PIG_HYDRO_C2);
             }
@@ -1050,12 +1077,14 @@ kernel void pignet2Score(
 
     float total = E_vdw + E_hbond + E_metal + E_hydrophobic;
     float oopPenalty = poses[tid].clashPenalty;
+    float clashPenalty = oopPenalty + proteinClashPenalty;
 
     // Store in pose (energy for GA minimization; decomposition in diagnostic fields)
-    poses[tid].energy = total + oopPenalty;
+    poses[tid].energy = total + clashPenalty;
     poses[tid].stericEnergy = E_vdw;
     poses[tid].hydrophobicEnergy = E_hydrophobic;
     poses[tid].hbondEnergy = E_hbond + E_metal;
     poses[tid].torsionPenalty = penalty;
     poses[tid].drusinaCorrection = E_metal;
+    poses[tid].clashPenalty = clashPenalty;
 }

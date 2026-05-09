@@ -312,6 +312,15 @@ extension DockingEngine {
                 tg: tgCount,
                 tgs: tgSize
             )
+        } else if scoringMethod == .pignet2 {
+            let tgSize = MTLSize(width: 1, height: 1, depth: 1)
+            let tgCount = MTLSize(width: representativePoses.count, height: 1, depth: 1)
+            scorePIGNet2(
+                buffer: repBuffer,
+                gaParamsBuffer: rerankGABuffer,
+                tg: tgCount,
+                tgs: tgSize
+            )
         } else {
             scorePopulationExplicit(
                 buffer: repBuffer,
@@ -389,6 +398,18 @@ extension DockingEngine {
         isRunning = true
         currentGeneration = 0
         bestEnergy = .infinity
+
+        // Diffusion-guided search needs an attention-producing learned scorer; Vina/Drusina
+        // grids don't expose per-atom gradients. Promote scoring to DruseAF so the user
+        // doesn't have to remember to flip both knobs.
+        var scoringMethod = scoringMethod
+        if config.searchMethod == .diffusionGuided && scoringMethod != .druseAffinity {
+            ActivityLog.shared.info(
+                "[Engine] Diffusion search requires DruseAF scoring — promoting from \(scoringMethod.rawValue) to Druse Affinity",
+                category: .dock
+            )
+            scoringMethod = .druseAffinity
+        }
 
         let preparedLigand = prepareLigandGeometry(ligand)
         let heavyAtoms = preparedLigand.heavyAtoms
@@ -555,19 +576,35 @@ extension DockingEngine {
                 popSize: config.populationSize)
         }
 
-        // Prepare PIGNet2 physics-informed GNN scoring buffers
-        let usePIGNet2 = scoringMethod == .pignet2
+        // Prepare PIGNet2 physics-informed GNN scoring buffers.
+        // PIGNet2 is a pose scorer, not a geometry-stable docking potential, so
+        // docking search stays Vina-guided and PIGNet2 is applied as a reranker.
+        let usePIGNet2Rescore = scoringMethod == .pignet2
             && pignet2SetupPipeline != nil && pignet2EncodePipeline != nil
             && pignet2ScorePipeline != nil && pignet2Weights != nil
-        if usePIGNet2 {
+        if usePIGNet2Rescore {
             preparePIGNet2Buffers(
                 ligandAtoms: heavyAtoms,
                 ligandBonds: heavyBonds,
                 gpuLigAtoms: gpuLigAtoms,
                 pocket: pocket,
                 popSize: config.populationSize)
+        } else if scoringMethod == .pignet2 {
+            // User picked PIGNet2 but the kernel failed to JIT-compile (typically
+            // XPC_ERROR_CONNECTION_INTERRUPTED on the score kernel). Make this
+            // visible; silently falling back to Vina is misleading.
+            var missing: [String] = []
+            if pignet2SetupPipeline == nil  { missing.append("setup") }
+            if pignet2EncodePipeline == nil { missing.append("encode") }
+            if pignet2ScorePipeline == nil  { missing.append("score") }
+            if pignet2Weights == nil        { missing.append("weights") }
+            let detail = missing.isEmpty ? "unknown reason" : "missing \(missing.joined(separator: ", "))"
+            ActivityLog.shared.error(
+                "PIGNet2 unavailable (\(detail)) - docking with Vina instead. Check Xcode console for MTLCompiler XPC errors and try /Library/Caches/com.apple.metal cleanup.",
+                category: .dock
+            )
         }
-        ActivityLog.shared.info("[Engine] Scoring method: \(scoringMethod.rawValue), Drusina: \(useDrusina), DruseAF: \(useDruseAF), PIGNet2: \(usePIGNet2)", category: .dock)
+        ActivityLog.shared.info("[Engine] Scoring method: \(scoringMethod.rawValue), Drusina: \(useDrusina), DruseAF: \(useDruseAF), PIGNet2 rerank: \(usePIGNet2Rescore)", category: .dock)
 
         let popSize = config.populationSize
         let poseSize = popSize * MemoryLayout<DockPose>.stride
@@ -674,7 +711,8 @@ extension DockingEngine {
                     ligandAtoms: heavyAtoms,
                     ligandPositions: best.transformedAtomPositions,
                     proteinAtoms: proteinAtoms,
-                    ligandBonds: heavyBonds
+                    ligandBonds: heavyBonds,
+                    scoringMethod: scoringMethod
                 )
                 onPoseUpdate?(best, interactions)
             }
@@ -698,7 +736,7 @@ extension DockingEngine {
         }
         let affinityBuf = vinaAffinityGridBuffer
         let typeIdxBuf = vinaTypeIndexBuffer
-        if !useDruseAF && !usePIGNet2 && (affinityBuf == nil || typeIdxBuf == nil) {
+        if !useDruseAF && (affinityBuf == nil || typeIdxBuf == nil) {
             ActivityLog.shared.error("[Engine] Vina affinity grids nil — cannot score (affinity=\(affinityBuf != nil) typeIdx=\(typeIdxBuf != nil))", category: .dock)
             isRunning = false
             return []
@@ -887,7 +925,8 @@ extension DockingEngine {
                             ligandAtoms: heavyAtoms,
                             ligandPositions: best.transformedAtomPositions,
                             proteinAtoms: proteinAtoms,
-                            ligandBonds: heavyBonds
+                            ligandBonds: heavyBonds,
+                            scoringMethod: scoringMethod
                         )
                         onPoseUpdate?(best, interactions)
                     }
@@ -913,6 +952,256 @@ extension DockingEngine {
 
             ActivityLog.shared.info("[Engine] REMC completed: \(aggregatedResults.count) poses extracted from \(K) replicas", category: .dock)
 
+        } else if resolvedSearchMethod == .fragmentBased {
+        // =====================================================================
+        // MARK: Fragment-Based Incremental Construction
+        // =====================================================================
+        guard let fragEng = fragmentEngine,
+              let snap = gridSnapshot(),
+              let smiles = ligand.smiles, !smiles.isEmpty else {
+            let reason: String
+            if fragmentEngine == nil { reason = "fragment engine pipelines unavailable" }
+            else if gridSnapshot() == nil { reason = "grid snapshot unavailable (run grid computation first)" }
+            else { reason = "ligand SMILES not available — fragment decomposition requires SMILES" }
+            ActivityLog.shared.error("[Engine] Fragment-based docking unavailable: \(reason)", category: .dock)
+            isRunning = false
+            return []
+        }
+
+        let fragmentPoses = await fragEng.runFragmentDocking(
+            ligandSmiles: smiles,
+            gpuLigAtoms: gpuLigAtoms,
+            gridSnapshot: snap,
+            config: config.fragment
+        )
+
+        if fragmentPoses.isEmpty {
+            ActivityLog.shared.error("[Engine] Fragment-based docking produced no valid poses", category: .dock)
+            isRunning = false
+            return []
+        }
+
+        // Copy fragment-reconstructed poses into the population buffer (truncate or pad).
+        let fragCount = min(fragmentPoses.count, popSize)
+        let popPtr = popBuf.contents().bindMemory(to: DockPose.self, capacity: popSize)
+        for i in 0..<fragCount { popPtr[i] = fragmentPoses[i] }
+        for i in fragCount..<popSize { popPtr[i] = fragmentPoses[0] }
+
+        ActivityLog.shared.info(
+            "[Engine] Fragment search produced \(fragmentPoses.count) poses; refining \(fragCount) with Vina local search",
+            category: .dock
+        )
+
+        // Local-search refinement + final scoring (matches the post-search refinement of REMC/GA).
+        gaParams.localSearchSteps = UInt32(max(config.localSearchSteps, 20))
+        gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
+        if !useDruseAF {
+            localOptimize(buffer: popBuf, tg: tgCount, tgs: tgSize)
+        }
+        if useDruseAF {
+            scoreDruseAF(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
+        } else if useDrusina {
+            scoreDrusina(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
+        } else {
+            scorePopulation(buffer: popBuf, tg: tgCount, tgs: tgSize)
+        }
+        copyPoseBuffer(from: popBuf, to: bestBuf, poseCount: popSize)
+
+        if usePIGNet2Rescore {
+            let pigTgSize = MTLSize(width: 1, height: 1, depth: 1)
+            let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+            scorePIGNet2(buffer: bestBuf, gaParamsBuffer: gaBuf, tg: pigTgCount, tgs: pigTgSize)
+        } else {
+            decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+        }
+
+        aggregatedResults = extractAllResults(
+            from: bestBuf,
+            ligandAtoms: heavyAtoms,
+            centroid: centroid,
+            scoringMethod: scoringMethod
+        )
+        ActivityLog.shared.info("[Engine] Fragment-based docking complete: \(aggregatedResults.count) poses extracted", category: .dock)
+
+        } else if resolvedSearchMethod == .diffusionGuided {
+        // =====================================================================
+        // MARK: Diffusion-Guided (DruseAF attention-guided reverse diffusion)
+        // =====================================================================
+        guard useDruseAF else {
+            ActivityLog.shared.error(
+                "[Engine] Diffusion-guided docking requires DruseAF scoring. Set scoring method to 'Druse Affinity' and ensure DruseAF weights are loaded.",
+                category: .dock
+            )
+            isRunning = false
+            return []
+        }
+        ActivityLog.shared.info(
+            "[Engine] Diffusion: \(popSize) poses, \(config.diffusion.numDenoisingSteps) denoising steps, schedule=\(config.diffusion.noiseSchedule.rawValue), backend=\(useAFv4 ? "v4 PGN" : "v3 cross-attn")",
+            category: .dock
+        )
+
+        // Per-step progress: copy live poses into bestBuf and emit live update so the UI animates.
+        let onDiffStep: (Int, Int) -> Void = { [weak self] step, _ in
+            guard let self = self else { return }
+            self.copyPoseBuffer(from: popBuf, to: bestBuf, poseCount: popSize)
+            self.currentGeneration = step
+            emitLiveUpdate(generation: step)
+        }
+
+        if useAFv4 {
+            // v4 PGN attention-guided diffusion.
+            guard let diffEng = diffusionEngine, diffEng.isAvailableV4,
+                  let scoreGradPipe = afv4ScoreWithGradPipeline,
+                  let encodePipe = druseAFEncodePipeline,
+                  let v4Params = afv4ParamsBuffer,
+                  let compatParams = afv4EncodeCompatParamsBuffer,
+                  let dProtPos = druseAFProtPosBuffer,
+                  let protPP = afv4ProtPairProjBuffer,
+                  let ligPP = afv4LigPairProjBuffer,
+                  let ligHidden = afv4LigHiddenBuffer,
+                  let dWeights = druseAFWeights?.weightBuffer,
+                  let dEntries = druseAFWeights?.entryBuffer,
+                  let dInter = druseAFIntermediateBuffer else {
+                var missing: [String] = []
+                if diffusionEngine == nil || diffusionEngine?.isAvailableV4 == false { missing.append("diffusion init/denoise pipelines") }
+                if afv4ScoreWithGradPipeline == nil { missing.append("v4 score-with-gradient pipeline") }
+                if druseAFEncodePipeline == nil { missing.append("DruseAF encode pipeline") }
+                if afv4ParamsBuffer == nil { missing.append("v4 params buffer") }
+                if afv4EncodeCompatParamsBuffer == nil { missing.append("v4 encode-compat params") }
+                if afv4ProtPairProjBuffer == nil || afv4LigPairProjBuffer == nil { missing.append("v4 pair projections") }
+                if afv4LigHiddenBuffer == nil { missing.append("v4 lig hidden buffer") }
+                if druseAFProtPosBuffer == nil { missing.append("protein positions") }
+                if druseAFIntermediateBuffer == nil { missing.append("intermediate buffer") }
+                if druseAFWeights == nil { missing.append("DruseAF weights") }
+                ActivityLog.shared.error("[Engine] Diffusion (v4) unavailable: missing \(missing.joined(separator: ", "))", category: .dock)
+                isRunning = false
+                return []
+            }
+
+            _ = await diffEng.runDiffusionDockingV4(
+                numPoses: popSize,
+                numLigandAtoms: gpuLigAtoms.count,
+                numTorsions: numTorsions,
+                config: config.diffusion,
+                gaParamsBuffer: gaBuf,
+                gridParamsBuffer: gpBuf,
+                ligandAtomBuffer: ligBuf,
+                torsionEdgeBuffer: teBuf,
+                movingIndicesBuffer: miBuf,
+                afv4ParamsBuffer: v4Params,
+                afv4EncodeCompatParamsBuffer: compatParams,
+                afv4ProtPosBuffer: dProtPos,
+                afv4ProtPairProjBuffer: protPP,
+                afv4LigPairProjBuffer: ligPP,
+                afv4LigHiddenBuffer: ligHidden,
+                druseAFWeightBuffer: dWeights,
+                druseAFEntryBuffer: dEntries,
+                druseAFIntermediateBuffer: dInter,
+                druseAFEncodePipeline: encodePipe,
+                afv4ScoreWithGradPipeline: scoreGradPipe,
+                populationBuffer: popBuf,
+                onStep: onDiffStep
+            )
+        } else {
+            // v3 cross-attention path (kept for the case v3 weights are bundled).
+            guard let diffEng = diffusionEngine, diffEng.isAvailable,
+                  let encodePipe = druseAFEncodePipeline,
+                  let dParams = druseAFParamsBuffer,
+                  let dProtPos = druseAFProtPosBuffer,
+                  let dWeights = druseAFWeights?.weightBuffer,
+                  let dEntries = druseAFWeights?.entryBuffer,
+                  let dSetup = druseAFSetupBuffer,
+                  let dInter = druseAFIntermediateBuffer else {
+                var missing: [String] = []
+                if diffusionEngine == nil || diffusionEngine?.isAvailable == false { missing.append("diffusion v3 pipelines") }
+                if druseAFParamsBuffer == nil { missing.append("DruseAF v3 params buffer") }
+                if druseAFSetupBuffer == nil { missing.append("DruseAF v3 setup buffer") }
+                if druseAFEncodePipeline == nil { missing.append("DruseAF encode pipeline") }
+                if druseAFProtPosBuffer == nil { missing.append("protein positions") }
+                if druseAFIntermediateBuffer == nil { missing.append("intermediate buffer") }
+                if druseAFWeights == nil { missing.append("DruseAF weights") }
+                ActivityLog.shared.error("[Engine] Diffusion (v3) unavailable: missing \(missing.joined(separator: ", "))", category: .dock)
+                isRunning = false
+                return []
+            }
+
+            _ = await diffEng.runDiffusionDocking(
+                numPoses: popSize,
+                numLigandAtoms: gpuLigAtoms.count,
+                numTorsions: numTorsions,
+                config: config.diffusion,
+                gaParamsBuffer: gaBuf,
+                gridParamsBuffer: gpBuf,
+                ligandAtomBuffer: ligBuf,
+                torsionEdgeBuffer: teBuf,
+                movingIndicesBuffer: miBuf,
+                druseAFParamsBuffer: dParams,
+                druseAFProtPosBuffer: dProtPos,
+                druseAFWeightBuffer: dWeights,
+                druseAFEntryBuffer: dEntries,
+                druseAFSetupBuffer: dSetup,
+                druseAFIntermediateBuffer: dInter,
+                druseAFEncodePipeline: encodePipe,
+                populationBuffer: popBuf,
+                onStep: onDiffStep
+            )
+        }
+
+        // Post-diffusion refinement: short Vina analytical local search to clean up the
+        // poses (diffusion gives a coarse attractor; Vina gradients tighten contacts and
+        // resolve clashes). Then final DruseAF rescore.
+        let refSteps = max(config.diffusion.refinementSteps, 0)
+        if refSteps > 0, vinaAffinityGridBuffer != nil, vinaTypeIndexBuffer != nil {
+            var refGA = gaParams
+            refGA.localSearchSteps = UInt32(refSteps)
+            gaParamsBuffer?.contents().copyMemory(from: &refGA, byteCount: MemoryLayout<GAParams>.stride)
+            localOptimize(buffer: popBuf, tg: tgCount, tgs: tgSize)
+            ActivityLog.shared.info("[Engine] Diffusion refined with \(refSteps) Vina local-search steps", category: .dock)
+            gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
+        }
+
+        // Vina local search and the denoise kernel both write pose.translation freely;
+        // the diffusion clamp only runs inside the denoise loop. Re-clamp here, and reject
+        // poses that drifted far enough outside the box that re-clamping would distort
+        // their geometry into the wall.
+        do {
+            let popPtr = popBuf.contents().bindMemory(to: DockPose.self, capacity: popSize)
+            let center = gridParams.searchCenter
+            let halfExt = gridParams.searchHalfExtent
+            let cMin = center - halfExt
+            let cMax = center + halfExt
+            let maxDriftAng: Float = 1.5
+            var rejected = 0
+            for i in 0..<popSize {
+                let t = popPtr[i].translation
+                let outside = simd_max(simd_abs(t - center) - halfExt, .zero)
+                let driftMag = outside.x + outside.y + outside.z
+                if driftMag > maxDriftAng {
+                    popPtr[i].energy = .infinity
+                    rejected += 1
+                } else {
+                    popPtr[i].translation = simd_clamp(t, cMin, cMax)
+                }
+            }
+            if rejected > 0 {
+                ActivityLog.shared.info("[Engine] Diffusion: rejected \(rejected)/\(popSize) poses that drifted >\(String(format: "%.1f", maxDriftAng)) Å outside the search box", category: .dock)
+            }
+        }
+
+        // The denoising kernel zeroes pose.energy at the end of every step (intended for
+        // mid-loop "needs rescoring" marker). Score one more time so extraction sees real
+        // energies. scoreDruseAF dispatches v3 or v4 internally based on useAFv4.
+        scoreDruseAF(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
+        copyPoseBuffer(from: popBuf, to: bestBuf, poseCount: popSize)
+
+        aggregatedResults = extractAllResults(
+            from: bestBuf,
+            ligandAtoms: heavyAtoms,
+            centroid: centroid,
+            scoringMethod: scoringMethod
+        )
+        ActivityLog.shared.info("[Engine] Diffusion-guided docking complete: \(aggregatedResults.count) poses extracted", category: .dock)
+
         } else {
         // =====================================================================
         // MARK: Standard GA / ILS Search
@@ -928,13 +1217,11 @@ extension DockingEngine {
             dispatchCompute(pipeline: initPopPipeline, buffers: [
                 (popBuf, 0), (gpBuf, 1), (gaBuf, 2)
             ], threadGroups: tgCount, threadGroupSize: tgSize)
-            if !useDruseAF && !usePIGNet2 {
+            if !useDruseAF {
                 localOptimize(buffer: popBuf, tg: tgCount, tgs: tgSize)
             }
             if useDruseAF {
                 scoreDruseAF(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
-            } else if usePIGNet2 {
-                scorePIGNet2(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
             } else if useDrusina {
                 scoreDrusina(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
             } else {
@@ -1021,7 +1308,7 @@ extension DockingEngine {
                 var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
                     (pipeline: mcPerturbPipeline, buffers: perturbBuffers)
                 ]
-                let doLocalSearch = step % effectiveLSFreq == 0 && !useDruseAF && !usePIGNet2
+                let doLocalSearch = step % effectiveLSFreq == 0 && !useDruseAF
                 if doLocalSearch && !localSearchIsSIMD {
                     dispatches.append((pipeline: activeLocalSearchPipeline, buffers: vinaScoreBuffers))
                 }
@@ -1032,15 +1319,6 @@ extension DockingEngine {
                         (offBuf, 0), (ligBuf, 1), (ringBuf, 2),
                         (teBuf, 3), (miBuf, 4),
                         (afParamsBuf, 5), (afIntermed, 6), (gpBuf, 7)
-                    ]
-                    dispatches.append((pipeline: encodePipe, buffers: encodeBuffers))
-                } else if usePIGNet2, let encodePipe = pignet2EncodePipeline,
-                          let pigParamsBuf = pignet2ParamsBuffer,
-                          let pigIntermed = pignet2IntermediateBuffer {
-                    let encodeBuffers: [(MTLBuffer, Int)] = [
-                        (offBuf, 0), (ligBuf, 1), (ringBuf, 2),
-                        (teBuf, 3), (miBuf, 4),
-                        (pigParamsBuf, 5), (pigIntermed, 6), (gpBuf, 7)
                     ]
                     dispatches.append((pipeline: encodePipe, buffers: encodeBuffers))
                 } else if useDrusina, let drusinaPipe = drusinaScorePipeline,
@@ -1068,7 +1346,7 @@ extension DockingEngine {
                 } else {
                     dispatches.append((pipeline: scorePipeline, buffers: vinaScoreBuffers))
                 }
-                if !useDruseAF && !usePIGNet2, let fe = flexEngine, fe.isEnabled {
+                if !useDruseAF, let fe = flexEngine, fe.isEnabled {
                     lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
                     if doLocalSearch && localSearchIsSIMD {
                         let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
@@ -1115,30 +1393,6 @@ extension DockingEngine {
                                                        threadGroups: afTgCount, threadGroupSize: afTgSize)
                     lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
                                                        threadGroups: tgCount, threadGroupSize: tgSize)
-                } else if usePIGNet2, let scorePipe = pignet2ScorePipeline,
-                          let pig2Weights = pignet2Weights,
-                          let pigParamsBuf = pignet2ParamsBuffer,
-                          let pigProtPos = pignet2ProtPosBuffer,
-                          let pigSetup = pignet2SetupBuffer,
-                          let pigIntermed = pignet2IntermediateBuffer,
-                          let pigLigFeat = pignet2LigFeatBuffer,
-                          let pigProtAux = pignet2ProtAuxBuffer,
-                          let pigLigAux = pignet2LigAuxBuffer,
-                          let pigLigEdgeBuf = pignet2LigEdgeBuffer {
-                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
-                    let pigScoreBuffers: [(MTLBuffer, Int)] = [
-                        (offBuf, 0), (pigProtPos, 1),
-                        (pig2Weights.weightBuffer, 2), (pig2Weights.entryBuffer, 3),
-                        (pigParamsBuf, 4), (pigIntermed, 5), (pigSetup, 6),
-                        (pigLigFeat, 7), (pigProtAux, 8), (pigLigAux, 9),
-                        (pigLigEdgeBuf, 10), (ringBuf, 11)
-                    ]
-                    let pigTgSize = MTLSize(width: 1, height: 1, depth: 1)
-                    let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
-                    lastCmdBuf = dispatchComputeAsync(pipeline: scorePipe, buffers: pigScoreBuffers,
-                                                       threadGroups: pigTgCount, threadGroupSize: pigTgSize)
-                    lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
-                                                       threadGroups: tgCount, threadGroupSize: tgSize)
                 } else {
                     if doLocalSearch && localSearchIsSIMD {
                         lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
@@ -1173,7 +1427,13 @@ extension DockingEngine {
                 lastCmdBuf = nil
             }
 
-            decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+            if usePIGNet2Rescore {
+                let pigTgSize = MTLSize(width: 1, height: 1, depth: 1)
+                let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+                scorePIGNet2(buffer: bestBuf, gaParamsBuffer: gaBuf, tg: pigTgCount, tgs: pigTgSize)
+            } else {
+                decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+            }
 
             aggregatedResults.append(contentsOf: extractAllResults(
                 from: bestPopulationBuffer,
@@ -1571,6 +1831,19 @@ extension DockingEngine {
             ActivityLog.shared.error("[PIGNet2] scorePIGNet2: missing buffers", category: .dock)
             return
         }
+        let ga = gaParamsBuffer.contents().bindMemory(to: GAParams.self, capacity: 1).pointee
+        let pig = pigParams.contents().bindMemory(to: PIGNet2Params.self, capacity: 1).pointee
+        let actualPopSize = max(Int(ga.populationSize), 1)
+        let scratchBytes = actualPopSize * 2 * max(Int(pig.numProteinAtoms), 1) * Int(PIG_DIM) * 4
+        if scratchBytes > pignet2ScoreScratchCapacity {
+            pignet2ScoreScratchBuffer = device.makeBuffer(length: scratchBytes, options: .storageModePrivate)
+            pignet2ScoreScratchCapacity = scratchBytes
+        }
+        guard let pigScoreScratch = pignet2ScoreScratchBuffer else {
+            ActivityLog.shared.error("[PIGNet2] scorePIGNet2: missing score scratch buffer", category: .dock)
+            return
+        }
+
         // Encode: transform ligand positions
         dispatchCompute(pipeline: encodePipe, buffers: [
             (buffer, 0), (ligBuf, 1), (gaParamsBuffer, 2),
@@ -1579,15 +1852,14 @@ extension DockingEngine {
         ], threadGroups: tg, threadGroupSize: tgs)
 
         // Score: GNN + physics (1 thread per pose)
-        let popSize = Int(tg.width * tgs.width)
         let pigTgSize = MTLSize(width: 1, height: 1, depth: 1)
-        let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
+        let pigTgCount = MTLSize(width: actualPopSize, height: 1, depth: 1)
         dispatchCompute(pipeline: scorePipe, buffers: [
             (buffer, 0), (pigProtPos, 1),
             (pig2Weights.weightBuffer, 2), (pig2Weights.entryBuffer, 3),
             (pigParams, 4), (pigIntermed, 5), (pigSetup, 6),
             (pigLigFeat, 7), (pigProtAux, 8), (pigLigAux, 9),
-            (pigLigEdgeBuf, 10), (gaParamsBuffer, 11)
+            (pigLigEdgeBuf, 10), (gaParamsBuffer, 11), (pigScoreScratch, 12)
         ], threadGroups: pigTgCount, threadGroupSize: pigTgSize)
     }
 

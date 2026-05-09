@@ -131,10 +131,28 @@ struct LogConsoleView: View {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
+                    .onChange(of: filterLevel) { _, _ in
+                        scrollToLatest(proxy)
+                    }
+                    .onChange(of: isExpanded) { _, expanded in
+                        if expanded {
+                            scrollToLatest(proxy)
+                        }
+                    }
+                    .onAppear {
+                        scrollToLatest(proxy)
+                    }
                 }
                 .frame(height: consoleHeight)
                 .background(Color(nsColor: .controlBackgroundColor))
             }
+        }
+    }
+
+    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+        guard let last = filteredEntries.last else { return }
+        DispatchQueue.main.async {
+            proxy.scrollTo(last.id, anchor: .bottom)
         }
     }
 

@@ -540,6 +540,253 @@ kernel void druseAFv4Score(
 }
 
 // ---------------------------------------------------------------------------
+// Kernel 5b: druseAFv4ScoreWithGradient
+//   Per-pose pairwise scoring (same forward pass as druseAFv4Score) that ALSO
+//   writes per-ligand-atom attention gradients for diffusion-guided docking.
+//
+//   The gradient is the displacement from each ligand atom's current position
+//   to the context-gate-attention-weighted centroid of nearby protein atoms.
+//   This is the v4 PGN analogue of v3's cross-attention-weighted centroid.
+//
+//   Output layout matches v3's `AttentionGradient` struct: pullDirection (unit
+//   vector) + pullMagnitude (Å). Diffusion can use this as a structural prior
+//   to guide reverse-noise updates toward favourable binding regions.
+// ---------------------------------------------------------------------------
+
+kernel void druseAFv4ScoreWithGradient(
+    device DockPose*                poses          [[buffer(0)]],   // [numPoses]
+    device const float*             protPos        [[buffer(1)]],   // [P, 3]
+    device const float*             protPairProj   [[buffer(2)]],   // [P, PD]
+    device const float*             ligPairProj    [[buffer(3)]],   // [L, PD]
+    device const float*             ligHidden      [[buffer(4)]],   // [L, H]
+    device const float*             weights        [[buffer(5)]],
+    device const DruseAFWeightEntry* entries       [[buffer(6)]],
+    constant DruseAFv4Params&       params         [[buffer(7)]],
+    device const float*             ligTransformed [[buffer(8)]],   // [numPoses, L, 3]
+    constant GridParams&            gridParams     [[buffer(9)]],
+    device AttentionGradient*       attnGradients  [[buffer(10)]],  // [numPoses × L]
+    uint tid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]]
+) {
+    uint pose_idx = gid;
+    uint P = params.numProteinAtoms;
+    uint L = params.numLigandAtoms;
+    bool valid = (tid < L);
+
+    device const float* rbf_w  = weights + entries[36].offset;
+    device const float* rbf_b  = weights + entries[37].offset;
+    device const float* pe_w   = weights + entries[38].offset;
+    device const float* pe_b   = weights + entries[39].offset;
+    device const float* cg_w   = weights + entries[40].offset;
+    device const float* cg_b   = weights + entries[41].offset;
+    device const float* cp_w   = weights + entries[42].offset;
+    device const float* cp_b   = weights + entries[43].offset;
+    device const float* ln_w   = weights + entries[44].offset;
+    device const float* ln_b   = weights + entries[45].offset;
+
+    float lig_p[PD];
+    if (valid) {
+        for (uint d = 0; d < PD; d++)
+            lig_p[d] = ligPairProj[tid * PD + d];
+    }
+
+    float3 my_pos = float3(0);
+    if (valid) {
+        uint base = pose_idx * L * 3 + tid * 3;
+        my_pos = float3(ligTransformed[base], ligTransformed[base+1], ligTransformed[base+2]);
+    }
+
+    // Forward pass + attention-centroid accumulator.
+    float energy_sum = 0.0f;
+    float ctx[PD];
+    float gate_sum = 0.0f;
+    float max_g = -INFINITY;
+    float3 attn_centroid = float3(0.0f);  // gate-weighted protein centroid for this lig atom
+    for (uint d = 0; d < PD; d++) ctx[d] = 0.0f;
+
+    if (valid) {
+        float rbf_spacing = CRS_CUT / float(CRS_RBF - 1);
+
+        for (uint p = 0; p < P; p++) {
+            float3 p_pos = float3(protPos[p*3], protPos[p*3+1], protPos[p*3+2]);
+            float dist = distance(my_pos, p_pos);
+            if (dist > CRS_CUT || dist < 0.01f) continue;
+
+            float rbf[CRS_RBF];
+            for (uint b = 0; b < CRS_RBF; b++) {
+                float diff = dist - float(b) * rbf_spacing;
+                rbf[b] = exp(-RBF_G * diff * diff);
+            }
+
+            float pair[PD];
+            for (uint d = 0; d < PD; d++) {
+                float rbf_val = rbf_b[d];
+                for (uint b = 0; b < CRS_RBF; b++)
+                    rbf_val += rbf[b] * rbf_w[d * CRS_RBF + b];
+                rbf_val = gelu_tanh(rbf_val);
+                float pp = protPairProj[p * PD + d];
+                pair[d] = lig_p[d] * pp * rbf_val;
+            }
+
+            float e = pe_b[0];
+            for (uint d = 0; d < PD; d++)
+                e += gelu_tanh(pair[d]) * pe_w[d];
+            energy_sum += e;
+
+            float g = cg_b[0];
+            for (uint d = 0; d < PD; d++)
+                g += pair[d] * cg_w[d];
+            if (g > max_g) {
+                float scale = exp(max_g - g);
+                gate_sum *= scale;
+                attn_centroid *= scale;
+                for (uint d = 0; d < PD; d++) ctx[d] *= scale;
+                max_g = g;
+            }
+            float w = exp(g - max_g);
+            gate_sum += w;
+            attn_centroid += w * p_pos;
+            for (uint d = 0; d < PD; d++)
+                ctx[d] += w * protPairProj[p * PD + d];
+        }
+    }
+
+    // Write attention gradient: pull toward context-attention centroid.
+    // Fallback when no protein atom is in cutoff (very common at noise init):
+    // pull softly toward the pocket center so the pose can drift into range
+    // where the learned attention gradient takes over.
+    if (valid) {
+        uint grad_idx = pose_idx * L + tid;
+        float3 centroid;
+        float3 pull;
+        if (gate_sum > 1e-8f) {
+            centroid = attn_centroid / gate_sum;
+            pull = centroid - my_pos;
+        } else {
+            centroid = float3(gridParams.searchCenter);
+            pull = (centroid - my_pos) * 0.5f;
+        }
+        float pull_mag = length(pull);
+        attnGradients[grad_idx].pullDirection = (pull_mag > 1e-6f) ? (pull / pull_mag) : float3(0.0f);
+        attnGradients[grad_idx].pullMagnitude = pull_mag;
+    }
+
+    // Context normalization + lig hidden update (identical to druseAFv4Score).
+    float lig_h_ctx[H];
+    if (valid) {
+        float inv_gate = 1.0f / (gate_sum + 1e-8f);
+        for (uint d = 0; d < PD; d++)
+            ctx[d] *= inv_gate;
+
+        for (uint d = 0; d < H; d++) {
+            float proj = cp_b[d];
+            for (uint d2 = 0; d2 < PD; d2++)
+                proj += ctx[d2] * cp_w[d * PD + d2];
+            lig_h_ctx[d] = ligHidden[tid * H + d] + proj;
+        }
+
+        float mean_val = 0.0f;
+        for (uint d = 0; d < H; d++) mean_val += lig_h_ctx[d];
+        mean_val /= float(H);
+        float var_val = 0.0f;
+        for (uint d = 0; d < H; d++) {
+            float diff = lig_h_ctx[d] - mean_val;
+            var_val += diff * diff;
+        }
+        var_val /= float(H);
+        float inv_std = rsqrt(var_val + 1e-5f);
+        for (uint d = 0; d < H; d++)
+            lig_h_ctx[d] = (lig_h_ctx[d] - mean_val) * inv_std * ln_w[d] + ln_b[d];
+    }
+
+    // Threadgroup reduction (identical to druseAFv4Score).
+    threadgroup float tg_energy[64];
+    threadgroup float tg_scratch[64];
+    threadgroup float tg_repr[128];
+
+    tg_energy[tid] = valid ? energy_sum : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total_energy = 0.0f;
+    if (tid == 0) {
+        for (uint i = 0; i < L; i++)
+            total_energy += tg_energy[i];
+    }
+
+    for (uint d = 0; d < H; d++) {
+        tg_scratch[tid] = valid ? lig_h_ctx[d] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (uint i = 0; i < L; i++) sum += tg_scratch[i];
+            tg_repr[d] = sum / float(L);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float pair_scale = weights[entries[54].offset];
+        float pair_bias  = weights[entries[55].offset];
+
+        device const float* ah0_w = weights + entries[46].offset;
+        device const float* ah0_b = weights + entries[47].offset;
+        device const float* ah1_w = weights + entries[48].offset;
+        device const float* ah1_b = weights + entries[49].offset;
+
+        float aff_h[64];
+        for (uint d = 0; d < 64; d++) {
+            float val = ah0_b[d];
+            for (uint d2 = 0; d2 < H; d2++)
+                val += tg_repr[d2] * ah0_w[d * H + d2];
+            aff_h[d] = gelu_tanh(val);
+        }
+        float global_aff = ah1_b[0];
+        for (uint d = 0; d < 64; d++)
+            global_aff += aff_h[d] * ah1_w[d];
+
+        float pKd = total_energy * pair_scale + global_aff + pair_bias;
+
+        device const float* ch0_w = weights + entries[50].offset;
+        device const float* ch0_b = weights + entries[51].offset;
+        device const float* ch1_w = weights + entries[52].offset;
+        device const float* ch1_b = weights + entries[53].offset;
+
+        float conf_h[64];
+        for (uint d = 0; d < 64; d++) {
+            float val = ch0_b[d];
+            for (uint d2 = 0; d2 < H; d2++)
+                val += tg_repr[d2] * ch0_w[d * H + d2];
+            conf_h[d] = gelu_tanh(val);
+        }
+        float conf_logit = ch1_b[0];
+        for (uint d = 0; d < 64; d++)
+            conf_logit += conf_h[d] * ch1_w[d];
+        float confidence = 1.0f / (1.0f + exp(-conf_logit));
+
+        float score = pKd * confidence;
+
+        float3 lig_center = float3(0);
+        for (uint i = 0; i < L; i++) {
+            uint b = pose_idx * L * 3 + i * 3;
+            lig_center += float3(ligTransformed[b], ligTransformed[b+1], ligTransformed[b+2]);
+        }
+        lig_center /= float(L);
+
+        float3 grid_center = gridParams.searchCenter;
+        float3 half_ext = gridParams.searchHalfExtent;
+        float3 delta = abs(lig_center - grid_center) - half_ext;
+        float oob_penalty = max(delta.x, 0.0f) + max(delta.y, 0.0f) + max(delta.z, 0.0f);
+        oob_penalty *= 10.0f;
+
+        poses[pose_idx].energy = -score + oob_penalty;
+        poses[pose_idx].stericEnergy = pKd;
+        poses[pose_idx].hydrophobicEnergy = confidence;
+        poses[pose_idx].hbondEnergy = score;
+        poses[pose_idx].clashPenalty = oob_penalty;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel 6: druseAFv4Rescore
 //   Single-pose rescoring (not inside GA loop).
 //   Same computation as druseAFv4Score but for a pre-placed ligand.

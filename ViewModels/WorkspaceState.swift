@@ -103,6 +103,18 @@ struct WorkspaceState {
     // Only used when chainColorModes[id] == .custom
     var chainColorOverrides: [String: SIMD3<Float>] = [:]
 
+    /// Scope of a chain/ligand color override: paint all atoms uniformly,
+    /// or only carbons (heteroatoms keep CPK colors). Matches PyMOL/ChimeraX
+    /// "color carbons by chain" convention.
+    enum ChainColorScope: Equatable {
+        case carbonsOnly
+        case allAtoms
+    }
+    /// Per-chain coloring scope. Missing entry = `.carbonsOnly` (default).
+    var chainColorScopes: [String: ChainColorScope] = [:]
+    /// Whether the ligand color override applies only to carbons (default true).
+    var ligandColorCarbonsOnly: Bool = true
+
     /// Ligand render mode override: allows ligand to render differently from the global protein mode.
     /// nil = follow global renderMode, otherwise uses this specific mode for the ligand.
     var ligandRenderMode: RenderMode? = nil

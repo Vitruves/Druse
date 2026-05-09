@@ -367,6 +367,7 @@ struct ResultsDatabaseWindow: View {
                     .font(.footnote.monospaced().weight(.medium))
                     .foregroundStyle(.cyan)
                     .frame(width: 60, alignment: .leading)
+                    .help("Cluster \(result.clusterID) — RMSD-based binding-mode group. Poses sharing this ID occupy the same pose family (RMSD < 2.0 Å); different IDs are structurally distinct binding modes.")
             } else {
                 Text("-")
                     .font(.footnote.monospaced())

@@ -40,6 +40,15 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.2)) { showConsole = true }
             }
         }
+        .onChange(of: viewModel.workspace.requestedTabToken) { _, _ in
+            // View-model–driven tab switch (e.g. "Optimize" on a docking pose
+            // jumps to the Lead Opt tab with the reference already populated).
+            guard let target = viewModel.workspace.requestedTab else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                pipelineTab = target
+                pipelinePanelOpen = true
+            }
+        }
         .onChange(of: viewModel.molecules.protein?.atomCount) { old, new in
             // Auto-show inspector when first molecule is loaded
             if old == nil && new != nil && !showInspector {
@@ -129,56 +138,63 @@ struct ContentView: View {
     // MARK: - Main Content Area (extracted to help type checker)
 
     private var mainContentArea: some View {
-        HStack(spacing: 0) {
-            // Pipeline panel — fixed width, takes priority over the viewport so
-            // it never gets compressed when the inspector opens.
-            if pipelinePanelOpen {
-                PipelineContentPanel(
-                    selectedTab: $pipelineTab,
-                    panelOpen: $pipelinePanelOpen
-                )
-                .layoutPriority(1)
-                .zIndex(2)
-                .transition(.move(edge: .leading).combined(with: .opacity))
-
-                Divider()
-                    .zIndex(2)
-            }
-
-            // Metal viewport with overlays — fills the remaining space. The
-            // control shelf scrolls horizontally, so it does not impose a wide
-            // minimum that can push fixed side panels off-screen.
-            ZStack {
-                metalViewport
-                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-
-                if viewModel.molecules.protein == nil && !viewModel.isDemoRunning {
-                    WelcomeScreen(
-                        pipelineTab: $pipelineTab,
-                        pipelinePanelOpen: $pipelinePanelOpen
+        ZStack(alignment: .bottom) {
+            HStack(spacing: 0) {
+                // Pipeline panel — fixed width, takes priority over the viewport so
+                // it never gets compressed when the inspector opens.
+                if pipelinePanelOpen {
+                    PipelineContentPanel(
+                        selectedTab: $pipelineTab,
+                        panelOpen: $pipelinePanelOpen
                     )
-                    .transition(.opacity)
-                } else {
-                    viewportTopBottom
+                    .layoutPriority(1)
+                    .zIndex(2)
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+
+                    Divider()
+                        .zIndex(2)
                 }
 
-                // Demo narration overlay (always on top when demo is active)
-                DemoOverlay()
-            }
-            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-            .zIndex(0)
-            .clipped()
+                // Metal viewport with overlays — fills the remaining space.
+                ZStack(alignment: .bottom) {
+                    metalViewport
+                        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
 
-            if showInspector {
-                Divider()
-                InspectorPanel(showInspector: $showInspector)
-                    .layoutPriority(1)
-                    .zIndex(1)
+                    if viewModel.molecules.protein == nil && !viewModel.isDemoRunning {
+                        WelcomeScreen(
+                            pipelineTab: $pipelineTab,
+                            pipelinePanelOpen: $pipelinePanelOpen
+                        )
+                        .transition(.opacity)
+                    } else {
+                        viewportTopOverlay
+                    }
+
+                    // Demo narration overlay (always on top when demo is active)
+                    DemoOverlay()
+
+                    // Render control shelf scoped to the viewport so it cannot
+                    // intercept clicks on the pipeline or inspector panels.
+                    if viewModel.molecules.protein != nil || viewModel.isDemoRunning {
+                        renderControlShelf
+                            .padding(12)
+                    }
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(0)
+                .clipped()
+
+                if showInspector {
+                    Divider()
+                    InspectorPanel(showInspector: $showInspector)
+                        .layoutPriority(1)
+                        .zIndex(1)
+                }
             }
         }
     }
 
-    private var viewportTopBottom: some View {
+    private var viewportTopOverlay: some View {
         VStack {
             HStack(alignment: .top) {
                 moleculeBadges
@@ -198,17 +214,14 @@ struct ContentView: View {
             .padding(12)
 
             Spacer()
-
-            renderControlShelf
-                .padding(12)
         }
     }
 
     private var renderControlShelf: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        CenteredHorizontalScroll {
             renderControls
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Metal Viewport
@@ -733,5 +746,23 @@ struct ContentView: View {
         case .hydrophobicity: "drop.fill"
         case .pharmacophore: "circle.hexagongrid"
         }
+    }
+}
+
+private struct CenteredHorizontalScroll<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                content
+                    .frame(minWidth: proxy.size.width, alignment: .center)
+            }
+        }
+        .frame(height: 56)
     }
 }

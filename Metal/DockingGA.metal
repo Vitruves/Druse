@@ -133,13 +133,12 @@ kernel void initializePopulation(
 
     float3 searchSize = halfExtent * 2.0f;
     float minDim = min(searchSize.x, min(searchSize.y, searchSize.z));
-    float focusSpread = min(minDim * 0.45f, 10.0f);
+    float focusSpread = min(minDim * 0.65f, 14.0f);
 
-    // --- Translation: 60% focused near center, 40% full box ---
-    // GPU parallelism (200 poses) compensates for less steps per trajectory vs Vina,
-    // so we keep moderate focus but ensure broad coverage.
+    // --- Translation: 40% focused near center, 60% full box ---
+    // Tuned for broader pocket coverage (see docking_tuning.md).
     float3 spread;
-    if (tid < popSize * 6 / 10) {
+    if (tid < popSize * 4 / 10) {
         spread = float3(focusSpread);
     } else {
         spread = halfExtent;
@@ -260,8 +259,8 @@ kernel void gaEvolve(
     float3 searchMin = searchCenter - searchHalfExtent;
     float3 searchMax = searchCenter + searchHalfExtent;
 
-    // Diversity injection: reinitialize bottom 20% with random poses every 5 generations.
-    bool doInject = (gaParams.generation % 5 == 0) && (gaParams.generation > 0);
+    // Diversity injection: reinitialize bottom 20% with random poses every 3 generations.
+    bool doInject = (gaParams.generation % 3 == 0) && (gaParams.generation > 0);
     uint injectThreshold = popSize - max(popSize / 5, 6u);  // bottom 20%
     if (doInject && tid >= injectThreshold) {
         child.translation = searchCenter + float3(

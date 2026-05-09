@@ -466,11 +466,11 @@ struct DruseAFWeightEntry {
 #define PIG_INTERACT_MIN   0.5f   // min distance for pairwise interactions
 #define PIG_VDW_EPS_LO     0.0178f
 #define PIG_VDW_EPS_HI     0.0356f
-#define PIG_DEV_VDW_COEFF  0.2f
+#define PIG_DEV_VDW_COEFF  0.0f
 #define PIG_VDW_CLAMP     100.0f
 #define PIG_VDW_WIDTH_LO    1.0f   // Morse width scale range
 #define PIG_VDW_WIDTH_HI    2.0f
-#define PIG_SHORT_RANGE_A   2.1f   // Morse short-range width
+#define PIG_SHORT_RANGE_A   2.0f   // Morse short-range width
 #define PIG_HBOND_C1      (-0.7f)
 #define PIG_HBOND_C2        0.0f
 #define PIG_METAL_C1      (-0.7f)
@@ -504,10 +504,8 @@ struct PIGNet2Edge {
 };
 
 // PIGNet2 setup buffer layout offsets (in floats, relative to buffer start)
-// After setup kernel: stores protein embeddings + cached InteractionNet projections
-// PROT_EMBED:      [P × PIG_DIM]       — protein features after 3× intra-GatedGAT
-// INTER_W2X[0-2]:  [P × PIG_DIM] × 3   — cached W2*x_prot for each InteractionNet layer
-// Total: 4 × P × PIG_DIM floats
+// After setup kernel: stores protein embeddings after 3x intra-GatedGAT.
+// Total: P x PIG_DIM floats
 #define PIG_SETUP_PROT_EMBED    0u
 // Offsets computed at runtime based on actual P
 

@@ -107,6 +107,13 @@ final class Renderer: NSObject {
     var proteinAtomCount: Int = 0
     /// Per-chain color map for chain-colored mode (protein atoms only; ligand keeps CPK)
     var chainColorMap: [String: SIMD3<Float>] = [:]
+    /// Per-chain coloring scope. If a chain id is in `chainColorMap` but its
+    /// scope is `.carbonsOnly` (or simply present in this set), the override
+    /// applies only to carbons; heteroatoms keep their element colors.
+    var chainColorCarbonsOnly: Set<String> = []
+    /// When true, `ligandCarbonColor` is applied only to carbons (default).
+    /// When false, it paints the whole ligand uniformly.
+    var ligandColorCarbonsOnly: Bool = true
 
     /// Whether a ligand is currently visible (controls interaction lines and grid visibility)
     var ligandVisible: Bool = true
@@ -373,13 +380,17 @@ final class Renderer: NSObject {
             let atomScale = isProteinAtom ? protAtomScale : ligAtomScale
             var color = atom.element.color
             if !chainColorMap.isEmpty, isProteinAtom {
-                // Per-chain coloring mode
+                // Per-chain coloring mode (carbons-only by default; heteroatoms keep CPK)
                 if let chainColor = chainColorMap[atom.chainID] {
-                    color = SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                    let carbonsOnly = chainColorCarbonsOnly.contains(atom.chainID)
+                    if !carbonsOnly || atom.element == .C {
+                        color = SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                    }
                 }
             } else if isProteinAtom, let protColor = uniformProteinColor {
                 color = SIMD4<Float>(protColor.x, protColor.y, protColor.z, 1.0)
-            } else if !isProteinAtom, atom.element == .C, let ligCarbon = ligandCarbonColor {
+            } else if !isProteinAtom, let ligCarbon = ligandCarbonColor,
+                      !ligandColorCarbonsOnly || atom.element == .C {
                 color = SIMD4<Float>(ligCarbon.x, ligCarbon.y, ligCarbon.z, 1.0)
             }
 
@@ -436,11 +447,15 @@ final class Renderer: NSObject {
                 let isProt = atom.id < proteinAtomCount
                 if !chainColorMap.isEmpty, isProt {
                     if let chainColor = chainColorMap[atom.chainID] {
-                        return SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                        let carbonsOnly = chainColorCarbonsOnly.contains(atom.chainID)
+                        if !carbonsOnly || atom.element == .C {
+                            return SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                        }
                     }
                 } else if isProt, let protColor = uniformProteinColor {
                     return SIMD4<Float>(protColor.x, protColor.y, protColor.z, 1.0)
-                } else if !isProt, atom.element == .C, let ligCarbon = ligandCarbonColor {
+                } else if !isProt, let ligCarbon = ligandCarbonColor,
+                          !ligandColorCarbonsOnly || atom.element == .C {
                     return SIMD4<Float>(ligCarbon.x, ligCarbon.y, ligCarbon.z, 1.0)
                 }
                 return atom.element.color

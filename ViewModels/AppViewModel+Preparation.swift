@@ -21,7 +21,9 @@ extension AppViewModel {
             workspace.statusMessage = "No waters to remove"
             return
         }
-        molecules.protein = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
+        let updated = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
+        updated.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        molecules.protein = updated
         molecules.keptWaterKeys.removeAll()
         pushToRenderer()
         renderer?.fitToContent()

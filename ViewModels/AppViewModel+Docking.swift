@@ -170,6 +170,47 @@ extension AppViewModel {
 
     // MARK: - Docking
 
+    private func nonEmptySMILES(_ smiles: String?) -> String? {
+        guard let trimmed = smiles?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    private func looksLikeInlineSMILES(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+    }
+
+    /// Fragment docking requires SMILES, but the active ligand can be rebuilt
+    /// from pose coordinates after a previous docking run. Recover the database
+    /// SMILES before passing that molecule to the engine.
+    private func ensureLigandHasSMILES(_ ligand: Molecule) -> Molecule {
+        if nonEmptySMILES(ligand.smiles) != nil { return ligand }
+
+        let resolved: String?
+        if let activeLigandEntryID,
+           let entry = ligandDB.entries.first(where: { $0.id == activeLigandEntryID }),
+           let smiles = nonEmptySMILES(entry.smiles) {
+            resolved = smiles
+        } else if let entry = ligandDB.entries.first(where: { $0.name == ligand.name }),
+                  let smiles = nonEmptySMILES(entry.smiles) {
+            resolved = smiles
+        } else if looksLikeInlineSMILES(ligand.title) {
+            resolved = ligand.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            resolved = nil
+        }
+
+        guard let resolved else { return ligand }
+        ligand.smiles = resolved
+        if ligand.title.isEmpty {
+            ligand.title = resolved
+        }
+        log.info("Recovered SMILES for \(ligand.name) from ligand metadata", category: .dock)
+        return ligand
+    }
+
     func runDocking() {
         guard let pocket = docking.selectedPocket,
               let prot = molecules.protein,
@@ -179,11 +220,28 @@ extension AppViewModel {
             return
         }
 
-        docking.originalDockingLigand = Molecule(name: lig.name, atoms: lig.atoms, bonds: lig.bonds, title: lig.title)
+        let dockingLigand = ensureLigandHasSMILES(lig)
+        docking.originalDockingLigand = Molecule(
+            name: dockingLigand.name,
+            atoms: dockingLigand.atoms,
+            bonds: dockingLigand.bonds,
+            title: dockingLigand.title,
+            smiles: dockingLigand.smiles
+        )
 
         docking.isDocking = true
         docking.dockingGeneration = 0
-        docking.dockingTotalGenerations = docking.dockingConfig.numGenerations
+        // Each search method has a different "step" budget; the GA-derived numGenerations
+        // is wrong for Diffusion (which iterates denoising steps) and Fragment (which
+        // iterates over fragment growth, harder to predict — fall back to fragment count).
+        switch docking.dockingConfig.searchMethod {
+        case .diffusionGuided:
+            docking.dockingTotalGenerations = max(docking.dockingConfig.diffusion.numDenoisingSteps, 1)
+        case .fragmentBased:
+            docking.dockingTotalGenerations = max(docking.dockingConfig.fragment.beamWidth, 1)
+        default:
+            docking.dockingTotalGenerations = docking.dockingConfig.numGenerations
+        }
         docking.dockingResults = []
         docking.currentInteractions = []
         docking.dockingBestEnergy = .infinity
@@ -193,7 +251,7 @@ extension AppViewModel {
         docking.selectedPoseIndices = []
         let cfg = docking.dockingConfig
         log.info("Starting docking: pop=\(cfg.populationSize), gen=\(cfg.numGenerations) (\(cfg.numRuns)×\(cfg.generationsPerRun)), grid=\(String(format: "%.3f", cfg.gridSpacing)) Å", category: .dock)
-        log.info("  Ligand: \(lig.name) (\(lig.atoms.filter { $0.element != .H }.count) heavy atoms, \(lig.atoms.count) total, \(lig.bondCount) bonds)", category: .dock)
+        log.info("  Ligand: \(dockingLigand.name) (\(dockingLigand.atoms.filter { $0.element != .H }.count) heavy atoms, \(dockingLigand.atoms.count) total, \(dockingLigand.bondCount) bonds)", category: .dock)
         log.info("  Pocket: center=(\(String(format: "%.1f, %.1f, %.1f", pocket.center.x, pocket.center.y, pocket.center.z))), size=(\(String(format: "%.1f, %.1f, %.1f", pocket.size.x, pocket.size.y, pocket.size.z))), volume=\(String(format: "%.0f", pocket.volume)) ų", category: .dock)
         log.info("  Scoring: \(docking.scoringMethod.rawValue), charges: \(docking.chargeMethod.rawValue)", category: .dock)
         log.info("  Config: localSearchFreq=\(cfg.localSearchFrequency), localSearchSteps=\(cfg.localSearchSteps), explorationRatio=\(String(format: "%.2f", cfg.explorationPhaseRatio))", category: .dock)
@@ -272,8 +330,8 @@ extension AppViewModel {
 
             // Auto-tune: adapt config to system complexity
             if docking.dockingConfig.autoMode {
-                let heavyAtoms = lig.atoms.filter { $0.element != .H }.count
-                let torsions = RDKitBridge.buildTorsionTree(smiles: lig.smiles ?? "")?.count ?? 0
+                let heavyAtoms = dockingLigand.atoms.filter { $0.element != .H }.count
+                let torsions = RDKitBridge.buildTorsionTree(smiles: dockingLigand.smiles ?? "")?.count ?? 0
                 let tuned = DockingConfig.autoTune(
                     proteinAtomCount: scoringProtein.atoms.count,
                     pocketVolume: pocket.volume,
@@ -302,7 +360,7 @@ extension AppViewModel {
             engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
             log.success("Grid maps computed — \(scoringProtein.atoms.count) receptor atoms", category: .dock)
 
-            let origLig = self.docking.originalDockingLigand ?? lig
+            let origLig = self.docking.originalDockingLigand ?? dockingLigand
 
             log.info("  Original ligand: \(origLig.name), \(origLig.atoms.count) atoms, \(origLig.bonds.count) bonds", category: .dock)
 
@@ -345,7 +403,7 @@ extension AppViewModel {
 
             // One entry = one docking job (flat model)
             let allResults = await engine.runDocking(
-                ligand: lig, pocket: pocket,
+                ligand: dockingLigand, pocket: pocket,
                 config: docking.dockingConfig,
                 scoringMethod: docking.scoringMethod)
 
@@ -359,6 +417,24 @@ extension AppViewModel {
                     : "E=\(String(format: "%.3f", best.energy)) kcal/mol"
                 log.info("  Best pose: \(scoreStr), cluster=\(best.clusterID), gen=\(best.generation)",
                          category: .dock)
+            }
+
+            guard !results.isEmpty else {
+                docking.dockingResults = []
+                docking.isDocking = false
+                docking.dockingBestEnergy = .infinity
+                docking.dockingBestPKi = nil
+                docking.dockingDuration = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
+                docking.currentInteractions = []
+                docking.selectedPoseIndices = []
+                renderer?.updateInteractionLines([])
+                renderer?.clearGhostPose()
+                if let pocket = docking.selectedPocket {
+                    showGridBoxForPocket(pocket)
+                }
+                workspace.statusMessage = "Docking produced no valid poses"
+                log.error("Docking produced no valid poses; skipping post-processing", category: .dock)
+                return
             }
 
             // Signal that GA search is done — post-processing begins
@@ -411,26 +487,19 @@ extension AppViewModel {
                 log.success("GFN2-xTB refinement complete: \(refined)/\(min(gfn2Config.topPosesToRefine, rankedResults.count)) converged", category: .dock)
             }
 
-            // GFN2 single-point energy on best pose (always-on, ~2ms, informational)
-            if let bestResult = rankedResults.first {
-                let spHeavyAtoms = origLig.atoms.filter { $0.element != .H }
-                let spPositions = bestResult.transformedAtomPositions
-                if spHeavyAtoms.count >= 2, spPositions.count == spHeavyAtoms.count {
-                    var spAtoms = spHeavyAtoms
-                    for j in 0..<spAtoms.count { spAtoms[j].position = spPositions[j] }
-                    let formalCharge = spHeavyAtoms.reduce(0) { $0 + $1.formalCharge }
-                    if let sp = try? await GFN2Refiner.computeEnergy(
-                        atoms: spAtoms, totalCharge: formalCharge, solvation: .water
-                    ) {
-                        rankedResults[0].gfn2Energy = sp.totalEnergy_kcal
-                        rankedResults[0].gfn2DispersionEnergy = sp.dispersionEnergy * 627.509
-                        rankedResults[0].gfn2SolvationEnergy = sp.solvationEnergy * 627.509
-                        rankedResults[0].gfn2Converged = sp.converged
-                        log.info(String(format: "GFN2-xTB best pose: %.1f kcal/mol (D4:%.2f, solv:%.2f)",
-                                        sp.totalEnergy_kcal, sp.dispersionEnergy * 627.509, sp.solvationEnergy * 627.509),
-                                 category: .dock)
-                    }
-                }
+            // PoseBusters-style validity checks (bond geometry, clashes, connectivity).
+            let validationLigandHeavy = origLig.atoms.filter { $0.element != .H }
+            let validationLigandBonds = buildHeavyBonds(from: origLig)
+            let validationProteinHeavy = scoringProtein.atoms.filter { $0.element != .H }
+            rankedResults = PoseValidator.validateBatch(
+                results: rankedResults,
+                ligandHeavyAtoms: validationLigandHeavy,
+                ligandHeavyBonds: validationLigandBonds,
+                proteinHeavyAtoms: validationProteinHeavy
+            )
+            let invalidPoses = rankedResults.filter { ($0.validity?.passed == false) }.count
+            if invalidPoses > 0 {
+                log.warn("\(invalidPoses)/\(rankedResults.count) poses failed PoseBusters checks", category: .dock)
             }
 
             docking.dockingResults = rankedResults
@@ -447,7 +516,8 @@ extension AppViewModel {
                         ligandAtoms: heavyAtoms,
                         ligandPositions: best.transformedAtomPositions,
                         proteinAtoms: scoringProtein.atoms.filter { $0.element != .H },
-                        ligandBonds: heavyBonds
+                        ligandBonds: heavyBonds,
+                        scoringMethod: docking.scoringMethod
                     )
                     renderer?.updateInteractionLines(docking.currentInteractions)
                 }
@@ -505,7 +575,11 @@ extension AppViewModel {
         // this snapshot, clearing the view would also strand any saved poses.
         if docking.originalDockingLigand == nil, let lig = molecules.ligand {
             docking.originalDockingLigand = Molecule(
-                name: lig.name, atoms: lig.atoms, bonds: lig.bonds, title: lig.title
+                name: lig.name,
+                atoms: lig.atoms,
+                bonds: lig.bonds,
+                title: lig.title,
+                smiles: lig.smiles
             )
         }
         molecules.ligand = nil
@@ -531,7 +605,8 @@ extension AppViewModel {
                 ligandAtoms: heavyAtoms,
                 ligandPositions: result.transformedAtomPositions,
                 proteinAtoms: prot.atoms.filter { $0.element != .H },
-                ligandBonds: heavyBonds
+                ligandBonds: heavyBonds,
+                scoringMethod: docking.scoringMethod
             )
             renderer?.updateInteractionLines(docking.currentInteractions)
 
@@ -577,7 +652,8 @@ extension AppViewModel {
                     ligandAtoms: heavyAtoms,
                     ligandPositions: result.transformedAtomPositions,
                     proteinAtoms: prot.atoms.filter { $0.element != .H },
-                    ligandBonds: heavyBonds
+                    ligandBonds: heavyBonds,
+                    scoringMethod: docking.scoringMethod
                 )
                 renderer?.updateInteractionLines(docking.currentInteractions)
             }
@@ -692,7 +768,13 @@ extension AppViewModel {
         guard let (newAtoms, newBonds) = buildTransformedLigand(result: result, originalLigand: originalLigand) else { return }
 
         renderer?.clearGhostPose()
-        molecules.ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
+        molecules.ligand = Molecule(
+            name: originalLigand.name,
+            atoms: newAtoms,
+            bonds: newBonds,
+            title: originalLigand.title,
+            smiles: originalLigand.smiles
+        )
         pushToRenderer()
 
         if !docking.currentInteractions.isEmpty {
@@ -703,7 +785,13 @@ extension AppViewModel {
     func applyLiveDockingPose(_ result: DockingResult, originalLigand: Molecule) {
         guard let (newAtoms, newBonds) = buildTransformedLigand(result: result, originalLigand: originalLigand) else { return }
 
-        molecules.ligand = Molecule(name: originalLigand.name, atoms: newAtoms, bonds: newBonds, title: originalLigand.title)
+        molecules.ligand = Molecule(
+            name: originalLigand.name,
+            atoms: newAtoms,
+            bonds: newBonds,
+            title: originalLigand.title,
+            smiles: originalLigand.smiles
+        )
         pushToRenderer()
 
         if !docking.currentInteractions.isEmpty {

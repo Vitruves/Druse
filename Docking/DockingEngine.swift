@@ -105,6 +105,7 @@ final class DockingEngine {
     var afv4MsgAggregatePipeline: MTLComputePipelineState?
     var afv4PairPrepPipeline: MTLComputePipelineState?
     var afv4ScorePipeline: MTLComputePipelineState?
+    var afv4ScoreWithGradPipeline: MTLComputePipelineState?
     var afv4RescorePipeline: MTLComputePipelineState?
     var afv4ProtHiddenBuffer: MTLBuffer?
     var afv4LigHiddenBuffer: MTLBuffer?
@@ -131,6 +132,11 @@ final class DockingEngine {
     var pignet2LigEdgeBuffer: MTLBuffer?
     var pignet2SetupBuffer: MTLBuffer?
     var pignet2ScratchBuffer: MTLBuffer?
+    /// Per-pose protein-embedding scratch for the InteractionNet phase of `pignet2Score`.
+    /// Layout: [popSize, 2, numPocketProteinAtoms, PIG_DIM] floats. Living in device memory keeps
+    /// the kernel's per-thread stack frame small enough for MTLCompiler to compile.
+    var pignet2ScoreScratchBuffer: MTLBuffer?
+    var pignet2ScoreScratchCapacity: Int = 0
     var pignet2IntermediateBuffer: MTLBuffer?
     var pignet2IntermediateCapacity: Int = 0
 
@@ -149,6 +155,13 @@ final class DockingEngine {
 
     /// Optional flex docking engine for receptor flexibility (induced fit).
     var flexEngine: FlexDockingEngine?
+
+    /// Optional fragment-based docking engine (incremental construction with beam search).
+    var fragmentEngine: FragmentDockingEngine?
+
+    /// Optional diffusion-guided docking engine (DruseAF attention-guided reverse diffusion).
+    var diffusionEngine: DiffusionDockingEngine?
+
     var gridParams = GridParams()
     var config = DockingConfig()
     /// Tracks the last allocated population buffer capacity to avoid redundant reallocation.
@@ -251,6 +264,10 @@ final class DockingEngine {
                     afv4ScorePipeline = try device.makeComputePipelineState(function: v4Score)
                     afv4RescorePipeline = try device.makeComputePipelineState(function: v4Rescore)
                 }
+                // v4 score-with-gradient kernel for diffusion-guided docking (optional).
+                if let v4ScoreGrad = library.makeFunction(name: "druseAFv4ScoreWithGradient") {
+                    afv4ScoreWithGradPipeline = try device.makeComputePipelineState(function: v4ScoreGrad)
+                }
             } catch {
                 print("[DockingEngine] DruseAF pipeline creation failed (non-fatal): \(error)")
             }
@@ -271,6 +288,10 @@ final class DockingEngine {
             print("Failed to create docking pipelines: \(error)")
             return nil
         }
+
+        // Optional alternative search engines (non-fatal if pipelines unavailable)
+        fragmentEngine = FragmentDockingEngine(device: device, commandQueue: queue)
+        diffusionEngine = DiffusionDockingEngine(device: device, commandQueue: queue)
     }
 
     // MARK: - Vina Atom Typing
@@ -1927,8 +1948,8 @@ final class DockingEngine {
         )
         pignet2ParamsBuffer = device.makeBuffer(bytes: &pigParams, length: MemoryLayout<PIGNet2Params>.stride, options: .storageModeShared)
 
-        // Setup buffer: 4 sections × P × 128 floats
-        let setupFloats = 4 * P * 128  // 4 sections × P atoms × 128 hidden dim
+        // Setup buffer: final protein embeddings after 3x intra-GatedGAT.
+        let setupFloats = P * Int(PIG_DIM)
         pignet2SetupBuffer = device.makeBuffer(length: max(setupFloats * 4, 16), options: .storageModeShared)
 
         // Scratch buffer for GatedGAT ping-pong: P × 128 floats
@@ -1941,6 +1962,16 @@ final class DockingEngine {
         if requiredBytes > pignet2IntermediateCapacity {
             pignet2IntermediateBuffer = device.makeBuffer(length: requiredBytes, options: .storageModeShared)
             pignet2IntermediateCapacity = requiredBytes
+        }
+
+        // Per-pose protein-embedding scratch for InteractionNet (prot_h + prot_new sections).
+        // Size: popSize × 2 × P × PIG_DIM × sizeof(float).
+        // This replaces a large per-thread stack frame that was crashing MTLCompiler
+        // with XPC errors while avoiding the full 256-protein-atom reserve for small pockets.
+        let scoreScratchBytes = popSize * 2 * max(P, 1) * Int(PIG_DIM) * 4
+        if scoreScratchBytes > pignet2ScoreScratchCapacity {
+            pignet2ScoreScratchBuffer = device.makeBuffer(length: scoreScratchBytes, options: .storageModePrivate)
+            pignet2ScoreScratchCapacity = scoreScratchBytes
         }
 
         // Dispatch setup kernel

@@ -219,69 +219,45 @@ kernel void pruneFragmentBeam(
 
     // Mark invalid if above threshold
     float cutoff = bestE + threshold;
-    uint validCount = 0;
     for (uint i = 0; i < N; i++) {
         if (!placements[i].valid || placements[i].energy > cutoff) {
             placements[i].valid = 0;
-        } else {
-            validCount++;
         }
     }
 
-    // If still too many, do a simple selection sort to keep top beamWidth
-    if (validCount > beamWidth) {
-        // Bubble the worst valid ones to invalid
-        // Simple approach: find the beamWidth-th best energy, invalidate above it
-        // Use partial selection: find the k-th smallest energy among valid placements
-        // Iterative approach for GPU simplicity
-        uint kept = 0;
-        float kthEnergy = bestE;
-        for (uint pass = 0; pass < beamWidth && pass < N; pass++) {
-            float nextBest = 1e10f;
-            uint nextIdx = N;
-            for (uint i = 0; i < N; i++) {
-                if (placements[i].valid && placements[i].energy <= nextBest) {
-                    // Skip if we already counted this energy level
-                    if (placements[i].energy > kthEnergy || (placements[i].energy == kthEnergy && i > nextIdx)) {
-                        // already processed
-                    } else {
-                        nextBest = placements[i].energy;
-                        nextIdx = i;
-                    }
-                }
-            }
-            if (nextIdx < N) {
-                kthEnergy = nextBest;
-                kept++;
-            }
-        }
-        // Actually: simpler approach — just mark invalid everything above beam width
-        // Count valid from start, once we hit beam width, invalidate the rest
-        // But this doesn't sort by energy. Let's do an O(N*K) selection:
-        uint remaining = 0;
-        for (uint k = 0; k < beamWidth; k++) {
-            float minE = 1e10f;
-            uint minIdx = N;
-            for (uint i = 0; i < N; i++) {
-                if (placements[i].valid && placements[i].energy < minE) {
-                    minE = placements[i].energy;
-                    minIdx = i;
-                }
-            }
-            if (minIdx < N) {
-                // Temporarily mark as "selected" by negating valid
-                placements[minIdx].valid = 2; // selected
-                remaining++;
-            }
-        }
-        // Now mark everything still valid=1 as invalid, and restore selected (2→1)
+    // Select the best surviving placements and compact them into slots 0..<K.
+    // Growth/reconstruction read a dense beam from the front of the buffer.
+    FragmentPlacement selected[MAX_BEAM_WIDTH];
+    uint keepLimit = min(beamWidth, MAX_BEAM_WIDTH);
+    uint kept = 0;
+    for (uint k = 0; k < keepLimit; k++) {
+        float minE = 1e10f;
+        uint minIdx = N;
         for (uint i = 0; i < N; i++) {
-            if (placements[i].valid == 2) {
-                placements[i].valid = 1;
-            } else {
-                placements[i].valid = 0;
+            if (placements[i].valid == 1 && placements[i].energy < minE) {
+                minE = placements[i].energy;
+                minIdx = i;
             }
         }
+        if (minIdx >= N) break;
+        selected[kept] = placements[minIdx];
+        selected[kept].valid = 1;
+        placements[minIdx].valid = 0;
+        kept++;
+    }
+
+    for (uint i = 0; i < N; i++) {
+        placements[i].valid = 0;
+    }
+    for (uint i = 0; i < kept; i++) {
+        placements[i] = selected[i];
+        placements[i].valid = 1;
+    }
+
+    // Keep deterministic invalid entries for callers that copy a fixed beam size.
+    for (uint i = kept; i < beamWidth && i < N; i++) {
+        placements[i].energy = 1e10f;
+        placements[i].valid = 0;
     }
 }
 

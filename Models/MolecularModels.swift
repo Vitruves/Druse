@@ -322,7 +322,7 @@ struct ResidueSubset: Identifiable, Sendable {
 
 // MARK: - Scoring Method
 
-/// Which scoring function to use for ranking docked poses.
+/// Which scoring/reranking function to use for docked poses.
 enum ScoringMethod: String, CaseIterable, Sendable {
     case vina = "Vina"
     case drusina = "Drusina"
@@ -335,7 +335,7 @@ enum ScoringMethod: String, CaseIterable, Sendable {
         case .vina:          "Vina"
         case .drusina:       "Drusina"
         case .druseAffinity: "Druse AF"
-        case .pignet2:       "PIGNet2"
+        case .pignet2:       "Vina + PIGNet2"
         }
     }
 
@@ -353,7 +353,7 @@ enum ScoringMethod: String, CaseIterable, Sendable {
         case .vina:          "Empirical energy scoring (kcal/mol)"
         case .drusina:       "Extended Vina + π-π, π-cation, halogen bond, metal coord (kcal/mol)"
         case .druseAffinity: "Neural network affinity prediction (pKi)"
-        case .pignet2:       "Physics-informed GNN — vdW + H-bond + metal + hydrophobic (kcal/mol)"
+        case .pignet2:       "Vina-guided docking with PIGNet2 GNN reranking/rescoring (kcal/mol)"
         }
     }
 
@@ -403,10 +403,15 @@ enum SearchMethod: String, CaseIterable, Sendable {
         switch self {
         case .genetic:          "Genetic algorithm + Metropolis ILS (default)"
         case .fragmentBased:    "Incremental fragment construction with beam search"
-        case .diffusionGuided:  "DruseAF attention-guided reverse diffusion"
+        case .diffusionGuided:  "Experimental: DruseAF attention-grad reverse diffusion. The DruseAF model was trained for affinity prediction, not denoising — gradients are heuristic and pose quality is currently poor. Use GA or Fragment for production work."
         case .parallelTempering: "Replica exchange Monte Carlo (multiple temperatures)"
         case .auto:             "Automatically select based on ligand flexibility"
         }
+    }
+
+    /// True for methods that are not production-ready and should be visually flagged.
+    var isExperimental: Bool {
+        self == .diffusionGuided
     }
 }
 

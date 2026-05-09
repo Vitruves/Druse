@@ -258,7 +258,8 @@ final class PipelineTests: DockingTestCase {
 
         let interactions = InteractionDetector.detect(
             ligandAtoms: heavyAtoms, ligandPositions: best.transformedAtomPositions,
-            proteinAtoms: proteinHeavy, ligandBonds: hBonds)
+            proteinAtoms: proteinHeavy, ligandBonds: hBonds,
+            scoringMethod: .drusina)
 
         XCTAssertGreaterThanOrEqual(interactions.count, 2, "Should detect ≥2 interactions")
         for inter in interactions {

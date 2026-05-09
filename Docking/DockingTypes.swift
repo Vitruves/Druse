@@ -17,7 +17,7 @@ struct DockingConfig: Sendable {
     // Search operators
     var mutationRate: Float = 0.10
     var crossoverRate: Float = 0.75
-    var translationStep: Float = 2.0 // Angstroms, aligned with Vina mutation amplitude
+    var translationStep: Float = 3.0 // Angstroms (raised from 2.0 for broader pocket coverage)
     var rotationStep: Float = 0.3    // radians (~17°)
     var torsionStep: Float = 0.8     // radians (~46°) — large enough to escape tangled conformers
     var mcTemperature: Float = 1.2   // kcal/mol, matches Vina's default Metropolis temperature (RT at ~600K)
@@ -51,7 +51,7 @@ struct DockingConfig: Sendable {
     var explorationPhaseRatio: Float = 0.55  // first 55% of generations use broader search
     var explorationTranslationStep: Float = 5.0  // wider initial translation (vs 2.0 during refinement)
     var explorationRotationStep: Float = 0.8     // wider initial rotation (vs 0.3)
-    var explorationMutationRate: Float = 0.25    // higher mutation during exploration
+    var explorationMutationRate: Float = 0.35    // higher mutation during exploration (raised from 0.25)
     var explorationLocalSearchFrequency: Int = 3  // during exploration, LS every 3rd gen
 
     // Post-docking refinement
@@ -275,6 +275,9 @@ struct DockingResult: Identifiable, Sendable {
     var formLabel: String? = nil            // chemical form label (e.g. "Taut2", "prot_Amine+Taut1")
     var formPopulation: Float? = nil        // Boltzmann population fraction of this form
 
+    // PoseBusters-style validity report (populated post-dock)
+    var validity: PoseValidity? = nil
+
     /// The display score depending on the active scoring method.
     func displayScore(method: ScoringMethod) -> Float {
         switch method {
@@ -292,6 +295,33 @@ struct DockingResult: Identifiable, Sendable {
     var vdwEnergy: Float { stericEnergy }
     var elecEnergy: Float { hydrophobicEnergy }
     var desolvEnergy: Float { torsionPenalty }
+}
+
+// MARK: - Pose Validity (PoseBusters-style checks)
+
+/// Result of validity checks on a docked pose. Each `Bool` is `true` when the corresponding
+/// check passed. `failures` enumerates only the checks that failed, suitable for tooltip display.
+struct PoseValidity: Sendable, Hashable {
+    var bondLengthsOK: Bool        = true   // each bond within tolerance of covalent reference
+    var bondAnglesOK: Bool         = true   // each angle within reasonable bounds
+    var internalClashOK: Bool      = true   // no non-bonded ligand atoms in steric clash
+    var proteinClashOK: Bool       = true   // no ligand-protein heavy atoms in severe clash
+    var connectedOK: Bool          = true   // all heavy atoms still connected via bonds
+    var extentOK: Bool             = true   // ligand bounding box within sane bounds
+    /// Worst observed bond-length deviation as a multiple of the equilibrium length (1.0 = perfect).
+    var worstBondRatio: Float      = 1.0
+    /// Smallest ligand-protein heavy atom distance (Å).
+    var minProteinDistance: Float  = .greatestFiniteMagnitude
+    /// Smallest 1-4+ non-bonded internal distance (Å).
+    var minInternalDistance: Float = .greatestFiniteMagnitude
+    /// Names of the checks that failed.
+    var failures: [String]         = []
+
+    var passed: Bool {
+        bondLengthsOK && bondAnglesOK && internalClashOK
+            && proteinClashOK && connectedOK && extentOK
+    }
+    var failureCount: Int { failures.count }
 }
 
 struct DockPoseSwift: Sendable {
@@ -382,6 +412,22 @@ struct MolecularInteraction: Identifiable, Sendable {
             case .amideStack:  "Amide-π"
             case .chalcogen:   "Chalcogen bond"
             }
+        }
+    }
+}
+
+extension ScoringMethod {
+    /// Interaction types that this scoring function actually accounts for.
+    /// Used to gate the live interaction display so users don't see lines
+    /// (e.g. π-stacking under Vina) that don't influence the score.
+    /// DruseAFv4 is a learned/opaque scorer with no per-interaction terms,
+    /// so the empty set hides interaction lines entirely for that method.
+    var accountedInteractionTypes: Set<MolecularInteraction.InteractionType> {
+        switch self {
+        case .vina:          return [.hbond, .hydrophobic]
+        case .drusina:       return Set(MolecularInteraction.InteractionType.allCases)
+        case .pignet2:       return [.hbond, .hydrophobic, .metalCoord]
+        case .druseAffinity: return []
         }
     }
 }

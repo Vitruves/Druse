@@ -593,8 +593,11 @@ enum InteractionDetector {
         ligandAtoms: [Atom],
         ligandPositions: [SIMD3<Float>],
         proteinAtoms: [Atom],
-        ligandBonds: [Bond] = []
+        ligandBonds: [Bond] = [],
+        scoringMethod: ScoringMethod
     ) -> [MolecularInteraction] {
+        let allowedTypes = scoringMethod.accountedInteractionTypes
+        if allowedTypes.isEmpty { return [] }
         var result: [MolecularInteraction] = []
         var idCounter = 0
 
@@ -809,6 +812,9 @@ enum InteractionDetector {
             }
         }
 
+        if allowedTypes.count < MolecularInteraction.InteractionType.allCases.count {
+            result.removeAll { !allowedTypes.contains($0.type) }
+        }
         return result
     }
 }

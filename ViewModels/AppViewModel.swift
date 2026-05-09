@@ -94,7 +94,8 @@ final class AppViewModel {
                  altLoc: atom.altLoc)
         }
         let normalizedLigand = Molecule(name: molecule.name, atoms: normalizedAtoms,
-                                         bonds: molecule.bonds, title: molecule.title)
+                                         bonds: molecule.bonds, title: molecule.title,
+                                         smiles: molecule.smiles)
 
         molecules.ligand = normalizedLigand
         activeLigandEntryID = entryID
@@ -166,15 +167,21 @@ final class AppViewModel {
             selectedIndices: Array(chainAtomIndices).sorted()
         )
 
-        let ligMol = Molecule(name: ligandName, atoms: ligAtoms, bonds: ligBonds)
-        setLigandForDocking(ligMol)
-
         var smiles = ""
         if !ligBonds.isEmpty {
             smiles = RDKitBridge.atomsBondsToSMILES(atoms: ligAtoms, bonds: ligBonds) ?? ""
         }
+
+        let ligMol = Molecule(
+            name: ligandName,
+            atoms: ligAtoms,
+            bonds: ligBonds,
+            title: smiles,
+            smiles: smiles.isEmpty ? nil : smiles
+        )
+        setLigandForDocking(ligMol)
+
         if !smiles.isEmpty {
-            ligMol.smiles = smiles
             log.info("Generated SMILES for \(ligandName): \(smiles.prefix(60))...", category: .molecule)
         }
 
@@ -191,6 +198,7 @@ final class AppViewModel {
             ligandDB.entries[existingIdx].isPrepared = true
             ligandDB.entries[existingIdx].sourceChainID = chainID
             if !smiles.isEmpty { ligandDB.entries[existingIdx].smiles = smiles }
+            activeLigandEntryID = ligandDB.entries[existingIdx].id
             log.info("Updated existing \(ligandName) in ligand database", category: .molecule)
         } else {
             let dbEntry = LigandEntry(
@@ -203,6 +211,7 @@ final class AppViewModel {
                 sourceChainID: chainID
             )
             ligandDB.add(dbEntry)
+            activeLigandEntryID = dbEntry.id
         }
 
         let keepIndices = prot.atoms.indices.filter { !chainAtomIndices.contains($0) }
@@ -696,6 +705,7 @@ final class AppViewModel {
         // Build chain color map respecting per-chain color modes (CPK / Chain / Custom)
         if let prot = molecules.protein {
             var colorMap: [String: SIMD3<Float>] = [:]
+            var carbonsOnly: Set<String> = []
             let palette = WorkspaceState.MoleculeColorScheme.chainPalette
             // Default per-chain mode depends on the global color scheme:
             // - .chainColored → chains get palette colors by default
@@ -715,18 +725,26 @@ final class AppViewModel {
                         colorMap[chain.id] = palette[i % palette.count]
                     }
                 }
+                if colorMap[chain.id] != nil {
+                    let scope = workspace.chainColorScopes[chain.id] ?? .carbonsOnly
+                    if scope == .carbonsOnly { carbonsOnly.insert(chain.id) }
+                }
             }
             renderer.chainColorMap = colorMap
+            renderer.chainColorCarbonsOnly = carbonsOnly
         } else {
             renderer.chainColorMap = [:]
+            renderer.chainColorCarbonsOnly = []
         }
 
-        // Ligand carbon color: user override from inspector, otherwise from color scheme
+        // Ligand carbon color: user override from inspector, otherwise from color scheme.
+        // Scope (carbons-only vs all atoms) is user-controlled via the inspector.
         if let userLigColor = workspace.ligandCarbonColor {
             renderer.ligandCarbonColor = userLigColor
         } else {
             renderer.ligandCarbonColor = workspace.colorScheme.ligandCarbon
         }
+        renderer.ligandColorCarbonsOnly = workspace.ligandColorCarbonsOnly
 
         // Track how many protein atoms are in the buffer so Renderer can distinguish them
         let protCount = workspace.showProtein ? (molecules.protein?.atoms.filter { atom in

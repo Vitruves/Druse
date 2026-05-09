@@ -585,7 +585,7 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private var dockingConfigSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 14) {
             Label("Configuration", systemImage: "gearshape")
                 .font(.callout.weight(.semibold))
 
@@ -621,153 +621,141 @@ struct DockingTabView: View {
                 .padding(.vertical, 2)
             }
 
-            configRow("Population") {
-                intField(value: Binding(
-                    get: { viewModel.docking.dockingConfig.populationSize },
-                    set: { viewModel.docking.dockingConfig.populationSize = max(10, $0) }
-                ))
-            }
-            .help("Number of candidate poses per generation")
-
-            configRow("Generations") {
-                intField(value: Binding(
-                    get: { viewModel.docking.dockingConfig.generationsPerRun },
-                    set: { viewModel.docking.dockingConfig.generationsPerRun = max(10, $0) }
-                ))
-            }
-            .help("Number of GA evolution cycles per run")
-
-            configRow("Runs") {
-                intField(value: Binding(
-                    get: { viewModel.docking.dockingConfig.numRuns },
-                    set: { viewModel.docking.dockingConfig.numRuns = max(1, $0) }
-                ))
-            }
-            .help("Independent docking runs (more = better sampling)")
-
-            Toggle("Ligand Flexibility", isOn: Binding(
-                get: { viewModel.docking.dockingConfig.enableFlexibility },
-                set: { viewModel.docking.dockingConfig.enableFlexibility = $0 }
-            ))
-            .font(.subheadline)
-            .help("Allow rotatable bonds to flex during docking")
-
-            configRow("Grid Spacing") {
-                Picker("", selection: Binding(
-                    get: { viewModel.docking.dockingConfig.gridSpacing },
-                    set: { viewModel.docking.dockingConfig.gridSpacing = $0 }
-                )) {
-                    Text("0.375 \u{00C5}").tag(Float(0.375))
-                    Text("0.500 \u{00C5}").tag(Float(0.500))
-                    Text("0.750 \u{00C5}").tag(Float(0.750))
+            // Group 1: Search Budget
+            configGroup("Search Budget", icon: "speedometer") {
+                LabeledContent("Population") {
+                    intField(value: Binding(
+                        get: { viewModel.docking.dockingConfig.populationSize },
+                        set: { viewModel.docking.dockingConfig.populationSize = max(10, $0) }
+                    ))
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .frame(width: 80)
-            }
-            .help("Energy grid resolution (smaller = more accurate but slower)")
+                .help("Candidate poses per generation")
 
-            VStack(alignment: .leading, spacing: 2) {
+                LabeledContent("Generations / run") {
+                    intField(value: Binding(
+                        get: { viewModel.docking.dockingConfig.generationsPerRun },
+                        set: { viewModel.docking.dockingConfig.generationsPerRun = max(10, $0) }
+                    ))
+                }
+                .help("GA evolution cycles within each independent run")
+
+                LabeledContent("Runs") {
+                    intField(value: Binding(
+                        get: { viewModel.docking.dockingConfig.numRuns },
+                        set: { viewModel.docking.dockingConfig.numRuns = max(1, $0) }
+                    ))
+                }
+                .help("Independent restarts (more = better sampling)")
+
+                Divider().padding(.vertical, 1)
+
                 HStack {
-                    Text("Mutation Rate")
+                    Text("Total evaluations")
                         .font(.subheadline)
-                    Spacer()
-                    Text(String(format: "%.3f", viewModel.docking.dockingConfig.mutationRate))
-                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(totalEvaluationsString)
+                        .font(.footnote.monospaced().weight(.semibold))
                 }
-                Slider(
+                .help("Population × Generations × Runs")
+            }
+
+            // Group 2: Search Behavior
+            configGroup("Search Behavior", icon: "slider.horizontal.3") {
+                sliderRow(
+                    label: "Mutation Rate",
                     value: Binding(
                         get: { viewModel.docking.dockingConfig.mutationRate },
                         set: { viewModel.docking.dockingConfig.mutationRate = $0 }
                     ),
-                    in: 0.01...0.25,
-                    step: 0.005
+                    range: 0.01...0.25,
+                    step: 0.005,
+                    valueText: String(format: "%.3f", viewModel.docking.dockingConfig.mutationRate)
                 )
-                .controlSize(.small)
+
+                Toggle("Ligand Flexibility", isOn: Binding(
+                    get: { viewModel.docking.dockingConfig.enableFlexibility },
+                    set: { viewModel.docking.dockingConfig.enableFlexibility = $0 }
+                ))
+                .font(.subheadline)
+                .help("Allow rotatable bonds to flex during docking")
+
+                LabeledContent("Grid Spacing") {
+                    Picker("", selection: Binding(
+                        get: { viewModel.docking.dockingConfig.gridSpacing },
+                        set: { viewModel.docking.dockingConfig.gridSpacing = $0 }
+                    )) {
+                        Text("0.375 \u{00C5}").tag(Float(0.375))
+                        Text("0.500 \u{00C5}").tag(Float(0.500))
+                        Text("0.750 \u{00C5}").tag(Float(0.750))
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(width: 90)
+                }
+                .help("Energy grid resolution (smaller = more accurate but slower)")
             }
 
-            DisclosureGroup("Exploration") {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("Exploration Phase Ratio")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", viewModel.docking.dockingConfig.explorationPhaseRatio))
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(
+            // Group 3: Exploration Phase
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 10) {
+                    sliderRow(
+                        label: "Phase Ratio",
                         value: Binding(
                             get: { viewModel.docking.dockingConfig.explorationPhaseRatio },
                             set: { viewModel.docking.dockingConfig.explorationPhaseRatio = $0 }
                         ),
-                        in: 0.2...0.8,
-                        step: 0.05
+                        range: 0.2...0.8,
+                        step: 0.05,
+                        valueText: String(format: "%.2f", viewModel.docking.dockingConfig.explorationPhaseRatio)
                     )
-                    .controlSize(.small)
-                }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("Local Search Freq.")
-                            .font(.subheadline)
-                        Spacer()
-                        Text("every \(viewModel.docking.dockingConfig.explorationLocalSearchFrequency)th gen")
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Stepper(
+                    sliderRow(
+                        label: "Local Search Freq.",
                         value: Binding(
-                            get: { viewModel.docking.dockingConfig.explorationLocalSearchFrequency },
-                            set: { viewModel.docking.dockingConfig.explorationLocalSearchFrequency = $0 }
+                            get: { Float(viewModel.docking.dockingConfig.explorationLocalSearchFrequency) },
+                            set: { viewModel.docking.dockingConfig.explorationLocalSearchFrequency = max(1, Int($0.rounded())) }
                         ),
-                        in: 1...10
-                    ) {
-                        EmptyView()
-                    }
-                    .controlSize(.small)
-                }
+                        range: 1.0...10.0,
+                        step: 1.0,
+                        valueText: {
+                            let n = viewModel.docking.dockingConfig.explorationLocalSearchFrequency
+                            return "every \(n)\(ordinalSuffix(n)) gen"
+                        }()
+                    )
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("MC Temperature")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.1f", viewModel.docking.dockingConfig.mcTemperature))
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(
+                    sliderRow(
+                        label: "MC Temperature",
                         value: Binding(
                             get: { viewModel.docking.dockingConfig.mcTemperature },
                             set: { viewModel.docking.dockingConfig.mcTemperature = $0 }
                         ),
-                        in: 0.5...4.0,
-                        step: 0.1
+                        range: 0.5...4.0,
+                        step: 0.1,
+                        valueText: String(format: "%.1f", viewModel.docking.dockingConfig.mcTemperature)
                     )
-                    .controlSize(.small)
-                }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("Exploration Mutation")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", viewModel.docking.dockingConfig.explorationMutationRate))
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(
+                    sliderRow(
+                        label: "Exploration Mutation",
                         value: Binding(
                             get: { viewModel.docking.dockingConfig.explorationMutationRate },
                             set: { viewModel.docking.dockingConfig.explorationMutationRate = $0 }
                         ),
-                        in: 0.10...0.50,
-                        step: 0.01
+                        range: 0.10...0.50,
+                        step: 0.01,
+                        valueText: String(format: "%.2f", viewModel.docking.dockingConfig.explorationMutationRate)
                     )
-                    .controlSize(.small)
                 }
+                .padding(.top, 6)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "sparkles")
+                        .font(.caption2)
+                    Text("Exploration Phase")
+                        .font(.caption.weight(.semibold))
+                        .textCase(.uppercase)
+                }
+                .foregroundStyle(.secondary)
             }
         }
     }
@@ -809,12 +797,43 @@ struct DockingTabView: View {
     }
 
     @ViewBuilder
-    private func configRow<Content: View>(_ label: String, @ViewBuilder control: () -> Content) -> some View {
-        HStack {
-            Text(label)
-                .font(.subheadline)
-            Spacer()
-            control()
+    private func configGroup<Content: View>(
+        _ title: String,
+        icon: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.caption2)
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .textCase(.uppercase)
+            }
+            .foregroundStyle(.secondary)
+
+            content()
+        }
+    }
+
+    @ViewBuilder
+    private func sliderRow(
+        label: String,
+        value: Binding<Float>,
+        range: ClosedRange<Float>,
+        step: Float,
+        valueText: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label).font(.subheadline)
+                Spacer()
+                Text(valueText)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range, step: step)
+                .controlSize(.small)
         }
     }
 
@@ -825,6 +844,34 @@ struct DockingTabView: View {
             .font(.footnote.monospaced())
             .frame(width: 70)
             .multilineTextAlignment(.trailing)
+    }
+
+    private func ordinalSuffix(_ n: Int) -> String {
+        let mod100 = n % 100
+        if (11...13).contains(mod100) { return "th" }
+        switch n % 10 {
+        case 1: return "st"
+        case 2: return "nd"
+        case 3: return "rd"
+        default: return "th"
+        }
+    }
+
+    private var totalEvaluationsString: String {
+        let cfg = viewModel.docking.dockingConfig
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        let total: Int
+        switch cfg.searchMethod {
+        case .diffusionGuided:
+            total = cfg.populationSize * max(cfg.diffusion.numDenoisingSteps, 1)
+        case .fragmentBased:
+            // Fragment search size depends on ligand decomposition — show beam-width-based estimate.
+            return "≈ beam × frags"
+        default:
+            total = cfg.populationSize * cfg.generationsPerRun * cfg.numRuns
+        }
+        return f.string(from: NSNumber(value: total)) ?? "\(total)"
     }
 
     // MARK: - Pharmacophore Constraints
@@ -1170,9 +1217,20 @@ struct DockingTabView: View {
                     .frame(minWidth: 200, maxWidth: 260)
                 }
 
-                Text("Requires DruseAF weights")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Text("Experimental — pose quality currently poor")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.orange)
+                    }
+                    Text("DruseAF was trained for affinity prediction, not denoising; the gradient is heuristic. Use GA or Fragment for production work.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.top, 2)
         }
@@ -1204,12 +1262,26 @@ struct DockingTabView: View {
                     ForEach(SearchMethod.allCases, id: \.self) { method in
                         Button {
                             vm.docking.dockingConfig.searchMethod = method
+                            // Diffusion requires DruseAF attention gradients — auto-switch
+                            // scoring so the user doesn't have to set both.
+                            if method == .diffusionGuided && vm.docking.scoringMethod != .druseAffinity {
+                                vm.docking.scoringMethod = .druseAffinity
+                            }
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: method.icon)
                                     .font(.subheadline)
                                 Text(method.shortLabel)
                                     .font(.subheadline.weight(.medium))
+                                if method.isExperimental {
+                                    Text("BETA")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.orange)
+                                        .padding(.horizontal, 3)
+                                        .padding(.vertical, 1)
+                                        .background(Color.orange.opacity(0.15))
+                                        .clipShape(RoundedRectangle(cornerRadius: 2))
+                                }
                             }
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 4)
@@ -1261,6 +1333,8 @@ struct DockingTabView: View {
                 Text(viewModel.docking.scoringMethod.description)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+
+                ScoringInteractionsBadgeRow(method: viewModel.docking.scoringMethod)
             }
 
             Divider()
@@ -1545,6 +1619,36 @@ struct DockingTabView: View {
             .frame(maxWidth: .infinity)
             .background(RoundedRectangle(cornerRadius: 6).fill(Color.green.opacity(0.06)))
 
+            // PoseBusters validity summary
+            if results.contains(where: { $0.validity != nil }) {
+                let validCount = results.filter { $0.validity?.passed == true }.count
+                let total = results.count
+                let allPassed = validCount == total
+                HStack(spacing: 6) {
+                    Image(systemName: allPassed ? "checkmark.seal.fill" : "exclamationmark.shield")
+                        .foregroundStyle(allPassed ? .green : .orange)
+                        .font(.footnote)
+                    Text("PoseBusters: \(validCount)/\(total) passed")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    if !allPassed, let firstBad = results.first(where: { $0.validity?.passed == false }),
+                       let v = firstBad.validity, !v.failures.isEmpty {
+                        Spacer()
+                        Text(v.failures.prefix(2).joined(separator: ", "))
+                            .font(.footnote.monospaced())
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                    } else {
+                        Spacer()
+                    }
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill((allPassed ? Color.green : Color.orange).opacity(0.08)))
+                .help("PoseBusters checks: bond lengths/angles, internal & protein clashes, connectivity, extent.")
+            }
+
             // Best pose scoring breakdown
             if let best = results.first {
                 VStack(alignment: .leading, spacing: 3) {
@@ -1810,5 +1914,97 @@ struct DockingTabView: View {
         )
         viewModel.docking.detectedPockets = [pocket]
         viewModel.docking.selectedPocket = pocket
+    }
+}
+
+/// Small caption + wrapped color-chip row showing which interaction types
+/// the selected scoring function actually accounts for. Renders nothing for
+/// scorers with no per-interaction terms (e.g. DruseAFv4).
+private struct ScoringInteractionsBadgeRow: View {
+    let method: ScoringMethod
+
+    private var types: [MolecularInteraction.InteractionType] {
+        let allowed = method.accountedInteractionTypes
+        return MolecularInteraction.InteractionType.allCases.filter { allowed.contains($0) }
+    }
+
+    var body: some View {
+        if types.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Accounted interactions")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                WrapHStack(spacing: 4, lineSpacing: 4) {
+                    ForEach(types, id: \.self) { t in
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color(red: Double(t.color.x),
+                                            green: Double(t.color.y),
+                                            blue: Double(t.color.z))
+                                        .opacity(Double(t.color.w)))
+                                .frame(width: 6, height: 6)
+                            Text(t.label)
+                                .font(.caption2)
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(Color.secondary.opacity(0.12))
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Minimal wrapping HStack layout — places subviews left-to-right and wraps
+/// to a new line when the proposed width is exceeded.
+private struct WrapHStack: Layout {
+    var spacing: CGFloat = 4
+    var lineSpacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var widestLine: CGFloat = 0
+        for sv in subviews {
+            let sz = sv.sizeThatFits(.unspecified)
+            if x > 0 && x + sz.width > maxWidth {
+                widestLine = max(widestLine, x - spacing)
+                x = 0
+                y += lineHeight + lineSpacing
+                lineHeight = 0
+            }
+            x += sz.width + spacing
+            lineHeight = max(lineHeight, sz.height)
+        }
+        widestLine = max(widestLine, x - spacing)
+        return CGSize(width: maxWidth.isFinite ? maxWidth : widestLine,
+                      height: y + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
+                       subviews: Subviews, cache: inout ()) {
+        let maxWidth = bounds.width
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        for sv in subviews {
+            let sz = sv.sizeThatFits(.unspecified)
+            if x > 0 && x + sz.width > maxWidth {
+                x = 0
+                y += lineHeight + lineSpacing
+                lineHeight = 0
+            }
+            sv.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
+                     proposal: ProposedViewSize(sz))
+            x += sz.width + spacing
+            lineHeight = max(lineHeight, sz.height)
+        }
     }
 }

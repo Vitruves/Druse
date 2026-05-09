@@ -334,6 +334,7 @@ struct ResultsTabView: View {
                         .padding(.vertical, 2)
                         .background(Capsule().fill(Color.cyan.opacity(0.15)))
                         .foregroundStyle(.cyan)
+                        .help("Cluster \(result.clusterID) — RMSD-based binding-mode group. Poses sharing this ID occupy the same pose family (RMSD < 2.0 Å); different IDs are structurally distinct binding modes.")
                 }
             }
 

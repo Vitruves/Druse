@@ -8,6 +8,7 @@ struct SearchTabView: View {
     @State private var pdbID: String = ""
     @State private var searchQuery: String = ""
     @State private var cachedEntries: [CachedPDBEntry] = []
+    @State private var isLoadingCache: Bool = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -123,15 +124,26 @@ struct SearchTabView: View {
                 }
             }
 
-            if !cachedEntries.isEmpty {
+            if isLoadingCache || !cachedEntries.isEmpty {
                 Divider()
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Label("Previously Fetched", systemImage: "clock.arrow.circlepath")
-                        .font(.callout.weight(.semibold))
+                    HStack(spacing: 6) {
+                        Label("Previously Fetched", systemImage: "clock.arrow.circlepath")
+                            .font(.callout.weight(.semibold))
+                        if isLoadingCache {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
 
-                    ForEach(cachedEntries) { entry in
-                        cachedEntryRow(entry)
+                    if isLoadingCache && cachedEntries.isEmpty {
+                        Text("Scanning cache…")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(cachedEntries) { entry in
+                            cachedEntryRow(entry)
+                        }
                     }
                 }
             }
@@ -176,7 +188,10 @@ struct SearchTabView: View {
     }
 
     private func refreshCachedEntries() async {
-        cachedEntries = await PDBService.shared.cachedEntries()
+        isLoadingCache = true
+        let entries = await PDBService.shared.cachedEntries()
+        cachedEntries = entries
+        isLoadingCache = false
     }
 
     @ViewBuilder

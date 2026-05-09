@@ -521,7 +521,13 @@ extension AppViewModel {
                         newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
                     }
                 }
-                molecules.ligand = Molecule(name: lig.name, atoms: newAtoms, bonds: newBonds, title: lig.title)
+                molecules.ligand = Molecule(
+                    name: lig.name,
+                    atoms: newAtoms,
+                    bonds: newBonds,
+                    title: lig.title,
+                    smiles: lig.smiles
+                )
             }
         }
 

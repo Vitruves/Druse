@@ -238,7 +238,7 @@ struct PreDockSheet: View {
                 Spacer()
                 Picker("", selection: $vm.docking.scoringMethod) {
                     ForEach(ScoringMethod.allCases, id: \.self) { method in
-                        Label(method.rawValue, systemImage: method.icon).tag(method)
+                        Label(method.shortLabel, systemImage: method.icon).tag(method)
                     }
                 }
                 .pickerStyle(.menu)
