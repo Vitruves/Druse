@@ -245,11 +245,23 @@ struct SerializedDockingConfig: Codable {
     let populationSize, numRuns, generationsPerRun: Int
     let gridSpacing: Float
     let enableFlexibility, useAnalyticalGradients: Bool
+    let torsionSearchPreset: TorsionSearchPreset?
+    let torsionExactFraction: Float?
+    let torsionLocalFraction: Float?
+    let torsionLocalAmplitude: Float?
+    let torsionRandomResetProbability: Float?
+    let torsionPerturbationScale: Float?
 
     init(from c: DockingConfig) {
         populationSize = c.populationSize; numRuns = c.numRuns
         generationsPerRun = c.generationsPerRun; gridSpacing = c.gridSpacing
         enableFlexibility = c.enableFlexibility; useAnalyticalGradients = c.useAnalyticalGradients
+        torsionSearchPreset = c.torsionSearchPreset
+        torsionExactFraction = c.torsionExactFraction
+        torsionLocalFraction = c.torsionLocalFraction
+        torsionLocalAmplitude = c.torsionLocalAmplitude
+        torsionRandomResetProbability = c.torsionRandomResetProbability
+        torsionPerturbationScale = c.torsionPerturbationScale
     }
 
     func toConfig() -> DockingConfig {
@@ -257,6 +269,29 @@ struct SerializedDockingConfig: Codable {
         c.populationSize = populationSize; c.numRuns = numRuns
         c.generationsPerRun = generationsPerRun; c.gridSpacing = gridSpacing
         c.enableFlexibility = enableFlexibility; c.useAnalyticalGradients = useAnalyticalGradients
+        if let preset = torsionSearchPreset {
+            c.applyTorsionSearchPreset(preset)
+        }
+        if let torsionExactFraction {
+            c.torsionSearchPreset = .manual
+            c.torsionExactFraction = torsionExactFraction
+        }
+        if let torsionLocalFraction {
+            c.torsionSearchPreset = .manual
+            c.torsionLocalFraction = torsionLocalFraction
+        }
+        if let torsionLocalAmplitude {
+            c.torsionSearchPreset = .manual
+            c.torsionLocalAmplitude = torsionLocalAmplitude
+        }
+        if let torsionRandomResetProbability {
+            c.torsionSearchPreset = .manual
+            c.torsionRandomResetProbability = torsionRandomResetProbability
+        }
+        if let torsionPerturbationScale {
+            c.torsionSearchPreset = .manual
+            c.torsionPerturbationScale = torsionPerturbationScale
+        }
         return c
     }
 }

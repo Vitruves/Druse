@@ -284,37 +284,29 @@ struct InspectorPanel: View {
             Divider()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    selectionSection
-
-                    Divider()
-
-                    chainVisibilitySection
-
-                    Divider()
-
-                    residueSubsetsSection
-
-                    Divider()
-
-                    statisticsSection
+                VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
+                    selectionCard
+                    chainsCard
+                    subsetsCard
+                    statisticsCard
+                    Spacer(minLength: 0)
                 }
                 .padding(12)
             }
+            .scrollIndicators(.hidden)
         }
         .frame(width: 260)
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
-    // MARK: - Selection Section
+    // MARK: - Selection card
 
     @ViewBuilder
-    private var selectionSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Mode toggle
-            HStack {
-                sectionHeader("Selection", icon: "cursorarrow.click.2")
-                Spacer()
+    private var selectionCard: some View {
+        PanelCard(
+            "Selection",
+            icon: "cursorarrow.click.2",
+            accessory: {
                 Picker("", selection: Binding(
                     get: { viewModel.workspace.selectionMode },
                     set: { viewModel.workspace.selectionMode = $0 }
@@ -324,16 +316,78 @@ struct InspectorPanel: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 130)
+                .controlSize(.mini)
+                .frame(width: 110)
             }
-
-            // Content based on selection state
+        ) {
             if selectionMode == .atom {
                 atomSelectionContent
             } else {
                 residueSelectionContent
             }
         }
+    }
+
+    // MARK: - Empty selection placeholder
+
+    @ViewBuilder
+    private func emptySelectionContent(icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                Text("No Selection")
+                    .font(PanelStyle.titleFont)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                shortcutHint(keys: ["Click"],            description: "select an item")
+                shortcutHint(keys: ["⌥", "Click"],       description: "add to selection")
+                shortcutHint(keys: ["⌥", "Drag"],        description: "box-select")
+                shortcutHint(keys: ["Double-click"],     description: "select chain")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Renders one or more keys as separate pill chips joined by a small "+",
+    /// followed by the human-readable description. Splitting `⌥` into its
+    /// own chip makes the modifier visible at small font sizes (the previous
+    /// `⌥Click` glyph collapsed into a single barely-readable token).
+    @ViewBuilder
+    private func shortcutHint(keys: [String], description: String) -> some View {
+        HStack(spacing: 4) {
+            ForEach(Array(keys.enumerated()), id: \.offset) { idx, key in
+                if idx > 0 {
+                    Text("+")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
+                keyChip(key)
+            }
+            Text(description)
+                .font(PanelStyle.smallFont)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 2)
+        }
+    }
+
+    private func keyChip(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.primary.opacity(0.10))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
+            .fixedSize()
     }
 
     // MARK: - Atom Selection Content
@@ -343,17 +397,10 @@ struct InspectorPanel: View {
         let selectedCount = viewModel.workspace.selectedAtomIndices.count
 
         if selectedCount == 0 {
-            ContentUnavailableView {
-                Label("No Selection", systemImage: "atom")
-            } description: {
-                Text("Click to select \u{2022} \u{2325}Click to multi-select \u{2022} \u{2325}Drag to box-select \u{2022} Double-click to select chain")
-            }
-            .frame(height: 100)
+            emptySelectionContent(icon: "atom")
         } else if selectedCount == 1, let atom = viewModel.selectedAtom {
-            // Single atom detail
             atomInspector(atom)
         } else {
-            // Multi-atom summary
             multiAtomSummary(count: selectedCount)
         }
     }
@@ -365,20 +412,13 @@ struct InspectorPanel: View {
         let selectedCount = viewModel.workspace.selectedResidueIndices.count
 
         if selectedCount == 0 {
-            ContentUnavailableView {
-                Label("No Selection", systemImage: "rectangle.stack")
-            } description: {
-                Text("Click to select \u{2022} \u{2325}Click to multi-select \u{2022} \u{2325}Drag to box-select \u{2022} Double-click to select chain")
-            }
-            .frame(height: 100)
+            emptySelectionContent(icon: "rectangle.stack")
         } else if selectedCount == 1, let prot = viewModel.molecules.protein {
-            // Single residue detail
             let resIdx = viewModel.workspace.selectedResidueIndices.first!
             if resIdx < prot.residues.count {
                 singleResidueInspector(prot.residues[resIdx], in: prot)
             }
         } else {
-            // Multi-residue summary
             multiResidueSummary(count: selectedCount)
         }
     }
@@ -487,23 +527,18 @@ struct InspectorPanel: View {
             .sorted { $0.value > $1.value }
 
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: "atom")
-                    .font(.body)
+                    .font(.system(size: 13))
                     .foregroundStyle(.cyan)
                 Text("\(count) atoms selected")
-                    .font(.headline)
+                    .font(PanelStyle.titleFont)
             }
 
-            // Element breakdown
-            HStack(spacing: 4) {
-                ForEach(elementCounts.prefix(6), id: \.key) { symbol, cnt in
-                    Text("\(symbol):\(cnt)")
-                        .font(.footnote.monospaced())
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.06))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+            // Element breakdown — wrap chips so they don't overflow
+            FlowLayout(spacing: 4) {
+                ForEach(elementCounts.prefix(8), id: \.key) { symbol, cnt in
+                    countChip(label: symbol, count: cnt)
                 }
             }
 
@@ -521,7 +556,6 @@ struct InspectorPanel: View {
                 infoRow("Total charge", String(format: "%.2f", totalCharge))
             }
 
-            // Selection actions
             selectionActions
         }
     }
@@ -568,14 +602,9 @@ struct InspectorPanel: View {
             let elements = Dictionary(grouping: residue.atomIndices.compactMap { idx in
                 idx < prot.atoms.count ? prot.atoms[idx].element : nil
             }, by: \.symbol).mapValues(\.count).sorted { $0.value > $1.value }
-            HStack(spacing: 4) {
+            FlowLayout(spacing: 4) {
                 ForEach(elements, id: \.key) { symbol, cnt in
-                    Text("\(symbol):\(cnt)")
-                        .font(.footnote.monospaced())
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.primary.opacity(0.05))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    countChip(label: symbol, count: cnt)
                 }
             }
 
@@ -618,27 +647,21 @@ struct InspectorPanel: View {
             }
 
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: "rectangle.stack")
-                    .font(.body)
+                    .font(.system(size: 13))
                     .foregroundStyle(.cyan)
                 Text("\(count) residues selected")
-                    .font(.headline)
+                    .font(PanelStyle.titleFont)
             }
 
-            // Residue type breakdown
+            // Residue type breakdown — wrap so labels are never split mid-token
             let typeCounts = Dictionary(grouping: residues, by: \.name)
                 .mapValues(\.count)
                 .sorted { $0.value > $1.value }
-
-            HStack(spacing: 4) {
-                ForEach(typeCounts.prefix(8), id: \.key) { name, cnt in
-                    Text("\(name):\(cnt)")
-                        .font(.footnote.monospaced())
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.06))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+            FlowLayout(spacing: 4) {
+                ForEach(typeCounts.prefix(12), id: \.key) { name, cnt in
+                    countChip(label: name, count: cnt)
                 }
             }
 
@@ -654,7 +677,6 @@ struct InspectorPanel: View {
                 infoRow("Range", "\(first)\u{2013}\(last)")
             }
 
-            // Selection actions
             selectionActions
         }
         }
@@ -667,66 +689,58 @@ struct InspectorPanel: View {
         let hasResidues = !viewModel.workspace.selectedResidueIndices.isEmpty
 
         VStack(spacing: 6) {
-            // Extend nearby
-            HStack(spacing: 6) {
+            PanelChoiceGrid(columns: 2) {
                 Menu {
                     ForEach([5, 6, 8, 10] as [Float], id: \.self) { d in
-                        Button(String(format: "%.0f \u{00C5}", d)) {
+                        Button(String(format: "%.0f Å", d)) {
                             viewModel.selectResiduesWithinDistance(d)
                         }
                     }
                 } label: {
-                    Label("Extend Nearby", systemImage: "circle.dashed")
-                        .frame(maxWidth: .infinity)
+                    HStack(spacing: 4) {
+                        Image(systemName: "circle.dashed")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("Extend Nearby")
+                            .font(PanelStyle.bodyFont)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: PanelStyle.buttonHeight)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.primary.opacity(PanelStyle.chipFillOpacity))
+                    )
+                    .contentShape(Rectangle())
                 }
                 .menuStyle(.borderlessButton)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 4)
-                .background(Color.primary.opacity(0.06))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .controlSize(.small)
+                .menuIndicator(.hidden)
+                .help("Extend selection to residues within a distance threshold")
 
-                Button(action: { viewModel.extendSelectionByOneResidue() }) {
-                    Label("+1 Res", systemImage: "arrow.left.and.right")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!hasResidues)
+                PanelSecondaryButton(
+                    title: "+1 Res", icon: "arrow.left.and.right",
+                    isDisabled: !hasResidues
+                ) { viewModel.extendSelectionByOneResidue() }
             }
+            PanelChoiceGrid(columns: 2) {
+                PanelSecondaryButton(
+                    title: "Invert", icon: "arrow.triangle.2.circlepath"
+                ) { viewModel.invertSelection() }
 
-            HStack(spacing: 6) {
-                Button(action: { viewModel.invertSelection() }) {
-                    Label("Invert", systemImage: "arrow.triangle.2.circlepath")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button(action: { viewModel.createSubsetFromSelection() }) {
-                    Label("Subset", systemImage: "plus.circle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!hasResidues)
+                PanelSecondaryButton(
+                    title: "Subset", icon: "plus.circle",
+                    isDisabled: !hasResidues
+                ) { viewModel.createSubsetFromSelection() }
             }
+            PanelChoiceGrid(columns: 2) {
+                PanelSecondaryButton(
+                    title: "Define Pocket", icon: "scope",
+                    isDisabled: !hasResidues
+                ) { viewModel.definePocketFromSelection() }
 
-            HStack(spacing: 6) {
-                Button(action: { viewModel.definePocketFromSelection() }) {
-                    Label("Define Pocket", systemImage: "scope")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!hasResidues)
-
-                Button(action: { viewModel.deselectAll() }) {
-                    Label("Clear", systemImage: "xmark.circle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                PanelSecondaryButton(
+                    title: "Clear", icon: "xmark.circle",
+                    tint: .red
+                ) { viewModel.deselectAll() }
             }
         }
     }
@@ -734,13 +748,18 @@ struct InspectorPanel: View {
     // MARK: - Chain Visibility
 
     @ViewBuilder
+    private var chainsCard: some View {
+        PanelCard("Chains & Display", icon: "link") {
+            chainVisibilitySection
+        }
+    }
+
+    @ViewBuilder
     private var chainVisibilitySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionHeader("Chains & Display", icon: "link")
-
             if viewModel.allChains.isEmpty && viewModel.molecules.ligand == nil {
                 Text("No chains loaded")
-                    .font(.subheadline)
+                    .font(PanelStyle.smallFont)
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(Array(viewModel.allChains.enumerated()), id: \.element.id) { chainIndex, chain in
@@ -900,15 +919,13 @@ struct InspectorPanel: View {
                         }
 
                         HStack(spacing: 6) {
-                            if lig.atoms.first?.isHetAtom == true && lig.smiles == nil {
-                                Button(action: { viewModel.definePocketFromLigand() }) {
-                                    Image(systemName: "scope")
-                                        .font(.footnote)
-                                }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(.green)
-                                .help("Define pocket from ligand")
+                            Button(action: { viewModel.fitToLigand() }) {
+                                Image(systemName: "scope")
+                                    .font(.footnote)
                             }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Color.accentColor)
+                            .help("Focus camera on ligand")
 
                             Spacer()
 
@@ -940,23 +957,33 @@ struct InspectorPanel: View {
     // MARK: - Residue Subsets
 
     @ViewBuilder
-    private var residueSubsetsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                sectionHeader("Subsets", icon: "square.stack.3d.up")
-                Spacer()
+    private var subsetsCard: some View {
+        PanelCard(
+            "Subsets",
+            icon: "square.stack.3d.up",
+            accessory: {
                 Button(action: { viewModel.createSubsetFromSelection() }) {
-                    Image(systemName: "plus.circle")
-                        .font(.body)
-                        .padding(4)
-                        .background(Color.accentColor.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 22, height: 22)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.14))
+                        )
+                        .foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.plain)
                 .disabled(viewModel.workspace.selectedResidueIndices.isEmpty)
                 .help("Create subset from selected residues")
             }
+        ) {
+            residueSubsetsSection
+        }
+    }
 
+    @ViewBuilder
+    private var residueSubsetsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
             if viewModel.workspace.residueSubsets.isEmpty {
                 Text("Select residues and click + to create a subset")
                     .font(.footnote)
@@ -1021,10 +1048,15 @@ struct InspectorPanel: View {
     // MARK: - Statistics
 
     @ViewBuilder
-    private var statisticsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionHeader("Statistics", icon: "chart.bar")
+    private var statisticsCard: some View {
+        PanelCard("Statistics", icon: "chart.bar") {
+            statisticsSection
+        }
+    }
 
+    @ViewBuilder
+    private var statisticsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
             if let prot = viewModel.molecules.protein {
                 Text("Protein: \(prot.name)")
                     .font(.subheadline.weight(.medium))
@@ -1094,23 +1126,40 @@ struct InspectorPanel: View {
 
     // MARK: - Helpers
 
-    private func sectionHeader(_ title: String, icon: String) -> some View {
-        Label(title, systemImage: icon)
-            .font(.callout.weight(.semibold))
-            .foregroundStyle(.primary)
-    }
-
     private func infoRow(_ label: String, _ value: String) -> some View {
         HStack {
             Text(label)
-                .font(.subheadline)
+                .font(PanelStyle.smallFont)
                 .foregroundStyle(.secondary)
-                .frame(width: 70, alignment: .leading)
+                .frame(width: 76, alignment: .leading)
             Text(value)
-                .font(.subheadline.monospaced())
+                .font(PanelStyle.monoSmall)
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
             Spacer()
         }
+    }
+
+    /// Single-line chip "LABEL : N" with a fixed intrinsic width so SwiftUI
+    /// never breaks the label across lines (was producing "LE\nU :3" in the
+    /// previous wrapping HStack).
+    private func countChip(label: String, count: Int) -> some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.primary)
+            Text("\(count)")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
+        .fixedSize()
     }
 
     private func coordLabel(_ axis: String, _ value: Float) -> some View {

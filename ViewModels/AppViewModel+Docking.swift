@@ -256,6 +256,7 @@ extension AppViewModel {
         log.info("  Scoring: \(docking.scoringMethod.rawValue), charges: \(docking.chargeMethod.rawValue)", category: .dock)
         log.info("  Config: localSearchFreq=\(cfg.localSearchFrequency), localSearchSteps=\(cfg.localSearchSteps), explorationRatio=\(String(format: "%.2f", cfg.explorationPhaseRatio))", category: .dock)
         log.info("  Config: torsionFlex=\(cfg.enableFlexibility), numRuns=\(cfg.numRuns)", category: .dock)
+        log.info("  Config: torsionSearch=\(cfg.torsionSearchPreset.rawValue), exact=\(String(format: "%.0f", cfg.torsionExactFraction * 100))%, local=\(String(format: "%.0f", cfg.torsionLocalFraction * 100))%, reset=\(String(format: "%.0f", cfg.torsionRandomResetProbability * 100))%", category: .dock)
 
         Task {
             if docking.dockingEngine == nil, let device = renderer?.device {

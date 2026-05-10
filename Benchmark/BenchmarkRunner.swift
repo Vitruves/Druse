@@ -214,6 +214,48 @@ final class BenchmarkRunner: XCTestCase {
     }
 
     @MainActor
+    private func prepareProteinForBenchmark(
+        rawProtein: Molecule,
+        rawPDBContent: String?
+    ) async -> Molecule {
+        switch Self.cfgProteinPrepMode {
+        case "raw":
+            return rawProtein
+
+        case "cleanup":
+            let rawAtoms = rawProtein.atoms
+            let rawBonds = rawProtein.bonds
+            let cleanup = await Task.detached { @Sendable in
+                ProteinPreparation.cleanupStructure(atoms: rawAtoms, bonds: rawBonds)
+            }.value
+            return Molecule(
+                name: rawProtein.name,
+                atoms: cleanup.atoms,
+                bonds: cleanup.bonds,
+                title: rawProtein.title
+            )
+
+        default:
+            let rawAtoms = rawProtein.atoms
+            let rawBonds = rawProtein.bonds
+            let prepared = await Task.detached { @Sendable in
+                ProteinPreparation.prepareForDocking(
+                    atoms: rawAtoms, bonds: rawBonds,
+                    rawPDBContent: rawPDBContent,
+                    pH: 7.4,
+                    chargeMethod: Self.cfgChargeMethod
+                )
+            }.value
+            return Molecule(
+                name: rawProtein.name,
+                atoms: prepared.atoms,
+                bonds: prepared.bonds,
+                title: rawProtein.title
+            )
+        }
+    }
+
+    @MainActor
     private func loadCrystalLigand(sdfPath: String) -> Molecule? {
         guard let content = try? String(contentsOfFile: sdfPath, encoding: .utf8),
               let data = SDFParser.parse(content).first else { return nil }
@@ -528,7 +570,9 @@ final class BenchmarkRunner: XCTestCase {
                 populationSize: config.populationSize,
                 generations: config.generationsPerRun,
                 gridSpacing: config.gridSpacing,
-                numRuns: config.numRuns
+                numRuns: config.numRuns,
+                proteinPrepMode: Self.cfgProteinPrepMode,
+                torsionSearchPreset: config.torsionSearchPreset.rawValue
             ),
             entries: []
         )
@@ -551,24 +595,15 @@ final class BenchmarkRunner: XCTestCase {
             )
 
             do {
-                // 1. Load + prepare protein (full pipeline: protonation, H, charges)
+                // 1. Load + prepare protein according to benchmark prep mode.
                 guard let rawProtein = loadProtein(path: resolve(complex.proteinPdb)) else {
                     throw BenchmarkError.step("parse protein")
                 }
                 let pdbContent = try? String(contentsOfFile: resolve(complex.proteinPdb), encoding: .utf8)
-                let rawAtoms = rawProtein.atoms
-                let rawBonds = rawProtein.bonds
-                let prepared = await Task.detached { @Sendable in
-                    ProteinPreparation.prepareForDocking(
-                        atoms: rawAtoms, bonds: rawBonds,
-                        rawPDBContent: pdbContent,
-                        pH: 7.4,
-                        chargeMethod: Self.cfgChargeMethod
-                    )
-                }.value
-                let protein = Molecule(name: rawProtein.name,
-                                       atoms: prepared.atoms, bonds: prepared.bonds,
-                                       title: rawProtein.title)
+                let protein = await prepareProteinForBenchmark(
+                    rawProtein: rawProtein,
+                    rawPDBContent: pdbContent
+                )
 
                 // 2. Load crystal ligand from SDF (reference for RMSD and optional redocking)
                 guard let crystalLig = loadCrystalLigand(sdfPath: resolve(complex.ligandSdf)) else {
@@ -693,6 +728,7 @@ final class BenchmarkRunner: XCTestCase {
                     // Top-N pose RMSDs for convergence analysis
                     let topN = min(results.count, 10)
                     var poseRmsds = [Float]()
+                    entry.allPoseEnergies = (0..<topN).map { results[$0].energy }
                     if Self.cfgPipelineMode == "full" {
                         let crystalHeavy = crystalLig.atoms.filter { $0.element != .H }
                         let dockedHeavy = ligand.atoms.filter { $0.element != .H }
@@ -718,6 +754,10 @@ final class BenchmarkRunner: XCTestCase {
                     }
                     if !poseRmsds.isEmpty {
                         entry.allPoseRmsds = poseRmsds
+                        if let bestRankAndRmsd = poseRmsds.enumerated().min(by: { $0.element < $1.element }) {
+                            entry.bestTopPoseRank = bestRankAndRmsd.offset + 1
+                            entry.bestTopPoseRmsd = bestRankAndRmsd.element
+                        }
                     }
 
                     // Strain energy from best pose
@@ -936,6 +976,40 @@ final class BenchmarkRunner: XCTestCase {
         c.explicitRerankTopClusters = cfgInt("rerankTop") ?? 12
         c.explicitRerankVariantsPerCluster = cfgInt("rerankVariants") ?? 4
 
+        // Ligand torsion search
+        if let rawPreset = (cfg["torsionSearchPreset"] as? String)?.lowercased() {
+            switch rawPreset {
+            case "redocking":
+                c.applyTorsionSearchPreset(.redocking)
+            case "exploratory", "explore":
+                c.applyTorsionSearchPreset(.exploratory)
+            case "manual":
+                c.torsionSearchPreset = .manual
+            default:
+                c.applyTorsionSearchPreset(.balanced)
+            }
+        }
+        if let v = cfgFloat("torsionExactFraction") {
+            c.torsionSearchPreset = .manual
+            c.torsionExactFraction = v
+        }
+        if let v = cfgFloat("torsionLocalFraction") {
+            c.torsionSearchPreset = .manual
+            c.torsionLocalFraction = v
+        }
+        if let v = cfgFloat("torsionLocalAmplitude") {
+            c.torsionSearchPreset = .manual
+            c.torsionLocalAmplitude = v
+        }
+        if let v = cfgFloat("torsionRandomResetProbability") {
+            c.torsionSearchPreset = .manual
+            c.torsionRandomResetProbability = v
+        }
+        if let v = cfgFloat("torsionPerturbationScale") {
+            c.torsionSearchPreset = .manual
+            c.torsionPerturbationScale = v
+        }
+
         // GFN2-xTB refinement
         c.gfn2Refinement.enabled = cfgBool("gfn2Opt") ?? false
         c.gfn2Refinement.topPosesToRefine = cfgInt("gfn2TopPoses") ?? 20
@@ -996,6 +1070,21 @@ final class BenchmarkRunner: XCTestCase {
     /// Read receptor flexibility flag from config file.
     private static var cfgFlexResidues: Bool {
         (loadFileConfig()["flexResidues"] as? Bool) ?? false
+    }
+
+    /// Read protein preparation mode from config file.
+    private static var cfgProteinPrepMode: String {
+        guard let raw = (loadFileConfig()["proteinPrepMode"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return "full"
+        }
+        switch raw {
+        case "raw", "cleanup":
+            return raw
+        default:
+            return "full"
+        }
     }
 
     /// Read receptor charge method from config file.

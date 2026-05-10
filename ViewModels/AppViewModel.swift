@@ -231,19 +231,6 @@ final class AppViewModel {
         workspace.statusMessage = "\(ligandName) extracted as ligand"
     }
 
-    /// Define a docking pocket from the current active ligand's position.
-    func definePocketFromLigand() {
-        guard let prot = molecules.protein, let lig = molecules.ligand else { return }
-        if let pocket = BindingSiteDetector.ligandGuidedPocket(
-            protein: prot, ligand: lig, excludedChainIDs: workspace.hiddenChainIDs
-        ) {
-            docking.detectedPockets = [pocket]
-            docking.selectedPocket = pocket
-            showGridBoxForPocket(pocket)
-            log.success("Pocket from ligand: \(pocket.residueIndices.count) residues, \(Int(pocket.volume)) A\u{00B3}", category: .dock)
-        }
-    }
-
     /// Remove a specific chain from the protein molecule.
     func removeChain(chainID: String) {
         guard let prot = molecules.protein else { return }

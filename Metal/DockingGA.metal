@@ -111,12 +111,10 @@ kernel void scoreBatchRigidPoses(
 }
 
 /// Initialize population with conformer-aware seeding.
-/// Three tiers to balance exploitation of the RDKit conformer with exploration:
-///   Tier 1 (30%): Reference conformer (torsions=0) with positional + rotational diversity
-///                  — these poses START from the chemically reasonable RDKit geometry
-///   Tier 2 (30%): Reference torsions + small Gaussian noise (±30°) with random placement
-///                  — conformational variants near the reference
-///   Tier 3 (40%): Fully random torsions for exploration of alternative binding modes
+/// Three tiers to balance exploitation of the input conformer with exploration:
+///   Tier 1 (70%): Reference conformer (torsions=0)
+///   Tier 2 (25%): Small local torsion variants near the reference
+///   Tier 3 (5%): Fully random torsions for alternative binding modes
 kernel void initializePopulation(
     device DockPose            *poses        [[buffer(0)]],
     constant GridParams        &gridParams   [[buffer(1)]],
@@ -158,14 +156,22 @@ kernel void initializePopulation(
     float sq2 = sqrt(u1);
     poses[tid].rotation = float4(sq1 * sin(u2), sq1 * cos(u2), sq2 * sin(u3), sq2 * cos(u3));
 
-    // --- Torsions: two-tier strategy ---
-    // Tier 1 (20%): reference conformer (torsions=0) for fast convergence near input geometry
-    // Tier 2 (80%): fully random for broad exploration (Vina-aligned)
-    uint tier1End = popSize / 5;   // 20% reference conformer
+    // --- Torsions: reference-biased strategy ---
+    // Redocking starts from a crystallographic conformer. Keep most initial
+    // torsions near that conformer and reserve a smaller tail for broad search.
+    float exactFraction = clamp(gaParams.torsionExactFraction, 0.0f, 1.0f);
+    float localFraction = clamp(gaParams.torsionLocalFraction, 0.0f, 1.0f - exactFraction);
+    float localAmplitude = max(gaParams.torsionLocalAmplitude, 0.0f);
+    uint tier1End = uint(float(popSize) * exactFraction);
+    uint tier2End = uint(float(popSize) * (exactFraction + localFraction));
 
     if (tid < tier1End) {
         for (uint t = 0; t < gaParams.numTorsions; t++) {
             poses[tid].torsions[t] = 0.0f;
+        }
+    } else if (tid < tier2End) {
+        for (uint t = 0; t < gaParams.numTorsions; t++) {
+            poses[tid].torsions[t] = (gpuRandom(seed, 6 + t) * 2.0f - 1.0f) * localAmplitude;
         }
     } else {
         for (uint t = 0; t < gaParams.numTorsions; t++) {

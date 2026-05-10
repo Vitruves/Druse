@@ -379,12 +379,7 @@ extension DockingEngine {
             }
         }
 
-        return reranked.sorted {
-            if $0.energy != $1.energy { return $0.energy < $1.energy }
-            if $0.clusterID != $1.clusterID { return $0.clusterID < $1.clusterID }
-            if $0.clusterRank != $1.clusterRank { return $0.clusterRank < $1.clusterRank }
-            return $0.id < $1.id
-        }
+        return reranked
     }
 
     // MARK: - Run Docking
@@ -639,7 +634,13 @@ extension DockingEngine {
             mcTemperature: config.mcTemperature,
             referenceIntraEnergy: referenceIntraEnergy,
             numIntraPairs: UInt32(pairList.count),
-            runSeed: 0
+            runSeed: 0,
+            torsionExactFraction: config.torsionExactFraction,
+            torsionLocalFraction: config.torsionLocalFraction,
+            torsionLocalAmplitude: config.torsionLocalAmplitude,
+            torsionRandomResetProbability: config.torsionRandomResetProbability,
+            torsionPerturbationScale: config.torsionPerturbationScale,
+            _pad0: 0
         )
         gaParamsBuffer = device.makeBuffer(bytes: &gaParams, length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
 
@@ -1630,7 +1631,13 @@ extension DockingEngine {
                 pairList: rrPairList
             ),
             numIntraPairs: UInt32(rrPairList.count),
-            runSeed: 0
+            runSeed: 0,
+            torsionExactFraction: config.torsionExactFraction,
+            torsionLocalFraction: config.torsionLocalFraction,
+            torsionLocalAmplitude: config.torsionLocalAmplitude,
+            torsionRandomResetProbability: config.torsionRandomResetProbability,
+            torsionPerturbationScale: config.torsionPerturbationScale,
+            _pad0: 0
         )
         gaParamsBuffer = device.makeBuffer(
             bytes: &gaParams,

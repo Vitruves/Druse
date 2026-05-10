@@ -32,8 +32,13 @@ extension AppViewModel {
 
     func loadFromPDB(id: String) {
         workspace.isLoading = true
-        workspace.loadingMessage = "Fetching \(id.uppercased())..."
-        log.info("Fetching PDB \(id.uppercased()) from RCSB...", category: .network)
+        let upper = id.uppercased()
+        let cached = PDBService.isCached(id: id)
+        workspace.loadingMessage = cached ? "Loading \(upper) from cache…" : "Fetching \(upper)…"
+        log.info(cached
+                 ? "Loading PDB \(upper) from local cache..."
+                 : "Fetching PDB \(upper) from RCSB...",
+                 category: .network)
 
         Task {
             do {

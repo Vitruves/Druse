@@ -7,6 +7,26 @@ import simd
 
 // MARK: - Docking Configuration
 
+enum TorsionSearchPreset: String, CaseIterable, Sendable, Codable {
+    case balanced = "Balanced"
+    case redocking = "Redocking"
+    case exploratory = "Exploratory"
+    case manual = "Manual"
+
+    var help: String {
+        switch self {
+        case .balanced:
+            return "Keeps useful conformer bias while preserving broad torsion exploration"
+        case .redocking:
+            return "Preserves the input conformer; best when the ligand geometry is already near-native"
+        case .exploratory:
+            return "Uses broader torsion sampling for uncertain or generated conformers"
+        case .manual:
+            return "Use the manual torsion-search values below"
+        }
+    }
+}
+
 struct DockingConfig: Sendable {
     // Population and search
     var populationSize: Int = 300
@@ -33,6 +53,15 @@ struct DockingConfig: Sendable {
     // Flexibility
     var enableFlexibility: Bool = true  // torsion flexibility during docking
     var flexRefinementSteps: Int = 50   // extra torsion refinement steps after GA
+
+    // Ligand torsion search policy. These values control how strongly the GA/MC
+    // preserves the input conformer versus exploring new torsion states.
+    var torsionSearchPreset: TorsionSearchPreset = .balanced
+    var torsionExactFraction: Float = 0.40
+    var torsionLocalFraction: Float = 0.40
+    var torsionLocalAmplitude: Float = 0.55
+    var torsionRandomResetProbability: Float = 0.15
+    var torsionPerturbationScale: Float = 1.0
 
     // Gradient method
     var useAnalyticalGradients: Bool = true  // analytical (~28x fewer evals) vs numerical finite differences
@@ -79,6 +108,32 @@ struct DockingConfig: Sendable {
     // Legacy flat-generation count (for backward compatibility)
     var numGenerations: Int { numRuns * generationsPerRun }
 
+    mutating func applyTorsionSearchPreset(_ preset: TorsionSearchPreset) {
+        torsionSearchPreset = preset
+        switch preset {
+        case .balanced:
+            torsionExactFraction = 0.40
+            torsionLocalFraction = 0.40
+            torsionLocalAmplitude = 0.55
+            torsionRandomResetProbability = 0.15
+            torsionPerturbationScale = 1.0
+        case .redocking:
+            torsionExactFraction = 0.70
+            torsionLocalFraction = 0.25
+            torsionLocalAmplitude = 0.25
+            torsionRandomResetProbability = 0.05
+            torsionPerturbationScale = 0.4
+        case .exploratory:
+            torsionExactFraction = 0.20
+            torsionLocalFraction = 0.30
+            torsionLocalAmplitude = 1.0
+            torsionRandomResetProbability = 0.25
+            torsionPerturbationScale = 1.2
+        case .manual:
+            break
+        }
+    }
+
     /// Compute adaptive docking parameters based on system complexity.
     /// Called once per protein (for pocket/protein features) and can be refined per ligand.
     static func autoTune(
@@ -122,6 +177,9 @@ struct DockingConfig: Sendable {
             config.explorationPhaseRatio = 0.5 // more exploration for floppy molecules
             config.explorationTranslationStep = 5.0
             config.explorationMutationRate = 0.18
+            config.applyTorsionSearchPreset(.exploratory)
+        } else {
+            config.applyTorsionSearchPreset(.balanced)
         }
 
         // --- Local search frequency: increase for rigid ligands (cheap, high payoff) ---

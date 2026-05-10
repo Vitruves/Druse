@@ -388,15 +388,15 @@ struct DockingTabView: View {
             VStack(alignment: .leading, spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
                     PanelSubheader(title: "Center")
-                    PanelAxisSlider(axis: "X", value: gridCenterBinding(\.x), range: -200...200) { _ in applyGridBoxFromSliders() }
-                    PanelAxisSlider(axis: "Y", value: gridCenterBinding(\.y), range: -200...200) { _ in applyGridBoxFromSliders() }
-                    PanelAxisSlider(axis: "Z", value: gridCenterBinding(\.z), range: -200...200) { _ in applyGridBoxFromSliders() }
+                    PanelAxisSlider(axis: "X", value: gridCenterBinding(\.x), range: -200...200, onChange: { _ in applyGridBoxFromSliders() })
+                    PanelAxisSlider(axis: "Y", value: gridCenterBinding(\.y), range: -200...200, onChange: { _ in applyGridBoxFromSliders() })
+                    PanelAxisSlider(axis: "Z", value: gridCenterBinding(\.z), range: -200...200, onChange: { _ in applyGridBoxFromSliders() })
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     PanelSubheader(title: "Half-size")
-                    PanelAxisSlider(axis: "X", value: gridHalfBinding(\.x), range: 2...50) { _ in applyGridBoxFromSliders() }
-                    PanelAxisSlider(axis: "Y", value: gridHalfBinding(\.y), range: 2...50) { _ in applyGridBoxFromSliders() }
-                    PanelAxisSlider(axis: "Z", value: gridHalfBinding(\.z), range: 2...50) { _ in applyGridBoxFromSliders() }
+                    PanelAxisSlider(axis: "X", value: gridHalfBinding(\.x), range: 2...50, onChange: { _ in applyGridBoxFromSliders() })
+                    PanelAxisSlider(axis: "Y", value: gridHalfBinding(\.y), range: 2...50, onChange: { _ in applyGridBoxFromSliders() })
+                    PanelAxisSlider(axis: "Z", value: gridHalfBinding(\.z), range: 2...50, onChange: { _ in applyGridBoxFromSliders() })
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     PanelSubheader(title: "Center on")
@@ -442,21 +442,24 @@ struct DockingTabView: View {
 
     private var searchCard: some View {
         return PanelCard("Search", icon: "magnifyingglass") {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 18) {
                 presetSection
+                searchBudgetSection
                 searchMethodSection
                 scoringFunctionSection
-                searchBudgetSection
-                PanelLabeledDivider(title: "Advanced", icon: "slider.horizontal.3")
-                    .padding(.top, 4)
                 VStack(alignment: .leading, spacing: 18) {
+                    PanelLabeledDivider(title: "Advanced", icon: "slider.horizontal.3")
                     searchBehaviorSection
+                    if viewModel.docking.dockingConfig.enableFlexibility {
+                        torsionSearchSection
+                    }
                     searchMethodOptionsSection
                     VStack(alignment: .leading, spacing: 8) {
                         PanelSubheader(title: "Exploration Phase", icon: "sparkles")
                         explorationPhaseSection
                     }
                 }
+                .padding(.top, 2)
             }
         }
     }
@@ -613,6 +616,84 @@ struct DockingTabView: View {
                 .labelsHidden()
                 .frame(width: 96)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var torsionSearchSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PanelSubheader(title: "Torsion Search", icon: "arrow.triangle.2.circlepath")
+            PanelChoiceGrid(columns: 2) {
+                ForEach(TorsionSearchPreset.allCases, id: \.self) { preset in
+                    PanelChoiceButton(
+                        title: preset.rawValue,
+                        isSelected: viewModel.docking.dockingConfig.torsionSearchPreset == preset,
+                        help: preset.help
+                    ) {
+                        viewModel.docking.dockingConfig.applyTorsionSearchPreset(preset)
+                    }
+                }
+            }
+            PanelSliderRow(
+                label: "Exact",
+                value: Binding(
+                    get: { viewModel.docking.dockingConfig.torsionExactFraction },
+                    set: {
+                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
+                        viewModel.docking.dockingConfig.torsionExactFraction = min(max($0, 0), 1)
+                    }
+                ),
+                range: 0...1, step: 0.05,
+                format: { String(format: "%.0f%%", $0 * 100) }
+            )
+            PanelSliderRow(
+                label: "Local",
+                value: Binding(
+                    get: { viewModel.docking.dockingConfig.torsionLocalFraction },
+                    set: {
+                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
+                        viewModel.docking.dockingConfig.torsionLocalFraction = min(max($0, 0), 1)
+                    }
+                ),
+                range: 0...1, step: 0.05,
+                format: { String(format: "%.0f%%", $0 * 100) }
+            )
+            PanelSliderRow(
+                label: "Local Width",
+                value: Binding(
+                    get: { viewModel.docking.dockingConfig.torsionLocalAmplitude },
+                    set: {
+                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
+                        viewModel.docking.dockingConfig.torsionLocalAmplitude = max(0, $0)
+                    }
+                ),
+                range: 0...1.5, step: 0.05,
+                format: { String(format: "%.2f rad", $0) }
+            )
+            PanelSliderRow(
+                label: "Reset",
+                value: Binding(
+                    get: { viewModel.docking.dockingConfig.torsionRandomResetProbability },
+                    set: {
+                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
+                        viewModel.docking.dockingConfig.torsionRandomResetProbability = min(max($0, 0), 1)
+                    }
+                ),
+                range: 0...0.5, step: 0.01,
+                format: { String(format: "%.0f%%", $0 * 100) }
+            )
+            PanelSliderRow(
+                label: "Step Scale",
+                value: Binding(
+                    get: { viewModel.docking.dockingConfig.torsionPerturbationScale },
+                    set: {
+                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
+                        viewModel.docking.dockingConfig.torsionPerturbationScale = max(0, $0)
+                    }
+                ),
+                range: 0...1.5, step: 0.05,
+                format: { String(format: "%.2fx", $0) }
+            )
         }
     }
 
@@ -1332,18 +1413,22 @@ struct DockingTabView: View {
             viewModel.docking.dockingConfig.populationSize = 200
             viewModel.docking.dockingConfig.generationsPerRun = 150
             viewModel.docking.dockingConfig.numRuns = 3
+            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.balanced)
         case "Fast":
             viewModel.docking.dockingConfig.populationSize = 50
             viewModel.docking.dockingConfig.generationsPerRun = 30
             viewModel.docking.dockingConfig.numRuns = 3
+            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.balanced)
         case "Standard":
             viewModel.docking.dockingConfig.populationSize = 150
             viewModel.docking.dockingConfig.generationsPerRun = 80
             viewModel.docking.dockingConfig.numRuns = 5
+            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.balanced)
         case "Thorough":
             viewModel.docking.dockingConfig.populationSize = 300
             viewModel.docking.dockingConfig.generationsPerRun = 200
             viewModel.docking.dockingConfig.numRuns = 10
+            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.exploratory)
         default: break
         }
     }
@@ -1566,7 +1651,9 @@ private struct ScoringInteractionsBadgeRow: View {
             EmptyView()
         } else {
             VStack(alignment: .leading, spacing: 4) {
-                PanelSubheader(title: "Accounted interactions")
+                Text("Accounted interactions")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
                 FlowLayout(spacing: 4) {
                     ForEach(types, id: \.self) { t in
                         HStack(spacing: 3) {

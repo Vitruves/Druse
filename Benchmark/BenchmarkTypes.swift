@@ -70,6 +70,8 @@ struct BenchmarkConfigRecord: Codable {
     let generations: Int
     let gridSpacing: Float
     let numRuns: Int
+    let proteinPrepMode: String?
+    let torsionSearchPreset: String?
 }
 
 struct BenchmarkResultEntry: Codable {
@@ -99,6 +101,9 @@ struct BenchmarkResultEntry: Codable {
     var conformerRmsd: Float?           // RMSD of SMILES-derived conformer vs crystal (measures 3D embedding quality, not docking)
     var strainEnergy: Float?           // MMFF strain of best pose (kcal/mol)
     var allPoseRmsds: [Float]?         // RMSDs of top-N poses (for convergence analysis)
+    var allPoseEnergies: [Float]?      // energies of top-N poses, same order as allPoseRmsds
+    var bestTopPoseRmsd: Float?        // lowest RMSD among saved top-N poses
+    var bestTopPoseRank: Int?          // 1-based energy rank of bestTopPoseRmsd
     var drusinaDecomposition: [String: Float]?  // per-term Drusina scores on crystal pose
 
     enum CodingKeys: String, CodingKey {
@@ -125,6 +130,9 @@ struct BenchmarkResultEntry: Codable {
         case conformerRmsd = "conformer_rmsd"
         case strainEnergy = "strain_energy"
         case allPoseRmsds = "all_pose_rmsds"
+        case allPoseEnergies = "all_pose_energies"
+        case bestTopPoseRmsd = "best_top_pose_rmsd"
+        case bestTopPoseRank = "best_top_pose_rank"
         case drusinaDecomposition = "drusina_decomposition"
     }
 }

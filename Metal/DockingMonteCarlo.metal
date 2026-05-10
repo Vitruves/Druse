@@ -49,7 +49,15 @@ kernel void mcPerturb(
     } else {
         uint torsionIndex = which - 2u;
         if (torsionIndex < gaParams.numTorsions) {
-            dst.torsions[torsionIndex] = gpuRandom(seed, 30 + torsionIndex) * 2.0f * M_PI_F - M_PI_F;
+            float resetProbability = clamp(gaParams.torsionRandomResetProbability, 0.0f, 1.0f);
+            if (gpuRandom(seed, 29 + torsionIndex) < resetProbability) {
+                dst.torsions[torsionIndex] = gpuRandom(seed, 30 + torsionIndex) * 2.0f * M_PI_F - M_PI_F;
+            } else {
+                float perturbationScale = max(gaParams.torsionPerturbationScale, 0.0f);
+                float perturbation = (gpuRandom(seed, 30 + torsionIndex) - 0.5f) * gaParams.torsionStep * perturbationScale;
+                float newVal = src.torsions[torsionIndex] + perturbation;
+                dst.torsions[torsionIndex] = newVal - 2.0f * M_PI_F * floor((newVal + M_PI_F) / (2.0f * M_PI_F));
+            }
         }
     }
 

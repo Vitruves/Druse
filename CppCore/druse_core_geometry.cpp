@@ -31,6 +31,39 @@ static std::unordered_set<int> bfs_from_excluding(
     return visited;
 }
 
+static bool is_amide_like_bond(const ROMol &mol, const Bond *bond) {
+    if (!bond || bond->getBondType() != Bond::SINGLE) return false;
+
+    const auto *a1 = bond->getBeginAtom();
+    const auto *a2 = bond->getEndAtom();
+    if (!a1 || !a2) return false;
+
+    const Atom *carbon = nullptr;
+    const Atom *nitrogen = nullptr;
+    if (a1->getAtomicNum() == 6 && a2->getAtomicNum() == 7) {
+        carbon = a1;
+        nitrogen = a2;
+    } else if (a1->getAtomicNum() == 7 && a2->getAtomicNum() == 6) {
+        carbon = a2;
+        nitrogen = a1;
+    } else {
+        return false;
+    }
+
+    (void)nitrogen;
+    for (const auto *neighborBond : mol.atomBonds(carbon)) {
+        if (neighborBond == bond) continue;
+        if (neighborBond->getBondType() != Bond::DOUBLE) continue;
+        const auto *neighbor = neighborBond->getOtherAtom(carbon);
+        if (!neighbor) continue;
+        const int atomicNum = neighbor->getAtomicNum();
+        if (atomicNum == 8 || atomicNum == 16) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static DruseTorsionTree* build_torsion_tree_for_mol(ROMol &mol) {
     struct RotBond {
         int atom1, atom2;
@@ -42,6 +75,7 @@ static DruseTorsionTree* build_torsion_tree_for_mol(ROMol &mol) {
         const auto *bond = mol.getBondWithIdx(bi);
         if (bond->getBondType() != Bond::SINGLE) continue;
         if (mol.getRingInfo()->numBondRings(bi) != 0) continue;
+        if (is_amide_like_bond(mol, bond)) continue;
 
         int a1 = bond->getBeginAtomIdx();
         int a2 = bond->getEndAtomIdx();

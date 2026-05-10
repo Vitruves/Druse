@@ -243,6 +243,12 @@ struct GAParams {
     float       referenceIntraEnergy;
     uint32_t    numIntraPairs;       // number of packed pairs in intraPairs buffer (replaces exclusion bitmask)
     uint32_t    runSeed;             // per-run random seed for independent MC trajectories (0, 1, 2, ...)
+    float       torsionExactFraction;
+    float       torsionLocalFraction;
+    float       torsionLocalAmplitude;
+    float       torsionRandomResetProbability;
+    float       torsionPerturbationScale;
+    float       _pad0;
 };
 
 struct BatchLigandInfo {

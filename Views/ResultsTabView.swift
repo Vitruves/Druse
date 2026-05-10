@@ -8,6 +8,10 @@ struct ResultsTabView: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.openWindow) private var openWindow
 
+    @State private var showMultiPoseAnalysis = false
+    @State private var multiPoseInitialMode: MultiPoseAnalysisSheet.Mode = .rmsd
+    @State private var showExportMenu = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
             // Always-visible "Open Results Database" button when results exist.
@@ -53,6 +57,10 @@ struct ResultsTabView: View {
                 openWindow(id: "interaction-diagram")
                 viewModel.docking.showInteractionDiagram = false
             }
+        }
+        .sheet(isPresented: $showMultiPoseAnalysis) {
+            MultiPoseAnalysisSheet(initialMode: multiPoseInitialMode)
+                .environment(viewModel)
         }
     }
 
@@ -158,22 +166,78 @@ struct ResultsTabView: View {
 
     @ViewBuilder
     private var multiPoseActions: some View {
-        HStack(spacing: 6) {
-            Text("\(viewModel.docking.selectedPoseIndices.count) selected")
-                .font(PanelStyle.smallFont.weight(.medium))
-                .foregroundStyle(.secondary)
-            Spacer()
-            PanelSecondaryButton(title: "View", icon: "eye") {
-                viewModel.showSelectedPoses()
+        let count = viewModel.docking.selectedPoseIndices.count
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.blue)
+                Text("\(count) poses selected")
+                    .font(PanelStyle.smallFont.weight(.medium))
+                Spacer()
+                Button("Clear") {
+                    viewModel.docking.selectedPoseIndices.removeAll()
+                }
+                .font(PanelStyle.smallFont)
+                .buttonStyle(.plain)
+                .foregroundStyle(.red)
+                .accessibilityIdentifier(AccessibilityID.resultsClearSelection)
             }
-            .accessibilityIdentifier(AccessibilityID.resultsViewSelected)
-            .frame(width: 76)
-            PanelSecondaryButton(title: "Clear", tint: .red) {
-                viewModel.docking.selectedPoseIndices.removeAll()
+            PanelChoiceGrid(columns: 2) {
+                PanelSecondaryButton(
+                    title: "View 3D", icon: "eye",
+                    help: "Show selected poses in the 3D viewport (best as primary, others as ghosts)"
+                ) { viewModel.showSelectedPoses() }
+                .accessibilityIdentifier(AccessibilityID.resultsViewSelected)
+
+                Menu {
+                    Button("Export as SDF") { viewModel.exportSelectedDockingPosesSDF() }
+                    Button("Export as PDB") { viewModel.exportSelectedDockingPosesPDB() }
+                    Button("Export as CSV") { viewModel.exportSelectedDockingPosesCSV() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("Export…")
+                            .font(PanelStyle.bodyFont)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: PanelStyle.buttonHeight)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.primary.opacity(PanelStyle.chipFillOpacity))
+                    )
+                    .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("Export selected poses (SDF / PDB / CSV)")
             }
-            .accessibilityIdentifier(AccessibilityID.resultsClearSelection)
-            .frame(width: 76)
+            PanelChoiceGrid(columns: 2) {
+                PanelSecondaryButton(
+                    title: "RMSD", icon: "square.grid.3x3",
+                    isDisabled: count < 2,
+                    help: "Pairwise heavy-atom RMSD between selected poses"
+                ) {
+                    multiPoseInitialMode = .rmsd
+                    showMultiPoseAnalysis = true
+                }
+                PanelSecondaryButton(
+                    title: "Fingerprints", icon: "circle.hexagongrid.fill",
+                    isDisabled: count < 1,
+                    help: "Per-residue interaction fingerprint heatmap"
+                ) {
+                    multiPoseInitialMode = .interactions
+                    showMultiPoseAnalysis = true
+                }
+            }
         }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.blue.opacity(0.08))
+        )
     }
 
     // MARK: - Energy landscape

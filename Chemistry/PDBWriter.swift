@@ -94,6 +94,91 @@ enum PDBWriter {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
+    /// Build a PDB string with the protein written once followed by N ligand
+    /// poses as additional HETATM blocks with distinct residue sequence numbers.
+    /// Most molecular viewers (PyMOL, ChimeraX, VMD) will display each pose as
+    /// a separate residue under chain `ligandChainID`.
+    @MainActor
+    static func combinedMultiPose(
+        protein: Molecule?,
+        ligandTemplate: Molecule?,
+        poses: [(rank: Int, positions: [SIMD3<Float>], scoreLine: String)],
+        ligandResidueName: String = "LIG",
+        ligandChainID: String = "X",
+        title: String? = nil
+    ) -> String {
+        var lines: [String] = []
+
+        if let title {
+            for chunk in titleChunks(title) {
+                lines.append(chunk)
+            }
+        }
+
+        // Protein block (written once)
+        var serial = 1
+        var lastChain: String? = nil
+        if let protein {
+            for atom in protein.atoms {
+                if let prev = lastChain, prev != atom.chainID {
+                    lines.append(terRecord(serial: serial,
+                                           residueName: atom.residueName,
+                                           chainID: prev,
+                                           residueSeq: atom.residueSeq))
+                    serial += 1
+                }
+                lines.append(atomRecord(record: atom.isHetAtom ? "HETATM" : "ATOM",
+                                        serial: serial,
+                                        atom: atom,
+                                        position: atom.position))
+                serial += 1
+                lastChain = atom.chainID
+            }
+            if let last = lastChain, let lastAtom = protein.atoms.last {
+                lines.append(terRecord(serial: serial,
+                                       residueName: lastAtom.residueName,
+                                       chainID: last,
+                                       residueSeq: lastAtom.residueSeq))
+                serial += 1
+            }
+        }
+
+        // Each ligand pose as a separate residue (residueSeq = rank)
+        if let ligandTemplate {
+            let heavyAtoms = ligandTemplate.atoms.filter { $0.element != .H }
+            for pose in poses {
+                lines.append("REMARK   2 \(pose.scoreLine)")
+                let count = min(heavyAtoms.count, pose.positions.count)
+                for i in 0..<count {
+                    let template = heavyAtoms[i]
+                    let atomName = ligandAtomName(template: template, index: i)
+                    let synth = Atom(
+                        id: serial,
+                        element: template.element,
+                        position: pose.positions[i],
+                        name: atomName,
+                        residueName: ligandResidueName,
+                        residueSeq: pose.rank,
+                        chainID: ligandChainID,
+                        charge: template.charge,
+                        formalCharge: template.formalCharge,
+                        isHetAtom: true,
+                        occupancy: 1.0,
+                        tempFactor: 0.0
+                    )
+                    lines.append(atomRecord(record: "HETATM",
+                                            serial: serial,
+                                            atom: synth,
+                                            position: pose.positions[i]))
+                    serial += 1
+                }
+            }
+        }
+
+        lines.append("END")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     // MARK: - Record formatting
 
     private static func atomRecord(record: String, serial: Int, atom: Atom, position: SIMD3<Float>) -> String {

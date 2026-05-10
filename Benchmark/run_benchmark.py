@@ -144,10 +144,33 @@ def parse_args():
 
     # ── Charge Method ────────────────────────────────────────────────────
     ch = p.add_argument_group("Charge Computation")
+    ch.add_argument("--protein-prep-mode", type=str, default="full",
+                    choices=["full", "cleanup", "raw"],
+                    help="Protein preparation for benchmark docking: "
+                         "full=Druse cleanup/reconstruction/protonation/charges, "
+                         "cleanup=altloc/nonstandard/water/chain cleanup only, "
+                         "raw=parsed PDB atoms without Druse preparation (closest to reference PDB->PDBQT conversion)")
     ch.add_argument("--charge-method", type=str, default="gasteiger",
                     choices=["gasteiger", "eem", "qeq", "xtb"],
                     help="Partial charge method for protein/ligand preparation "
                          "(default: gasteiger)")
+
+    # ── Ligand Torsion Search ───────────────────────────────────────────
+    tors = p.add_argument_group("Ligand Torsion Search")
+    tors.add_argument("--torsion-preset", type=str, default="redocking",
+                      choices=["balanced", "redocking", "exploratory", "manual"],
+                      help="Ligand torsion search policy: redocking preserves the input/crystal conformer, "
+                           "balanced is the app default, exploratory samples broader torsion states")
+    tors.add_argument("--torsion-exact", type=float, default=None,
+                      help="Manual fraction initialized with exact input torsions")
+    tors.add_argument("--torsion-local", type=float, default=None,
+                      help="Manual fraction initialized with local torsion perturbations")
+    tors.add_argument("--torsion-local-amplitude", type=float, default=None,
+                      help="Manual local torsion initialization amplitude in radians")
+    tors.add_argument("--torsion-reset-probability", type=float, default=None,
+                      help="Manual MC probability of full random torsion reset")
+    tors.add_argument("--torsion-perturbation-scale", type=float, default=None,
+                      help="Manual scale multiplier for local MC torsion perturbations")
 
     # ── Post-Docking Refinement ──────────────────────────────────────────
     pd = p.add_argument_group("Post-Docking Refinement")
@@ -319,7 +342,11 @@ def build_config(args) -> dict:
         "flexRefineSteps": args.flex_refinement_steps,
 
         # Charge method
+        "proteinPrepMode": args.protein_prep_mode,
         "chargeMethod": args.charge_method,
+
+        # Ligand torsion search
+        "torsionSearchPreset": args.torsion_preset,
 
         # Strain penalty
         "strainPenalty": strain_on,
@@ -365,6 +392,17 @@ def build_config(args) -> dict:
         "outputPrefix": args.output_prefix,
         "outputFile": "",  # set per scoring method
     }
+
+    torsion_overrides = {
+        "torsionExactFraction": args.torsion_exact,
+        "torsionLocalFraction": args.torsion_local,
+        "torsionLocalAmplitude": args.torsion_local_amplitude,
+        "torsionRandomResetProbability": args.torsion_reset_probability,
+        "torsionPerturbationScale": args.torsion_perturbation_scale,
+    }
+    for key, value in torsion_overrides.items():
+        if value is not None:
+            config[key] = value
 
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
     return config
@@ -589,6 +627,8 @@ def print_config_summary(args, methods):
     strain_on = args.strain_penalty and not args.no_strain_penalty
     grad_str = "numerical (FD)" if args.no_analytical_gradients else "analytical"
     pipeline_str = f"{args.pipeline_mode}/{args.pocket_mode}"
+    prep_str = f"prep={args.protein_prep_mode}"
+    torsion_str = f"torsion={args.torsion_preset}"
 
     print()
     print(f"\033[1mDruse Benchmark\033[0m  v{VERSION}")
@@ -596,7 +636,7 @@ def print_config_summary(args, methods):
     print(f"  {dataset_str}  |  {scoring_str}  |  {args.preset or 'custom'} preset  |  {pipeline_str}")
     print(f"  pop={args.population} gen={args.generations} runs={args.runs}  "
           f"grid={args.grid_spacing}A  LS every {args.local_search_freq} gen x{args.local_search_steps}  "
-          f"{grad_str}")
+          f"{grad_str}  {prep_str}  {torsion_str}")
 
     flags = []
     if not args.no_ligand_flex:

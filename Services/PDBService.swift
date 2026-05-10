@@ -148,6 +148,20 @@ actor PDBService {
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
+    /// Quick non-blocking check for whether a PDB entry is currently cached
+    /// (and not expired). Used by the UI to choose the right "Loading…" /
+    /// "Fetching…" status message before the full async load runs.
+    nonisolated static func isCached(id: String) -> Bool {
+        let cleanID = id.trimmingCharacters(in: .whitespaces).uppercased()
+        guard cleanID.count == 4 else { return false }
+        let url = cacheFileURL(for: cleanID)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let date = attrs[.modificationDate] as? Date else {
+            return false
+        }
+        return Date().timeIntervalSince(date) < cacheRetention
+    }
+
     private static func writeCache(id: String, content: String) {
         let url = cacheFileURL(for: id)
         let dir = url.deletingLastPathComponent()
