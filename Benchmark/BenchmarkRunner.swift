@@ -26,8 +26,16 @@ import MetalKit
 final class BenchmarkRunner: XCTestCase {
     override func setUpWithError() throws {
         try super.setUpWithError()
-        guard ProcessInfo.processInfo.environment["DRUSE_RUN_BENCHMARKS"] == "1" else {
-            throw XCTSkip("Set DRUSE_RUN_BENCHMARKS=1 to run CASF benchmark tests.")
+        // Env vars don't reliably propagate through xcodebuild's test host, so
+        // the presence of .bench_config.json (written by run_benchmark.py) is
+        // the primary signal. The env var remains a fallback for direct Xcode runs.
+        let configPath = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .appendingPathComponent(".bench_config.json").path
+        let scriptInvocation = FileManager.default.fileExists(atPath: configPath)
+        let envInvocation = ProcessInfo.processInfo.environment["DRUSE_RUN_BENCHMARKS"] == "1"
+        guard scriptInvocation || envInvocation else {
+            throw XCTSkip("Run via Benchmark/run_benchmark.py or set DRUSE_RUN_BENCHMARKS=1.")
         }
     }
 

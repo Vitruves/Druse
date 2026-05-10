@@ -216,15 +216,24 @@ struct PipelineContentPanel: View {
 
             Divider()
 
-            ScrollView {
-                switch selectedTab {
-                case .search:           SearchTabView()
-                case .preparation:      PreparationTabView()
-                case .sequence:         SequenceView()
-                case .ligands:          LigandDatabaseView()
-                case .dock:             DockingTabView()
-                case .results:          ResultsTabView()
-                case .leadOptimization: LeadOptimizationTabView()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Color.clear.frame(height: 0).id("__panel_top__")
+                    switch selectedTab {
+                    case .search:           SearchTabView()
+                    case .preparation:      PreparationTabView()
+                    case .sequence:         SequenceView()
+                    case .ligands:          LigandDatabaseView()
+                    case .dock:             DockingTabView()
+                    case .results:          ResultsTabView()
+                    case .leadOptimization: LeadOptimizationTabView()
+                    }
+                }
+                .onChange(of: selectedTab) { _, _ in
+                    proxy.scrollTo("__panel_top__", anchor: .top)
+                }
+                .onChange(of: panelOpen) { _, isOpen in
+                    if isOpen { proxy.scrollTo("__panel_top__", anchor: .top) }
                 }
             }
         }
