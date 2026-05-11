@@ -94,6 +94,8 @@ if(DRUSE_ENABLE_OPENMM)
                 -DOPENMM_BUILD_PYTHON_WRAPPERS=OFF
                 -DOPENMM_BUILD_C_AND_FORTRAN_WRAPPERS=OFF
                 -DOPENMM_BUILD_EXAMPLES=OFF
+                -DCMAKE_C_FLAGS=-w
+                -DCMAKE_CXX_FLAGS=-w
             RESULT_VARIABLE _openmm_cfg_result
         )
         if(_openmm_cfg_result EQUAL 0)
