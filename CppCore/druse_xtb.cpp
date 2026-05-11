@@ -86,9 +86,7 @@ struct GFN2Element {
 };
 
 // GFN2-xTB Hamiltonian global parameters
-static constexpr double GFN2_WEXP = 0.5;       // distance weighting exponent
 static constexpr double GFN2_ENSCALE = 0.02;   // electronegativity scaling
-static constexpr double GFN2_KPOL = 2.0;       // polarization scaling
 
 // Shell-pair scaling constants (Hamiltonian)
 static constexpr double GFN2_KAB_SS = 1.85;
@@ -104,10 +102,6 @@ static constexpr double GFN2_THIRDORDER_D = 0.25;
 
 // Repulsion parameters
 static constexpr double GFN2_KEXP = 1.5;
-static constexpr double GFN2_KLIGHT = 1.0;
-
-// Charge interaction parameters
-static constexpr double GFN2_GEXP = 2.0;
 
 // Maximum supported atomic number
 static constexpr int MAX_ATOMIC_NUM = 86;
@@ -577,7 +571,7 @@ static const STOnGData* getSTOnG(int principalQN, int angMom, int ngauss) {
 /// Determine principal quantum number from shell label convention.
 /// For main-group: row 1 → n=1, row 2 → n=2, row 3 → n=3, row 4 → n=4, row 5 → n=5
 /// For transition metals (d shells): n is one less than the row.
-static int getPrincipalQN(int Z, int shellIdx, int angMom) {
+static int getPrincipalQN(int Z, int angMom) {
     // Determine the period (row) of the element
     int period;
     if (Z <= 2) period = 1;
@@ -627,7 +621,6 @@ static int getPrincipalQN(int Z, int shellIdx, int angMom) {
 /// PA, PB: distances from Gaussian product center P to centers A and B
 static double overlap1D(double a, double b, int la, int lb, double PA, double PB) {
     double p = a + b;
-    double mu = a * b / p;
 
     // Recursion base cases:
     // E(0,0) = 1
@@ -727,12 +720,6 @@ struct CartComponent {
 // d_{x²-y²} (m=2):  (xx - yy)/2
 // d_{xy} (m=-2):    xy
 
-static const int nCartD = 6;
-// Indices: xx=0, xy=1, xz=2, yy=3, yz=4, zz=5
-static const int cartD_lx[] = {2, 1, 1, 0, 0, 0};
-static const int cartD_ly[] = {0, 1, 0, 2, 1, 0};
-static const int cartD_lz[] = {0, 0, 1, 0, 1, 2};
-
 // For each of the 5 spherical d harmonics, give the Cartesian decomposition
 struct SphericalD {
     int nTerms;
@@ -811,36 +798,6 @@ static void computeCN(const double *pos_bohr, const int *Z, int natom,
 // ============================================================================
 // MARK: - Exponential Gamma Function (Coulomb Interaction)
 // ============================================================================
-
-/// Compute the exponential gamma function for DFTB Coulomb interaction.
-///
-/// For two atoms i,j with Hubbard parameters U_i and U_j at distance R:
-///   γ(R, U_i, U_j) describes the Coulomb interaction between charge
-///   distributions centered on atoms i and j.
-///
-/// At short range, it interpolates between the on-site Hubbard U and
-/// the long-range 1/R Coulomb interaction. The exponential form (Klopman)
-/// gives smoother potentials than the original DFTB Mataga-Nishimoto formula.
-///
-/// Parameters:
-///   r_bohr: interatomic distance in Bohr
-///   ui, uj: Hubbard parameters (chemical hardness) in Hartree
-
-static double gamma_asymmetric(double r, double taui, double tauj) {
-    // One term of the asymmetric gamma function
-    // Used when taui ≠ tauj
-    double ti2 = taui * taui;
-    double tj2 = tauj * tauj;
-    double diff2 = ti2 - tj2;
-    if (std::fabs(diff2) < 1e-14) return 0.0;
-
-    double prefac = 0.5 * ti2 * ti2 / (diff2 * diff2);
-    double expr = std::exp(-taui * r);
-    // Include the polynomial correction
-    double poly = 1.0 - (tj2 / ti2 - tj2) * r;
-    // Full asymmetric expression
-    return prefac * expr * (taui - (2.0 * taui / (ti2 - tj2)));
-}
 
 /// Ohno-Klopman gamma function for GFN2-xTB Coulomb interaction.
 /// gamma(R, gi, gj) = 1 / (R^gExp + gij^(-gExp))^(1/gExp)
@@ -1098,7 +1055,7 @@ static double getShellPairK(int li, int lj) {
 ///   2. Shell polynomial correction: h_poly = h * (1 + shpoly * (CN - CN_ref))
 ///   3. Electronegativity scaling between different atoms
 static void buildH0(const std::vector<ShellInfo> &shells,
-                    const double *pos_bohr, const int *Z, int natom,
+                    const double *pos_bohr, const int *Z, [[maybe_unused]] int natom,
                     int nbasis,
                     const std::vector<double> &S,
                     const std::vector<double> &cn,
@@ -1292,7 +1249,7 @@ static void mullikenCharges(const std::vector<double> &P,
 ///
 /// This includes both second-order (γ * Δq) and third-order (Γ * Δq²) terms.
 static void buildChargeShift(const std::vector<ShellInfo> &shells,
-                             const double *pos_bohr, const int *Z, int natom,
+                             const double *pos_bohr, const int *Z, [[maybe_unused]] int natom,
                              int nbasis,
                              const std::vector<double> &shellCharges,
                              const std::vector<double> &atomCharges,
@@ -1492,11 +1449,9 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
 
     std::vector<ShellInfo> shells;
     int nbasis = 0;
-    int totalElectrons = -totalCharge;  // electrons = nuclear charge - total charge
 
     for (int a = 0; a < atomCount; a++) {
         const auto &par = gfn2Params[Z[a]];
-        totalElectrons += Z[a];  // we'll subtract core electrons below
 
         for (int s = 0; s < par.nShells; s++) {
             ShellInfo sh;
@@ -1509,7 +1464,7 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
             sh.selfEnergy = par.selfEnergy[s];
             sh.refOcc = par.refOcc[s];
             sh.hubbard = par.gam * par.lgam[s];
-            sh.principalQN = getPrincipalQN(Z[a], s, sh.angMom);
+            sh.principalQN = getPrincipalQN(Z[a], sh.angMom);
             sh.ngauss = par.ngauss[s];
             nbasis += sh.basisCount;
             shells.push_back(sh);
@@ -1940,7 +1895,7 @@ static bool runSCC(const float *positions, const int32_t *atomicNumbers,
             sh.selfEnergy = par.selfEnergy[s];
             sh.refOcc = par.refOcc[s];
             sh.hubbard = par.gam * par.lgam[s];
-            sh.principalQN = getPrincipalQN(ws.Z[a], s, sh.angMom);
+            sh.principalQN = getPrincipalQN(ws.Z[a], sh.angMom);
             sh.ngauss = par.ngauss[s];
             ws.nbasis += sh.basisCount;
             ws.shells.push_back(sh);
@@ -2139,7 +2094,6 @@ static constexpr double D4_S6  = 1.0;
 static constexpr double D4_S8  = 2.7;
 static constexpr double D4_A1  = 0.52;
 static constexpr double D4_A2  = 5.0;    // Bohr (already in atomic units)
-static constexpr double D4_S9  = 0.0;    // ATM three-body (disabled for speed)
 
 // D4 reference C6 coefficients for common elements (Hartree·Bohr⁶)
 // Simplified: single reference per element from Grimme's D4 reference set.
@@ -2342,7 +2296,6 @@ static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
 
     for (int i = 0; i < natom; i++) {
         double ri = getVdwRad(Z[i]) + offset_bohr;
-        double rho_i = ri * bornScale;
 
         for (int j = 0; j < natom; j++) {
             if (i == j) continue;
@@ -2621,7 +2574,7 @@ static double ohno_gamma_deriv(double r_bohr, double gi, double gj) {
 
 /// Coulomb gradient: dE_coul/dR_A = Σ_ij Δq_i * (dγ_ij/dR_A) * Δq_j
 static void computeCoulombGradient(const std::vector<ShellInfo> &shells,
-                                    const double *pos_bohr, const int *Z, int natom,
+                                    const double *pos_bohr, const int *Z, [[maybe_unused]] int natom,
                                     const std::vector<double> &shellCharges,
                                     double *gradient) {
     int nshells = (int)shells.size();
@@ -2732,55 +2685,6 @@ static void computeElectronicGradient(const SCCWorkspace &ws, double *gradient) 
             }
 
             gradient[3*a + d] += grad_a;
-        }
-    }
-}
-
-// ============================================================================
-// MARK: - CN Gradient (for D4 CN-derivative propagation)
-// ============================================================================
-
-/// Gradient of coordination number w.r.t. atomic positions.
-/// dCN_i/dR_A contributes to the total gradient via:
-///   dE/dR_A += Σ_i (dE/dCN_i) * (dCN_i/dR_A)
-///
-/// Here we only compute dCN/dR; dE/dCN comes from H0 or D4.
-static void computeCNGradient(const double *pos_bohr, const int *Z, int natom,
-                               double *cn_gradient_atom,  // 3*natom, accumulates
-                               const double *dEdCN) {     // natom, dE/dCN_i
-    // GPU path
-    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_cn_gradient && natom >= 8) {
-        g_xtb_gpu->gpu_compute_cn_gradient(g_xtb_gpu->context, pos_bohr,
-                                            reinterpret_cast<const int32_t*>(Z),
-                                            natom, dEdCN, cn_gradient_atom);
-        return;
-    }
-
-    // CPU fallback
-    for (int i = 0; i < natom; i++) {
-        for (int j = 0; j < i; j++) {
-            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
-            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
-            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
-            double rij = std::sqrt(dx*dx + dy*dy + dz*dz);
-            if (rij < 1e-6) continue;
-
-            double rcov = getCovRad(Z[i]) + getCovRad(Z[j]);
-            double arg = -16.0 * (4.0/3.0 * rcov / rij - 1.0);
-            double exparg = std::exp(arg);
-            double denom = (1.0 + exparg);
-            // dcount/dr_ij = 16 * (4/3) * rcov / rij² * exparg / denom²
-            double dcountdr = 16.0 * (4.0/3.0) * rcov / (rij * rij) * exparg / (denom * denom);
-
-            // Chain rule: dE/dR via CN
-            double scale = (dEdCN[i] + dEdCN[j]) * dcountdr / rij;
-
-            cn_gradient_atom[3*i]   -= scale * dx;
-            cn_gradient_atom[3*i+1] -= scale * dy;
-            cn_gradient_atom[3*i+2] -= scale * dz;
-            cn_gradient_atom[3*j]   += scale * dx;
-            cn_gradient_atom[3*j+1] += scale * dy;
-            cn_gradient_atom[3*j+2] += scale * dz;
         }
     }
 }

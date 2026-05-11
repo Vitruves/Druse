@@ -149,7 +149,7 @@ target_include_directories(druse_core PRIVATE
 
 if(DRUSE_HAS_OPENMM)
     target_compile_definitions(druse_core PRIVATE DRUSE_HAS_OPENMM)
-    target_include_directories(druse_core PRIVATE "${OPENMM_INSTALL_DIR}/include")
+    target_include_directories(druse_core SYSTEM PRIVATE "${OPENMM_INSTALL_DIR}/include")
     target_link_directories(druse_core PRIVATE "${OPENMM_INSTALL_DIR}/lib")
     target_link_libraries(druse_core OpenMM)
 endif()
