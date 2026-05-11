@@ -197,23 +197,34 @@ extension AppViewModel {
         }
 
         molecules.isMinimizing = true
-        log.info("Running protein structure cleanup (protonation + charges)...", category: .prep)
+        log.info("Running protein structure cleanup (loops + protonation + charges)...", category: .prep)
         workspace.statusMessage = "Protein cleanup..."
 
-        let atoms = prot.atoms
-        let bonds = prot.bonds
+        let initialAtoms = prot.atoms
+        let initialBonds = prot.bonds
         let name = prot.name
         let title = prot.title
         let secondaryStructure = prot.secondaryStructureAssignments
         let rawPDBContent = molecules.rawPDBContent
         let pH = molecules.protonationPH
         let chargeMethod = docking.chargeMethod
+        let metalDevice = renderer?.device
 
         Task {
+            // Phase 0: Build short missing loops (≤15 residues) before NME/ACE
+            // capping runs in prepareForDocking — otherwise the gap gets capped
+            // off and the loop builder can no longer bridge the anchors.
+            let loopOutcome = await Self.buildShortMissingLoops(
+                atoms: initialAtoms,
+                bonds: initialBonds,
+                rawPDBContent: rawPDBContent,
+                metalDevice: metalDevice
+            )
+
             let prepared = await Task.detached(priority: .userInitiated) {
                 ProteinPreparation.prepareForDocking(
-                    atoms: atoms,
-                    bonds: bonds,
+                    atoms: loopOutcome.atoms,
+                    bonds: loopOutcome.bonds,
                     rawPDBContent: rawPDBContent,
                     pH: pH,
                     chargeMethod: chargeMethod,
@@ -228,7 +239,11 @@ extension AppViewModel {
             renderer?.fitToContent()
             molecules.preparationReport = ProteinPreparation.analyze(atoms: prepared.atoms, bonds: prepared.bonds)
 
+            let loopSummary: String? = loopOutcome.gapsBuilt > 0
+                ? "\(loopOutcome.gapsBuilt) loop\(loopOutcome.gapsBuilt == 1 ? "" : "s") built (\(loopOutcome.residuesAdded) residues)"
+                : nil
             let summary = [
+                loopSummary,
                 prepared.report.altConformerAtomsRemoved > 0 ? "\(prepared.report.altConformerAtomsRemoved) altloc atoms removed" : nil,
                 prepared.report.heterogenResiduesRemoved > 0 ? "\(prepared.report.heterogenResiduesRemoved) non-standard residues removed" : nil,
                 prepared.report.cappingResiduesAdded > 0 ? "\(prepared.report.cappingResiduesAdded) cap residues added" : nil,
@@ -242,10 +257,78 @@ extension AppViewModel {
                 "pH \(String(format: "%.1f", molecules.protonationPH)), charges on \(prepared.report.nonZeroChargeAtoms) atoms)",
                 category: .prep
             )
+            if loopOutcome.gapsTooLong > 0 {
+                log.warn(
+                    "\(loopOutcome.gapsTooLong) gap\(loopOutcome.gapsTooLong == 1 ? "" : "s") longer than 15 residues left as chain breaks (capped) — use ML structure prediction (ESM-Fold/AlphaFold) for missing domains",
+                    category: .prep
+                )
+            }
             workspace.statusMessage = "Cleanup complete"
             molecules.proteinPrepared = true
             molecules.isMinimizing = false
         }
+    }
+
+    // MARK: - Shared loop-building helper
+
+    /// Detect short residue-numbering gaps (≤15 res) and run the loop builder
+    /// (with optional GPU refinement) so the chain is bridged before downstream
+    /// chain-break capping. Returns the loop-built atom/bond arrays plus stats.
+    /// Long gaps (> 15 res) are reported but not built — those need full
+    /// homology / ML structure prediction.
+    fileprivate static func buildShortMissingLoops(
+        atoms: [Atom],
+        bonds: [Bond],
+        rawPDBContent: String?,
+        metalDevice: MTLDevice?
+    ) async -> (atoms: [Atom], bonds: [Bond], gapsBuilt: Int, residuesAdded: Int, gapsTooLong: Int) {
+        let gaps = ProteinPreparation.detectMissingResidues(in: atoms)
+        let buildable = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
+        let tooLong = gaps.count - buildable.count
+        guard !buildable.isEmpty else {
+            return (atoms, bonds, 0, 0, tooLong)
+        }
+
+        return await Task.detached(priority: .userInitiated) {
+            var chainSequences: [GemmiBridge.ChainSequence] = []
+            if let content = rawPDBContent {
+                chainSequences = (try? GemmiBridge.entitySequences(content: content)) ?? []
+            }
+
+            let result = LoopBuilder.buildMissingLoops(
+                atoms: atoms, bonds: bonds,
+                gaps: buildable, chainSequences: chainSequences
+            )
+            guard result.gapsBuilt > 0 else {
+                return (atoms, bonds, 0, 0, tooLong)
+            }
+
+            // GPU-refine the newly built loop atoms only (same as the manual
+            // "Fix Missing Residues" flow) so the geometry isn't a raw spline.
+            var finalAtoms = result.atoms
+            if let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) {
+                var isLoopAtom = [Bool](repeating: false, count: result.atoms.count)
+                for i in atoms.count..<result.atoms.count { isLoopAtom[i] = true }
+                let loopAngles = AppViewModel.extractLoopBackboneAngles(
+                    atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom)
+                let loopTorsions = AppViewModel.extractLoopOmegaTorsions(
+                    atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom)
+                let refineInput = LoopMetalAccelerator.LoopRefineInput(
+                    atoms: result.atoms, bonds: result.bonds,
+                    isLoopAtom: isLoopAtom, angles: loopAngles, torsions: loopTorsions)
+                let output = accelerator.refine(input: refineInput, maxIterations: 500, tolerance: 0.05)
+                for i in 0..<result.atoms.count where isLoopAtom[i] {
+                    finalAtoms[i] = Atom(
+                        id: finalAtoms[i].id, element: finalAtoms[i].element,
+                        position: output.positions[i], name: finalAtoms[i].name,
+                        residueName: finalAtoms[i].residueName, residueSeq: finalAtoms[i].residueSeq,
+                        chainID: finalAtoms[i].chainID, charge: finalAtoms[i].charge,
+                        formalCharge: finalAtoms[i].formalCharge, isHetAtom: finalAtoms[i].isHetAtom,
+                        occupancy: finalAtoms[i].occupancy, tempFactor: finalAtoms[i].tempFactor)
+                }
+            }
+            return (finalAtoms, result.bonds, result.gapsBuilt, result.residuesAdded, tooLong)
+        }.value
     }
 
     // MARK: - Fix Missing Residues (Detection + Loop Building + Atom Reconstruction)

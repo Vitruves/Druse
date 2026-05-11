@@ -65,7 +65,14 @@ Optional (for GFN2-xTB quantum refinement):
 brew install xtb
 ```
 
-**2. Build the C++ core**
+**2. Clone the repository**
+
+```bash
+git clone https://github.com/Vitruves/Druse.git
+cd Druse
+```
+
+**3. Build the C++ core**
 
 ```bash
 cd CppCore
@@ -75,16 +82,20 @@ make -j$(sysctl -n hw.ncpu)
 cd ../..
 ```
 
-OpenMM is fetched and built automatically by CMake. This step may take a few minutes on the first run.
+OpenMM is fetched and built automatically by CMake. The first run can take several minutes.
 
-**3. Generate the Xcode project and build**
+**4. Generate the Xcode project and build the app**
 
 ```bash
 xcodegen generate
 xcodebuild -project Druse.xcodeproj -scheme Druse -configuration Release build
 ```
 
-The built app will be in `build/Release/Druse.app` (or under `DerivedData/`).
+The built `Druse.app` lands in Xcode's `DerivedData` directory; the build log prints the exact path. To launch it directly:
+
+```bash
+open "$(xcodebuild -project Druse.xcodeproj -scheme Druse -configuration Release -showBuildSettings 2>/dev/null | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{print $2}')/Druse.app"
+```
 
 </details>
 
