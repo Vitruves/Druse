@@ -97,6 +97,46 @@ The built `Druse.app` lands in Xcode's `DerivedData` directory; the build log pr
 open "$(xcodebuild -project Druse.xcodeproj -scheme Druse -configuration Release -showBuildSettings 2>/dev/null | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{print $2}')/Druse.app"
 ```
 
+**Running the benchmark**
+
+The CASF-2016 benchmark suite requires the PDBbind refined-set + CASF-2016 core set data (not redistributed with the repo) and a manifest generated from them.
+
+1. **Obtain the data.** Place the extracted archives under `Benchmark/data/` so the layout is:
+
+```
+Benchmark/data/
+├── CASF-2016/         # CASF-2016 core set (CoreSet.dat + complexes)
+└── refined-set/       # PDBbind refined-set (one folder per PDB ID)
+```
+
+2. **Install the Python dependencies** (Python 3.10+ recommended):
+
+```bash
+pip install -r Benchmark/requirements.txt
+```
+
+3. **Build the manifest** from the data above:
+
+```bash
+python Benchmark/prepare.py
+# writes Benchmark/manifests/casf_manifest.json
+```
+
+4. **Run a benchmark.** Each invocation drives `xcodebuild test` against the `DruseTests` target — a GUI window will open during the run.
+
+```bash
+# Quick smoke test: redock 10 complexes with Vina scoring
+python Benchmark/run_benchmark.py --casf --scoring vina --preset standard --quick 10
+
+# Compare all scoring functions on the full core set
+python Benchmark/run_benchmark.py --casf --scoring vina,drusina,druseaf,pignet2
+
+# All options
+python Benchmark/run_benchmark.py --help
+```
+
+Results land in `Benchmark/results/` as timestamped JSON files. If the run reports `PASSED` in seconds with no per-complex output, the manifest is missing — re-run step 3.
+
 </details>
 
 <br>
