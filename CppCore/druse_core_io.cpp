@@ -17,6 +17,8 @@ DruseMoleculeResult* druse_add_hydrogens_pdb(const char *pdbContent) {
         return mol_to_result(*mol, "protein");
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error adding hydrogens to PDB");
     }
 }
 
@@ -30,6 +32,8 @@ DruseMoleculeResult* druse_compute_charges_pdb(const char *pdbContent) {
         return mol_to_result(*mol, "protein");
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error computing PDB charges");
     }
 }
 
@@ -54,6 +58,8 @@ DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock) {
         return mol_to_result(*mol, "ligand");
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error computing mol block charges");
     }
 }
 
@@ -107,6 +113,9 @@ DruseMoleculeResult* druse_atoms_bonds_to_smiles(
             int a1 = bonds[i].atom1;
             int a2 = bonds[i].atom2;
             if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount) continue;
+            // RDKit throws on self-bonds and duplicate bonds, which would
+            // discard the whole molecule; skip them instead.
+            if (a1 == a2 || mol->getBondBetweenAtoms(a1, a2)) continue;
             Bond::BondType bt;
             switch (bonds[i].order) {
                 case 2:  bt = Bond::DOUBLE;   break;
@@ -142,6 +151,8 @@ DruseMoleculeResult* druse_atoms_bonds_to_smiles(
         return mol_to_result(*mol, name ? name : "ligand");
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error building molecule from atoms/bonds");
     }
 }
 

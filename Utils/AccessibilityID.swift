@@ -174,4 +174,5 @@ enum AccessibilityID {
     // MARK: - Inspector
     static let inspectorClose = "inspector_close"
     static let inspectorToggle = "inspector_toggle"
+    static let navigatorToggle = "navigator_toggle"
 }

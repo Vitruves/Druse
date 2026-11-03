@@ -21,6 +21,21 @@ struct PIGNet2WeightLoader {
         let totalFloats: Int
     }
 
+    /// Per-tensor float counts read by PIGNet2Compute.metal (61 tensors; order =
+    /// EXPORT_WEIGHT_ORDER in export_pignet2_weights.py, in_features=47, dim=128).
+    static let expectedCounts: [Int] = {
+        let gatedGAT: [Int] = [128 * 128, 128 * 128, 128, 256, 1]        // W2, W1.w, W1.b, gate.w, gate.b
+        let interactionNet: [Int] = [128 * 128, 128, 128 * 128, 128,      // W1, W2
+                                     384 * 128, 384 * 128, 384, 384]      // GRU w_ih, w_hh, b_ih, b_hh
+        let pairHead: [Int] = [128 * 256, 128, 128, 1]
+        var counts: [Int] = [1, 1, 1, 1, 1]                               // physics coefficients
+        counts.append(128 * 47)                                           // embed
+        for _ in 0..<3 { counts += gatedGAT }
+        for _ in 0..<3 { counts += interactionNet }
+        for _ in 0..<4 { counts += pairHead }                             // epsilon, dvdw, width, radius
+        return counts
+    }()
+
     /// Load PIGNet2 weights from the app bundle.
     static func loadFromBundle(device: MTLDevice, filename: String = "PIGNet2") -> LoadedWeights? {
         guard let url = Bundle.main.url(forResource: filename, withExtension: "weights") else {
@@ -75,6 +90,10 @@ struct PIGNet2WeightLoader {
             let count = data.withUnsafeBytes { $0.load(fromByteOffset: entryOffset + 4, as: UInt32.self) }
             entries.append(DruseAFWeightEntry(offset: offset, count: count))
         }
+
+        guard DruseAFWeightLoader.validateEntries(
+            entries, totalFloats: totalFloats, expectedCounts: expectedCounts, tag: "PIGNet2"
+        ) else { return nil }
 
         let weightBytes = totalFloats * MemoryLayout<Float>.stride
         guard let weightBuffer = data.withUnsafeBytes({ rawBuf -> MTLBuffer? in

@@ -145,7 +145,7 @@ kernel void scorePosesBatched(
     applyTorsions(positions, nA, pose, myEdges, myMoving, nTor);
 
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridUpperBound(gridParams);
     float totalE = 0.0f, penalty = 0.0f;
 
     for (uint a = 0; a < nA; a++) {
@@ -367,7 +367,10 @@ kernel void replicaSwap(
     constant ReplicaParams     &repParams   [[buffer(2)]],
     uint                        tid         [[thread_position_in_grid]])
 {
-    uint numPairs = repParams.numReplicas - 1u;
+    // Guard the unsigned subtraction (numReplicas == 0 would wrap) and the temperatures[] bound.
+    uint numReplicas = min(repParams.numReplicas, MAX_REPLICAS);
+    if (numReplicas < 2u) return;
+    uint numPairs = numReplicas - 1u;
     if (tid >= numPairs) return;
 
     // Checkerboard: even gen swaps even pairs, odd gen swaps odd pairs

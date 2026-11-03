@@ -71,7 +71,10 @@ struct SurfaceLegend: Sendable {
 
 // MARK: - Surface Generation Result
 
-struct SurfaceResult {
+/// The buffers are fully written and all GPU work on them has completed before a
+/// result is returned; ownership then transfers to the caller (the renderer), so the
+/// result can safely cross from the generator's executor to the main actor.
+struct SurfaceResult: @unchecked Sendable {
     let vertexBuffer: MTLBuffer
     let indexBuffer: MTLBuffer
     let vertexCount: Int
@@ -84,8 +87,20 @@ struct SurfaceResult {
 /// GPU-accelerated molecular surface generator using marching cubes.
 /// Computes Connolly (SES) or Gaussian surfaces on the GPU, optionally
 /// colored by electrostatic potential.
-@MainActor
-final class SurfaceGenerator {
+///
+/// Not actor-isolated: generation runs off the main actor so large proteins do not
+/// freeze the UI. Every stored property is an immutable `let`, and Metal devices,
+/// command queues, libraries and pipeline states are documented as thread-safe,
+/// so sharing one instance across tasks is safe.
+final class SurfaceGenerator: @unchecked Sendable {
+
+    /// Per-request surface parameters.
+    struct Settings: Equatable, Sendable {
+        var fieldType: SurfaceFieldType = .connolly
+        var colorMode: SurfaceColorMode = .uniform
+        var gridSpacing: Float = 0.5   // Angstroms per grid cell
+        var probeRadius: Float = 1.4   // Water probe radius in Angstroms
+    }
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -101,13 +116,9 @@ final class SurfaceGenerator {
     private let hydrophobicityValuePipeline: MTLComputePipelineState
     private let pharmacophorePipeline: MTLComputePipelineState
 
-    // Configuration
-    var gridSpacing: Float = 0.5       // Angstroms per grid cell
-    var padding: Float = 6.0           // Angstroms of padding around bounding box
-    var probeRadius: Float = 1.4       // Water probe radius in Angstroms
-    var isovalue: Float = 0.5          // Gaussian field isovalue (only for gaussian mode)
-    var fieldType: SurfaceFieldType = .connolly
-    var colorMode: SurfaceColorMode = .uniform
+    // Fixed configuration
+    private let padding: Float = 6.0           // Angstroms of padding around bounding box
+    private let isovalue: Float = 0.5          // Gaussian field isovalue (only for gaussian mode)
 
     // Buffer limits
     private let maxVertices: UInt32 = 4_000_000
@@ -169,63 +180,38 @@ final class SurfaceGenerator {
     /// Generate a molecular surface from atom positions, VdW radii, and partial charges.
     /// - Parameters:
     ///   - atoms: Array of atoms with positions and element types
+    ///   - settings: Field type, coloring, grid spacing and probe radius
     ///   - Returns: SurfaceResult with vertex and index buffers ready for rendering
-    func generateSurface(atoms: [Atom]) -> SurfaceResult? {
+    func generateSurface(atoms: [Atom], settings: Settings) async -> SurfaceResult? {
         guard !atoms.isEmpty else {
-            ActivityLog.shared.debug("[Surface] generateSurface skipped: empty atom array", category: .render)
+            await ActivityLog.shared.debug("[Surface] generateSurface skipped: empty atom array", category: .render)
             return nil
         }
-        ActivityLog.shared.info("[Surface] Generating \(fieldType == .connolly ? "Connolly" : "Gaussian") surface: \(atoms.count) atoms, spacing=\(gridSpacing), probe=\(probeRadius), color=\(colorMode.rawValue)", category: .render)
+        await ActivityLog.shared.info("[Surface] Generating \(settings.fieldType == .connolly ? "Connolly" : "Gaussian") surface: \(atoms.count) atoms, spacing=\(settings.gridSpacing), probe=\(settings.probeRadius), color=\(settings.colorMode.rawValue)", category: .render)
 
         // Prepare GPU atom data
         let gpuAtoms = atoms.map { atom -> GPUSurfaceAtom in
             makeSurfaceAtom(from: atom)
         }
 
-        return generateSurface(
+        return await generateSurface(
             gpuAtoms: gpuAtoms,
-            positions: atoms.map(\.position)
+            positions: atoms.map(\.position),
+            settings: settings
         )
-    }
-
-    /// Generate a molecular surface from raw arrays.
-    /// - Parameters:
-    ///   - positions: Atom center positions
-    ///   - radii: VdW radii per atom
-    ///   - charges: Partial charges per atom
-    /// - Returns: SurfaceResult with vertex and index buffers
-    func generateSurface(
-        positions: [SIMD3<Float>],
-        radii: [Float],
-        charges: [Float]
-    ) -> SurfaceResult? {
-        guard positions.count == radii.count,
-              positions.count == charges.count,
-              !positions.isEmpty else {
-            ActivityLog.shared.debug("[Surface] generateSurface(raw) skipped: mismatched or empty arrays (pos=\(positions.count), radii=\(radii.count), charges=\(charges.count))", category: .render)
-            return nil
-        }
-
-        let gpuAtoms = (0..<positions.count).map { i -> GPUSurfaceAtom in
-            GPUSurfaceAtom(
-                position: (positions[i].x, positions[i].y, positions[i].z),
-                vdwRadius: radii[i],
-                charge: charges[i],
-                atomicNum: 6, // default to carbon for raw arrays
-                flags: SurfaceAtomFlags.hydrophobic,
-                hydrophobicity: 0.35
-            )
-        }
-
-        return generateSurface(gpuAtoms: gpuAtoms, positions: positions)
     }
 
     // MARK: - Private Implementation
 
     private func generateSurface(
         gpuAtoms: [GPUSurfaceAtom],
-        positions: [SIMD3<Float>]
-    ) -> SurfaceResult? {
+        positions: [SIMD3<Float>],
+        settings: Settings
+    ) async -> SurfaceResult? {
+        let gridSpacing = settings.gridSpacing
+        let fieldType = settings.fieldType
+        let colorMode = settings.colorMode
+
         // Compute bounding box with padding
         let (bbMin, bbMax) = boundingBox(positions)
         let paddedMin = bbMin - SIMD3<Float>(repeating: padding)
@@ -239,13 +225,13 @@ final class SurfaceGenerator {
 
         // Safety check: grid must be reasonable
         guard totalPoints > 0, totalPoints < 256_000_000 else {
-            ActivityLog.shared.warn("[Surface] Grid too large: \(nx)x\(ny)x\(nz) = \(totalPoints) points (max 256M)", category: .render)
+            await ActivityLog.shared.warn("[Surface] Grid too large: \(nx)x\(ny)x\(nz) = \(totalPoints) points (max 256M)", category: .render)
             return nil
         }
 
         let totalVoxels = Int((nx - 1) * (ny - 1) * (nz - 1))
         guard totalVoxels > 0 else {
-            ActivityLog.shared.warn("[Surface] Zero voxels after grid setup", category: .render)
+            await ActivityLog.shared.warn("[Surface] Zero voxels after grid setup", category: .render)
             return nil
         }
 
@@ -260,7 +246,7 @@ final class SurfaceGenerator {
             numAtoms: UInt32(gpuAtoms.count),
             maxVertices: maxVertices,
             maxIndices: maxIndices,
-            probeRadius: probeRadius,
+            probeRadius: settings.probeRadius,
             _pad0: 0, _pad1: 0, _pad2: 0
         )
 
@@ -270,7 +256,7 @@ final class SurfaceGenerator {
             length: gpuAtoms.count * MemoryLayout<GPUSurfaceAtom>.stride,
             options: .storageModeShared
         ) else {
-            ActivityLog.shared.error("[Surface] Failed to create atom buffer (\(gpuAtoms.count) atoms)", category: .render)
+            await ActivityLog.shared.error("[Surface] Failed to create atom buffer (\(gpuAtoms.count) atoms)", category: .render)
             return nil
         }
         atomBuffer.label = "SurfaceAtoms"
@@ -359,8 +345,7 @@ final class SurfaceGenerator {
             encoder.endEncoding()
         }
 
-        cmdBuf1.commit()
-        cmdBuf1.waitUntilCompleted()
+        await commitAndWait(cmdBuf1)
 
         // ====================================================================
         // CPU: Read back total triangle count, compute exclusive prefix sum
@@ -369,7 +354,7 @@ final class SurfaceGenerator {
             .bindMemory(to: UInt32.self, capacity: 1).pointee)
 
         guard totalTriangles > 0 else {
-            ActivityLog.shared.info("[Surface] Marching cubes produced 0 triangles", category: .render)
+            await ActivityLog.shared.info("[Surface] Marching cubes produced 0 triangles", category: .render)
             return nil
         }
 
@@ -379,7 +364,7 @@ final class SurfaceGenerator {
         // Clamp to buffer limits
         guard totalVertices <= Int(maxVertices), totalIndices <= Int(maxIndices) else {
             // Surface too large for allocated buffers
-            ActivityLog.shared.warn("[Surface] Surface too large: \(totalVertices) vertices (max \(maxVertices)), \(totalIndices) indices (max \(maxIndices))", category: .render)
+            await ActivityLog.shared.warn("[Surface] Surface too large: \(totalVertices) vertices (max \(maxVertices)), \(totalIndices) indices (max \(maxIndices))", category: .render)
             return nil
         }
 
@@ -409,7 +394,7 @@ final class SurfaceGenerator {
             length: vertexBufferSize,
             options: .storageModeShared
         ) else {
-            ActivityLog.shared.error("[Surface] Failed to create vertex buffer (\(vertexBufferSize / 1024) KB)", category: .render)
+            await ActivityLog.shared.error("[Surface] Failed to create vertex buffer (\(vertexBufferSize / 1024) KB)", category: .render)
             return nil
         }
         vertexBuffer.label = "SurfaceVertices"
@@ -419,7 +404,7 @@ final class SurfaceGenerator {
             length: indexBufferSize,
             options: .storageModeShared
         ) else {
-            ActivityLog.shared.error("[Surface] Failed to create index buffer (\(indexBufferSize / 1024) KB)", category: .render)
+            await ActivityLog.shared.error("[Surface] Failed to create index buffer (\(indexBufferSize / 1024) KB)", category: .render)
             return nil
         }
         indexBuffer.label = "SurfaceIndices"
@@ -492,15 +477,14 @@ final class SurfaceGenerator {
                     encoder.endEncoding()
                 }
                 legend = nil
-                cmdBuf2.commit()
-                cmdBuf2.waitUntilCompleted()
+                await commitAndWait(cmdBuf2)
                 let computedLegend = applyMetricColors(
                     to: vertexBuffer,
                     vertexCount: totalVertices,
                     values: metricBuffer,
                     mode: colorMode
                 )
-                ActivityLog.shared.debug("[Surface] Complete: \(totalVertices) vertices, \(totalTriangles) triangles, grid \(nx)x\(ny)x\(nz)", category: .render)
+                await ActivityLog.shared.debug("[Surface] Complete: \(totalVertices) vertices, \(totalTriangles) triangles, grid \(nx)x\(ny)x\(nz)", category: .render)
                 return SurfaceResult(
                     vertexBuffer: vertexBuffer,
                     indexBuffer: indexBuffer,
@@ -546,10 +530,9 @@ final class SurfaceGenerator {
             legend = nil
         }
 
-        cmdBuf2.commit()
-        cmdBuf2.waitUntilCompleted()
+        await commitAndWait(cmdBuf2)
 
-        ActivityLog.shared.debug("[Surface] Complete: \(totalVertices) vertices, \(totalTriangles) triangles, grid \(nx)x\(ny)x\(nz)", category: .render)
+        await ActivityLog.shared.debug("[Surface] Complete: \(totalVertices) vertices, \(totalTriangles) triangles, grid \(nx)x\(ny)x\(nz)", category: .render)
         return SurfaceResult(
             vertexBuffer: vertexBuffer,
             indexBuffer: indexBuffer,
@@ -557,6 +540,14 @@ final class SurfaceGenerator {
             indexCount: totalIndices,
             legend: legend
         )
+    }
+
+    /// Commit a command buffer and suspend (without blocking a thread) until the GPU finishes it.
+    private func commitAndWait(_ commandBuffer: MTLCommandBuffer) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            commandBuffer.addCompletedHandler { _ in continuation.resume() }
+            commandBuffer.commit()
+        }
     }
 
     // MARK: - Surface Chemistry

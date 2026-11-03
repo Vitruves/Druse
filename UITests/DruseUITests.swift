@@ -137,7 +137,7 @@ final class DruseUITests: XCTestCase {
         tapIfExists("welcome_startProtein")
         usleep(300_000)
 
-        let tabs = ["Search", "Preparation", "Sequence", "Ligands", "Docking", "Results", "Lead Opt"]
+        let tabs = ["Search", "Preparation", "Ligands", "Binding Site", "Docking", "Results", "Lead Opt", "Sequence"]
         for tab in tabs {
             openTab(tab)
             usleep(300_000)
@@ -298,7 +298,7 @@ final class DruseUITests: XCTestCase {
 
     func testDockingTabButtonsExist() {
         loadTestProtein()
-        openTab("Docking")
+        openTab("Binding Site")
         usleep(300_000)
 
         // Pocket detection buttons
@@ -310,12 +310,14 @@ final class DruseUITests: XCTestCase {
         assertExists("dock_gridProtein")
 
         // Start button
+        openTab("Docking")
+        usleep(300_000)
         assertExists("dock_startButton")
     }
 
     func testPocketDetection() {
         loadTestProtein()
-        openTab("Docking")
+        openTab("Binding Site")
         usleep(300_000)
 
         // Auto pocket detection
@@ -328,7 +330,7 @@ final class DruseUITests: XCTestCase {
 
     func testGridPlacement() {
         loadTestProtein()
-        openTab("Docking")
+        openTab("Binding Site")
         usleep(300_000)
 
         // Center on protein
@@ -481,11 +483,14 @@ final class DruseUITests: XCTestCase {
         tapIfExists("prep_addHydrogens")
         usleep(2_000_000)
 
-        // 4. Docking tab — detect pocket
-        openTab("Docking")
+        // 4. Binding Site — detect pocket
+        openTab("Binding Site")
         usleep(500_000)
         tapIfExists("dock_detectAuto")
         usleep(3_000_000)
+
+        openTab("Docking")
+        usleep(500_000)
 
         // 5. Start docking (opens PreDockSheet)
         tapIfExists("dock_startButton")
@@ -569,9 +574,11 @@ final class DruseUITests: XCTestCase {
             ("Sequence", [
                 "seq_copySequence", "seq_clearSelection"
             ]),
-            ("Docking", [
+            ("Binding Site", [
                 "dock_detectAuto", "dock_detectML",
-                "dock_applyGrid", "dock_gridProtein",
+                "dock_applyGrid", "dock_gridProtein"
+            ]),
+            ("Docking", [
                 "dock_startButton"
             ]),
             ("Results", [

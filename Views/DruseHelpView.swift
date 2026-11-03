@@ -5,12 +5,34 @@ import SwiftUI
 
 // MARK: - Help Data Model
 
+/// Sidebar grouping of the help topics.
+private enum HelpGroup: String, CaseIterable {
+    case basics = "Basics"
+    case steps = "Workflow Steps"
+    case tools = "Tools & Viewport"
+    case reference = "Reference"
+}
+
 private struct HelpSection: Identifiable {
-    let id = UUID()
+    enum Layout { case article, shortcuts }
+
     let icon: String
     let title: String
-    let color: Color
+    let summary: String
+    let tint: Color
+    let group: HelpGroup
+    /// The workflow step (or tool) this topic documents, if any. Drives the header eyebrow.
+    var step: SidebarTab? = nil
+    var layout: Layout = .article
     let items: [HelpItem]
+
+    /// Titles are unique, so they make a stable identity that survives search filtering.
+    var id: String { title }
+
+    func with(items: [HelpItem]) -> HelpSection {
+        HelpSection(icon: icon, title: title, summary: summary, tint: tint, group: group,
+                    step: step, layout: layout, items: items)
+    }
 }
 
 private struct HelpItem: Identifiable {
@@ -18,12 +40,14 @@ private struct HelpItem: Identifiable {
     let title: String
     let description: String
     let shortcut: String?
+    let icon: String?
     var isSubtitle: Bool = false
 
-    init(_ title: String, _ description: String, shortcut: String? = nil) {
+    init(_ title: String, _ description: String, shortcut: String? = nil, icon: String? = nil) {
         self.title = title
         self.description = description
         self.shortcut = shortcut
+        self.icon = icon
     }
 
     static func subtitle(_ title: String) -> HelpItem {
@@ -31,130 +55,178 @@ private struct HelpItem: Identifiable {
         item.isSubtitle = true
         return item
     }
+
+    func matches(_ query: String) -> Bool {
+        title.lowercased().contains(query) || description.lowercased().contains(query)
+    }
 }
+
+// MARK: - Workflow Article
+
+private func workflowDetail(_ tab: SidebarTab) -> String {
+    switch tab {
+    case .search:
+        "Open a PDB, mmCIF, MOL2, SDF or SMILES file, fetch a structure by its 4-character PDB ID, or search RCSB by keyword. The Loaded card shows what is currently in the workspace."
+    case .preparation:
+        "Run the one-click Prepare for Docking pipeline, or use the Manual Steps (cleanup, structure repair, hydrogens & protonation, charges) individually. Issues found in the structure are listed as warnings."
+    case .ligands:
+        "Add ligands from SMILES, files or the chemical sketcher, then prepare them. The Library card lists the compound set; the Ligand Database window (⌘L) manages it in full."
+    case .bindingSite:
+        "Detect pockets (Auto, ML, From Ligand, From Selection), focus a pocket with the Pocket View slab presets, and place the docking grid box."
+    case .dock:
+        "Review the inputs, choose a preset, search method and scoring function, add constraints or flexible residues, then press Run. The footer shows a run summary before you start."
+    case .results:
+        "Inspect ranked poses and clusters, open the 2D interaction diagram, compare several poses, and export SDF or CSV. Batch and screening hits appear here too."
+    case .leadOptimization:
+        "Start from a docked pose, generate analogues with property biases and ADMET filters, dock them, and compare each analogue with the reference."
+    case .sequence:
+        "Not a numbered step: a tool for browsing chains residue by residue, selecting by secondary structure, and renaming or merging chains."
+    }
+}
+
+private let workflowItems: [HelpItem] = {
+    var items: [HelpItem] = [.subtitle("Pipeline")]
+    for tab in SidebarTab.allCases where tab.isPipelineStep {
+        items.append(HelpItem("\(tab.shortcutNumber). \(tab.rawValue) — \(tab.subtitle)", workflowDetail(tab),
+                              shortcut: "⌘\(tab.shortcutNumber)", icon: tab.icon))
+    }
+    items.append(.subtitle("Tool"))
+    items.append(HelpItem("\(SidebarTab.sequence.rawValue) — \(SidebarTab.sequence.subtitle)",
+                          workflowDetail(.sequence), shortcut: "⌘\(SidebarTab.sequence.shortcutNumber)", icon: SidebarTab.sequence.icon))
+    items.append(.subtitle("Moving Between Steps"))
+    items.append(HelpItem("Step Buttons",
+                          "The centre of the window toolbar shows one button per step, with the Sequence tool last. Hover a button to see its number, name and shortcut; click it to switch steps.",
+                          shortcut: "⌘1 – ⌘8", icon: "rectangle.split.3x1"))
+    items.append(HelpItem("Next / Previous Step",
+                          "Workflow ▸ Next Step and Previous Step walk through the pipeline in order. Each step's footer also ends with a “Continue to …” link once the step is done.",
+                          shortcut: "⌘] / ⌘[", icon: "arrow.right"))
+    items.append(HelpItem("Status Badges",
+                          "Each step button carries a small badge: a green checkmark when the step is done, a filled accent dot when it is ready, a hollow dot while it waits on an earlier step, an orange exclamation mark when it needs attention, and a spinner while it runs.",
+                          icon: "checkmark.circle"))
+    return items
+}()
 
 // MARK: - Help Content
 
 private let helpSections: [HelpSection] = [
 
-    // ── 1. Getting Started ──────────────────────────────────────────────
+    // ── Basics ──────────────────────────────────────────────────────────
     HelpSection(
-        icon: "play.circle.fill",
+        icon: "play.circle",
         title: "Getting Started",
-        color: .blue,
+        summary: "A first tour of the window and two quick-start recipes.",
+        tint: DS.Color.accent,
+        group: .basics,
         items: [
-            HelpItem("Pipeline Overview",
-                     "Druse guides you through a 7-step pipeline shown in the toolbar: Search → Preparation → Sequence → Ligands → Docking → Results → Lead Opt. Each step unlocks as prerequisites are met. A green checkmark means the step is complete; an orange dot means it is ready to use."),
+            HelpItem("The Main Window",
+                     "The step buttons sit in the centre of the toolbar; click one (or press ⌘1–⌘8) to switch steps. The navigator on the left (⌃⌘S) shows the current step with its header, cards and a pinned footer for the main action. The 3D viewport fills the centre, the Inspector sits on the right (⌥⌘0), and the console opens from the bar under the viewport (⇧⌘Y). Drag the inner edge of the navigator or the Inspector to resize it. On the right of the toolbar, just before the Console and Inspector buttons, the activity indicator shows what is loaded and any running operation, with a stop button."),
             HelpItem("Quick Start: Redocking",
-                     "1) Open a PDB file containing a co-crystallised ligand (File → Open or ⌘O). 2) Click Preparation → Prepare for Docking. 3) Switch to Ligands, the co-crystallised ligand appears automatically — click Populate & Prepare. 4) Go to Docking, a pocket is auto-detected around the ligand. 5) Click Run Docking. Results appear in the Results tab."),
+                     "1) Open a PDB file containing a co-crystallised ligand (⌘O). 2) In Preparation, click Prepare for Docking. 3) In Ligands, the co-crystallised ligand is already in the library — prepare it. 4) In Binding Site, choose From Ligand to place the pocket and grid box. 5) In Docking, review the run summary and click Run. 6) Poses appear in Results."),
             HelpItem("Quick Start: Virtual Screening",
-                     "1) Load a protein and prepare it. 2) Open the Ligand Database (⌘L), import an SDF library, and batch-prepare all entries. 3) In the Docking tab, detect or define a pocket, then click Run Docking. All prepared ligands are docked and ranked."),
+                     "1) Load and prepare a protein. 2) Open the Ligand Database (⌘L), import an SDF library and batch-prepare all entries. 3) Detect a pocket in Binding Site. 4) Run Docking — every prepared ligand is docked and ranked. 5) Review the hits in Results."),
+            HelpItem("Guided Demo",
+                     "Choose Show Me Around on the welcome screen to watch a narrated, fully automatic run: Druse fetches trypsin, finds the S1 pocket, docks nafamostat and maps the interactions. Press Stop at any time, or Explore at the end to take over."),
             HelpItem("Apple Silicon GPU",
                      "Druse runs all compute-intensive tasks — grid map generation, genetic algorithm, neural network scoring, Connolly surfaces — on the Apple Silicon GPU via Metal compute shaders. No external GPU or CUDA installation is required."),
         ]
     ),
 
-    // ── 2. Loading Structures ───────────────────────────────────────────
     HelpSection(
-        icon: "doc.text.fill",
+        icon: "list.number",
+        title: "Workflow",
+        summary: "Seven steps from structure to optimised lead, plus the Sequence tool.",
+        tint: DS.Color.accent,
+        group: .basics,
+        items: workflowItems
+    ),
+
+    // ── Workflow steps ──────────────────────────────────────────────────
+    HelpSection(
+        icon: "square.and.arrow.down.on.square",
         title: "Loading Structures",
-        color: .blue,
+        summary: "Bring proteins and ligands into the workspace and save your session.",
+        tint: DS.Color.protein,
+        group: .steps,
+        step: .search,
         items: [
             HelpItem("Open File",
-                     "Load a protein or ligand from PDB, mmCIF, MOL2, SDF, or SMILES files. Multiple files can be loaded sequentially — the most recent protein replaces the previous one, while ligands accumulate in the database.", shortcut: "⌘O"),
+                     "Load a protein or ligand from PDB, mmCIF, MOL2, SDF, or SMILES files with File ▸ Open, the Open button in the toolbar, or Open File… in the Search step. Loading a new protein replaces the previous one, while ligands accumulate in the database.", shortcut: "⌘O"),
             HelpItem("Drag & Drop",
                      "Drag any supported file directly onto the 3D viewport. Druse detects the file type automatically."),
             HelpItem("Fetch by PDB ID",
-                     "In the Search tab, type a 4-character PDB accession code (e.g. 1HSG) and press Enter. Druse downloads the structure from RCSB PDB and loads it."),
+                     "In the Search step, type a 4-character PDB accession code (e.g. 1HSG) and press Fetch or Enter. Druse downloads the structure from RCSB PDB and loads it. Recent downloads are listed in the Search step and on the welcome screen."),
             HelpItem("Search RCSB",
-                     "Enter a keyword (e.g. \"HIV protease\") in the Search tab. Results are displayed as cards showing resolution, method, and release date. Click a card to fetch and load the structure."),
+                     "Enter a keyword (e.g. \"HIV protease\") in the Search RCSB card. Each result shows its PDB ID, title and resolution; click its load button to fetch the structure."),
+            HelpItem("Loaded Molecules",
+                     "The Loaded card in the Search step, and the chips at the top-left of the viewport, show the current protein and ligand. Use their ✕ buttons to clear either one."),
+            HelpItem.subtitle("Projects"),
             HelpItem("Save / Open Project",
-                     "Projects (.druse folder) save the full session: protein, ligands, docking results, grid box, workspace settings, and preparation state. Re-open a project to resume exactly where you left off.", shortcut: "⌘S / ⌘⇧O"),
-            HelpItem("Ligand Database Persistence",
-                     "The ligand database can be saved and loaded independently of projects. Use File → Save/Load Ligand Database to keep a reusable compound library across sessions.", shortcut: "⌘⇧S"),
+                     "Projects (.druse folder) save the full session: protein, ligands, docking results, grid box, workspace settings, and preparation state. Use the toolbar's Save and Open buttons or the File menu, and re-open a project to resume exactly where you left off.", shortcut: "⌘S / ⇧⌘O"),
+            HelpItem("Ligand Database Files",
+                     "The ligand database can be saved and loaded independently of projects with File ▸ Export / Import Ligand Database, or the Save… and Load… buttons in the Ligands step, so a compound library can be reused across sessions."),
         ]
     ),
 
-    // ── 3. Protein Preparation ──────────────────────────────────────────
     HelpSection(
-        icon: "wrench.and.screwdriver.fill",
+        icon: "wrench.and.screwdriver",
         title: "Protein Preparation",
-        color: .orange,
+        summary: "Clean, repair and protonate the receptor before docking.",
+        tint: DS.Color.protein,
+        group: .steps,
+        step: .preparation,
         items: [
             HelpItem("Why Prepare?",
                      "Crystal structures from the PDB often lack hydrogens, contain alternate conformations, have missing loops or atoms, and do not include protonation states. Proper preparation is critical for accurate docking — incorrect protonation alone can shift binding energies by several kcal/mol."),
             HelpItem.subtitle("Automatic Pipeline"),
             HelpItem("Prepare for Docking",
-                     "One-click pipeline that sequentially: 1) selects the best alternate conformer per residue (by occupancy, then B-factor), 2) removes non-standard residues and waters, 3) rebuilds missing heavy atoms from residue templates, 4) caps chain breaks with ACE/NME, 5) adds hydrogens at the specified pH, 6) assigns partial charges. The pH slider (default 7.4) controls protonation states."),
-            HelpItem.subtitle("Individual Steps"),
-            HelpItem("Add Hydrogens",
-                     "Adds polar or all hydrogens based on residue templates. Protonation states are assigned according to the target pH using a PROPKA-style pKa predictor that accounts for burial, hydrogen bonding, Coulomb interactions, and desolvation effects."),
-            HelpItem("Strip Hydrogens",
-                     "Removes all hydrogen atoms. Useful when re-preparing at a different pH or when importing a structure with incorrect protonation."),
-            HelpItem("Assign Charges",
-                     "Applies protonation states and assigns Gasteiger partial charges to all atoms. Ionisable residues (Asp, Glu, His, Lys, Arg, Cys, Tyr, N/C-termini) are titrated based on their predicted pKa at the target pH."),
-            HelpItem("Repair Gaps",
-                     "Detects chain breaks (Cα–Cα distance > 4.0 Å), reports missing residue ranges, rebuilds missing heavy atoms from standard templates, and adds ACE/NME capping groups at unresolved termini. Short missing loops (≤15 residues) can be rebuilt."),
-            HelpItem("Validate",
-                     "Checks each residue against its template and reports: missing atoms (with completeness %), extra atoms, unusual bond lengths (deviation from ideal), and steric clashes (contacts < 2.0 Å). Flagged issues appear as colour-coded badges in the Preparation tab."),
-            HelpItem.subtitle("Advanced Options"),
+                     "The button in the step footer runs the full pipeline: 1) selects the best alternate conformer per residue (by occupancy, then B-factor), 2) removes non-standard residues and waters, 3) rebuilds missing heavy atoms from residue templates, 4) caps chain breaks with ACE/NME, 5) adds hydrogens at the specified pH, 6) assigns partial charges. When it finishes, the footer offers “Continue to Ligands”."),
+            HelpItem("Issues",
+                     "Problems detected in the structure — missing atoms, chain gaps, clashes — are listed in the Issues card as warnings. While issues remain, the Preparation step button in the toolbar shows an attention badge."),
+            HelpItem.subtitle("Manual Steps"),
+            HelpItem("Cleanup",
+                     "Remove waters, non-standard residues, alternate conformations or hydrogens individually, without running the whole pipeline."),
+            HelpItem("Structure Repair",
+                     "Analyse missing residues and atoms, then repair them. Chain breaks (Cα–Cα distance > 4.0 Å) are reported as missing residue ranges, heavy atoms are rebuilt from standard templates, and ACE/NME caps are added at unresolved termini. Short missing loops (≤15 residues) can be rebuilt."),
+            HelpItem("Hydrogens & Protonation",
+                     "Adds polar or all hydrogens based on residue templates. Protonation states follow the target pH using a PROPKA-style pKa predictor that accounts for burial, hydrogen bonding, Coulomb interactions, and desolvation effects. Removing hydrogens is useful when re-preparing at a different pH."),
+            HelpItem("Charges",
+                     "Assigns partial charges to all atoms. Ionisable residues (Asp, Glu, His, Lys, Arg, Cys, Tyr, N/C-termini) are titrated based on their predicted pKa at the target pH."),
+            HelpItem.subtitle("Options"),
+            HelpItem("pH",
+                     "Sets the target pH for protonation (range 2.0–12.0, default 7.4). This affects the charge states of ionisable residues and directly influences docking energetics — for example, at pH 4.0 Asp/Glu remain protonated (neutral), while at pH 7.4 they are deprotonated (negative). The pKa reference table is available in a disclosure below the slider."),
             HelpItem("H-Bond Network Optimisation",
-                     "After adding hydrogens, Druse optimises the orientation of rotatable polar groups. It considers: hydroxyl rotations (Ser, Thr, Tyr — 3 orientations each), thiol rotations (Cys), amino rotations (Lys), amide flips (Asn OD1↔ND2, Gln OE1↔NE2), and histidine tautomers (6 states: 3 tautomers × 2 flip orientations). Conflicting groups are identified via a spatial hash and resolved as independent cliques using greedy energy minimisation."),
+                     "After adding hydrogens, Druse optimises the orientation of rotatable polar groups: hydroxyl rotations (Ser, Thr, Tyr — 3 orientations each), thiol rotations (Cys), amino rotations (Lys), amide flips (Asn OD1↔ND2, Gln OE1↔NE2), and histidine tautomers (6 states: 3 tautomers × 2 flip orientations). Conflicting groups are identified via a spatial hash and resolved as independent cliques using greedy energy minimisation."),
             HelpItem("Bridging Waters",
                      "Some water molecules mediate key protein–ligand hydrogen bonds. Enable this option to retain crystallographic waters near the binding pocket as part of the rigid receptor during docking."),
-            HelpItem("pH Slider",
-                     "Sets the target pH for protonation (range 2.0–12.0, default 7.4). This affects the charge states of ionisable residues and directly influences docking energetics — for example, at pH 4.0 Asp/Glu remain protonated (neutral), while at pH 7.4 they are deprotonated (negative)."),
+            HelpItem("Statistics",
+                     "Atom, residue and chain counts for the prepared protein live in the Statistics section of the Inspector (⌥⌘0)."),
         ]
     ),
 
-    // ── 4. Sequence View ────────────────────────────────────────────────
     HelpSection(
-        icon: "text.alignleft",
-        title: "Sequence View",
-        color: .indigo,
-        items: [
-            HelpItem("Overview",
-                     "The Sequence tab displays a high-performance, scrollable canvas of one-letter amino-acid codes for each chain. It is not a list of SwiftUI views — it uses a custom canvas renderer for smooth scrolling even with very large proteins."),
-            HelpItem.subtitle("Visual Encoding"),
-            HelpItem("Secondary Structure Colouring",
-                     "Each residue cell is colour-coded by secondary structure assignment: red (α-helix), yellow (β-sheet), grey (coil), cyan (turn). A legend is shown at the top of the view."),
-            HelpItem("Gap Markers",
-                     "Missing residues appear as orange gap markers between resolved segments. The marker shows the number of missing residues (e.g. \"gap 5\"). These correspond to unresolved density in the crystal structure."),
-            HelpItem("Nucleic Acid Chains",
-                     "DNA and RNA chains are displayed in a separate section below protein chains, using standard single-letter nucleotide codes."),
-            HelpItem.subtitle("Selection"),
-            HelpItem("Click to Select",
-                     "Click a residue cell to select it. The corresponding residue highlights in the 3D viewport. The bottom panel shows details: sequence number, residue name, atom count, and secondary structure."),
-            HelpItem("Select by Secondary Structure",
-                     "Use the toolbar menu to select all helices, sheets, coils, or turns across the entire protein. Useful for visual analysis or defining docking constraints on structural motifs."),
-            HelpItem.subtitle("Chain Operations"),
-            HelpItem("Chain Context Menu",
-                     "Right-click a chain header to access: Select Chain (select all residues), Copy Chain Sequence (clipboard), Rename Chain (change chain ID), Merge Chains (combine two chains), Delete Residues (remove selected, with confirmation)."),
-            HelpItem("Copy Sequence",
-                     "The toolbar copy button exports the full FASTA sequence of the selected chain to the clipboard."),
-            HelpItem("Collapse / Expand",
-                     "Click the chain header disclosure triangle to collapse or expand individual chains, keeping the view focused on the chain of interest."),
-        ]
-    ),
-
-    // ── 5. Ligand Preparation ───────────────────────────────────────────
-    HelpSection(
-        icon: "atom",
+        icon: "hexagon",
         title: "Ligand Preparation",
-        color: .purple,
+        summary: "Build, prepare and enumerate the compound set to dock.",
+        tint: DS.Color.ligand,
+        group: .steps,
+        step: .ligands,
         items: [
+            HelpItem("Ligands Step",
+                     "The Active Ligand card shows the current ligand with its SMILES and key properties. The Library card lists every compound with its preparation status; use a row to make it active. Manager… opens the full Ligand Database window."),
             HelpItem("Ligand Database",
-                     "All ligands are managed through the Ligand Database (⌘L). The database stores molecular properties (MW, LogP, TPSA, HBD, HBA, RotB), preparation status, and enumerated forms. Columns are sortable and filterable; you can filter by Lipinski compliance or search by name/SMILES.", shortcut: "⌘L"),
+                     "The Ligand Database window stores molecular properties (MW, LogP, TPSA, HBD, HBA, RotB), preparation status, and enumerated forms. Columns are sortable and filterable; you can filter by Lipinski compliance or search by name/SMILES. Select an entry to see its structure, properties and conformers in the inspector; select several to prepare, enumerate, dock or delete them together. Each compound is Prepared, Not prepared or Failed (hover the warning icon to see why).", shortcut: "⌘L"),
             HelpItem.subtitle("Adding Ligands"),
             HelpItem("SMILES Input",
-                     "Type or paste a SMILES string in the quick-entry field (Ligands tab or database window). Druse converts it to a 3D conformer via RDKit with MMFF94 force-field optimisation."),
+                     "Type or paste a SMILES string in the Add Ligand card, or choose Add ▸ SMILES… in the Ligand Database window. Druse converts it to a 3D conformer via RDKit with MMFF94 force-field optimisation."),
+            HelpItem("Draw a Structure",
+                     "Choose Add ▸ Draw Structure… in the Ligand Database window to sketch a molecule in the built-in chemical editor."),
             HelpItem("Import File",
-                     "Import ligands from SDF (multiple molecules), MOL2, or SMILES files. SDF files preserve 3D coordinates if present. All imported molecules are added to the database."),
+                     "In the Ligand Database window, Add ▸ Import File with Column Mapping reads SMILES lists (.smi), CSV tables (.csv) and SDF files (.sdf, multiple molecules, 3D coordinates kept). The mapping sheet lets you choose which columns hold names, SMILES and affinity values; other columns become custom table columns."),
             HelpItem("Co-crystallised Ligand",
-                     "When loading a PDB with a bound ligand, it is automatically extracted and added to the database. Use \"From Ligand\" pocket detection to define the binding site around it."),
+                     "When loading a PDB with a bound ligand, it is automatically extracted and added to the database. Use From Ligand in the Binding Site step to define the site around it."),
             HelpItem.subtitle("Preparation Pipeline"),
-            HelpItem("Populate & Prepare",
-                     "Full preparation pipeline: add polar hydrogens → MMFF94 energy minimisation → Gasteiger charge assignment → enumerate tautomers/protomers at target pH → generate 3D conformers. A ligand must be prepared (green badge) before it can be docked."),
+            HelpItem("Prepare",
+                     "Prepares the dominant form: add hydrogens → protonate at the target pH → MMFF94 energy minimisation → Gasteiger charges → 3D conformers. A ligand must be prepared before it can be docked; use Enumerate… to dock several tautomers and protomers instead."),
             HelpItem.subtitle("Preparation Options"),
             HelpItem("pKa Method",
                      "Choose between GNN (Metal GPU-accelerated neural network, more accurate for drug-like molecules) or Table (fast lookup from reference pKa values, faster but less accurate for unusual functional groups)."),
@@ -171,51 +243,86 @@ private let helpSections: [HelpSection] = [
             HelpItem("Min Population",
                      "Protomers below this Boltzmann population fraction (default 1.0%) are discarded. Ensures only chemically relevant forms are docked."),
             HelpItem("Number of Conformers",
-                     "3D conformers generated per tautomer/protomer (default 50). These serve as starting geometries for the genetic algorithm. More conformers improve sampling but increase preparation time."),
-            HelpItem.subtitle("Enumeration Badges"),
+                     "3D conformers generated per tautomer/protomer (default 10). These serve as starting geometries for the genetic algorithm. More conformers improve sampling but increase preparation time."),
+            HelpItem.subtitle("Enumeration"),
+            HelpItem("Enumerate…",
+                     "Opens the enumeration sheet from the Ligand Database window to generate tautomers and protomers for the selected compounds."),
             HelpItem("Form Types",
-                     "Each enumerated form is labelled: Parent (green, original input), Tautomer (cyan, bond rearrangement), Protomer (orange, charge state change), Tautomer-Protomer (purple, both). In ensemble docking, all forms are docked and the best-scoring form is reported."),
+                     "Each enumerated form is labelled Parent (original input), Tautomer (bond rearrangement), Protomer (charge state change) or Tautomer-Protomer (both). In ensemble docking, all forms are docked and the best-scoring form is reported."),
         ]
     ),
 
-    // ── 6. Pocket Detection ─────────────────────────────────────────────
     HelpSection(
-        icon: "target",
-        title: "Pocket Detection",
-        color: .green,
+        icon: "scope",
+        title: "Binding Site",
+        summary: "Find the pocket and place the docking grid box.",
+        tint: DS.Color.pocket,
+        group: .steps,
+        step: .bindingSite,
         items: [
             HelpItem("Overview",
-                     "Before docking, you must define where on the protein the ligand should bind. Druse offers four detection methods plus manual grid box placement. Detected pockets are ranked by druggability score and display their volume (ų), buriedness (%), and residue count."),
-            HelpItem.subtitle("Detection Methods"),
+                     "Before docking, define where on the protein the ligand should bind. The Binding Site step gathers all of it: four detection methods, the list of detected pockets, the Pocket View slab, and the grid box. Detected pockets are ranked by druggability and show their volume (Å³), buriedness and residue count."),
+            HelpItem.subtitle("Detect"),
             HelpItem("Auto (Hybrid)",
                      "Combines ML and geometric detection. First attempts GNN-based prediction; falls back to alpha-sphere/DBSCAN if the ML model is unavailable or finds no pockets. Recommended for most use cases."),
             HelpItem("ML Detection (GNN)",
                      "A graph neural network trained on known binding sites. More reliable for cryptic or shallow pockets that geometric methods may miss. Requires the pocket detector CoreML model (loaded at startup)."),
-            HelpItem("Alpha-Sphere / DBSCAN",
-                     "Geometry-based algorithm: 1) Places probe points on a 1.0 Å grid around the protein. 2) Retains probes 2.0–5.5 Å from the nearest protein atom. 3) Scores buriedness by casting 26 rays and counting how many are blocked by protein (≥30% required). 4) Clusters surviving probes with DBSCAN (ε = 3.5 Å, minPts = 8). 5) Ranks pockets by druggability = volume × buriedness × (residue count / 100)."),
             HelpItem("From Ligand",
                      "Defines a pocket centred on the current ligand position. Ideal when a co-crystallised ligand is present — the grid box tightly wraps the known binding site."),
             HelpItem("From Selection",
-                     "Builds a pocket from residues you select in the Sequence tab or 3D viewport. Useful for targeting allosteric sites or known functional residues."),
-            HelpItem.subtitle("Grid Box"),
-            HelpItem("Grid Box Controls",
-                     "The docking grid box defines the search volume. Adjust center (X, Y, Z) and half-size (X, Y, Z) with sliders. Quick-placement buttons snap the box to the protein centroid, ligand position, selected residues, or detected pocket."),
-            HelpItem("Visualisation",
-                     "The grid box appears as a wireframe cube in the 3D viewport. Line thickness and colour are adjustable in Settings. Use ⌘-drag to move the box and ⌘⇧-drag to resize interactively."),
+                     "Builds a pocket from residues you select in the Sequence tool or the 3D viewport. Useful for targeting allosteric sites or known functional residues."),
+            HelpItem("Alpha-Sphere / DBSCAN",
+                     "The geometric algorithm behind Auto: 1) Places probe points on a 1.0 Å grid around the protein. 2) Retains probes 2.0–5.5 Å from the nearest protein atom. 3) Scores buriedness by casting 26 rays and counting how many are blocked by protein (≥30% required). 4) Clusters surviving probes with DBSCAN (ε = 3.5 Å, minPts = 8). 5) Ranks pockets by druggability = volume × buriedness × (residue count / 100)."),
+            HelpItem.subtitle("Pockets"),
+            HelpItem("Focus a Pocket",
+                     "Click a pocket in the Pockets card to select it and frame it in the viewport. The selected pocket drives the grid box and the Pocket View slab."),
             HelpItem.subtitle("Pocket View"),
             HelpItem("Z-Slab Clipping",
-                     "Clips the 3D view to a depth slab around the pocket for unobstructed inspection. Controls: Thickness (2–40 Å, orange warning below 10 Å), Offset (−20 to +20 Å), Presets (Tight 8 Å / Medium 16 Å / Wide 30 Å). Enabling a slab preset automatically turns on the molecular surface at 55% opacity for cavity visualisation."),
+                     "Clips the 3D view to a depth slab around the pocket for unobstructed inspection. Turn Pocket View on and choose a preset (Tight 8 Å / Medium 16 Å / Wide 30 Å); enabling a preset also shows the molecular surface at 55% opacity for cavity visualisation. Fine-tune thickness (2–40 Å) and offset (−20 to +20 Å) from the clipping control's popover in the viewport."),
+            HelpItem.subtitle("Grid Box"),
+            HelpItem("Grid Box Controls",
+                     "The grid box defines the docking search volume. Snap it to the protein, the ligand, the selected residues or the selected pocket, adjust its centre and half-size with the axis sliders, then click Apply. Once a grid is defined, the footer offers “Continue to Dock”."),
+            HelpItem("Visualisation",
+                     "The grid box appears as a wireframe cube in the 3D viewport. Use ⌘-drag to move the box and ⇧⌘-drag to resize it interactively.", shortcut: "⌘ Drag"),
         ]
     ),
 
-    // ── 7. Docking – Scoring Functions ──────────────────────────────────
+    HelpSection(
+        icon: "arrow.down.right.and.arrow.up.left",
+        title: "Running Docking",
+        summary: "Configure the search, review the run summary, and dock.",
+        tint: DS.Color.accent,
+        group: .steps,
+        step: .dock,
+        items: [
+            HelpItem("Inputs",
+                     "The Inputs card checks that a protein, at least one ligand and a binding site are ready. A missing input shows a red mark with a button that takes you to the step that provides it. Manage… opens the Ligand Database."),
+            HelpItem("Search",
+                     "Choose a preset, the search method, the scoring function and the search budget. Behaviour, torsion, exploration and method-specific options are grouped under Advanced. The Search card is the one place where the scoring function is chosen."),
+            HelpItem("Constraints, Flexibility, Refinement",
+                     "Add pharmacophore constraints, enable flexible receptor sidechains, and configure post-docking refinement in their own cards below Search."),
+            HelpItem.subtitle("Run"),
+            HelpItem("Run Summary",
+                     "The footer lists the protein, ligands, site, method, scoring and budget that will be used, directly above the Run button."),
+            HelpItem("Review & Run",
+                     "With “Confirm before docking” on (Settings ▸ Docking, on by default), Run opens a review sheet before starting. Tick “Don't ask again” in the sheet to start directly next time."),
+            HelpItem("Progress",
+                     "While docking runs, progress, the current generation and the best score appear in the toolbar's activity indicator and in a floating panel above the viewport's display controls. Stop the run from either place, or with Cancel in the step footer. A translucent ghost ligand shows the current best pose in real time."),
+            HelpItem("When Done",
+                     "The Docking step shows a one-line summary of the run (pose count and best score) and a link to continue to Results."),
+        ]
+    ),
+
     HelpSection(
         icon: "function",
         title: "Scoring Functions",
-        color: .yellow,
+        summary: "Vina, Drusina, DruseAF and Vina + PIGNet2 explained.",
+        tint: DS.Color.success,
+        group: .steps,
+        step: .dock,
         items: [
             HelpItem("Overview",
-                     "Druse provides four scoring modes. Vina, Drusina, and DruseAF can guide pose ranking during search. Vina + PIGNet2 uses Vina for pose generation and local optimisation, then applies PIGNet2 to rescore and rerank the generated poses. You can switch scoring functions in the Results tab to compare score displays without re-docking."),
+                     "Druse provides four scoring modes, chosen in the Search card of the Docking step. Vina, Drusina, and DruseAF can guide pose ranking during search. Vina + PIGNet2 uses Vina for pose generation and local optimisation, then applies PIGNet2 to rescore and rerank the generated poses."),
             HelpItem.subtitle("Vina (Classical Empirical)"),
             HelpItem("Vina Energy Terms",
                      "AutoDock Vina scoring (Trott & Olson, 2010) decomposes binding energy into five terms:\n• Gauss₁: short-range van der Waals attraction (w = −0.0356)\n• Gauss₂: long-range van der Waals attraction (w = −0.0052)\n• Repulsion: steric clash penalty for atom overlap (w = +0.840)\n• Hydrophobic: desolvation reward for lipophilic contacts (w = −0.0351)\n• H-bond: directional hydrogen bond reward (w = −0.587)\nPlus a rotatable-bond entropy penalty of +0.058 kcal/mol per torsion."),
@@ -250,7 +357,7 @@ private let helpSections: [HelpSection] = [
             HelpItem("DruseAF Architecture",
                      "A learned scoring function predicting binding affinity (pKd). Version 3 uses cross-attention layers (ligand queries × protein keys, 256-dim, 4 heads, 3 layers). Version 4 (PGN) uses a pairwise geometric network with message-passing on atom-pair features. Output is predicted −log₁₀(Kd), higher = tighter binding."),
             HelpItem("DruseAF Usage",
-                     "Can be used as the primary scoring function during docking or as a post-docking rescorer (enable \"AF Rescore\" in advanced settings). Neural scoring generalises well across chemotypes but may be less reliable for very unusual scaffolds."),
+                     "Can be used as the primary scoring function during docking or as a post-docking rescorer (AF Rescore in the Refinement card). Neural scoring generalises well across chemotypes but may be less reliable for very unusual scaffolds."),
             HelpItem.subtitle("Vina + PIGNet2 (Physics-Informed GNN Rerank)"),
             HelpItem("PIGNet2 Architecture",
                      "A graph neural network (128-dim, 3 GatedGAT layers, 5 Å intermolecular cutoff) that decomposes its prediction into physics-interpretable components: van der Waals (Morse potential), hydrogen bonds, metal coordination, hydrophobic contacts, and rotor entropy. Outputs kcal/mol. Max 256 protein atoms, 64 ligand atoms per evaluation."),
@@ -259,14 +366,16 @@ private let helpSections: [HelpSection] = [
         ]
     ),
 
-    // ── 8. Docking – Search Algorithms ──────────────────────────────────
     HelpSection(
-        icon: "bolt.fill",
+        icon: "bolt",
         title: "Docking Algorithms",
-        color: .orange,
+        summary: "How the GPU search explores the pose space.",
+        tint: DS.Color.accent,
+        group: .steps,
+        step: .dock,
         items: [
             HelpItem("Overview",
-                     "Druse uses a GPU-parallel search to explore the binding pose space. The search method is auto-selected based on ligand flexibility, or you can choose manually. All methods run entirely on the Metal GPU."),
+                     "Druse uses a GPU-parallel search to explore the binding pose space. The search method is auto-selected based on ligand flexibility, or you can choose it in the Search card. All methods run entirely on the Metal GPU."),
             HelpItem.subtitle("Genetic Algorithm (Default)"),
             HelpItem("Lamarckian GA",
                      "The default search method, inspired by AutoDock Vina. Each \"individual\" encodes a ligand pose as (translation, rotation quaternion, torsion angles). The GA evolves a population through selection, crossover, mutation, and Lamarckian local search (basin-hopping). Metropolis acceptance (temperature = 1.5 kcal/mol) allows uphill moves to escape local minima."),
@@ -290,11 +399,13 @@ private let helpSections: [HelpSection] = [
         ]
     ),
 
-    // ── 9. Docking – Parameters ─────────────────────────────────────────
     HelpSection(
         icon: "slider.horizontal.3",
         title: "Docking Parameters",
-        color: .red,
+        summary: "Presets, budget, exploration tuning, flexibility and constraints.",
+        tint: DS.Color.accent,
+        group: .steps,
+        step: .dock,
         items: [
             HelpItem("Presets",
                      "Four presets configure all parameters at once: Auto (adapts to complexity), Fast (pop 50, gen 30, 3 runs), Standard (pop 150, gen 80, 5 runs), Thorough (pop 300, gen 200, 10 runs). You can also edit parameters individually after selecting a preset."),
@@ -309,7 +420,7 @@ private let helpSections: [HelpSection] = [
                      "Resolution of the pre-computed affinity grid maps in Å. Options: 0.375 (high resolution, best accuracy), 0.500 (balanced), 0.750 (fast, lower accuracy). Finer grids require more VRAM."),
             HelpItem("Mutation Rate",
                      "Probability that each degree of freedom is randomly perturbed during GA mutation. Range 0.01–0.25 (default 0.10). Higher values increase exploration but slow convergence."),
-            HelpItem.subtitle("Exploration Tuning"),
+            HelpItem.subtitle("Advanced: Exploration Tuning"),
             HelpItem("Exploration Phase Ratio",
                      "Fraction of generations spent in the broad exploration phase (default 0.55 = 55%). During exploration, translation/rotation steps and mutation rate are amplified. Range 0.2–0.8."),
             HelpItem("Local Search Frequency",
@@ -322,67 +433,74 @@ private let helpSections: [HelpSection] = [
             HelpItem("Ligand Flexibility",
                      "Toggle to allow rotatable bonds to flex during docking. When disabled, the ligand is treated as a rigid body (translation + rotation only). Enable for any ligand with rotatable bonds — rigid docking of a flexible molecule will miss the correct binding mode."),
             HelpItem("Flexible Receptor (Induced Fit)",
-                     "Sample sidechain χ angles for selected pocket-lining residues during docking. Two modes: Soft (automatic selection of sidechains near the pocket, purple badges show selected residues and χ-angle count) or Manual (hand-pick up to 8 residues). Increases computational cost but captures induced-fit effects."),
+                     "Sample sidechain χ angles for selected pocket-lining residues during docking. Two modes: Soft (automatic selection of sidechains near the pocket, with the selected residues and χ-angle count listed) or Manual (hand-pick up to 8 residues). Increases computational cost but captures induced-fit effects."),
             HelpItem.subtitle("Constraints"),
             HelpItem("Pharmacophore Constraints",
-                     "Force specific interactions during docking. Add constraints by clicking atoms/residues in the 3D viewport: H-bond acceptor/donor, aromatic ring, lipophilic contact, positive/negative charge. Each constraint has a strength (Hard = strict requirement; Soft = 5.0 kcal/mol penalty) and distance threshold (2.5–4.0 Å). Poses violating hard constraints are eliminated; soft constraint violations add an energy penalty."),
-            HelpItem.subtitle("Post-Docking"),
+                     "Force specific interactions during docking. Add constraints by clicking atoms/residues in the 3D viewport or in the pharmacophore editor: H-bond acceptor/donor, aromatic ring, lipophilic contact, positive/negative charge. Each constraint has a strength (Hard = strict requirement; Soft = 5.0 kcal/mol penalty) and distance threshold (2.5–4.0 Å). Poses violating hard constraints are eliminated; soft constraint violations add an energy penalty."),
+            HelpItem.subtitle("Refinement"),
             HelpItem("GFN2-xTB Refinement",
                      "Semi-empirical quantum-mechanical geometry optimisation of top poses (default: top 20). Uses GFN2-xTB with D4 dispersion and implicit water solvation (ALPB or GBSA). Options: optimisation level (crude/normal/tight), harmonic position restraint (0.005 Ha/Å² ≈ 0.3 Å allowed motion), max RMSD filter (2.0 Å), blend weight (0.3 = 30% GFN2 + 70% Vina). Improves pose quality for tight binders."),
             HelpItem("AF Rescore",
-                     "After docking, rescore top cluster representatives with DruseAF v4 neural network. Particularly useful when Vina/Drusina ranking disagrees with expected SAR."),
+                     "After docking, rescore top cluster representatives with the DruseAF v4 neural network. Particularly useful when Vina/Drusina ranking disagrees with expected SAR."),
             HelpItem.subtitle("Clash & Strain"),
             HelpItem("Clash Handling",
                      "Atom overlaps exceeding 0.4 Å trigger a penalty of 5.0 kcal/mol per Å excess. Prevents physically impossible poses from dominating the population."),
             HelpItem("Strain Penalty",
-                     "Post-docking MMFF94 internal energy check. Poses with intramolecular strain > 6.0 kcal/mol above the relaxed conformer receive a weighted penalty (default weight 0.5). High strain values (> 4.0) are flagged in red in the Results tab."),
+                     "Post-docking MMFF94 internal energy check. Poses with intramolecular strain > 6.0 kcal/mol above the relaxed conformer receive a weighted penalty (default weight 0.5). High strain values (> 4.0) are flagged in the Results step."),
         ]
     ),
 
-    // ── 10. Results & Analysis ──────────────────────────────────────────
     HelpSection(
-        icon: "chart.bar.fill",
+        icon: "chart.bar.doc.horizontal",
         title: "Results & Analysis",
-        color: .cyan,
+        summary: "Rank, inspect, compare and export docked poses.",
+        tint: DS.Color.success,
+        group: .steps,
+        step: .results,
         items: [
-            HelpItem("Results Tab",
-                     "After docking, poses are ranked by score and grouped into clusters (RMSD threshold = 2.0 Å). Each cluster represents a distinct binding mode. The summary card shows: best energy, pose count, cluster count. Click any pose to display it in the 3D viewport."),
-            HelpItem.subtitle("Energy Landscape"),
-            HelpItem("Histogram",
-                     "An interactive bar chart showing the energy distribution of the top 50 poses. Bars are colour-coded: green (< −8 kcal/mol, strong binding) through yellow to red (poor). Click a bar to view the corresponding pose. The spread of the histogram indicates convergence — a narrow peak suggests the search converged well."),
+            HelpItem("Summary",
+                     "After docking, poses are ranked by score and grouped into clusters (RMSD threshold = 2.0 Å). The Summary card shows the best and mean score, pose and cluster counts, the method and scoring function used, and the wall time. Scores are coloured green (good), amber (fair) or orange (weak)."),
+            HelpItem("Poses",
+                     "Each row shows the rank, score, cluster and RMSD. Use the row buttons to view the pose in the viewport, open its interaction diagram, or send it to Lead Opt. Tick several poses to view or clear them together."),
+            HelpItem("Score Landscape",
+                     "A bar chart in the Summary card shows the scores of the top 50 ranked poses, coloured by score tone, with the displayed pose highlighted. Outliers are clamped so one poor pose does not flatten the chart. Click a bar to view that pose."),
             HelpItem.subtitle("Pose Details"),
             HelpItem("Energy Decomposition",
-                     "Each pose shows tagged energy components: vdW (van der Waals), elec (electrostatic), hb (hydrogen bond), str (strain — red warning if > 4.0), xtb (GFN2-xTB energy if refined, purple), cst (constraint penalty if any, orange)."),
-            HelpItem("Cluster Badges",
+                     "Each pose shows tagged energy components: vdW (van der Waals), elec (electrostatic), hb (hydrogen bond), str (strain — flagged if > 4.0), xtb (GFN2-xTB energy if refined), cst (constraint penalty, if any)."),
+            HelpItem("Cluster Tags",
                      "Each pose shows its cluster ID (C0, C1, etc.). Poses in the same cluster have similar binding modes (RMSD < 2.0 Å). The cluster representative (rank 0) is typically the best-scoring member."),
-            HelpItem("Scoring Method Switching",
-                     "Use the dropdown at the top to view scores with a different method (Vina, Drusina, Druse AF, Vina + PIGNet2). Vina + PIGNet2 indicates that poses were generated with Vina and reranked/rescored with PIGNet2, so it is not a standalone PIGNet2 search mode."),
+            HelpItem("Multi-Pose Analysis",
+                     "Opens from the step footer to compare several poses side by side — scores, interactions and pose-to-pose RMSD."),
             HelpItem.subtitle("Interaction Diagram"),
             HelpItem("2D Interaction Diagram",
-                     "A schematic view of protein–ligand contacts with the ligand centred and interacting residues arranged radially. Interactions are colour-coded: H-bonds (cyan), salt bridges (orange), π-stacking (purple), hydrophobic (grey), halogen bonds (green), metal coordination (gold). Residues are coloured by type: acidic (red), basic (blue), polar (green), hydrophobic (orange). Distances are labelled on connecting lines."),
+                     "A schematic window of protein–ligand contacts with the ligand centred and interacting residues arranged radially. Pick the pose to show from its toolbar. Interactions are colour-coded: H-bonds (blue, dashed), salt bridges (red), hydrophobic contacts (olive), π-stacking (green), π-cation (pink), halogen bonds (teal) and metal coordination (bronze); distances label the connecting lines. Export the diagram as PNG, SVG or PDF."),
+            HelpItem("Viewport Legends",
+                     "When interactions or a coloured surface are shown, floating legends appear at the top-right of the viewport. Click a legend to collapse it into a small pill."),
             HelpItem.subtitle("Results Database"),
             HelpItem("Full Pose Analysis",
-                     "The Results Database window (⌘⇧R) provides a comprehensive table of all poses with sortable columns, multi-column selection, energy bars, and a detail panel showing 2D interaction diagrams, pocket metrics, and per-atom energy contributions.", shortcut: "⌘⇧R"),
+                     "The Results Database window lists batches in its sidebar and their poses in a sortable table, with the selected pose's 2D diagram, pocket metrics and per-atom energy contributions in the side panel. Its toolbar holds Correlation, Interaction Diagram, Export and a search field. Open it from the Results step or View ▸ Results Database.", shortcut: "⇧⌘R"),
             HelpItem("Correlation Analysis",
                      "In batch mode, the correlation view shows a scatter plot of docking scores vs experimental affinity (if Ki/Kd values are provided). Includes a regression line with R² value and outlier identification. Useful for validating the scoring function against known actives/inactives."),
             HelpItem.subtitle("Export"),
             HelpItem("Export Poses",
-                     "Export selected poses as SDF (with 3D coordinates and energy properties) or the results table as CSV. Available from both the Results tab and the Database window."),
+                     "Export poses as SDF (with 3D coordinates and energy properties) or the results table as CSV from the Results step footer or the Results Database toolbar."),
         ]
     ),
 
-    // ── 11. Virtual Screening ───────────────────────────────────────────
     HelpSection(
-        icon: "rectangle.stack.fill",
+        icon: "rectangle.stack",
         title: "Virtual Screening",
-        color: .mint,
+        summary: "Dock a whole library and rank the hits.",
+        tint: DS.Color.info,
+        group: .steps,
+        step: .results,
         items: [
             HelpItem("Overview",
-                     "Virtual screening docks an entire ligand database against the target pocket. All prepared ligands in the database are queued automatically when you click Run Docking. Results are ranked by best score per compound."),
+                     "Virtual screening docks an entire ligand database against the target pocket. All prepared ligands in the database are queued automatically when you click Run in the Docking step. Results are ranked by best score per compound."),
             HelpItem("Batch Progress",
-                     "The Results tab shows batch docking progress with per-ligand status. Each compound is docked independently using the same grid maps and search parameters."),
+                     "Overall progress shows in the toolbar's activity indicator; the Batch card in the Results step lists per-ligand status and has a Cancel button. Each compound is docked independently using the same grid maps and search parameters."),
             HelpItem("Hit Ranking",
-                     "Compounds are ranked by their best pose energy. The batch results list shows: rank, ligand name, best energy, pose count, and estimated Ki (if available)."),
+                     "Compounds are ranked by their best pose energy. The Screening Hits card shows rank, ligand name, best energy, pose count, and estimated Ki (if available), and can export the hit list."),
             HelpItem("Filtering",
                      "Filter hits by affinity threshold (discard compounds weaker than a cutoff), RMSD cutoff (only keep well-converged poses), and ADMET properties (Lipinski, Veber, hERG safety)."),
             HelpItem("Ensemble Docking",
@@ -390,14 +508,16 @@ private let helpSections: [HelpSection] = [
         ]
     ),
 
-    // ── 12. Lead Optimisation ───────────────────────────────────────────
     HelpSection(
-        icon: "wand.and.stars",
+        icon: "arrow.triangle.branch",
         title: "Lead Optimisation",
-        color: .pink,
+        summary: "Generate, dock and compare analogues of a docked pose.",
+        tint: DS.Color.ligand,
+        group: .steps,
+        step: .leadOptimization,
         items: [
             HelpItem("Overview",
-                     "Starting from a docked pose, the Lead Opt tab generates and evaluates structural analogues. Workflow: 1) Dock a compound, 2) In Results, click \"Optimize\" on your best pose, 3) Configure analogue generation, 4) Generate and dock analogues, 5) Compare with the reference."),
+                     "Starting from a docked pose, the Lead Opt step generates and evaluates structural analogues. Workflow: 1) Dock a compound, 2) In Results, click Optimize on your best pose, 3) Configure analogue generation, 4) Generate and dock analogues, 5) Compare with the reference."),
             HelpItem.subtitle("Generation Controls"),
             HelpItem("Analogue Count",
                      "Number of analogues to generate: 10, 25, 50, or 100. More analogues explore more chemical space but take longer to dock."),
@@ -407,22 +527,60 @@ private let helpSections: [HelpSection] = [
                      "When enabled, only R-groups are modified — the core scaffold is preserved. Useful for SAR exploration around a validated binding mode."),
             HelpItem("Property Direction",
                      "Four sliders bias analogue generation: Polarity (less ↔ more), Rigidity (flexible ↔ rigid), Lipophilicity (hydrophilic ↔ lipophilic), Size (smaller ↔ larger). Centre position = no bias."),
+            HelpItem("Scaffold Analogs",
+                     "Analogs… in the Ligand Database window enumerates substitutions on a chosen scaffold and adds the results to the library."),
             HelpItem.subtitle("ADMET Filters"),
             HelpItem("Drug-Likeness Filters",
-                     "Pre-filter analogues before docking: Lipinski Rule of 5 (MW ≤ 500, LogP ≤ 5, HBD ≤ 5, HBA ≤ 10), Veber (TPSA ≤ 140, RotB ≤ 10), hERG safety (cardiac toxicity risk), CYP safety (metabolic liability), Max LogP (1–8 lipophilicity cap). Filtered compounds are marked orange; failed compounds are marked red."),
+                     "Pre-filter analogues before docking: Lipinski Rule of 5 (MW ≤ 500, LogP ≤ 5, HBD ≤ 5, HBA ≤ 10), Veber (TPSA ≤ 140, RotB ≤ 10), hERG safety (cardiac toxicity risk), CYP safety (metabolic liability), Max LogP (1–8 lipophilicity cap). Filtered and failed compounds are marked in the Analogs list."),
             HelpItem.subtitle("Analysis"),
-            HelpItem("Comparison Card",
-                     "Select an analogue to see a side-by-side comparison with the reference: property differences (ΔMW, ΔLogP, ΔTPSA, ΔRotB), ADMET status icons, docking energy difference, and Tanimoto similarity. A comparison sheet shows overlay structures and a detailed ADMET profile heatmap."),
+            HelpItem("Dock & Deliver",
+                     "Dock all generated analogues against the same site; Stop halts the run. Each analogue row then shows its score difference against the reference."),
+            HelpItem("Comparison",
+                     "Select an analogue to compare it with the reference: property differences (ΔMW, ΔLogP, ΔTPSA, ΔRotB), ADMET status, docking energy difference, and Tanimoto similarity. The comparison view shows overlay structures and a detailed ADMET profile heatmap."),
             HelpItem("3D Alignment",
                      "The analogue's best pose is aligned to the reference pose in the 3D viewport, allowing direct visual comparison of binding modes."),
         ]
     ),
 
-    // ── 13. 3D Viewport ─────────────────────────────────────────────────
+    // ── Tools & viewport ────────────────────────────────────────────────
+    HelpSection(
+        icon: "textformat.abc",
+        title: "Sequence Tool",
+        summary: "Browse chains residue by residue and edit chain topology.",
+        tint: DS.Color.protein,
+        group: .tools,
+        step: .sequence,
+        items: [
+            HelpItem("Overview",
+                     "The Sequence tool (the last of the toolbar's step buttons) displays a scrollable canvas of one-letter codes for each chain. It uses a custom canvas renderer for smooth scrolling even with very large proteins.", shortcut: "⌘8"),
+            HelpItem.subtitle("Visual Encoding"),
+            HelpItem("Secondary Structure Colouring",
+                     "Each residue cell is colour-coded by secondary structure assignment (helix, sheet, coil, turn). A legend at the top of the view shows the colours."),
+            HelpItem("Gap Markers",
+                     "Missing residues appear as gap markers between resolved segments, showing the number of missing residues (e.g. \"gap 5\"). These correspond to unresolved density in the crystal structure."),
+            HelpItem("Nucleic Acid Chains",
+                     "DNA and RNA chains are displayed in a separate section below protein chains, using standard single-letter nucleotide codes."),
+            HelpItem.subtitle("Selection"),
+            HelpItem("Click to Select",
+                     "Click a residue cell to select it. The corresponding residue highlights in the 3D viewport, and the panel below shows its sequence number, residue name, atom count, and secondary structure."),
+            HelpItem("Select by Secondary Structure",
+                     "Use the selection buttons to select all helices, sheets, coils, or turns across the entire protein. Clear removes the selection. Useful for visual analysis or for building a binding site from a structural motif."),
+            HelpItem.subtitle("Chain Operations"),
+            HelpItem("Chain Context Menu",
+                     "Right-click a chain header to access: Select Chain (select all residues), Copy Chain Sequence (clipboard), Rename Chain (change chain ID), Merge Chains (combine two chains), Delete Residues (remove selected, with confirmation)."),
+            HelpItem("Copy Sequence",
+                     "The Copy button exports the full FASTA sequence of the selected chain to the clipboard."),
+            HelpItem("Collapse / Expand",
+                     "Click the chain header disclosure triangle to collapse or expand individual chains, keeping the view focused on the chain of interest."),
+        ]
+    ),
+
     HelpSection(
         icon: "move.3d",
         title: "3D Viewport",
-        color: .teal,
+        summary: "Navigate, select, and control how molecules are drawn.",
+        tint: DS.Color.accent,
+        group: .tools,
         items: [
             HelpItem.subtitle("Navigation"),
             HelpItem("Orbit",
@@ -433,40 +591,47 @@ private let helpSections: [HelpSection] = [
                      "Scroll wheel or pinch gesture to zoom in and out. Scroll up = zoom in.", shortcut: "Scroll"),
             HelpItem("Z-Roll",
                      "Control + drag to spin the view around the viewing axis (roll).", shortcut: "⌃ Drag"),
-            HelpItem("Recenter",
-                     "Fit all visible atoms to the viewport with smooth animation.", shortcut: "Space"),
+            HelpItem("Camera Controls",
+                     "The vertical cluster at the top-right of the viewport fits the view to everything, to the ligand or to the protein, and resets the camera. Fit to View is also in the View menu, or press Space with the viewport focused.", shortcut: "⌘0"),
             HelpItem.subtitle("Selection"),
             HelpItem("Click to Select",
-                     "Single-click an atom (or residue in ribbon mode) to select it. Selection highlights in the viewport, Sequence tab, and inspector."),
+                     "Single-click an atom (or residue in ribbon mode) to select it. Selection highlights in the viewport, the Sequence tool, and the Inspector."),
             HelpItem("Multi-Select",
                      "Option + click to toggle atoms in and out of the selection without clearing previous selections.", shortcut: "⌥ Click"),
             HelpItem("Box Select",
                      "Option + drag to draw a selection rectangle. All atoms within the box are selected. Shift + box select adds to the existing selection.", shortcut: "⌥ Drag"),
             HelpItem("Deselect All",
                      "Press Escape or click on empty space to clear the selection.", shortcut: "Esc"),
+            HelpItem.subtitle("Display Controls"),
+            HelpItem("Display Cluster",
+                     "The floating bar at the bottom of the viewport groups the display controls: style (the four render modes), show (hydrogens, side chains, surface, surface colour, colour scheme), and look (lighting, clipping, probe radius). The active control is tinted with the accent colour. On narrow windows the last groups collapse into a “…” menu."),
+            HelpItem("Molecule Chips",
+                     "Chips at the top-left of the viewport name the loaded protein and ligand; their ✕ clears the molecule."),
             HelpItem.subtitle("Render Modes"),
             HelpItem("Ball & Stick",
-                     "Atoms as impostor spheres, bonds as impostor cylinders. Default mode for detailed atom inspection. GPU ray-sphere/ray-cylinder intersection gives pixel-perfect smooth rendering.", shortcut: "⌘1"),
+                     "Atoms as impostor spheres, bonds as impostor cylinders. Default mode for detailed atom inspection. GPU ray-sphere/ray-cylinder intersection gives pixel-perfect smooth rendering.", shortcut: "⌃⌘1"),
             HelpItem("Space Filling (CPK)",
-                     "Van der Waals spheres at full radius. Shows the molecular surface and steric interactions. Useful for visualising clashes and surface complementarity.", shortcut: "⌘2"),
+                     "Van der Waals spheres at full radius. Shows the molecular surface and steric interactions. Useful for visualising clashes and surface complementarity.", shortcut: "⌃⌘2"),
             HelpItem("Wireframe",
-                     "Bonds only, no atom spheres. Minimal visual clutter — good for large proteins or dense binding sites.", shortcut: "⌘3"),
+                     "Bonds only, no atom spheres. Minimal visual clutter — good for large proteins or dense binding sites.", shortcut: "⌃⌘3"),
             HelpItem("Ribbon (Cartoon)",
-                     "Secondary-structure cartoon: α-helices as ribbons, β-sheets as arrows, coils as tubes. Click a ribbon element to select the corresponding residue. Best for protein fold overview.", shortcut: "⌘4"),
+                     "Secondary-structure cartoon: α-helices as ribbons, β-sheets as arrows, coils as tubes. Click a ribbon element to select the corresponding residue. Best for protein fold overview.", shortcut: "⌃⌘4"),
             HelpItem.subtitle("Display Options"),
             HelpItem("Toggle Hydrogens",
-                     "Show or hide hydrogen atoms globally. Hiding hydrogens reduces clutter in crowded binding sites.", shortcut: "⌘H"),
+                     "Show or hide hydrogen atoms globally with the “H” button in the display cluster. Hiding hydrogens reduces clutter in crowded binding sites.", shortcut: "⌃⌘H"),
             HelpItem("Molecular Surface",
-                     "Compute and display the Connolly solvent-excluded surface (probe radius 1.4 Å) via Metal marching-cubes GPU kernel. Colour modes: Uniform (solid), Electrostatic (red/blue ESP gradient), Hydrophobicity (polar blue ↔ lipophilic orange), Pharmacophore (interaction-type colours). Opacity is adjustable (default 85%)."),
-            HelpItem("Atom Labels",
-                     "Overlay labels on atoms: none, element symbol, atom index, or PDB serial number. Accessible from the toolbar."),
+                     "Compute and display the Connolly solvent-excluded surface via a Metal marching-cubes GPU kernel. Colour modes: Uniform (solid), Electrostatic (red/blue ESP gradient), Hydrophobicity (polar ↔ lipophilic), Pharmacophore (interaction-type colours). The probe radius (default 1.4 Å) is adjustable from its popover in the display cluster."),
+            HelpItem("Clipping",
+                     "Turn clipping on from the display cluster; its popover holds the slab Thickness and Offset sliders. The Pocket View presets in the Binding Site step set the same slab."),
             HelpItem("Lighting Mode",
                      "Uniform (flat, no depth cues) or Directional (shaded with fixed light direction for 3D perception). Directional is better for presentations and screenshots."),
+            HelpItem("Atom Labels",
+                     "Overlay labels on atoms: none, element symbol, atom index, or PDB serial number."),
             HelpItem.subtitle("Colouring"),
             HelpItem("CPK (Element) Colours",
                      "Default atom colouring by element: C grey, N blue, O red, S yellow, H light grey, halogens green/orange. Standard across chemistry."),
             HelpItem("Chain Colours",
-                     "Each chain receives an automatic palette colour. Override in the Inspector by clicking the chain colour swatch and choosing from 16 presets or a custom colour picker."),
+                     "Each chain receives an automatic palette colour. Override it in the Inspector by clicking the chain colour swatch and choosing from 16 presets or a custom colour picker."),
             HelpItem("Ligand Carbon Colour",
                      "Set a custom colour for ligand carbon atoms to distinguish the ligand from protein atoms. Choose from 16 presets in the Inspector."),
             HelpItem.subtitle("Ghost Ligand"),
@@ -475,58 +640,82 @@ private let helpSections: [HelpSection] = [
         ]
     ),
 
-    // ── 14. Inspector & Display ─────────────────────────────────────────
     HelpSection(
-        icon: "info.circle.fill",
-        title: "Inspector & Status",
-        color: .gray,
+        icon: "sidebar.trailing",
+        title: "Inspector & Workspace",
+        summary: "The Inspector, toolbar activity, console and Settings.",
+        tint: DS.Color.info,
+        group: .tools,
         items: [
-            HelpItem.subtitle("Inspector Panel"),
-            HelpItem("Atom Details",
-                     "When an atom is selected, the inspector shows: atom index, name, element, coordinates (X, Y, Z), van der Waals radius, partial charge, parent residue, and chain ID."),
-            HelpItem("Residue Details",
-                     "For a selected residue: sequence number, residue name (3-letter code), atom count, secondary structure assignment, and completeness percentage."),
-            HelpItem("Chain Colour Picker",
-                     "Click the colour swatch next to a chain to choose from: CPK mode (element colouring), Chain default (automatic palette), or Custom (16 preset colours: blue, cyan, teal, green, lime, yellow, orange, red, pink, purple, grey, brown, slate, etc.)."),
-            HelpItem.subtitle("Status Strip"),
-            HelpItem("Bottom Status Bar",
-                     "Shows real-time information: current operation (loading, docking, preparing), progress bar for batch operations, molecule counts (atoms, residues), selection info, grid dimensions, and memory usage (VRAM/RAM)."),
-            HelpItem("Log Console",
-                     "Expandable console at the bottom of the window. Entries are colour-coded: green (success), blue (info), orange (warning), red (error). Filter by level, search text, and auto-expand on errors."),
+            HelpItem.subtitle("Inspector"),
+            HelpItem("Show / Hide",
+                     "The Inspector is the right-hand column. Toggle it with the toolbar button, View ▸ Show Inspector, or its close button. It opens automatically on wide windows when a protein is loaded.", shortcut: "⌥⌘0"),
+            HelpItem("Selection",
+                     "For a selected atom: index, name, element, coordinates (X, Y, Z), van der Waals radius, partial charge, parent residue, and chain ID. For a residue: sequence number, residue name, atom count, secondary structure, and completeness."),
+            HelpItem("Chains & Display",
+                     "Click the colour swatch next to a chain to choose CPK (element colouring), Chain default (automatic palette), or one of 16 custom colours. Subsets let you show or hide parts of the structure."),
+            HelpItem("Statistics",
+                     "Atom, residue and chain counts for the loaded protein. This is the one place protein statistics are shown."),
+            HelpItem.subtitle("Toolbar"),
+            HelpItem("Activity Indicator",
+                     "The capsule on the right of the toolbar, next to the Console and Inspector buttons, names the loaded protein and ligand and shows the current operation with its progress. Its stop button cancels the running operation; click the capsule to see the most recent log lines."),
+            HelpItem.subtitle("Console"),
+            HelpItem("Console",
+                     "The bar at the bottom of the window shows a hint for the next step and counts warnings and errors. Click Console to open the log: filter by level, copy selected or all lines, clear it, or reveal the log file in Finder. Drag its top edge to resize it.", shortcut: "⇧⌘Y"),
             HelpItem.subtitle("Settings"),
-            HelpItem("Appearance",
-                     "Theme (Auto/Light/Dark), viewport background gradient intensity (0 = solid for screenshots, 1 = full gradient), grid box line thickness (1–8 px) and colour."),
+            HelpItem("General",
+                     "Appearance: Automatic (follows the system), Light or Dark."),
+            HelpItem("Viewport",
+                     "Viewport background and surface display options."),
+            HelpItem("Docking",
+                     "“Confirm before docking” shows the Review & Run sheet before every run (on by default)."),
             HelpItem("Logging",
-                     "Enable file logging, choose log directory, set retention period (default 7 days), manually archive or clear logs."),
+                     "Enable file logging, choose the log directory, set the retention period (default 7 days), and manually archive or clear logs."),
+            HelpItem.subtitle("Feedback"),
+            HelpItem("Report a Bug",
+                     "Help ▸ Report Bug… sends a description, optional reply-to address, system details and, if you allow it, the recent activity log directly to the developer."),
         ]
     ),
 
-    // ── 15. Keyboard Shortcuts ──────────────────────────────────────────
+    // ── Reference ───────────────────────────────────────────────────────
     HelpSection(
-        icon: "keyboard.fill",
+        icon: "keyboard",
         title: "Keyboard Shortcuts",
-        color: .gray,
+        summary: "Every shortcut in one place.",
+        tint: DS.Color.accent,
+        group: .reference,
+        layout: .shortcuts,
         items: [
             HelpItem.subtitle("File"),
             HelpItem("⌘O", "Open file (PDB, mmCIF, SDF, MOL2, SMILES)"),
+            HelpItem("⇧⌘O", "Open project"),
             HelpItem("⌘S", "Save project (.druse)"),
-            HelpItem("⌘⇧O", "Open project"),
-            HelpItem("⌘⇧S", "Save ligand database"),
+            HelpItem.subtitle("Workflow"),
+            HelpItem("⌘1 – ⌘7", "Go to step 1–7: Search, Preparation, Ligands, Binding Site, Docking, Results, Lead Opt"),
+            HelpItem("⌘8", "Open the Sequence tool"),
+            HelpItem("⌘]", "Next step"),
+            HelpItem("⌘[", "Previous step"),
             HelpItem.subtitle("View"),
-            HelpItem("⌘1", "Ball & Stick render mode"),
-            HelpItem("⌘2", "Space Filling (CPK) render mode"),
-            HelpItem("⌘3", "Wireframe render mode"),
-            HelpItem("⌘4", "Ribbon (cartoon) render mode"),
-            HelpItem("⌘H", "Toggle hydrogen atoms"),
-            HelpItem("Space", "Recenter / fit to view"),
-            HelpItem("Esc", "Deselect all"),
+            HelpItem("⌃⌘1", "Ball & Stick render mode"),
+            HelpItem("⌃⌘2", "Space Filling (CPK) render mode"),
+            HelpItem("⌃⌘3", "Wireframe render mode"),
+            HelpItem("⌃⌘4", "Ribbon (cartoon) render mode"),
+            HelpItem("⌃⌘H", "Toggle hydrogen atoms"),
+            HelpItem("⌘0", "Fit to view"),
+            HelpItem("⌃⌘S", "Show / hide the navigator"),
+            HelpItem("⌥⌘0", "Show / hide the Inspector"),
+            HelpItem("⇧⌘Y", "Show / hide the console"),
             HelpItem.subtitle("Windows"),
-            HelpItem("⌘L", "Open Ligand Database window"),
-            HelpItem("⌘⇧R", "Open Results Database window"),
+            HelpItem("⌘L", "Open the Ligand Database window"),
+            HelpItem("⇧⌘R", "Open the Results Database window"),
             HelpItem("⌘?", "Open this help window"),
-            HelpItem.subtitle("Docking"),
-            HelpItem("⌘⏎", "Run docking"),
-            HelpItem.subtitle("3D Viewport"),
+            HelpItem.subtitle("3D Viewport (when focused)"),
+            HelpItem("1 – 4", "Ball & Stick, Space Filling, Wireframe, Ribbon"),
+            HelpItem("H", "Toggle hydrogen atoms"),
+            HelpItem("L", "Toggle lighting mode"),
+            HelpItem("Space", "Fit to view"),
+            HelpItem("Esc", "Deselect all"),
+            HelpItem.subtitle("3D Viewport Mouse"),
             HelpItem("Drag", "Orbit (rotate view)"),
             HelpItem("⇧ Drag", "Pan (translate view)"),
             HelpItem("Scroll", "Zoom in / out"),
@@ -534,15 +723,16 @@ private let helpSections: [HelpSection] = [
             HelpItem("⌥ Click", "Toggle multi-select"),
             HelpItem("⌥ Drag", "Box selection"),
             HelpItem("⌘ Drag", "Move grid box"),
-            HelpItem("⌘⇧ Drag", "Resize grid box"),
+            HelpItem("⇧⌘ Drag", "Resize grid box"),
         ]
     ),
 
-    // ── 16. Algorithms Reference ────────────────────────────────────────
     HelpSection(
-        icon: "book.closed.fill",
+        icon: "book.closed",
         title: "Algorithms Reference",
-        color: .brown,
+        summary: "What runs under the hood, from grid maps to atom picking.",
+        tint: DS.Color.metal,
+        group: .reference,
         items: [
             HelpItem.subtitle("Grid Map Pre-computation"),
             HelpItem("Affinity Grids",
@@ -575,18 +765,18 @@ struct DruseHelpView: View {
     @State private var selectedSection: HelpSection.ID? = helpSections.first?.id
     @State private var searchText = ""
 
+    private var query: String {
+        searchText.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
     private var filteredSections: [HelpSection] {
-        guard !searchText.isEmpty else { return helpSections }
-        let q = searchText.lowercased()
+        let q = query
+        guard !q.isEmpty else { return helpSections }
         return helpSections.compactMap { section in
-            let items = section.items.filter {
-                $0.title.lowercased().contains(q) || $0.description.lowercased().contains(q)
-            }
-            if items.isEmpty && !section.title.lowercased().contains(q) { return nil }
-            return HelpSection(
-                icon: section.icon, title: section.title, color: section.color,
-                items: items.isEmpty ? section.items : items
-            )
+            let titleMatches = section.title.lowercased().contains(q) || section.summary.lowercased().contains(q)
+            let items = section.items.filter { !$0.isSubtitle && $0.matches(q) }
+            if items.isEmpty && !titleMatches { return nil }
+            return section.with(items: items.isEmpty ? section.items : items)
         }
     }
 
@@ -597,45 +787,59 @@ struct DruseHelpView: View {
             detail
         }
         .navigationTitle("Druse Help")
-        .searchable(text: $searchText, prompt: "Search help…")
+        .searchable(text: $searchText, placement: .toolbar, prompt: "Search help")
     }
 
-    // MARK: - Sidebar
+    // MARK: Sidebar
 
     private var sidebar: some View {
-        List(filteredSections, selection: $selectedSection) { section in
-            Label {
-                Text(section.title)
-                    .font(.system(size: 13))
-            } icon: {
-                Image(systemName: section.icon)
-                    .foregroundStyle(section.color)
-                    .frame(width: 20)
+        let sections = filteredSections
+        return List(selection: $selectedSection) {
+            ForEach(HelpGroup.allCases, id: \.self) { group in
+                let members = sections.filter { $0.group == group }
+                if !members.isEmpty {
+                    Section(group.rawValue) {
+                        ForEach(members) { section in
+                            Label {
+                                Text(section.title)
+                            } icon: {
+                                Image(systemName: section.icon)
+                            }
+                            .tag(section.id)
+                        }
+                    }
+                }
             }
-            .tag(section.id)
-            .padding(.vertical, 2)
         }
         .listStyle(.sidebar)
-        .frame(minWidth: 200)
-        .onChange(of: filteredSections.map(\.id)) { _, ids in
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack {
+                DruseWordmark(markSize: 20)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.l)
+            .padding(.top, DS.Space.xs)
+            .padding(.bottom, DS.Space.m)
+        }
+        .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 320)
+        .onChange(of: sections.map(\.id)) { _, ids in
             if let current = selectedSection, !ids.contains(current) {
                 selectedSection = ids.first
             }
         }
     }
 
-    // MARK: - Detail
+    // MARK: Detail
 
+    @ViewBuilder
     private var detail: some View {
-        Group {
-            if let id = selectedSection,
-               let section = filteredSections.first(where: { $0.id == id }) {
-                SectionDetailView(section: section)
-            } else if let first = filteredSections.first {
-                SectionDetailView(section: first)
-            } else {
-                ContentUnavailableView("No results", systemImage: "magnifyingglass")
-            }
+        let sections = filteredSections
+        if let section = sections.first(where: { $0.id == selectedSection }) ?? sections.first {
+            SectionDetailView(section: section, isFiltered: !query.isEmpty)
+                .id(section.id)
+        } else {
+            DSEmptyState("No Results", systemImage: "magnifyingglass",
+                         description: "No help topics match “\(searchText)”.")
         }
     }
 }
@@ -644,86 +848,174 @@ struct DruseHelpView: View {
 
 private struct SectionDetailView: View {
     let section: HelpSection
+    let isFiltered: Bool
+
+    /// Items split into runs that start at each subtitle, rendered as one card per run.
+    private var groups: [(title: String?, items: [HelpItem])] {
+        var result: [(title: String?, items: [HelpItem])] = []
+        for item in section.items {
+            if item.isSubtitle {
+                result.append((item.title, []))
+            } else if result.isEmpty {
+                result.append((nil, [item]))
+            } else {
+                result[result.count - 1].items.append(item)
+            }
+        }
+        return result.filter { !$0.items.isEmpty }
+    }
+
+    private var eyebrow: String {
+        guard let step = section.step else { return section.group.rawValue.uppercased() }
+        if let n = step.stepNumber { return "STEP \(n) · \(step.rawValue.uppercased())" }
+        return "TOOL · \(step.rawValue.uppercased())"
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                // Header
-                HStack(spacing: 14) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(section.color.opacity(0.15))
-                            .frame(width: 52, height: 52)
-                        Image(systemName: section.icon)
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundStyle(section.color)
-                    }
-                    Text(section.title)
-                        .font(.system(size: 22, weight: .semibold))
-                }
-                .padding(.bottom, 24)
-
-                // Items
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(section.items) { item in
-                        if item.isSubtitle {
-                            Text(item.title)
-                                .font(.system(size: 11, weight: .semibold))
+            VStack(alignment: .leading, spacing: DS.Space.xxl) {
+                header
+                ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
+                    VStack(alignment: .leading, spacing: DS.Space.s) {
+                        if let title = group.title {
+                            Text(title.uppercased())
+                                .font(DS.Font.eyebrow)
+                                .tracking(0.6)
                                 .foregroundStyle(.secondary)
-                                .textCase(.uppercase)
-                                .tracking(0.5)
-                                .padding(.top, 16)
-                                .padding(.bottom, 4)
-                        } else {
-                            HelpItemRow(item: item)
+                                .padding(.leading, DS.Space.xs)
                         }
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
+                                if index > 0 { Divider().padding(.leading, DS.Space.l) }
+                                switch section.layout {
+                                case .article: HelpArticleRow(item: item)
+                                case .shortcuts: HelpShortcutRow(item: item)
+                                }
+                            }
+                        }
+                        .dsCard(padding: 0)
                     }
                 }
             }
-            .padding(28)
+            .padding(.horizontal, DS.Space.xxxl)
+            .padding(.vertical, DS.Space.xxl)
+            .frame(maxWidth: 780, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(.background)
     }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: DS.Space.l) {
+            Image(systemName: section.icon)
+                .font(.title)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(section.tint)
+                .frame(width: 48, height: 48)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.m, style: .continuous)
+                        .fill(section.tint.opacity(0.14))
+                )
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Text(eyebrow)
+                    .font(DS.Font.eyebrow)
+                    .tracking(0.6)
+                    .foregroundStyle(.tertiary)
+                Text(section.title)
+                    .font(DS.Font.display)
+                Text(section.summary)
+                    .font(DS.Font.body)
+                    .foregroundStyle(.secondary)
+                if isFiltered {
+                    Text("Showing topics that match your search")
+                        .font(DS.Font.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 0)
+            if let step = section.step {
+                KeyCap("⌘\(step.shortcutNumber)")
+                    .help("Shortcut for \(step.rawValue) in the main window")
+            }
+        }
+    }
 }
 
-// MARK: - Help Item Row
+// MARK: - Rows
 
-private struct HelpItemRow: View {
+private struct HelpArticleRow: View {
     let item: HelpItem
-    @State private var isHovered = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(alignment: .top, spacing: DS.Space.l) {
+            if let icon = item.icon {
+                Image(systemName: icon)
+                    .font(DS.Font.body.weight(.medium))
+                    .foregroundStyle(DS.Color.accent)
+                    .frame(width: DS.Size.toolButton, height: DS.Size.toolButton)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                            .fill(DS.Color.accentSoft)
+                    )
+                    .accessibilityHidden(true)
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text(item.title)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(DS.Font.sectionTitle)
                 if !item.description.isEmpty {
                     Text(item.description)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+                        .font(DS.Font.label)
+                        .lineSpacing(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if let shortcut = item.shortcut {
-                Text(shortcut)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
-                    .padding(.top, 1)
+                KeyCap(shortcut)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isHovered ? Color.primary.opacity(0.05) : .clear)
-        )
-        .onHover { isHovered = $0 }
-        .animation(.easeInOut(duration: 0.1), value: isHovered)
+        .padding(.horizontal, DS.Space.l)
+        .padding(.vertical, DS.Space.m + DS.Space.xxs)
+    }
+}
+
+private struct HelpShortcutRow: View {
+    let item: HelpItem
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.l) {
+            KeyCap(item.title)
+                .frame(minWidth: DS.Size.labelColumn, alignment: .leading)
+            Text(item.description)
+                .font(DS.Font.label)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, DS.Space.l)
+        .padding(.vertical, DS.Space.m)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// A keyboard-key style chip for shortcuts and mouse gestures.
+private struct KeyCap: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+        Text(text)
+            .font(DS.Font.secondary.weight(.medium))
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, DS.Space.s)
+            .padding(.vertical, DS.Space.xxs)
+            .background(shape.fill(DS.Color.controlFill))
+            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
     }
 }

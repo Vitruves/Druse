@@ -42,7 +42,9 @@ enum FASPRSidechainPacker {
     ///   - bonds: Input bonds
     ///   - device: Metal device for GPU acceleration (nil = CPU-only)
     ///   - onlyIncomplete: If true, only repack residues with missing/incomplete sidechains
-    ///   - reconstructedResidueKeys: Set of (chainID, residueSeq) for residues that were reconstructed
+    ///   - reconstructedResidueKeys: Keys (see `residueKey`) of residues whose sidechain was
+    ///     reconstructed. With `onlyIncomplete`, only these are repacked; nil repacks every
+    ///     rotameric residue.
     /// - Returns: Updated atoms/bonds and report
     static func packSidechains(
         atoms: [Atom],
@@ -63,14 +65,16 @@ enum FASPRSidechainPacker {
         logSync("[FASPR] \(residueGroups.count) residues found")
 
         // Step 2: Build site list
-        let (sites, residueToSiteMap) = buildSites(
+        let built = buildSites(
             residueGroups: residueGroups,
             atoms: atoms,
             onlyIncomplete: onlyIncomplete,
             reconstructedKeys: reconstructedResidueKeys
         )
+        var sites = built.sites
+        let residueToSiteMap = built.residueToSiteMap
 
-        let variableSites = sites.filter { $0.nrots >= 2 }
+        let variableSites = sites.filter(\.isVariable)
         if variableSites.isEmpty {
             logSync("[FASPR] No variable sites to pack")
             report.elapsedMs = (CFAbsoluteTimeGetCurrent() - start) * 1000
@@ -84,9 +88,9 @@ enum FASPRSidechainPacker {
         // Step 3: Build contact map
         let conMap = buildContactMap(sites: sites)
 
-        // Step 4: Compute energies
+        // Step 4: Compute energies (may prune high-energy rotamers from `sites`)
         let calculator = FASPREnergyCalculator(device: device)
-        let (selfEnergies, pairEnergies) = calculator.computeAllEnergies(sites: sites, conMap: conMap)
+        let (selfEnergies, pairEnergies) = calculator.computeAllEnergies(sites: &sites, conMap: conMap)
 
         // Step 5: Search for optimal rotamers
         let nrots = sites.map { $0.nrots }
@@ -117,8 +121,22 @@ enum FASPRSidechainPacker {
 
     // MARK: - Step 1: Group Atoms by Residue
 
+    /// Residue identity used for grouping and for `reconstructedResidueKeys`.
+    /// Includes the insertion code so residues like 52 and 52A stay distinct.
+    static func residueKey(chainID: String, residueSeq: Int, insertionCode: String) -> String {
+        "\(chainID)_\(residueSeq)_\(insertionCode.trimmingCharacters(in: .whitespaces))"
+    }
+
+    /// Atom names are stored trimmed ("CA") by the parsers and reconstruction, while
+    /// FASPR topology names are PDB-padded (" CA "); compare both in trimmed form.
+    private static func normalizedName(_ name: String) -> String {
+        ProteinResidueTemplateStore.normalizeAtomName(name)
+    }
+
+    private static let backboneAtomNames = ["N", "CA", "C", "O", "CB"]
+
     struct ResidueGroup {
-        let key: String           // "chainID_residueSeq"
+        let key: String           // see residueKey(chainID:residueSeq:insertionCode:)
         let chainID: String
         let residueSeq: Int
         let residueName: String
@@ -131,7 +149,8 @@ enum FASPRSidechainPacker {
 
         for (i, atom) in atoms.enumerated() {
             guard !atom.isHetAtom, atom.element != .H else { continue }
-            let key = "\(atom.chainID)_\(atom.residueSeq)"
+            let key = residueKey(chainID: atom.chainID, residueSeq: atom.residueSeq,
+                                 insertionCode: atom.insertionCode)
             if groups[key] == nil {
                 groups[key] = (atom.chainID, atom.residueSeq, atom.residueName, [i])
                 order.append(key)
@@ -154,7 +173,7 @@ enum FASPRSidechainPacker {
         atoms: [Atom],
         onlyIncomplete: Bool,
         reconstructedKeys: Set<String>?
-    ) -> ([FASPRSite], [String: Int]) {
+    ) -> (sites: [FASPRSite], residueToSiteMap: [String: Int]) {
         let library = DunbrackRotamerLibrary.shared
         var sites: [FASPRSite] = []
         var residueToSiteMap: [String: Int] = [:]
@@ -164,8 +183,8 @@ enum FASPRSidechainPacker {
                 // Non-standard residue, skip
                 sites.append(FASPRSite(
                     siteIndex: groupIdx, residueType: "?",
-                    backbone: [], atomParams: [], atomTypeIndices: [],
-                    nrots: 0, rotamerProbs: [], maxProb: 0, rotamerCoords: []))
+                    backbone: [], atomParams: [], atomTypeIndices: [], isVariable: false,
+                    rotamerProbs: [], maxProb: 0, rotamerCoords: []))
                 residueToSiteMap[group.key] = groupIdx
                 continue
             }
@@ -173,11 +192,10 @@ enum FASPRSidechainPacker {
             residueToSiteMap[group.key] = groupIdx
 
             // Find backbone atoms
-            let backboneNames = [" N  ", " CA ", " C  ", " O  ", " CB "]
             var backbonePos = [SIMD3<Float>?](repeating: nil, count: 5)
             for atomIdx in group.atomIndices {
-                let name = atoms[atomIdx].name.padding(toLength: 4, withPad: " ", startingAt: 0)
-                for (bi, bname) in backboneNames.enumerated() {
+                let name = normalizedName(atoms[atomIdx].name)
+                for (bi, bname) in backboneAtomNames.enumerated() {
                     if name == bname { backbonePos[bi] = atoms[atomIdx].position }
                 }
             }
@@ -186,8 +204,8 @@ enum FASPRSidechainPacker {
                 // Incomplete backbone
                 sites.append(FASPRSite(
                     siteIndex: groupIdx, residueType: oneLetterCode,
-                    backbone: [], atomParams: [], atomTypeIndices: [],
-                    nrots: 0, rotamerProbs: [], maxProb: 0, rotamerCoords: []))
+                    backbone: [], atomParams: [], atomTypeIndices: [], isVariable: false,
+                    rotamerProbs: [], maxProb: 0, rotamerCoords: []))
                 continue
             }
 
@@ -208,7 +226,7 @@ enum FASPRSidechainPacker {
             if groupIdx > 0 {
                 let prev = residueGroups[groupIdx - 1]
                 if prev.chainID == group.chainID {
-                    if let prevC = findBackboneAtom(" C  ", in: prev, atoms: atoms) {
+                    if let prevC = findBackboneAtom("C", in: prev, atoms: atoms) {
                         let dist = simd_distance(prevC, n)
                         if dist < 2.1 {
                             phi = SidechainTopologyStore.phi(prevC: prevC, n: n, ca: ca, c: c)
@@ -219,7 +237,7 @@ enum FASPRSidechainPacker {
             if groupIdx < residueGroups.count - 1 {
                 let next = residueGroups[groupIdx + 1]
                 if next.chainID == group.chainID {
-                    if let nextN = findBackboneAtom(" N  ", in: next, atoms: atoms) {
+                    if let nextN = findBackboneAtom("N", in: next, atoms: atoms) {
                         let dist = simd_distance(c, nextN)
                         if dist < 2.1 {
                             psi = SidechainTopologyStore.psi(n: n, ca: ca, c: c, nextN: nextN)
@@ -237,31 +255,19 @@ enum FASPRSidechainPacker {
             if let o = backbonePos[3] { bbPositions.append(o) } else { bbPositions.append(.zero) }
             if let cb = backbonePos[4] { bbPositions.append(cb) }
 
-            if !needsPacking || oneLetterCode == "A" || oneLetterCode == "G" {
-                // Fixed site (0 or 1 rotamer)
-                let nrot = (oneLetterCode == "A" || oneLetterCode == "G") ? 0 : 1
-                var rotCoords: [[SIMD3<Float>]] = []
-                if nrot == 1 {
-                    // Use existing sidechain coordinates
-                    let scCoords = extractExistingSidechain(group: group, atoms: atoms, backboneNames: backboneNames)
-                    rotCoords = [scCoords]
-                }
+            let rotamers = (needsPacking && oneLetterCode != "A" && oneLetterCode != "G")
+                ? library.rotamers(for: oneLetterCode, phi: phi, psi: psi)
+                : []
+            if rotamers.isEmpty {
+                // Fixed site: Ala/Gly (no rotamer) or existing sidechain kept as the single rotamer.
+                let rotCoords: [[SIMD3<Float>]] = (oneLetterCode == "A" || oneLetterCode == "G")
+                    ? []
+                    : [extractExistingSidechain(group: group, atoms: atoms, residueType: oneLetterCode)]
                 sites.append(FASPRSite(
                     siteIndex: groupIdx, residueType: oneLetterCode,
                     backbone: bbPositions, atomParams: atomParams, atomTypeIndices: atomTypeIndices,
-                    nrots: nrot, rotamerProbs: nrot == 1 ? [1.0] : [], maxProb: 1.0,
+                    isVariable: false, rotamerProbs: rotCoords.isEmpty ? [] : [1.0], maxProb: 1.0,
                     rotamerCoords: rotCoords))
-                continue
-            }
-
-            // Load rotamers
-            let rotamers = library.rotamers(for: oneLetterCode, phi: phi, psi: psi)
-            guard !rotamers.isEmpty else {
-                sites.append(FASPRSite(
-                    siteIndex: groupIdx, residueType: oneLetterCode,
-                    backbone: bbPositions, atomParams: atomParams, atomTypeIndices: atomTypeIndices,
-                    nrots: 1, rotamerProbs: [1.0], maxProb: 1.0,
-                    rotamerCoords: [extractExistingSidechain(group: group, atoms: atoms, backboneNames: backboneNames)]))
                 continue
             }
 
@@ -269,6 +275,7 @@ enum FASPRSidechainPacker {
             let maxP = rotamers.first?.probability ?? 1.0
             var rotamerCoords: [[SIMD3<Float>]] = []
             var probs: [Float] = []
+            var builtCB: SIMD3<Float>?
 
             for rot in rotamers {
                 let scAtoms = SidechainTopologyStore.buildSidechain(
@@ -276,17 +283,20 @@ enum FASPRSidechainPacker {
                     residueType: oneLetterCode,
                     chiAngles: rot.chiAngles
                 )
-                // CB is atom[0] in sidechain build, remaining are the actual sidechain
-                // Skip CB (index 0), keep the rest as "sidechain atoms beyond CB"
-                let coords = scAtoms.dropFirst().map(\.position)
-                rotamerCoords.append(Array(coords))
+                // CB is atom[0] in sidechain build (chi-independent); the rest are
+                // the sidechain atoms beyond CB in topology order.
+                builtCB = builtCB ?? scAtoms.first?.position
+                rotamerCoords.append(scAtoms.dropFirst().map(\.position))
                 probs.append(rot.probability)
             }
+
+            // Energy terms index CB (backbone[4]); use the ideal CB when the input lacks one.
+            if bbPositions.count == 4, let cb = builtCB { bbPositions.append(cb) }
 
             sites.append(FASPRSite(
                 siteIndex: groupIdx, residueType: oneLetterCode,
                 backbone: bbPositions, atomParams: atomParams, atomTypeIndices: atomTypeIndices,
-                nrots: rotamers.count, rotamerProbs: probs, maxProb: maxP,
+                isVariable: true, rotamerProbs: probs, maxProb: maxP,
                 rotamerCoords: rotamerCoords))
         }
 
@@ -304,17 +314,19 @@ enum FASPRSidechainPacker {
             let cbI = sites[i].backbone.count >= 5 ? sites[i].backbone[4] : sites[i].backbone[1]  // CB or CA
             let radI = FASPRVDWParameters.residueRadius[sites[i].residueType] ?? 3.2
 
-            for j in 0..<n where j != i {
+            // Sites without a usable backbone (non-standard / incomplete residues)
+            // carry no atom parameters and cannot take part in energy terms.
+            for j in 0..<n where j != i && sites[j].backbone.count >= 4 {
                 let cbJ: SIMD3<Float>
                 if sites[j].residueType == "G" || sites[j].residueType == "A" {
-                    cbJ = sites[j].backbone.count >= 2 ? sites[j].backbone[1] : .zero
+                    cbJ = sites[j].backbone[1]
                 } else {
                     cbJ = sites[j].backbone.count >= 5 ? sites[j].backbone[4] : sites[j].backbone[1]
                 }
                 let radJ = FASPRVDWParameters.residueRadius[sites[j].residueType] ?? 3.2
 
                 let cbDist = simd_distance(cbI, cbJ)
-                let caDist = simd_distance(sites[i].backbone[1], sites[j].backbone.count >= 2 ? sites[j].backbone[1] : .zero)
+                let caDist = simd_distance(sites[i].backbone[1], sites[j].backbone[1])
 
                 if cbDist < radI + radJ + FASPRVDWParameters.residueDistCut
                     && cbDist < caDist + FASPRVDWParameters.cacbDistCut {
@@ -336,38 +348,36 @@ enum FASPRSidechainPacker {
         atoms: inout [Atom],
         bonds: inout [Bond]
     ) {
-        for (siteIdx, rot) in bestrot.enumerated() {
-            guard rot >= 0, siteIdx < sites.count else { continue }
+        for (siteIdx, searchRot) in bestrot.enumerated() {
+            guard siteIdx < sites.count else { continue }
             let site = sites[siteIdx]
-            guard site.nrots >= 2, rot < site.rotamerCoords.count else { continue }
+            // Sites left with a single rotamer (after self-energy pruning) are not
+            // assigned by the search; their only rotamer is the optimum.
+            let rot = site.nrots == 1 ? 0 : searchRot
+            guard site.isVariable, rot >= 0, rot < site.rotamerCoords.count else { continue }
 
             let group = residueGroups[siteIdx]
             let rotCoords = site.rotamerCoords[rot]
 
             // Get sidechain atom names from topology
             guard let topo = SidechainTopologyStore.topologies[site.residueType] else { continue }
-            let scAtomNames = topo.atoms.dropFirst().map(\.name)  // skip CB
-
-            // Update or add sidechain atoms
-            let backboneNames: Set<String> = [" N  ", " CA ", " C  ", " O  ", " CB "]
+            let scAtomNames = topo.atoms.dropFirst().map { normalizedName($0.name) }  // skip CB
 
             // Find existing sidechain atoms to update
             var existingSCAtoms: [String: Int] = [:]  // atomName -> atomIndex
             for atomIdx in group.atomIndices {
-                let name = atoms[atomIdx].name.padding(toLength: 4, withPad: " ", startingAt: 0)
-                if !backboneNames.contains(name) {
+                let name = normalizedName(atoms[atomIdx].name)
+                if !backboneAtomNames.contains(name) {
                     existingSCAtoms[name] = atomIdx
                 }
             }
 
-            // Update positions
+            // Update positions (reconstruction has already added all heavy atoms)
             for (k, atomName) in scAtomNames.enumerated() {
                 guard k < rotCoords.count else { break }
                 if let existingIdx = existingSCAtoms[atomName] {
                     atoms[existingIdx].position = rotCoords[k]
                 }
-                // If atom doesn't exist, we'd need to add it - but reconstruction should
-                // have already added all heavy atoms. Just update positions.
             }
         }
     }
@@ -376,24 +386,29 @@ enum FASPRSidechainPacker {
 
     private static func findBackboneAtom(_ name: String, in group: ResidueGroup, atoms: [Atom]) -> SIMD3<Float>? {
         for idx in group.atomIndices {
-            let atomName = atoms[idx].name.padding(toLength: 4, withPad: " ", startingAt: 0)
-            if atomName == name { return atoms[idx].position }
+            if normalizedName(atoms[idx].name) == name { return atoms[idx].position }
         }
         return nil
     }
 
+    /// Existing sidechain atoms beyond CB in FASPR topology order, so that index k
+    /// maps to atom parameter k + 5. Stops at the first missing atom to keep that
+    /// mapping valid; atoms outside the topology (e.g. OXT, altlocs) are ignored.
     private static func extractExistingSidechain(
         group: ResidueGroup,
         atoms: [Atom],
-        backboneNames: [String]
+        residueType: Character
     ) -> [SIMD3<Float>] {
-        let bbSet = Set(backboneNames)
-        var coords: [SIMD3<Float>] = []
+        guard let topo = SidechainTopologyStore.topologies[residueType] else { return [] }
+        var byName: [String: SIMD3<Float>] = [:]
         for idx in group.atomIndices {
-            let name = atoms[idx].name.padding(toLength: 4, withPad: " ", startingAt: 0)
-            if !bbSet.contains(name) && atoms[idx].element != .H {
-                coords.append(atoms[idx].position)
-            }
+            let name = normalizedName(atoms[idx].name)
+            if byName[name] == nil { byName[name] = atoms[idx].position }
+        }
+        var coords: [SIMD3<Float>] = []
+        for def in topo.atoms.dropFirst() {
+            guard let pos = byName[normalizedName(def.name)] else { break }
+            coords.append(pos)
         }
         return coords
     }

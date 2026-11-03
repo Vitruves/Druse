@@ -7,13 +7,22 @@ import simd
 enum SDFParser {
 
     static func parse(_ content: String) -> [MoleculeData] {
-        let blocks = content.components(separatedBy: "$$$$")
+        let blocks = normalizeLineEndings(content).components(separatedBy: "$$$$")
         var molecules: [MoleculeData] = []
 
-        for (idx, block) in blocks.enumerated() {
-            let trimmed = block.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            if let mol = parseMolBlock(trimmed, index: idx) {
+        for (idx, rawBlock) in blocks.enumerated() {
+            guard rawBlock.contains(where: { !$0.isWhitespace }) else { continue }
+            // The header block is line-positional (name, program, comment, counts):
+            // a blank name line is legal and must not be trimmed away. Only drop the
+            // remainder of the preceding "$$$$" line and trailing whitespace.
+            var block = Substring(rawBlock)
+            if idx > 0, let newline = block.firstIndex(of: "\n") {
+                block = block[block.index(after: newline)...]
+            }
+            while let last = block.last, last.isWhitespace {
+                block = block.dropLast()
+            }
+            if let mol = parseMolBlock(String(block), index: idx) {
                 molecules.append(mol)
             }
         }
@@ -30,7 +39,7 @@ enum SDFParser {
     // MARK: - Single MOL Block
 
     static func parseMolBlock(_ block: String, index: Int = 0) -> MoleculeData? {
-        let lines = block.components(separatedBy: "\n")
+        let lines = normalizeLineEndings(block).components(separatedBy: "\n")
         guard lines.count >= 4 else {
             Task { @MainActor in ActivityLog.shared.warn("[Parser] SDF mol block \(index) has fewer than 4 lines, skipped", category: .molecule) }
             return nil
@@ -54,6 +63,15 @@ enum SDFParser {
         return parseV2000(lines: lines, name: name, index: index)
     }
 
+    /// Convert CRLF / CR line endings to LF so fixed line positions and blank-line
+    /// terminators of SDF data items are recognised.
+    private static func normalizeLineEndings(_ text: String) -> String {
+        guard text.contains("\r") else { return text }
+        return text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
+
     // MARK: - V2000 Format
 
     private static func parseV2000(lines: [String], name: String, index: Int) -> MoleculeData? {
@@ -75,13 +93,14 @@ enum SDFParser {
             return nil
         }
 
-        // Parse atom block
+        // Parse atom block. Bonds and M  CHG entries address atoms by their line
+        // position, so a skipped atom line would silently shift every later index.
         var atoms: [Atom] = []
         for i in 0..<atomCount {
             let line = lines[4 + i]
             guard let atom = parseAtomLineV2000(line, id: i) else {
-                Task { @MainActor in ActivityLog.shared.debug("[Parser] SDF V2000 '\(name)' skipped unparseable atom line \(i)", category: .molecule) }
-                continue
+                Task { @MainActor in ActivityLog.shared.warn("[Parser] SDF V2000 '\(name)' has unparseable atom line \(i), molecule skipped", category: .molecule) }
+                return nil
             }
             atoms.append(atom)
         }
@@ -90,18 +109,27 @@ enum SDFParser {
         var bonds: [Bond] = []
         for i in 0..<bondCount {
             let line = lines[4 + atomCount + i]
-            guard let bond = parseBondLineV2000(line, id: i) else {
-                Task { @MainActor in ActivityLog.shared.debug("[Parser] SDF V2000 '\(name)' skipped unparseable bond line \(i)", category: .molecule) }
+            guard let bond = parseBondLineV2000(line, id: bonds.count),
+                  atoms.indices.contains(bond.atomIndex1),
+                  atoms.indices.contains(bond.atomIndex2),
+                  bond.atomIndex1 != bond.atomIndex2 else {
+                Task { @MainActor in ActivityLog.shared.debug("[Parser] SDF V2000 '\(name)' skipped invalid bond line \(i)", category: .molecule) }
                 continue
             }
             bonds.append(bond)
         }
 
-        // Parse M  CHG properties until M  END
+        // Parse M  CHG properties until M  END.
+        // CTfile spec: any M  CHG line supersedes all atom-block charges.
         var mEndLine = lines.count
+        var sawChargeProperty = false
         for i in (4 + atomCount + bondCount)..<lines.count {
             let line = lines[i]
             if line.hasPrefix("M  CHG") {
+                if !sawChargeProperty {
+                    sawChargeProperty = true
+                    for j in atoms.indices { atoms[j].formalCharge = 0 }
+                }
                 parseCharges(line, atoms: &atoms)
             } else if line.hasPrefix("M  END") {
                 mEndLine = i
@@ -114,152 +142,133 @@ enum SDFParser {
 
         let molName = name.isEmpty ? "Molecule \(index + 1)" : name
 
-        // Extract raw mol block (lines 0 through M  END) for direct RDKit parsing
-        let molBlockText = lines[0...mEndLine].joined(separator: "\n")
-
         return MoleculeData(
             name: molName,
             title: "",
             atoms: atoms,
             bonds: bonds,
             properties: properties,
-            molBlock: molBlockText
+            molBlock: rawMolBlock(lines: lines, mEndLine: mEndLine)
         )
+    }
+
+    /// Raw mol block (lines 0 through M  END) for direct RDKit parsing.
+    /// Returns nil when the block has no M  END line (RDKit requires it).
+    private static func rawMolBlock(lines: [String], mEndLine: Int) -> String? {
+        guard mEndLine < lines.count else { return nil }
+        return lines[0...mEndLine].joined(separator: "\n")
     }
 
     // MARK: - V3000 Format
 
     private static func parseV3000(lines: [String], name: String, index: Int) -> MoleculeData? {
-        // Find COUNTS line: M  V30 COUNTS natoms nbonds ...
-        var atomCount = 0
-        var atomBlockStart = -1
-        var bondBlockStart = -1
-        var atomBlockEnd = -1
-        var bondBlockEnd = -1
+        // Collect logical "M  V30" records: strip the prefix and join continuation
+        // lines (a record ending in "-" continues on the next M  V30 line).
+        var records: [String] = []
+        var pending: String?
         var mEndLine = lines.count
-
         for (i, line) in lines.enumerated() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("M  V30 COUNTS") || trimmed.hasPrefix("M V30 COUNTS") {
-                let parts = trimmed.split(separator: " ")
-                // M V30 COUNTS natoms nbonds ...
-                if parts.count >= 5 {
-                    atomCount = Int(parts[3]) ?? 0
-                    _ = Int(parts[4]) ?? 0  // bond count parsed but not used directly
-                }
-            } else if trimmed.contains("V30 BEGIN ATOM") {
-                atomBlockStart = i + 1
-            } else if trimmed.contains("V30 END ATOM") {
-                atomBlockEnd = i
-            } else if trimmed.contains("V30 BEGIN BOND") {
-                bondBlockStart = i + 1
-            } else if trimmed.contains("V30 END BOND") {
-                bondBlockEnd = i
-            } else if trimmed.hasPrefix("M  END") {
+            if line.hasPrefix("M  END") {
                 mEndLine = i
                 break
             }
-        }
-
-        guard atomCount > 0, atomBlockStart > 0, atomBlockEnd > atomBlockStart else {
-            Task { @MainActor in ActivityLog.shared.warn("[Parser] SDF V3000 block '\(name)' missing or empty atom block", category: .molecule) }
-            return nil
-        }
-
-        // Parse V3000 atom block
-        // Format: M  V30 index type x y z aamap [properties...]
-        var atoms: [Atom] = []
-        var atomID = 0
-        for i in atomBlockStart..<atomBlockEnd {
-            let line = lines[i].trimmingCharacters(in: .whitespaces)
-            // Handle line continuation (trailing -)
-            guard !line.isEmpty else { continue }
-
-            // Strip "M  V30 " or "M V30 " prefix
-            let content: String
+            let content: Substring
             if line.hasPrefix("M  V30 ") {
-                content = String(line.dropFirst(7))
+                content = line.dropFirst(7)
             } else if line.hasPrefix("M V30 ") {
-                content = String(line.dropFirst(6))
+                content = line.dropFirst(6)
             } else {
                 continue
             }
-
-            let parts = content.split(separator: " ")
-            // index type x y z aamap [CHG=n] [RAD=n] ...
-            guard parts.count >= 5,
-                  let x = Float(parts[2]),
-                  let y = Float(parts[3]),
-                  let z = Float(parts[4])
-            else { continue }
-
-            let elemStr = String(parts[1])
-            let element = Element.from(symbol: elemStr) ?? .C
-
-            // Extract formal charge from CHG=n
-            var formalCharge = 0
-            for part in parts[5...] where part.hasPrefix("CHG=") {
-                formalCharge = Int(part.dropFirst(4)) ?? 0
+            var text: String = (pending ?? "") + String(content)
+            while text.last?.isWhitespace == true { text.removeLast() }
+            if text.hasSuffix("-") {
+                text.removeLast()
+                pending = text
+                continue
             }
-
-            atoms.append(Atom(
-                id: atomID,
-                element: element,
-                position: SIMD3<Float>(x, y, z),
-                name: "\(element.symbol)\(atomID + 1)",
-                residueName: "LIG",
-                residueSeq: 1,
-                chainID: "A",
-                formalCharge: formalCharge,
-                isHetAtom: true
-            ))
-            atomID += 1
+            pending = nil
+            records.append(text.trimmingCharacters(in: .whitespaces))
         }
 
-        // Parse V3000 bond block
-        // Format: M  V30 index type atom1 atom2 [properties...]
-        var bonds: [Bond] = []
-        var bondID = 0
-        if bondBlockStart > 0, bondBlockEnd > bondBlockStart {
-            for i in bondBlockStart..<bondBlockEnd {
-                let line = lines[i].trimmingCharacters(in: .whitespaces)
-                guard !line.isEmpty else { continue }
+        enum Section { case none, atom, bond }
+        var section = Section.none
+        var atoms: [Atom] = []
+        // V3000 bonds reference atoms by their index field, not by line position.
+        var atomIndexByID: [Int: Int] = [:]
+        var bondFields: [(type: Int, a1: Int, a2: Int)] = []
 
-                let content: String
-                if line.hasPrefix("M  V30 ") {
-                    content = String(line.dropFirst(7))
-                } else if line.hasPrefix("M V30 ") {
-                    content = String(line.dropFirst(6))
-                } else {
-                    continue
+        for record in records {
+            if record.hasPrefix("BEGIN ATOM") { section = .atom; continue }
+            if record.hasPrefix("BEGIN BOND") { section = .bond; continue }
+            if record.hasPrefix("END ") { section = .none; continue }
+
+            let parts = record.split(whereSeparator: \.isWhitespace)
+            switch section {
+            case .atom:
+                // index type x y z aamap [CHG=n] [RAD=n] ...
+                guard parts.count >= 5,
+                      let atomID = Int(parts[0]),
+                      let x = Float(parts[2]),
+                      let y = Float(parts[3]),
+                      let z = Float(parts[4])
+                else {
+                    Task { @MainActor in ActivityLog.shared.warn("[Parser] SDF V3000 block '\(name)' has an unparseable atom record, molecule skipped", category: .molecule) }
+                    return nil
                 }
 
-                let parts = content.split(separator: " ")
+                let element = Element.from(symbol: String(parts[1])) ?? .C
+                var formalCharge = 0
+                for part in parts.dropFirst(5) where part.hasPrefix("CHG=") {
+                    formalCharge = Int(part.dropFirst(4)) ?? 0
+                }
+
+                let newIndex = atoms.count
+                atomIndexByID[atomID] = newIndex
+                atoms.append(Atom(
+                    id: newIndex,
+                    element: element,
+                    position: SIMD3<Float>(x, y, z),
+                    name: "\(element.symbol)\(newIndex + 1)",
+                    residueName: "LIG",
+                    residueSeq: 1,
+                    chainID: "A",
+                    formalCharge: formalCharge,
+                    isHetAtom: true
+                ))
+
+            case .bond:
                 // index type atom1 atom2 [properties...]
                 guard parts.count >= 4,
                       let typeInt = Int(parts[1]),
                       let a1 = Int(parts[2]),
                       let a2 = Int(parts[3])
                 else { continue }
+                bondFields.append((typeInt, a1, a2))
 
-                let order: BondOrder
-                switch typeInt {
-                case 1: order = .single
-                case 2: order = .double
-                case 3: order = .triple
-                case 4: order = .aromatic
-                default: order = .single
-                }
-
-                // V3000 atom indices are 1-based
-                bonds.append(Bond(id: bondID, atomIndex1: a1 - 1, atomIndex2: a2 - 1, order: order))
-                bondID += 1
+            case .none:
+                continue
             }
         }
 
         guard !atoms.isEmpty else {
-            Task { @MainActor in ActivityLog.shared.warn("[Parser] SDF V3000 block '\(name)' produced no atoms after parsing", category: .molecule) }
+            Task { @MainActor in ActivityLog.shared.warn("[Parser] SDF V3000 block '\(name)' missing or empty atom block", category: .molecule) }
             return nil
+        }
+
+        var bonds: [Bond] = []
+        for field in bondFields {
+            guard let i1 = atomIndexByID[field.a1],
+                  let i2 = atomIndexByID[field.a2],
+                  i1 != i2 else { continue }
+            let order: BondOrder
+            switch field.type {
+            case 2: order = .double
+            case 3: order = .triple
+            case 4: order = .aromatic
+            default: order = .single
+            }
+            bonds.append(Bond(id: bonds.count, atomIndex1: i1, atomIndex2: i2, order: order))
         }
 
         // Parse SDF data blocks after M  END
@@ -267,16 +276,13 @@ enum SDFParser {
 
         let molName = name.isEmpty ? "Molecule \(index + 1)" : name
 
-        // Extract raw mol block (lines 0 through M  END) for direct RDKit parsing
-        let molBlockText = lines[0...mEndLine].joined(separator: "\n")
-
         return MoleculeData(
             name: molName,
             title: "",
             atoms: atoms,
             bonds: bonds,
             properties: properties,
-            molBlock: molBlockText
+            molBlock: rawMolBlock(lines: lines, mEndLine: mEndLine)
         )
     }
 
@@ -407,7 +413,7 @@ enum SDFParser {
 
     private static func parseCharges(_ line: String, atoms: inout [Atom]) {
         // M  CHG  n  aaa vvv  aaa vvv ...
-        let parts = line.split(separator: " ").map(String.init)
+        let parts = line.split(whereSeparator: \.isWhitespace)
         guard parts.count >= 4, let count = Int(parts[2]) else { return }
 
         var idx = 3
@@ -418,21 +424,8 @@ enum SDFParser {
             else { break }
 
             let atomIdx = atomNum - 1
-            if atomIdx >= 0 && atomIdx < atoms.count {
-                atoms[atomIdx] = Atom(
-                    id: atoms[atomIdx].id,
-                    element: atoms[atomIdx].element,
-                    position: atoms[atomIdx].position,
-                    name: atoms[atomIdx].name,
-                    residueName: atoms[atomIdx].residueName,
-                    residueSeq: atoms[atomIdx].residueSeq,
-                    chainID: atoms[atomIdx].chainID,
-                    charge: atoms[atomIdx].charge,
-                    formalCharge: charge,
-                    isHetAtom: atoms[atomIdx].isHetAtom,
-                    occupancy: atoms[atomIdx].occupancy,
-                    tempFactor: atoms[atomIdx].tempFactor
-                )
+            if atoms.indices.contains(atomIdx) {
+                atoms[atomIdx].formalCharge = charge
             }
             idx += 2
         }

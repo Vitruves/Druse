@@ -43,6 +43,9 @@ final class FlexGridProxy {
         totalPoints: Int,
         numAffinityTypes: Int
     ) {
+        // A zero-width threadgroup is a Metal validation error.
+        guard totalPoints > 0 else { return }
+
         // Typed affinity maps: one repulsion pass across all (type, point) pairs
         if let pipeline = repulsionPipeline, numAffinityTypes > 0 {
             let totalEntries = totalPoints * numAffinityTypes

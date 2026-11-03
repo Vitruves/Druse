@@ -221,47 +221,16 @@ kernel void localSearchAnalytical(
     for (int step = 0; step < maxSteps; step++) {
         float gradT[3], gradR[3], gradTor[32];
 
+        // Energy + gradient (includes boundary and pharmacophore penalties, matching
+        // evaluatePoseConstrained used for verification below).
         float baseE = evaluatePoseWithGradient(
             pose, ligandAtoms, nAtoms, nTor,
             torsionEdges, movingIndices,
             affinityMaps, typeIndexLookup, gridParams,
             gaParams.referenceIntraEnergy, intraPairs, nPairs,
+            pharmaConstraints, pharmaParams,
             gradT, gradR, gradTor
         );
-
-        // Add pharmacophore constraint penalty + gradient to the analytical gradient.
-        // We need the transformed positions to evaluate constraints. Re-transform (cheap).
-        if (pharmaParams.numConstraints > 0) {
-            float3 cPositions[128];
-            float3 cForces[128];
-            for (uint a = 0; a < nAtoms; a++) {
-                cPositions[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
-                cForces[a] = float3(0);
-            }
-            applyTorsions(cPositions, nAtoms, pose, torsionEdges, movingIndices, nTor);
-
-            float cPen = evaluateConstraintPenaltyWithGrad(
-                cPositions, cForces, ligandAtoms, nAtoms, pharmaConstraints, pharmaParams);
-            baseE += cPen;
-
-            // Propagate atom-level forces back to translation and rotation gradients.
-            // Translation gradient: sum of all forces (dE/d(tx) = sum_a dE/d(xa))
-            for (uint a = 0; a < nAtoms; a++) {
-                // Force is negative gradient already, so negate back
-                gradT[0] -= cForces[a].x;
-                gradT[1] -= cForces[a].y;
-                gradT[2] -= cForces[a].z;
-            }
-            // Rotation gradient: torque approximation (simplified — project onto rotation axes)
-            for (uint a = 0; a < nAtoms; a++) {
-                float3 r = cPositions[a] - pose.translation;
-                float3 f = -cForces[a];  // convert from force to gradient direction
-                float3 torque = cross(r, f);
-                gradR[0] += torque.x;
-                gradR[1] += torque.y;
-                gradR[2] += torque.z;
-            }
-        }
 
         // Compute total gradient magnitude
         float gradMag = 0;
@@ -365,7 +334,7 @@ kernel void localSearchAnalyticalSIMD(
     float3 gMin = gridParams.searchCenter - gridParams.searchHalfExtent;
     float3 gMax = gridParams.searchCenter + gridParams.searchHalfExtent;
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridUpperBound(gridParams);
 
     float nRotF = float(nTor);
     float normFactor = vinaRotNormalization(nRotF);
@@ -403,20 +372,26 @@ kernel void localSearchAnalyticalSIMD(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // === Zero forces (parallel) ===
-        for (uint a = lane; a < nA; a += 32) tg_forces[a] = float3(0);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         // === Grid scoring with gradient (parallel across lanes) ===
+        // Same boundary handling as the verification pass below: atoms beyond the
+        // interpolatable grid get the wPenalty quadratic penalty instead of a grid sample.
+        // Each lane assigns tg_forces for exactly the atoms it owns, so no zeroing pass is needed.
         float laneGridE = 0.0f;
+        float laneGradPenalty = 0.0f;
         for (uint a = lane; a < nA; a += 32) {
             float3 grad;
-            float e = sampleTypedAffinityMapWithGrad(
-                affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, tg_pos[a], gridParams, grad);
-            laneGridE += e;
-            tg_forces[a] = -grad * normFactor;
+            float oopP = outOfGridPenaltyWithGrad(tg_pos[a], gridMin, gridMax, grad);
+            if (oopP > 0.0f) {
+                laneGradPenalty += oopP;
+                tg_forces[a] = -wPenalty * grad;
+            } else {
+                laneGridE += sampleTypedAffinityMapWithGrad(
+                    affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, tg_pos[a], gridParams, grad);
+                tg_forces[a] = -grad * normFactor;
+            }
         }
         float totalIntermolecular = simd_sum(laneGridE);
+        float gradPenalty = simd_sum(laneGradPenalty);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // === Intramolecular with gradient (lane 0 — force writes need sequential) ===
@@ -438,7 +413,23 @@ kernel void localSearchAnalyticalSIMD(
         intraE = simd_broadcast_first(intraE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float totalEnergy = (totalIntermolecular + intraE - gaParams.referenceIntraEnergy) * normFactor;
+        // === Pharmacophore constraints (lane 0) ===
+        // Constraint forces are folded into tg_forces before the torque accumulation so
+        // translation, rotation AND torsion gradients all see the constraint penalty.
+        float cPen = 0.0f;
+        if (pharmaParams.numConstraints > 0) {
+            if (lane == 0) {
+                float3 cPos[128], cF[128];
+                for (uint a = 0; a < nA; a++) { cPos[a] = tg_pos[a]; cF[a] = float3(0); }
+                cPen = evaluateConstraintPenaltyWithGrad(cPos, cF, ligandAtoms, nA, pharmaConstraints, pharmaParams);
+                for (uint a = 0; a < nA; a++) tg_forces[a] += cF[a];
+            }
+            cPen = simd_broadcast_first(cPen);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float totalEnergy = (totalIntermolecular + intraE - gaParams.referenceIntraEnergy) * normFactor
+                          + wPenalty * gradPenalty + cPen;
 
         // === Torsion gradients (parallel per torsion's moving atoms) ===
         float gradTor[32];
@@ -468,21 +459,6 @@ kernel void localSearchAnalyticalSIMD(
         float3 totalTorqueRot = simd_sum(ltr);
         float gradT[3] = {-totalForce.x, -totalForce.y, -totalForce.z};
         float gradR[3] = {-totalTorqueRot.x, -totalTorqueRot.y, -totalTorqueRot.z};
-
-        // === Pharmacophore constraints (lane 0) ===
-        if (pharmaParams.numConstraints > 0 && lane == 0) {
-            float3 cPos[128], cF[128];
-            for (uint a = 0; a < nA; a++) { cPos[a] = tg_pos[a]; cF[a] = float3(0); }
-            float cPen = evaluateConstraintPenaltyWithGrad(cPos, cF, ligandAtoms, nA, pharmaConstraints, pharmaParams);
-            totalEnergy += cPen;
-            for (uint a = 0; a < nA; a++) {
-                gradT[0] -= cF[a].x; gradT[1] -= cF[a].y; gradT[2] -= cF[a].z;
-                float3 torque = cross(tg_pos[a] - pose.translation, -cF[a]);
-                gradR[0] += torque.x; gradR[1] += torque.y; gradR[2] += torque.z;
-            }
-        }
-        totalEnergy = simd_broadcast_first(totalEnergy);
-        for (int i = 0; i < 3; i++) { gradT[i] = simd_broadcast_first(gradT[i]); gradR[i] = simd_broadcast_first(gradR[i]); }
 
         float gradMag = 0;
         for (int i = 0; i < 3; i++) gradMag += gradT[i] * gradT[i] + gradR[i] * gradR[i];
@@ -522,7 +498,8 @@ kernel void localSearchAnalyticalSIMD(
                 if (pose.torsions[t] < -M_PI_F) pose.torsions[t] += 2.0f * M_PI_F;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lane 0 wrote the trial pose to device memory; make it visible to all lanes.
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
         // === SIMD-consistent verification ===
         // Re-score trial pose using same lane distribution as gradient loop.
@@ -598,6 +575,9 @@ kernel void localSearchAnalyticalSIMD(
                 pose.energy = totalEnergy; stepSize *= 0.5f;
             }
         }
+        // Lane 0 may have restored the old pose; all lanes read it at the top of the next
+        // iteration, and tg_pos is about to be overwritten while lane 0 finished reading it.
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
         stepSize = simd_broadcast_first(stepSize);
         if (stepSize < 0.001f) break;
     }

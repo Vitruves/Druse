@@ -4,7 +4,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#include "ShaderTypes.h"
+#include "DockingCommon.h"
 
 // ============================================================================
 // MARK: - Diffusion-Guided Docking
@@ -37,13 +37,6 @@ inline float3 diffGaussian3(thread uint &seed, uint base) {
     float u4 = diffRandom(seed, base + 3u) * 2.0f * M_PI_F;
     float r2 = sqrt(-2.0f * log(u3));
     return float3(r * cos(u2), r * sin(u2), r2 * cos(u4));
-}
-
-// Quaternion rotation of a vector
-inline float3 diffQuatRotate(float4 q, float3 v) {
-    float3 u = q.xyz;
-    float s = q.w;
-    return 2.0f * dot(u, v) * u + (s * s - dot(u, u)) * v + 2.0f * s * cross(u, v);
 }
 
 // ============================================================================
@@ -120,30 +113,36 @@ kernel void diffusionDenoisingStep(
     device DockPose                *poses         [[buffer(0)]],
     device const AttentionGradient *attnGrads     [[buffer(1)]],  // [numPoses × numLigandAtoms]
     constant DiffusionParams       &diffParams    [[buffer(2)]],
-    constant GAParams              &gaParams      [[buffer(3)]],
     constant GridParams            &gridParams    [[buffer(4)]],
     constant DockLigandAtom        *ligandAtoms   [[buffer(5)]],
+    constant TorsionEdge           *torsionEdges  [[buffer(6)]],
+    constant int32_t               *movingIndices [[buffer(7)]],
     uint                            tid           [[thread_position_in_grid]])
 {
     if (tid >= diffParams.numPoses) return;
 
     device DockPose &pose = poses[tid];
-    uint nAtoms = diffParams.numLigandAtoms;
-    uint nTorsions = diffParams.numTorsions;
+    uint nAtoms = min(diffParams.numLigandAtoms, 128u);
+    uint nTorsions = min(diffParams.numTorsions, 32u);
     float guidanceScale = diffParams.guidanceScale;
     float noiseScale = diffParams.noiseScale;
 
     uint seed = tid * 482711u + diffParams.currentStep * 937373u;
 
     // Read attention gradients for this pose
-    uint gradBase = tid * nAtoms;
+    uint gradBase = tid * diffParams.numLigandAtoms;
+
+    // Posed atom positions (rigid body + torsions, the same transform the DruseAF encoder
+    // scored), so torque lever arms match the conformation the attention pulls refer to.
+    thread float3 posed[128];
+    transformAtoms(posed, ligandAtoms, nAtoms, pose, torsionEdges, movingIndices, nTorsions);
 
     // Compute net translation gradient: mean pull direction across all ligand atoms
     float3 netTransGrad = float3(0.0f);
     float3 netTorque = float3(0.0f);
     float totalMagnitude = 0.0f;
 
-    for (uint a = 0; a < nAtoms && a < 128; a++) {
+    for (uint a = 0; a < nAtoms; a++) {
         device const AttentionGradient &ag = attnGrads[gradBase + a];
         float3 pull = ag.pullDirection;
         float mag = ag.pullMagnitude;
@@ -151,10 +150,8 @@ kernel void diffusionDenoisingStep(
         netTransGrad += pull * mag;
         totalMagnitude += mag;
 
-        // Torque contribution for rotation gradient
-        float3 atomPos = ligandAtoms[a].position; // centroid-subtracted
-        float3 worldPos = diffQuatRotate(pose.rotation, atomPos);
-        netTorque += cross(worldPos, pull * mag);
+        // Torque about the rigid-body origin (pose.translation), which the rotation update pivots on
+        netTorque += cross(posed[a] - pose.translation, pull * mag);
     }
 
     if (totalMagnitude > 1e-6f) {
@@ -212,7 +209,7 @@ kernel void diffusionDenoisingStep(
 
         // Torsion noise
         float torNoiseMag = noiseScale * diffParams.torsionNoise;
-        for (uint t = 0; t < nTorsions && t < 32; t++) {
+        for (uint t = 0; t < nTorsions; t++) {
             float torNoise = (diffRandom(seed, 120 + t) - 0.5f) * torNoiseMag * 2.0f;
             pose.torsions[t] += torNoise;
             // Wrap to [-pi, pi]

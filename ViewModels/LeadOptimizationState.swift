@@ -17,6 +17,9 @@ struct LeadOptimizationState {
     var referenceResult: DockingResult?
     var referenceMolecule: Molecule?
     var referenceDescriptors: LigandDescriptors?
+    /// Scoring method of the reference pose. Analogs are mini-docked with the same method so
+    /// their scores sit on the reference's scale (kcal/mol for energies, pK for affinity models).
+    var scoringMethod: ScoringMethod = .vina
 
     // MARK: Generation Parameters
 
@@ -37,7 +40,6 @@ struct LeadOptimizationState {
     var filterHERG: Bool = false        // reject if hERG risk > 0.5
     var filterCYP: Bool = false         // reject if CYP2D6 or CYP3A4 > 0.5
     var maxLogP: Float = 7.0            // generous default — user can tighten
-    var minSolubility: Float = -8.0     // generous default
 
     // MARK: Generation State
 
@@ -63,6 +65,7 @@ struct LeadOptimizationState {
     // MARK: Computed
 
     var hasReference: Bool { !referenceSMILES.isEmpty }
+    var referenceScore: Float? { referenceResult?.displayScore(method: scoringMethod) }
     var dockedAnalogCount: Int { analogs.filter { $0.status == .docked }.count }
     var passedFilterCount: Int { analogs.filter { $0.status != .filtered && $0.status != .failed }.count }
 }
@@ -79,9 +82,9 @@ struct LeadOptAnalog: Identifiable, Sendable {
 
     // Docking results (filled after mini-docking)
     var dockingResults: [DockingResult] = []
-    var bestEnergy: Float?
+    /// Best pose score in `LeadOptimizationState.scoringMethod` units.
+    var bestScore: Float?
     var bestPoseAtoms: [SIMD3<Float>] = []
-    var rmsdToReference: Float?
 
     // Delta properties vs reference
     var deltaMW: Float?
@@ -98,5 +101,12 @@ struct LeadOptAnalog: Identifiable, Sendable {
         case docked         // Docking complete
         case filtered       // Failed ADMET filters
         case failed         // RDKit/docking error
+    }
+}
+
+extension ScoringMethod {
+    /// Whether score `a` ranks ahead of `b`: higher pK for affinity models, lower energy otherwise.
+    func ranks(_ a: Float, before b: Float) -> Bool {
+        isAffinityScore ? a > b : a < b
     }
 }

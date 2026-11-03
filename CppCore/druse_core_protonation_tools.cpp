@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -125,8 +124,7 @@ DruseSiteProtomerPair* druse_generate_site_protomers(
             if (cid < 0) {
                 try { RDDepict::compute2DCoords(mol); } catch (...) {}
             }
-            std::vector<std::pair<int,double>> mmffRes;
-            try { MMFF::MMFFOptimizeMoleculeConfs(mol, mmffRes, 0, 500); } catch (...) {}
+            try { mmff_minimize_single(mol); } catch (...) {}
             try { computeGasteigerCharges(mol); } catch (...) {}
         };
 
@@ -462,6 +460,9 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
         // numThreads=1 internally to avoid nested-parallelism oversubscription;
         // TBB handles the outer loop instead.
         tbb::parallel_for(0, (int)allForms.size(), [&](int fi) {
+          // An RDKit failure on one form must not abort the whole ensemble
+          // (TBB would rethrow it on the calling thread).
+          try {
             auto &form = allForms[fi];
             auto mol = std::make_unique<RWMol>(*form.mol);
             MolOps::addHs(*mol, false, true);
@@ -482,48 +483,34 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
             if (cids.empty()) return;
 
             std::vector<std::pair<int, double>> mmffResults;
-            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults, 1, 1000, "MMFF94"); } catch (...) {}
+            try { MMFF::MMFFOptimizeMoleculeConfs(*mol, mmffResults, 1, 1000, "MMFF94"); } catch (...) { mmffResults.clear(); }
             try { computeGasteigerCharges(*mol); } catch (...) {}
 
             std::vector<std::pair<int, double>> indexed;
             for (int ci = 0; ci < (int)cids.size(); ci++) {
-                double e = std::numeric_limits<double>::quiet_NaN();
-                if (ci < (int)mmffResults.size()) {
-                    if (mmffResults[ci].first == 0) e = mmffResults[ci].second;
-                    else continue;
-                }
-                if (std::isnan(e) || e > 1e6) continue;
+                // Accept converged and not-yet-converged MMFF results; keep
+                // NaN-energy geometries when MMFF has no parameters (see
+                // druse_core_variants.cpp).
+                double e = conformer_mmff_energy(mmffResults, ci);
+                if (e > 1e6) continue;
 
-                bool hasClash = false;
-                const Conformer &conf = mol->getConformer(cids[ci]);
-                int nAtoms = mol->getNumAtoms();
-                for (int a = 0; a < nAtoms && !hasClash; a++) {
-                    if (mol->getAtomWithIdx(a)->getAtomicNum() == 1) continue;
-                    const auto &pa = conf.getAtomPos(a);
-                    if (pa.x == 0.0 && pa.y == 0.0 && pa.z == 0.0) { hasClash = true; break; }
-                    for (int b = a + 1; b < nAtoms && !hasClash; b++) {
-                        if (mol->getAtomWithIdx(b)->getAtomicNum() == 1) continue;
-                        if (mol->getBondBetweenAtoms(a, b)) continue;
-                        const auto &pb = conf.getAtomPos(b);
-                        double d2 = (pa.x-pb.x)*(pa.x-pb.x) + (pa.y-pb.y)*(pa.y-pb.y) + (pa.z-pb.z)*(pa.z-pb.z);
-                        if (d2 < 1.0) hasClash = true;
-                    }
-                }
-                if (hasClash) continue;
+                if (conformer_is_collapsed(*mol, mol->getConformer(cids[ci]))) continue;
                 indexed.push_back({ci, e});
             }
 
-            if (indexed.empty() && !cids.empty()) {
-                for (int ci = 0; ci < (int)cids.size(); ci++) {
-                    if (ci < (int)mmffResults.size() && mmffResults[ci].first == 0) {
-                        indexed.push_back({ci, mmffResults[ci].second});
-                        break;
-                    }
+            if (indexed.empty()) {
+                // Every minimum collapsed: replace the first conformer with a fresh valid
+                // embedding rather than handing a collapsed geometry downstream.
+                double e = std::numeric_limits<double>::quiet_NaN();
+                if (!reembed_valid_conformer(*mol, cids[0], &e)) {
+                    fprintf(stderr, "[druse] no valid conformer for form %d (%s), skipping\n",
+                            fi, form.smi.c_str());
+                    return;
                 }
+                indexed.push_back({0, e});
             }
 
-            std::sort(indexed.begin(), indexed.end(),
-                      [](const auto &a, const auto &b) { return a.second < b.second; });
+            std::sort(indexed.begin(), indexed.end(), energy_less_nan_last);
 
             std::vector<PreparedConformer> localConformers;
             localConformers.reserve(indexed.size());
@@ -550,7 +537,17 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
 
             std::lock_guard<std::mutex> lock(allConformersMutex);
             for (auto &c : localConformers) allConformers.push_back(std::move(c));
+          } catch (const std::exception &e) {
+            fprintf(stderr, "[druse] conformer preparation failed for form %d: %s\n", fi, e.what());
+          } catch (...) {
+            fprintf(stderr, "[druse] conformer preparation failed for form %d\n", fi);
+          }
         });
+
+        std::sort(allConformers.begin(), allConformers.end(),
+            [](const PreparedConformer &a, const PreparedConformer &b) {
+                return a.formIdx != b.formIdx ? a.formIdx < b.formIdx : a.confIdx < b.confIdx;
+            });
 
         // Energy cutoff is applied PER FORM, not globally. Different tautomer/
         // protomer forms have wildly different MMFF baselines (e.g. amino vs
@@ -602,8 +599,10 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
         for (size_t i = 0; i < allConformers.size(); i++) {
             const auto &c = allConformers[i];
             auto it = minEPerForm.find(c.formIdx);
-            if (it == minEPerForm.end()) continue;
-            double dE = std::isnan(c.energy) ? 50.0 : (c.energy - it->second);
+            // A form with no finite MMFF energy (no MMFF parameters) has no
+            // reference: weight its conformers uniformly within the form.
+            double dE = (it == minEPerForm.end()) ? 0.0
+                      : std::isnan(c.energy) ? 50.0 : (c.energy - it->second);
             double boltz = std::exp(-dE / kBT);
             withinFormBoltz[i] = boltz;
             partitionPerForm[c.formIdx] += boltz;
@@ -625,7 +624,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble_ex(
 
         int count = (int)allConformers.size();
         result->count = count;
-        result->members = new DruseEnsembleMember[count];
+        result->members = new DruseEnsembleMember[count]();
         result->success = true;
 
         for (int i = 0; i < count; i++) {

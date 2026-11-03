@@ -6,47 +6,103 @@ import SwiftUI
 struct PreparationTabView: View {
     @Environment(AppViewModel.self) private var viewModel
 
-    @State private var manualStepsExpanded = false
     @State private var pkaReferenceExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
-            if let prot = viewModel.molecules.protein {
+        if let prot = viewModel.molecules.protein {
+            DSStepScaffold {
                 proteinCard(prot)
-                if let report = viewModel.molecules.preparationReport {
-                    if hasIssues(report) {
-                        issuesCard(report)
+                if viewModel.molecules.proteinPrepared {
+                    preparedCard(prot)
+                }
+                if let report = viewModel.molecules.preparationReport, hasIssues(report) {
+                    issuesCard(report)
+                }
+                manualStepsCard
+            } footer: {
+                footer
+            }
+        } else {
+            DSStepScaffold {
+                DSEmptyState(
+                    "No Protein Loaded",
+                    systemImage: "wrench.and.screwdriver",
+                    description: "Load a structure in step 1."
+                ) {
+                    Button("Go to Search") {
+                        viewModel.workspace.requestedTab = .search
+                        viewModel.workspace.requestedTabToken &+= 1
                     }
                 }
-                quickPrepareCard
-                manualStepsCard
-                statisticsCard(prot)
-            } else {
-                ContentUnavailableView {
-                    Label("No Protein", systemImage: "cube.transparent")
-                } description: {
-                    Text("Load a protein from PDB or file first")
-                }
-                .padding(.top, 24)
+                .padding(.top, DS.Space.xxl)
             }
-            Spacer(minLength: 0)
         }
-        .padding(12)
     }
 
-    // MARK: - Protein card
+    // MARK: - Footer (one-click pipeline)
+
+    private var phText: String { String(format: "%.1f", viewModel.molecules.protonationPH) }
 
     @ViewBuilder
+    private var footer: some View {
+        Text("Cleanup · repair · hydrogens at pH \(phText) · charges")
+            .font(DS.Font.caption)
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+        PanelRunButton(
+            title: viewModel.molecules.isMinimizing ? "Preparing…"
+                : viewModel.molecules.proteinPrepared ? "Prepare Again" : "Prepare for Docking",
+            icon: "wand.and.stars",
+            isDisabled: viewModel.molecules.isMinimizing
+        ) {
+            viewModel.runEnergyMinimization()
+        }
+        .help("Keeps the preferred alternate conformation, removes non-standard residues, builds short missing loops, caps chain breaks, rebuilds missing atoms, adds hydrogens at pH \(phText) and assigns partial charges. Waters are kept — use Cleanup below to remove them.")
+        .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
+
+        if viewModel.molecules.isMinimizing {
+            ProgressView()
+                .progressViewStyle(.linear)
+                .controlSize(.small)
+        } else if viewModel.molecules.proteinPrepared {
+            HStack {
+                DSTag("Prepared", tone: .success, systemImage: "checkmark")
+                Spacer(minLength: 0)
+                DSNextStepButton(SidebarTab.preparation.suggestedNextStep(in: viewModel) ?? .ligands)
+                    .fixedSize()
+            }
+        }
+    }
+
+    // MARK: - Protein summary card
+
     private func proteinCard(_ prot: Molecule) -> some View {
-        PanelCard("Protein", icon: "cube") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
+        PanelCard(
+            "Protein",
+            icon: "cube",
+            accessory: {
+                if viewModel.molecules.proteinPrepared {
+                    DSTag("Prepared", tone: .success)
+                } else {
+                    DSTag("Raw", tone: .warning)
+                }
+            }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                HStack(spacing: DS.Space.m) {
+                    Circle()
+                        .fill(DS.Color.protein)
+                        .frame(width: 8, height: 8)
                     Text(prot.name)
-                        .font(PanelStyle.bodyFont.weight(.medium))
+                        .font(DS.Font.label.weight(.medium))
                         .lineLimit(1)
-                    Spacer()
-                    Text("\(prot.chains.count) chain(s)")
-                        .font(PanelStyle.monoSmall)
+                        .truncationMode(.middle)
+                    Spacer(minLength: DS.Space.xs)
+                    Text("\(prot.chains.count) chain\(prot.chains.count == 1 ? "" : "s")")
+                        .font(DS.Font.secondary)
+                        .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
                 if let report = viewModel.molecules.preparationReport {
@@ -56,44 +112,90 @@ struct PreparationTabView: View {
         }
     }
 
-    @ViewBuilder
     private func structureSummary(_ report: ProteinPreparation.PreparationReport) -> some View {
-        VStack(spacing: 4) {
+        Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.xs) {
             ForEach(report.chainSummary, id: \.chainID) { chain in
-                HStack {
+                GridRow {
                     Text("Chain \(chain.chainID)")
-                        .font(PanelStyle.monoSmall.weight(.medium))
-                    Spacer()
-                    Text("\(chain.residueCount) res")
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
+                        .font(DS.Font.monoSmall.weight(.medium))
                     Text(chain.type)
-                        .font(PanelStyle.smallFont)
+                        .font(DS.Font.secondary)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text("\(chain.residueCount) res")
+                        .font(DS.Font.monoSmall)
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.trailing)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
             if report.waterCount > 0 {
-                HStack {
+                GridRow {
                     Text("Waters")
-                        .font(PanelStyle.smallFont)
-                    Spacer()
+                        .font(DS.Font.secondary)
                     Text("\(report.waterCount)")
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
+                        .font(DS.Font.monoSmall)
+                        .foregroundStyle(DS.Color.water)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .gridCellColumns(2)
                 }
             }
             if !report.hetGroups.isEmpty {
-                HStack {
+                GridRow(alignment: .top) {
                     Text("HETATM")
-                        .font(PanelStyle.smallFont)
-                    Spacer()
-                    Text(report.hetGroups.map(\.name).joined(separator: ", "))
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                        .font(DS.Font.secondary)
+                    FlowLayout(spacing: DS.Space.xs) {
+                        ForEach(Array(report.hetGroups.enumerated()), id: \.offset) { _, het in
+                            DSTag(het.name, tint: DS.Color.metal, monospaced: true)
+                        }
+                    }
+                    .gridCellColumns(2)
                 }
             }
+        }
+    }
+
+    // MARK: - Prepared card
+
+    /// What the structure looks like after "Prepare for Docking", read from the prepared
+    /// molecule itself so it stays true after later manual edits: protons placed, charge model
+    /// outcome, how chain breaks were handled and which waters/HET groups remain.
+    private func preparedCard(_ prot: Molecule) -> some View {
+        let atoms = prot.atoms
+        let hydrogens = atoms.reduce(into: 0) { n, atom in if atom.element == .H { n += 1 } }
+        let netCharge = atoms.reduce(Float(0)) { $0 + $1.charge }
+        let chargedAtoms = atoms.reduce(into: 0) { n, atom in if atom.charge != 0 { n += 1 } }
+        let waters = Set(atoms.lazy
+            .filter { ["HOH", "WAT", "DOD", "H2O"].contains($0.residueName) }
+            .map { "\($0.chainID):\($0.residueSeq)" }).count
+        let breaks = viewModel.molecules.preparationReport?.chainBreaks ?? []
+        let capped = breaks.filter(\.isCapped).count
+
+        return PanelCard("Prepared Structure", icon: "checkmark.seal") {
+            Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.xs) {
+                preparedRow("Hydrogens", "\(hydrogens.formatted()) at pH \(phText)")
+                preparedRow("Charges", chargedAtoms > 0
+                    ? "\(chargedAtoms.formatted()) atoms · net \(String(format: "%+.1f", netCharge)) e"
+                    : "none assigned")
+                if !breaks.isEmpty {
+                    preparedRow("Chain breaks", capped == breaks.count
+                        ? "\(capped) capped (ACE/NME)"
+                        : "\(capped) of \(breaks.count) capped")
+                }
+                preparedRow("Waters", waters > 0 ? "\(waters) kept" : "none")
+            }
+        }
+    }
+
+    private func preparedRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .font(DS.Font.secondary)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(DS.Font.monoSmall)
+                .monospacedDigit()
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
@@ -105,19 +207,23 @@ struct PreparationTabView: View {
             || !report.residueCompleteness.isEmpty
     }
 
-    @ViewBuilder
     private func issuesCard(_ report: ProteinPreparation.PreparationReport) -> some View {
-        PanelCard("Issues", icon: "exclamationmark.triangle") {
-            VStack(alignment: .leading, spacing: 10) {
+        let total = report.missingResidues.count + report.chainBreaks.count + report.residueCompleteness.count
+        return PanelCard(
+            "Issues",
+            icon: "exclamationmark.triangle",
+            accessory: { DSTag("\(total)", tone: .warning, monospaced: true) }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.l) {
                 if !report.missingResidues.isEmpty {
-                    issuesGroup(title: "Missing Residues", icon: "questionmark.diamond", color: .orange) {
+                    issuesGroup(title: "Missing Residues", icon: "questionmark.diamond", count: report.missingResidues.count) {
                         ForEach(report.missingResidues, id: \.gapStart) { gap in
                             issueLine("Chain \(gap.chainID): \(gap.gapStart)–\(gap.gapEnd)")
                         }
                     }
                 }
                 if !report.chainBreaks.isEmpty {
-                    issuesGroup(title: "Chain Breaks", icon: "scissors", color: .orange) {
+                    issuesGroup(title: "Chain Breaks", icon: "scissors", count: report.chainBreaks.count) {
                         ForEach(Array(report.chainBreaks.enumerated()), id: \.offset) { _, brk in
                             issueLine(
                                 "Chain \(brk.chainID): \(brk.previousResidueSeq)→\(brk.nextResidueSeq) "
@@ -127,129 +233,126 @@ struct PreparationTabView: View {
                     }
                 }
                 if !report.residueCompleteness.isEmpty {
-                    issuesGroup(title: "Incomplete Residues", icon: "checklist", color: .orange) {
+                    issuesGroup(title: "Incomplete Residues", icon: "checklist", count: report.residueCompleteness.count) {
                         ForEach(Array(report.residueCompleteness.prefix(6)), id: \.self) { residue in
-                            issueLine("Chain \(residue.chainID) \(residue.residueName) \(residue.residueSeq): \(residue.summary)")
+                            residueIssueLine(
+                                residue: "\(residue.chainID) \(residue.residueName) \(residue.residueSeq)",
+                                summary: residue.summary
+                            )
                         }
                         if report.residueCompleteness.count > 6 {
-                            issueLine("+\(report.residueCompleteness.count - 6) more incomplete residue(s)")
+                            issueLine("+\(report.residueCompleteness.count - 6) more")
                         }
                     }
                 }
+                PanelHint(
+                    text: "Structure Repair below rebuilds missing loops and atoms; “Prepare for Docking” runs it too.",
+                    icon: "lightbulb"
+                )
             }
         }
     }
 
-    @ViewBuilder
     private func issuesGroup<Content: View>(
         title: String,
         icon: String,
-        color: Color,
+        count: Int,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
-                Image(systemName: icon).font(.caption2)
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.xs) {
+                Image(systemName: icon)
+                    .font(DS.Font.caption)
+                    .foregroundStyle(DS.Color.warning)
                 Text(title)
-                    .font(.caption.weight(.semibold))
-                    .textCase(.uppercase)
+                    .font(DS.Font.label.weight(.medium))
+                Spacer(minLength: DS.Space.xs)
+                DSTag("\(count)", tone: .warning, monospaced: true)
             }
-            .foregroundStyle(color)
-            content()
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                content()
+            }
+            .padding(.leading, DS.Space.l)
         }
     }
 
-    @ViewBuilder
     private func issueLine(_ text: String) -> some View {
         Text(text)
-            .font(PanelStyle.monoSmall)
+            .font(DS.Font.monoSmall)
             .foregroundStyle(.secondary)
             .lineLimit(2)
+            .textSelection(.enabled)
     }
 
-    // MARK: - Quick prepare card
-
-    @ViewBuilder
-    private var quickPrepareCard: some View {
-        PanelCard("Prepare for Docking", icon: "wand.and.stars") {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Removes alternative conformations, non-standard residues and waters; rebuilds missing atoms; adds hydrogens at pH \(String(format: "%.1f", viewModel.molecules.protonationPH)); assigns partial charges.")
-                    .font(PanelStyle.smallFont)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 8) {
-                    PanelRunButton(
-                        title: "Run Full Pipeline",
-                        icon: "wand.and.stars",
-                        color: .accentColor,
-                        isDisabled: viewModel.molecules.protein == nil || viewModel.molecules.isMinimizing
-                    ) {
-                        viewModel.runEnergyMinimization()
-                    }
-                    .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
-                    if viewModel.molecules.isMinimizing {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-            }
+    /// One incomplete residue per line: fixed-width residue ID, summary truncated
+    /// (full text on hover) so long atom lists never wrap into ragged blocks.
+    private func residueIssueLine(residue: String, summary: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
+            Text(residue)
+                .font(DS.Font.monoSmall.weight(.medium))
+                .foregroundStyle(.primary)
+                .fixedSize()
+            Text(summary)
+                .font(DS.Font.secondary)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
+        .help("Chain \(residue): \(summary)")
+        .textSelection(.enabled)
     }
 
     // MARK: - Manual steps card
 
-    @ViewBuilder
     private var manualStepsCard: some View {
-        PanelCard("Manual Steps", icon: "slider.horizontal.below.rectangle") {
-            PanelDisclosure("Show all steps", isExpanded: $manualStepsExpanded) {
-                VStack(alignment: .leading, spacing: 12) {
-                    cleanupSection
-                    Divider().opacity(0.4)
-                    structureRepairSection
-                    Divider().opacity(0.4)
-                    hydrogensSection
-                    Divider().opacity(0.4)
-                    chargesSection
-                }
+        PanelCard("Manual Steps", icon: "slider.horizontal.3") {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                PanelLabeledDivider(title: "Cleanup", icon: "paintbrush")
+                cleanupSection
+                PanelLabeledDivider(title: "Structure Repair", icon: "bandage")
+                structureRepairSection
+                PanelLabeledDivider(title: "Hydrogens & Protonation", icon: "atom")
+                hydrogensSection
+                PanelLabeledDivider(title: "Charges", icon: "bolt")
+                chargesSection
             }
         }
     }
 
-    @ViewBuilder
     private var cleanupSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSubheader(title: "Cleanup", icon: "paintbrush")
-            PanelChoiceGrid(columns: 2) {
-                PanelSecondaryButton(
-                    title: "Remove Waters", icon: "drop.triangle"
-                ) { viewModel.removeWaters() }
-                .accessibilityIdentifier(AccessibilityID.prepRemoveWaters)
-                PanelSecondaryButton(
-                    title: "Keep Pocket Waters", icon: "drop.circle",
-                    isDisabled: viewModel.docking.selectedPocket == nil,
-                    help: "Remove bulk waters but keep those within \(String(format: "%.0f", viewModel.molecules.pocketWaterRadius)) Å of the pocket center"
-                ) { viewModel.keepPocketWaters() }
-                .accessibilityIdentifier(AccessibilityID.prepKeepPocketWaters)
-            }
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            PanelSecondaryButton(
+                title: "Remove All Waters", icon: "drop.triangle",
+                help: "Delete every water molecule"
+            ) { viewModel.removeWaters() }
+            .accessibilityIdentifier(AccessibilityID.prepRemoveWaters)
+
+            PanelSecondaryButton(
+                title: "Keep Pocket Waters Only", icon: "drop.circle",
+                isDisabled: viewModel.docking.selectedPocket == nil,
+                help: "Remove bulk waters but keep those within \(String(format: "%.0f", viewModel.molecules.pocketWaterRadius)) Å of the pocket center (needs a pocket from Binding Site)"
+            ) { viewModel.keepPocketWaters() }
+            .accessibilityIdentifier(AccessibilityID.prepKeepPocketWaters)
+
             if !viewModel.molecules.keptWaterKeys.isEmpty {
                 bridgingWaterInfo
             }
             PanelSecondaryButton(
-                title: "Remove Non-standard Residues", icon: "trash.slash"
+                title: "Remove Non-standard Residues", icon: "trash.slash",
+                help: "Delete ligands, ions and modified residues that are not part of the protein"
             ) { viewModel.removeNonStandardResidues() }
             .accessibilityIdentifier(AccessibilityID.prepRemoveNonStandard)
 
             PanelSecondaryButton(
-                title: "Remove Alt. Conformations", icon: "square.on.square.dashed"
+                title: "Remove Alt. Conformations", icon: "square.on.square.dashed",
+                help: "Keep only the highest-occupancy alternate location of each atom"
             ) { viewModel.removeAltConfs() }
             .accessibilityIdentifier(AccessibilityID.prepRemoveAltConfs)
         }
     }
 
-    @ViewBuilder
     private var structureRepairSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSubheader(title: "Structure Repair", icon: "bandage")
+        VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelSecondaryButton(
                 title: "Fix Missing Residues", icon: "bandage",
                 help: "Detect gaps in residue numbering, build missing loops (≤15 residues), and rebuild missing heavy atoms."
@@ -270,36 +373,67 @@ struct PreparationTabView: View {
         }
     }
 
-    @ViewBuilder
     private var hydrogensSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSubheader(title: "Hydrogens", icon: "atom")
-            PanelSecondaryButton(
-                title: "Add All Hydrogens", icon: "plus.circle",
-                isDisabled: viewModel.molecules.protein == nil,
-                help: "Add all hydrogens (polar + nonpolar) from residue templates."
-            ) { viewModel.addHydrogens() }
-            .accessibilityIdentifier(AccessibilityID.prepAddHydrogens)
+        @Bindable var vm = viewModel
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            HStack(spacing: DS.Space.m) {
+                Text("pH")
+                    .font(DS.Font.label)
+                    .foregroundStyle(.secondary)
+                // No `step:` — on macOS it draws one tick mark per step (130 here),
+                // which renders as a dark bar under the track. Round in the binding.
+                Slider(
+                    value: Binding(
+                        get: { vm.molecules.protonationPH },
+                        set: { vm.molecules.protonationPH = ($0 * 10).rounded() / 10 }
+                    ),
+                    in: 1.0...14.0
+                )
+                    .controlSize(.small)
+                    .accessibilityLabel("Protonation pH")
+                    .accessibilityValue(phText)
+                    .accessibilityIdentifier(AccessibilityID.prepPHSlider)
+                Text(phText)
+                    .font(DS.Font.monoSmall)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 32, alignment: .trailing)
+            }
 
-            protonationSection
-
             PanelSecondaryButton(
-                title: "Remove All Hydrogens", icon: "minus.circle",
-                tint: .red,
-                isDisabled: !viewModel.proteinHasHydrogens,
-                help: "Strip all hydrogen atoms from the protein."
-            ) { viewModel.removeHydrogens() }
-            .accessibilityIdentifier(AccessibilityID.prepRemoveHydrogens)
+                title: "Add Polar Hydrogens (pH \(phText))",
+                icon: "flask",
+                help: "Add polar hydrogens (N-H, O-H, S-H) with pH-dependent protonation states."
+            ) { viewModel.assignProtonation() }
+            .accessibilityIdentifier(AccessibilityID.prepAddPolarH)
+
+            PanelChoiceGrid(columns: 2) {
+                PanelSecondaryButton(
+                    title: "Add All H", icon: "plus.circle",
+                    help: "Add All Hydrogens: polar + nonpolar, from residue templates."
+                ) { viewModel.addHydrogens() }
+                .accessibilityIdentifier(AccessibilityID.prepAddHydrogens)
+
+                PanelSecondaryButton(
+                    title: "Remove All H", icon: "minus.circle",
+                    tint: DS.Color.danger,
+                    isDisabled: !viewModel.proteinHasHydrogens,
+                    help: "Remove All Hydrogens: strip every hydrogen atom from the protein."
+                ) { viewModel.removeHydrogens() }
+                .accessibilityIdentifier(AccessibilityID.prepRemoveHydrogens)
+            }
+
+            PanelDisclosure("pKa reference", icon: "books.vertical", isExpanded: $pkaReferenceExpanded) {
+                pkaReference
+            }
         }
     }
 
-    @ViewBuilder
     private var chargesSection: some View {
         @Bindable var vm = viewModel
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSubheader(title: "Charges", icon: "bolt")
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelLabeledRow("Method") {
-                Picker("", selection: $vm.docking.chargeMethod) {
+                Picker("Charge method", selection: $vm.docking.chargeMethod) {
                     ForEach(ChargeMethod.allCases, id: \.self) { method in
                         Text(method.rawValue).tag(method)
                     }
@@ -307,7 +441,7 @@ struct PreparationTabView: View {
                 .pickerStyle(.menu)
                 .controlSize(.small)
                 .labelsHidden()
-                .frame(width: 130)
+                .fixedSize()
                 .accessibilityIdentifier(AccessibilityID.prepChargePicker)
             }
             PanelSecondaryButton(
@@ -328,120 +462,88 @@ struct PreparationTabView: View {
 
     // MARK: - Bridging water info
 
-    @ViewBuilder
     private var bridgingWaterInfo: some View {
         @Bindable var vm = viewModel
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
+        return VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.xs) {
                 Image(systemName: "drop.fill")
-                    .foregroundStyle(.blue)
-                    .font(.system(size: 11))
+                    .font(DS.Font.caption)
+                    .foregroundStyle(DS.Color.water)
                 Text("\(viewModel.molecules.keptWaterKeys.count) bridging water(s) retained")
-                    .font(PanelStyle.smallFont)
+                    .font(DS.Font.secondary)
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
             PanelSliderRow(
                 label: "Radius",
                 value: $vm.molecules.pocketWaterRadius,
                 range: 2.0...10.0, step: 0.5,
-                format: { String(format: "%.1f Å", $0) }
+                format: { String(format: "%.1f Å", $0) },
+                labelWidth: 44
             )
         }
-        .padding(.leading, 4)
+        .padding(DS.Space.m)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(DS.Color.water.opacity(0.08))
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(AccessibilityID.prepRetainBridgingWaters)
     }
 
-    // MARK: - Protonation section (pH slider + pKa reference)
+    // MARK: - pKa reference
 
-    @ViewBuilder
-    private var protonationSection: some View {
-        @Bindable var vm = viewModel
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSecondaryButton(
-                title: "Add Polar Hydrogens (pH \(String(format: "%.1f", viewModel.molecules.protonationPH)))",
-                icon: "flask",
-                isDisabled: viewModel.molecules.protein == nil,
-                help: "Add polar hydrogens (N-H, O-H, S-H) with pH-dependent protonation states."
-            ) { viewModel.assignProtonation() }
-            .accessibilityIdentifier(AccessibilityID.prepAddPolarH)
-
-            PanelSliderRow(
-                label: "pH",
-                value: $vm.molecules.protonationPH,
-                range: 1.0...14.0, step: 0.1,
-                format: { String(format: "%.1f", $0) },
-                labelWidth: 30
-            )
-
-            PanelDisclosure("pKa reference", icon: "books.vertical", isExpanded: $pkaReferenceExpanded) {
-                VStack(alignment: .leading, spacing: 1) {
-                    pkaRow("ASP", 3.65)
-                    pkaRow("GLU", 4.25)
-                    pkaRow("HIS", 6.00)
-                    pkaRow("CYS", 8.18)
-                    pkaRow("TYR", 10.07)
-                    pkaRow("LYS", 10.53)
-                    pkaRow("ARG", 12.48)
-                }
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(Color.primary.opacity(0.04))
-                )
+    private var pkaReference: some View {
+        Grid(alignment: .leading, horizontalSpacing: DS.Space.l, verticalSpacing: DS.Space.xxs) {
+            GridRow {
+                pkaHeader("Residue")
+                pkaHeader("pKa").gridColumnAlignment(.trailing)
+                pkaHeader("At pH \(phText)")
             }
+            pkaRow("ASP", 3.65)
+            pkaRow("GLU", 4.25)
+            pkaRow("HIS", 6.00)
+            pkaRow("CYS", 8.18)
+            pkaRow("TYR", 10.07)
+            pkaRow("LYS", 10.53)
+            pkaRow("ARG", 12.48)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(DS.Space.m)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(DS.Color.controlFill)
+        )
+    }
+
+    private func pkaHeader(_ text: String) -> some View {
+        Text(text)
+            .font(DS.Font.caption)
+            .monospacedDigit()
+            .foregroundStyle(.tertiary)
     }
 
     private func pkaRow(_ residue: String, _ pKa: Float) -> some View {
-        let pH = viewModel.molecules.protonationPH
         let isAcidic = ["ASP", "GLU", "CYS", "TYR"].contains(residue)
-        let protonated = pH < pKa
+        let protonated = viewModel.molecules.protonationPH < pKa
         let chargeState: String
+        let color: Color
         if isAcidic {
-            chargeState = protonated ? "neutral" : "(-)"
+            chargeState = protonated ? "neutral" : "anion (−)"
+            color = protonated ? .secondary : DS.Color.danger
         } else {
-            chargeState = protonated ? "(+)" : "neutral"
+            chargeState = protonated ? "cation (+)" : "neutral"
+            color = protonated ? DS.Color.info : .secondary
         }
-        let color: Color = chargeState.contains("+") ? .blue
-                          : chargeState.contains("-") ? .red
-                          : .secondary
-        return HStack(spacing: 6) {
+        return GridRow {
             Text(residue)
-                .font(PanelStyle.monoSmall.weight(.medium))
-                .frame(width: 32, alignment: .leading)
+                .font(DS.Font.monoSmall.weight(.medium))
             Text(String(format: "%.2f", pKa))
-                .font(PanelStyle.monoSmall)
+                .font(DS.Font.monoSmall)
                 .foregroundStyle(.secondary)
-                .frame(width: 38, alignment: .trailing)
             Text(chargeState)
-                .font(PanelStyle.smallFont.weight(.medium))
+                .font(DS.Font.secondary.weight(.medium))
                 .foregroundStyle(color)
-        }
-    }
-
-    // MARK: - Statistics card
-
-    @ViewBuilder
-    private func statisticsCard(_ prot: Molecule) -> some View {
-        PanelCard("Statistics", icon: "chart.bar") {
-            VStack(spacing: 4) {
-                statRow("Atoms", "\(prot.atomCount)")
-                statRow("Heavy atoms", "\(prot.heavyAtomCount)")
-                statRow("Bonds", "\(prot.bondCount)")
-                statRow("Residues", "\(prot.residues.count)")
-                statRow("Chains", "\(prot.chains.count)")
-                statRow("MW", String(format: "%.0f Da", prot.molecularWeight))
-            }
-        }
-    }
-
-    private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(label)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text(value)
-                .font(PanelStyle.monoSmall)
         }
     }
 }

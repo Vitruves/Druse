@@ -38,7 +38,6 @@ final class XTBMetalAccelerator {
     private let d4Pipeline: MTLComputePipelineState
     private let repPipeline: MTLComputePipelineState
     private let bornPipeline: MTLComputePipelineState
-    private let gbPipeline: MTLComputePipelineState
     private let cnGradPipeline: MTLComputePipelineState
 
     init?() {
@@ -50,19 +49,20 @@ final class XTBMetalAccelerator {
         self.device = device
         self.queue = queue
 
+        // A missing kernel (e.g. stale metallib) disables GPU offload instead of crashing.
+        func pipeline(_ name: String) throws -> MTLComputePipelineState {
+            guard let function = library.makeFunction(name: name) else {
+                throw XTBMetalAcceleratorError.missingKernel(name)
+            }
+            return try device.makeComputePipelineState(function: function)
+        }
+
         do {
-            cnPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "xtb_compute_cn")!)
-            d4Pipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "xtb_d4_dispersion")!)
-            repPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "xtb_repulsion")!)
-            bornPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "xtb_born_radii")!)
-            gbPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "xtb_gb_solvation")!)
-            cnGradPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "xtb_cn_gradient")!)
+            cnPipeline = try pipeline("xtb_compute_cn")
+            d4Pipeline = try pipeline("xtb_d4_dispersion")
+            repPipeline = try pipeline("xtb_repulsion")
+            bornPipeline = try pipeline("xtb_born_radii")
+            cnGradPipeline = try pipeline("xtb_cn_gradient")
         } catch {
             print("[XTBMetalAccelerator] Failed to create pipelines: \(error)")
             return nil
@@ -177,8 +177,7 @@ final class XTBMetalAccelerator {
         var Edisp: Double = 0.0
         for i in 0..<natom { Edisp += Double(ePtr[i]) }
 
-        // Copy gradient (the C++ caller pre-zeroes with memset, so = is correct here;
-        // the GPU kernel already accumulated all pair contributions per atom)
+        // Accumulate into the caller's gradient (the C++ caller pre-zeroes it)
         if hasGrad, let grad = gradient {
             let gPtr = gradBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: natom)
             for i in 0..<natom {
@@ -202,9 +201,11 @@ final class XTBMetalAccelerator {
             let p = SIMD3<Float>(Float(positions[3*i]), Float(positions[3*i+1]), Float(positions[3*i+2]))
             let zi = Int(Z[i])
             let (zeff, arep) = getRepParams(zi)
+            // Pairs of two light (H/He) atoms use kexp = 1.0 (tblite gfn2
+            // rep_kexp_light), all other pairs use params.kexp.
             repAtoms.append(GFN2RepAtom(
                 position: p, zeff: Float(zeff), arep: Float(arep),
-                _pad0: 0, _pad1: 0, _pad2: 0))
+                isLight: zi <= 2 ? 1 : 0, _pad1: 0, _pad2: 0))
         }
 
         let hasGrad = gradient != nil
@@ -234,12 +235,13 @@ final class XTBMetalAccelerator {
         var Erep: Double = 0.0
         for i in 0..<natom { Erep += Double(ePtr[i]) }
 
+        // Accumulate like the CPU path (computeRepulsionGradient adds into the total gradient)
         if hasGrad, let grad = gradient {
             let gPtr = gradBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: natom)
             for i in 0..<natom {
-                grad[3*i]   = Double(gPtr[i].x)
-                grad[3*i+1] = Double(gPtr[i].y)
-                grad[3*i+2] = Double(gPtr[i].z)
+                grad[3*i]   += Double(gPtr[i].x)
+                grad[3*i+1] += Double(gPtr[i].y)
+                grad[3*i+2] += Double(gPtr[i].z)
             }
         }
 
@@ -289,50 +291,6 @@ final class XTBMetalAccelerator {
             bradOut[i] = Double(bPtr[i])
             sasaOut[i] = Double(sPtr[i])
         }
-    }
-
-    // MARK: - GB Solvation Energy
-
-    /// Compute Generalized Born + SASA solvation energy on GPU.
-    nonisolated func computeGBSolvation(positions: UnsafePointer<Double>,
-                                        atomCharges: UnsafePointer<Double>,
-                                        natom: Int, brad: UnsafePointer<Double>,
-                                        sasa: UnsafePointer<Double>,
-                                        keps: Float, gammaAU: Float) -> Double {
-        var gbAtoms = [GFN2GBAtom]()
-        gbAtoms.reserveCapacity(natom)
-        for i in 0..<natom {
-            let p = SIMD3<Float>(Float(positions[3*i]), Float(positions[3*i+1]), Float(positions[3*i+2]))
-            gbAtoms.append(GFN2GBAtom(
-                position: p, charge: -Float(atomCharges[i]),
-                bornRadius: Float(brad[i]), sasa: Float(sasa[i]),
-                _pad0: 0, _pad1: 0))
-        }
-
-        var params = GFN2GBParams(
-            atomCount: UInt32(natom), keps: keps, gamma_au: gammaAU, computeGrad: 0)
-
-        guard let atomBuf = makeBuffer(gbAtoms),
-              let paramBuf = device.makeBuffer(bytes: &params, length: MemoryLayout<GFN2GBParams>.stride, options: .storageModeShared),
-              let energyBuf = makeBuffer(count: natom, type: Float.self),
-              let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder()
-        else { return 0.0 }
-
-        encoder.setComputePipelineState(gbPipeline)
-        encoder.setBuffer(atomBuf, offset: 0, index: 0)
-        encoder.setBuffer(paramBuf, offset: 0, index: 1)
-        encoder.setBuffer(energyBuf, offset: 0, index: 2)
-        let (grid, tg) = threadgroupConfig(pipeline: gbPipeline, count: natom)
-        encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
-
-        let ePtr = energyBuf.contents().bindMemory(to: Float.self, capacity: natom)
-        var Esolv: Double = 0.0
-        for i in 0..<natom { Esolv += Double(ePtr[i]) }
-        return Esolv
     }
 
     // MARK: - CN Gradient
@@ -424,30 +382,32 @@ final class XTBMetalAccelerator {
 }
 
 // MARK: - Parameter Lookup Tables (mirroring C++ gfn2Params)
+// Tables are built once; they are queried per atom on every SCC iteration.
 
-/// Covalent radii in Bohr for CN computation (D3-type).
+/// Pyykko covalent radii (Angstrom) for CN computation (D3-type).
+private let covRadAng: [Int: Double] = [
+    1: 0.32, 2: 0.46, 3: 1.33, 4: 1.02, 5: 0.85, 6: 0.75, 7: 0.71,
+    8: 0.63, 9: 0.64, 10: 0.67, 11: 1.55, 12: 1.39, 13: 1.26, 14: 1.16,
+    15: 1.11, 16: 1.03, 17: 0.99, 18: 0.96, 19: 1.96, 20: 1.71,
+    25: 1.19, 26: 1.16, 27: 1.11, 28: 1.10, 29: 1.12, 30: 1.18,
+    35: 1.14, 53: 1.33
+]
+
 private func getCovRadBohr(_ Z: Int) -> Double {
-    // Pyykko covalent radii (Angstrom → Bohr)
-    let covRadAng: [Int: Double] = [
-        1: 0.32, 2: 0.46, 3: 1.33, 4: 1.02, 5: 0.85, 6: 0.75, 7: 0.71,
-        8: 0.63, 9: 0.64, 10: 0.67, 11: 1.55, 12: 1.39, 13: 1.26, 14: 1.16,
-        15: 1.11, 16: 1.03, 17: 0.99, 18: 0.96, 19: 1.96, 20: 1.71,
-        25: 1.19, 26: 1.16, 27: 1.11, 28: 1.10, 29: 1.12, 30: 1.18,
-        35: 1.14, 53: 1.33
-    ]
     let ANG_TO_BOHR = 1.0 / 0.529177210903
     return (covRadAng[Z] ?? 1.2) * ANG_TO_BOHR
 }
 
 /// Reference C6 coefficients (Hartree·Bohr⁶) for D4 dispersion.
+private let d4RefC6: [Int: Double] = [
+    1: 3.61, 2: 1.46, 3: 1380.0, 4: 214.0, 5: 99.5, 6: 46.6,
+    7: 24.2, 8: 15.6, 9: 9.52, 10: 6.38, 11: 1470.0, 12: 626.0,
+    13: 528.0, 14: 305.0, 15: 185.0, 16: 134.0, 17: 94.6, 18: 64.3,
+    19: 3880.0, 20: 2180.0, 25: 552.0, 26: 482.0, 27: 408.0,
+    28: 373.0, 29: 253.0, 30: 284.0, 35: 162.0
+]
+
 private func getRefC6(_ Z: Int) -> Double {
-    let d4RefC6: [Int: Double] = [
-        1: 3.61, 2: 1.46, 3: 1380.0, 4: 214.0, 5: 99.5, 6: 46.6,
-        7: 24.2, 8: 15.6, 9: 9.52, 10: 6.38, 11: 1470.0, 12: 626.0,
-        13: 528.0, 14: 305.0, 15: 185.0, 16: 134.0, 17: 94.6, 18: 64.3,
-        19: 3880.0, 20: 2180.0, 25: 552.0, 26: 482.0, 27: 408.0,
-        28: 373.0, 29: 253.0, 30: 284.0, 35: 162.0
-    ]
     if let c6 = d4RefC6[Z] { return c6 }
     return 25.0 * pow(Double(Z) / 6.0, 1.5)
 }
@@ -460,38 +420,43 @@ private func getCNRef(_ Z: Int) -> Double {
 }
 
 /// Van der Waals radii in Bohr (Bondi radii) for Born model.
+private let vdwRadBohr: [Int: Double] = [
+    1: 2.268, 2: 2.646, 3: 3.438, 4: 2.873, 5: 3.627, 6: 3.213,
+    7: 2.929, 8: 2.873, 9: 2.797, 10: 2.910, 11: 4.290, 12: 3.250,
+    13: 3.495, 14: 3.968, 15: 3.402, 16: 3.402, 17: 3.307, 18: 3.553,
+    19: 5.197, 20: 4.214, 25: 3.78, 26: 3.78, 27: 3.78, 28: 3.08,
+    29: 2.65, 30: 2.59, 35: 3.495
+]
+
 private func getVdwRadBohr(_ Z: Int) -> Double {
-    let vdw: [Int: Double] = [
-        1: 2.268, 2: 2.646, 3: 3.438, 4: 2.873, 5: 3.627, 6: 3.213,
-        7: 2.929, 8: 2.873, 9: 2.797, 10: 2.910, 11: 4.290, 12: 3.250,
-        13: 3.495, 14: 3.968, 15: 3.402, 16: 3.402, 17: 3.307, 18: 3.553,
-        19: 5.197, 20: 4.214, 25: 3.78, 26: 3.78, 27: 3.78, 28: 3.08,
-        29: 2.65, 30: 2.59, 35: 3.495
-    ]
-    return vdw[Z] ?? 3.4
+    vdwRadBohr[Z] ?? 3.4
 }
 
-/// Repulsion parameters (zeff, arep) from GFN2 parameter set.
+/// Repulsion parameters (zeff, arep) extracted from gfn2Params in druse_xtb.cpp.
+private let repParams: [Int: (Double, Double)] = [
+    1:  (1.105388, 2.213717),
+    2:  (1.094283, 3.604670),
+    3:  (1.289367, 0.475307),
+    4:  (4.221216, 0.939696),
+    5:  (7.192431, 1.373856),
+    6:  (4.231078, 1.247655),
+    7:  (5.493710, 1.670786),
+    8:  (6.667385, 1.559498),
+    9:  (7.670655, 2.363646),
+    14: (6.476760, 1.048000),
+    15: (5.800540, 1.300000),
+    16: (6.271840, 1.450000),
+    17: (7.145500, 1.890000),
+    35: (8.250000, 1.950000),
+    53: (9.100000, 2.100000),
+]
+
 private func getRepParams(_ Z: Int) -> (zeff: Double, arep: Double) {
-    // Extracted from gfn2Params in druse_xtb.cpp
-    let repParams: [Int: (Double, Double)] = [
-        1:  (1.105388, 2.213717),
-        2:  (1.094283, 3.604670),
-        3:  (1.289367, 0.475307),
-        4:  (4.221216, 0.939696),
-        5:  (7.192431, 1.373856),
-        6:  (4.231078, 1.247655),
-        7:  (5.493710, 1.670786),
-        8:  (6.667385, 1.559498),
-        9:  (7.670655, 2.363646),
-        14: (6.476760, 1.048000),
-        15: (5.800540, 1.300000),
-        16: (6.271840, 1.450000),
-        17: (7.145500, 1.890000),
-        35: (8.250000, 1.950000),
-        53: (9.100000, 2.100000),
-    ]
     if let p = repParams[Z] { return p }
     // Fallback for unsupported elements
     return (Double(Z) * 0.5, 1.5)
+}
+
+private enum XTBMetalAcceleratorError: Error {
+    case missingKernel(String)
 }

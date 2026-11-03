@@ -352,9 +352,11 @@ constant int triTable[256][16] = {
 // MARK: - Signed Distance Field for Connolly / SES Surface
 // ============================================================================
 
-/// Compute signed distance field (SDF) for Solvent Excluded Surface (Connolly surface).
-/// SDF value at point P = min over all atoms of (|P - atom_center| - vdw_radius - probe_radius).
-/// Negative = inside the molecular surface, positive = outside. Isosurface at 0.
+/// Compute the probe-inflated distance field for the Connolly surface mode.
+/// Field value at point P = -min over all atoms of (|P - atom_center| - vdw_radius - probe_radius).
+/// The sign is stored inside-positive (positive = inside, negative = outside, isosurface at 0)
+/// so it follows the same convention as the Gaussian field: the marching-cubes kernels treat
+/// `v >= iso` as inside and orient normals along -grad, which must point outward for lighting.
 /// Each thread processes one grid point.
 kernel void computeDistanceField(
     device float               *distanceField [[buffer(0)]],
@@ -382,7 +384,7 @@ kernel void computeDistanceField(
         minDist = min(minDist, sdf);
     }
 
-    distanceField[tid] = minDist;
+    distanceField[tid] = -minDist;
 }
 
 // ============================================================================
@@ -432,12 +434,18 @@ kernel void computeGaussianField(
 // MARK: - Marching Cubes
 // ============================================================================
 
-/// Helper: interpolate vertex position along edge between two grid points.
-inline float3 interpolateEdge(float3 p1, float3 p2, float v1, float v2, float iso) {
-    float t = (iso - v1) / (v2 - v1 + 1e-10f);
-    t = clamp(t, 0.0f, 1.0f);
-    return mix(p1, p2, t);
-}
+/// Corner pair (in the p[]/v[] corner numbering) spanned by each of the 12 cube edges.
+constant uchar2 kEdgeCorners[12] = {
+    uchar2(0, 1), uchar2(1, 2), uchar2(2, 3), uchar2(3, 0),
+    uchar2(4, 5), uchar2(5, 6), uchar2(6, 7), uchar2(7, 4),
+    uchar2(0, 4), uchar2(1, 5), uchar2(2, 6), uchar2(3, 7)
+};
+
+/// Grid offsets of the 8 voxel corners, matching the p[]/v[] corner numbering.
+constant uchar3 kCornerOffsets[8] = {
+    uchar3(0, 0, 0), uchar3(1, 0, 0), uchar3(1, 1, 0), uchar3(0, 1, 0),
+    uchar3(0, 0, 1), uchar3(1, 0, 1), uchar3(1, 1, 1), uchar3(0, 1, 1)
+};
 
 /// Compute gradient (normal) at a point in the scalar field using central differences.
 inline float3 computeGradient(
@@ -462,44 +470,37 @@ inline float3 computeGradient(
     return len > 1e-8f ? -grad / len : float3(0.0f, 1.0f, 0.0f);
 }
 
-inline float3 computeGradientInterpolated(
+/// Compute positions and normals of the isosurface crossings on the voxel edges flagged in
+/// `edges`. Every crossing lies on a voxel edge, so its normal is the linear blend of the
+/// two corner gradients at the same parameter t used for the position. The 8 corner
+/// gradients are evaluated once per voxel and shared by all (up to 12) crossings.
+inline void computeEdgeVertices(
     device const float *field,
-    float3 gp,
-    uint nx, uint ny, uint nz)
+    thread const float *v,
+    thread const float3 *p,
+    uint ix, uint iy, uint iz,
+    uint nx, uint ny, uint nz,
+    float iso, uint edges,
+    thread float3 *edgeVerts,
+    thread float3 *edgeNormals)
 {
-    float x = clamp(gp.x, 0.0f, float(nx - 1));
-    float y = clamp(gp.y, 0.0f, float(ny - 1));
-    float z = clamp(gp.z, 0.0f, float(nz - 1));
+    float3 cornerNormals[8];
+    for (uint c = 0; c < 8; c++) {
+        uint3 o = uint3(kCornerOffsets[c]);
+        cornerNormals[c] = computeGradient(field, ix + o.x, iy + o.y, iz + o.z, nx, ny, nz);
+    }
 
-    uint x0 = min(uint(floor(x)), nx - 1);
-    uint y0 = min(uint(floor(y)), ny - 1);
-    uint z0 = min(uint(floor(z)), nz - 1);
-    uint x1 = min(x0 + 1, nx - 1);
-    uint y1 = min(y0 + 1, ny - 1);
-    uint z1 = min(z0 + 1, nz - 1);
-
-    float tx = x - float(x0);
-    float ty = y - float(y0);
-    float tz = z - float(z0);
-
-    float3 g000 = computeGradient(field, x0, y0, z0, nx, ny, nz);
-    float3 g100 = computeGradient(field, x1, y0, z0, nx, ny, nz);
-    float3 g010 = computeGradient(field, x0, y1, z0, nx, ny, nz);
-    float3 g110 = computeGradient(field, x1, y1, z0, nx, ny, nz);
-    float3 g001 = computeGradient(field, x0, y0, z1, nx, ny, nz);
-    float3 g101 = computeGradient(field, x1, y0, z1, nx, ny, nz);
-    float3 g011 = computeGradient(field, x0, y1, z1, nx, ny, nz);
-    float3 g111 = computeGradient(field, x1, y1, z1, nx, ny, nz);
-
-    float3 g00 = mix(g000, g100, tx);
-    float3 g10 = mix(g010, g110, tx);
-    float3 g01 = mix(g001, g101, tx);
-    float3 g11 = mix(g011, g111, tx);
-    float3 g0 = mix(g00, g10, ty);
-    float3 g1 = mix(g01, g11, ty);
-    float3 grad = mix(g0, g1, tz);
-    float len = length(grad);
-    return len > 1e-8f ? normalize(grad) : float3(0.0f, 1.0f, 0.0f);
+    for (uint e = 0; e < 12; e++) {
+        if ((edges & (1u << e)) == 0) continue;
+        uint a = kEdgeCorners[e].x;
+        uint b = kEdgeCorners[e].y;
+        // A flagged edge has exactly one corner >= iso, so v[a] != v[b].
+        float t = clamp((iso - v[a]) / (v[b] - v[a]), 0.0f, 1.0f);
+        edgeVerts[e] = mix(p[a], p[b], t);
+        float3 n = mix(cornerNormals[a], cornerNormals[b], t);
+        float len = length(n);
+        edgeNormals[e] = len > 1e-8f ? n / len : float3(0.0f, 1.0f, 0.0f);
+    }
 }
 
 /// Marching cubes single-pass kernel (legacy fallback): each thread processes one voxel.
@@ -568,30 +569,12 @@ kernel void marchingCubesSinglePass(
     p[6] = origin + float3(float(ix + 1), float(iy + 1), float(iz + 1)) * sp;
     p[7] = origin + float3(float(ix),     float(iy + 1), float(iz + 1)) * sp;
 
-    // Compute edge intersection positions (up to 12 edges)
-    float3 edgeVerts[12];
+    // Compute edge intersection positions and normals (up to 12 edges)
     uint edges = edgeTable[cubeIndex];
-    if (edges &    1) edgeVerts[0]  = interpolateEdge(p[0], p[1], v[0], v[1], iso);
-    if (edges &    2) edgeVerts[1]  = interpolateEdge(p[1], p[2], v[1], v[2], iso);
-    if (edges &    4) edgeVerts[2]  = interpolateEdge(p[2], p[3], v[2], v[3], iso);
-    if (edges &    8) edgeVerts[3]  = interpolateEdge(p[3], p[0], v[3], v[0], iso);
-    if (edges &   16) edgeVerts[4]  = interpolateEdge(p[4], p[5], v[4], v[5], iso);
-    if (edges &   32) edgeVerts[5]  = interpolateEdge(p[5], p[6], v[5], v[6], iso);
-    if (edges &   64) edgeVerts[6]  = interpolateEdge(p[6], p[7], v[6], v[7], iso);
-    if (edges &  128) edgeVerts[7]  = interpolateEdge(p[7], p[4], v[7], v[4], iso);
-    if (edges &  256) edgeVerts[8]  = interpolateEdge(p[0], p[4], v[0], v[4], iso);
-    if (edges &  512) edgeVerts[9]  = interpolateEdge(p[1], p[5], v[1], v[5], iso);
-    if (edges & 1024) edgeVerts[10] = interpolateEdge(p[2], p[6], v[2], v[6], iso);
-    if (edges & 2048) edgeVerts[11] = interpolateEdge(p[3], p[7], v[3], v[7], iso);
-
-    // Compute normals from gradient at each edge intersection
+    float3 edgeVerts[12];
     float3 edgeNormals[12];
-    for (int e = 0; e < 12; e++) {
-        if (edges & (1u << e)) {
-            float3 gp = (edgeVerts[e] - origin) / sp;
-            edgeNormals[e] = computeGradientInterpolated(scalarField, gp, nx, ny, nz);
-        }
-    }
+    computeEdgeVertices(scalarField, v, p, ix, iy, iz, nx, ny, nz, iso, edges,
+                        edgeVerts, edgeNormals);
 
     // Emit triangles
     for (int i = 0; triTable[cubeIndex][i] != -1; i += 3) {
@@ -761,30 +744,12 @@ kernel void marchingCubesEmit(
     p[6] = origin + float3(float(ix + 1), float(iy + 1), float(iz + 1)) * sp;
     p[7] = origin + float3(float(ix),     float(iy + 1), float(iz + 1)) * sp;
 
-    // Compute edge intersection positions (up to 12 edges)
-    float3 edgeVerts[12];
+    // Compute edge intersection positions and normals (up to 12 edges)
     uint edges = edgeTable[cubeIndex];
-    if (edges &    1) edgeVerts[0]  = interpolateEdge(p[0], p[1], v[0], v[1], iso);
-    if (edges &    2) edgeVerts[1]  = interpolateEdge(p[1], p[2], v[1], v[2], iso);
-    if (edges &    4) edgeVerts[2]  = interpolateEdge(p[2], p[3], v[2], v[3], iso);
-    if (edges &    8) edgeVerts[3]  = interpolateEdge(p[3], p[0], v[3], v[0], iso);
-    if (edges &   16) edgeVerts[4]  = interpolateEdge(p[4], p[5], v[4], v[5], iso);
-    if (edges &   32) edgeVerts[5]  = interpolateEdge(p[5], p[6], v[5], v[6], iso);
-    if (edges &   64) edgeVerts[6]  = interpolateEdge(p[6], p[7], v[6], v[7], iso);
-    if (edges &  128) edgeVerts[7]  = interpolateEdge(p[7], p[4], v[7], v[4], iso);
-    if (edges &  256) edgeVerts[8]  = interpolateEdge(p[0], p[4], v[0], v[4], iso);
-    if (edges &  512) edgeVerts[9]  = interpolateEdge(p[1], p[5], v[1], v[5], iso);
-    if (edges & 1024) edgeVerts[10] = interpolateEdge(p[2], p[6], v[2], v[6], iso);
-    if (edges & 2048) edgeVerts[11] = interpolateEdge(p[3], p[7], v[3], v[7], iso);
-
-    // Compute normals from gradient at each edge intersection
+    float3 edgeVerts[12];
     float3 edgeNormals[12];
-    for (int e = 0; e < 12; e++) {
-        if (edges & (1u << e)) {
-            float3 gp = (edgeVerts[e] - origin) / sp;
-            edgeNormals[e] = computeGradientInterpolated(scalarField, gp, nx, ny, nz);
-        }
-    }
+    computeEdgeVertices(scalarField, v, p, ix, iy, iz, nx, ny, nz, iso, edges,
+                        edgeVerts, edgeNormals);
 
     // Write triangles at the pre-computed offset (no atomics)
     uint triOffset = triOffsets[tid];

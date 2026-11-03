@@ -75,7 +75,7 @@ kernel void scoreBatchRigidPoses(
     float totalHBond = 0.0f;
     float penalty = 0.0f;
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridUpperBound(gridParams);
 
     for (uint a = 0; a < nAtoms; a++) {
         DockLigandAtom atom = ligandAtoms[ligand.atomStart + a];

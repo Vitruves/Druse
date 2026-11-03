@@ -15,6 +15,9 @@ final class Camera {
     var aspectRatio: Float = 1.5
     var nearPlane: Float = 0.1
     var farPlane: Float = 500.0
+    /// Radius of the last sphere passed to `fitToSphere`; extends the far plane so
+    /// large assemblies (radius > ~120 Å) and zoomed-out views are not depth-clipped.
+    private var fitRadius: Float = 0
 
     // Interaction state
     private var dragStartOrientation: Quat = .identity
@@ -43,8 +46,11 @@ final class Camera {
         return Mat4.lookAt(eye: eye, center: target, up: up)
     }
 
+    /// Right-handed perspective projection with Metal's [0, 1] clip-space depth range
+    /// (see `Mat4.perspective`); the far plane grows so the whole fitted scene stays in front of it.
     var projectionMatrix: float4x4 {
-        Mat4.perspective(fovY: fovY, aspect: aspectRatio, near: nearPlane, far: farPlane)
+        Mat4.perspective(fovY: fovY, aspect: aspectRatio, near: nearPlane,
+                         far: max(farPlane, distance + 2.0 * fitRadius))
     }
 
     var rightVector: SIMD3<Float> {
@@ -145,6 +151,7 @@ final class Camera {
 
     func fitToSphere(center: SIMD3<Float>, radius: Float) {
         target = center
+        fitRadius = radius
         let fov = fovY * 0.5
         distance = max(radius / sinf(fov) * 1.2, 2.0)
         orientation = .identity
@@ -179,7 +186,7 @@ final class Camera {
     // MARK: - Ray Casting (for picking)
 
     func screenToWorldRay(screenPoint: SIMD2<Float>, viewportSize: SIMD2<Float>) -> (origin: SIMD3<Float>, direction: SIMD3<Float>) {
-        // Convert screen coordinates to NDC [-1, 1]
+        // Convert screen coordinates to NDC x/y [-1, 1]
         let ndc = SIMD2<Float>(
             (2.0 * screenPoint.x / viewportSize.x) - 1.0,
             1.0 - (2.0 * screenPoint.y / viewportSize.y) // flip Y
@@ -189,7 +196,8 @@ final class Camera {
         let invProj = projectionMatrix.inverse
         let invView = viewMatrix.inverse
 
-        let nearNDC = SIMD4<Float>(ndc.x, ndc.y, -1.0, 1.0)
+        // Metal clip-space depth: 0 at the near plane, 1 at the far plane
+        let nearNDC = SIMD4<Float>(ndc.x, ndc.y,  0.0, 1.0)
         let farNDC  = SIMD4<Float>(ndc.x, ndc.y,  1.0, 1.0)
 
         var nearView = invProj * nearNDC

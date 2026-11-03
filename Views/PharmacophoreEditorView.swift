@@ -43,7 +43,6 @@ struct PharmacophoreEditorView: View {
     @State private var featureOverlays: [FeatureOverlay] = []
 
     // Draw mode
-    @State private var showDrawer: Bool = false
     @State private var drawnSmarts: String = ""
     @State private var drawValidated: Bool = false
 
@@ -79,59 +78,72 @@ struct PharmacophoreEditorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            toolbar
+            header
             Divider()
             HSplitView {
                 structureView
                     .frame(minWidth: 440)
                 rightPanel
-                    .frame(width: 300)
+                    .frame(minWidth: DS.Size.navigatorMin, idealWidth: DS.Size.navigatorIdeal, maxWidth: DS.Size.navigatorMax)
             }
             Divider()
             footer
         }
-        .frame(minWidth: 820, minHeight: 580)
+        .frame(minWidth: 820, idealWidth: 960, minHeight: 580, idealHeight: 680)
         .onAppear {
             if !viewModel.ligandDB.entries.isEmpty {
                 sourceMode = .singleLigand
                 selectedForMCS = Set(viewModel.ligandDB.entries.map(\.id))
+                // Start from the ligand being docked rather than an empty "Select…" canvas.
+                if selectedEntryID == nil, let active = viewModel.activeLigandEntryID,
+                   let entry = viewModel.ligandDB.entries.first(where: { $0.id == active }) {
+                    selectedEntryID = active
+                    loadStructure(smiles: entry.smiles)
+                }
             }
         }
     }
 
     // =========================================================================
-    // MARK: - Toolbar
+    // MARK: - Header
     // =========================================================================
 
-    @ViewBuilder
-    private var toolbar: some View {
-        HStack(spacing: 10) {
+    private var header: some View {
+        HStack(spacing: DS.Space.l) {
             Image(systemName: "circle.hexagongrid.circle")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.purple)
-            Text("Pharmacophore Editor")
-                .font(.headline)
+                .font(.title3)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(DS.Color.accent)
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Text("Pharmacophore Editor")
+                    .font(DS.Font.stepTitle)
+                Text("Pick pharmacophoric features to turn into docking constraints.")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.secondary)
+            }
 
-            Spacer()
+            Spacer(minLength: DS.Space.l)
 
-            Picker("", selection: $sourceMode) {
+            Picker("Source", selection: $sourceMode) {
                 ForEach(SourceMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(width: 320)
+            .labelsHidden()
+            .fixedSize()
             .onChange(of: sourceMode) { _, _ in resetState() }
-
-            Spacer()
 
             Button(action: { dismiss() }) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title3)
+                    .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderless)
+            .help("Close")
+            .accessibilityLabel("Close")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.horizontal, DS.Space.xl)
+        .padding(.vertical, DS.Space.l)
     }
 
     // =========================================================================
@@ -141,7 +153,7 @@ struct PharmacophoreEditorView: View {
     @ViewBuilder
     private var structureView: some View {
         ZStack {
-            Color(nsColor: .controlBackgroundColor)
+            DS.Color.diagramPaper
 
             if sourceMode == .draw && !drawValidated {
                 ChemDrawerView(
@@ -196,7 +208,7 @@ struct PharmacophoreEditorView: View {
                             if idx < coords.positions.count {
                                 let pos = tx.toView(coords.positions[idx])
                                 Circle()
-                                    .stroke(Color.orange, lineWidth: 2.5)
+                                    .stroke(DS.Color.warning, lineWidth: 2.5)
                                     .frame(width: 30, height: 30)
                                     .position(x: pos.x, y: pos.y)
                                     .allowsHitTesting(false)
@@ -209,9 +221,9 @@ struct PharmacophoreEditorView: View {
                             let hasFeature = featureForAtom(idx) != nil
                             let inMultiSelect = pendingMultiSelect.contains(idx)
                             Circle()
-                                .stroke(hasFeature ? Color.red.opacity(0.6)
-                                        : inMultiSelect ? Color.orange.opacity(0.8)
-                                        : Color.white.opacity(0.5), lineWidth: 2)
+                                .stroke(hasFeature ? DS.Color.danger.opacity(0.7)
+                                        : inMultiSelect ? DS.Color.warning.opacity(0.85)
+                                        : DS.Color.accent.opacity(0.7), lineWidth: 2)
                                 .frame(width: 28, height: 28)
                                 .position(x: pos.x, y: pos.y)
                                 .allowsHitTesting(false)
@@ -220,26 +232,20 @@ struct PharmacophoreEditorView: View {
                     .overlay(alignment: .bottom) { statusBar }
                 }
             } else if isFindingMCS || isDetecting {
-                VStack(spacing: 8) {
+                VStack(spacing: DS.Space.m) {
                     ProgressView()
-                    Text(isFindingMCS ? "Computing common scaffold..." : "Detecting features...")
-                        .font(.callout).foregroundStyle(.secondary)
+                    Text(isFindingMCS ? "Computing common scaffold…" : "Detecting features…")
+                        .font(DS.Font.label)
+                        .foregroundStyle(.secondary)
                 }
             } else if let error = errorMessage {
-                VStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle).foregroundStyle(.red.opacity(0.5))
-                    Text(error)
-                        .font(.callout).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center).padding(.horizontal)
-                }
+                DSEmptyState("Structure Unavailable", systemImage: "exclamationmark.triangle", description: error)
             } else {
-                VStack(spacing: 8) {
-                    Image(systemName: "hexagon")
-                        .font(.system(size: 36)).foregroundStyle(.quaternary)
-                    Text("Load a structure to begin")
-                        .font(.callout).foregroundStyle(.tertiary)
-                }
+                DSEmptyState(
+                    "No Structure",
+                    systemImage: "hexagon",
+                    description: "Choose a ligand, a common scaffold, a SMILES string or draw a scaffold to begin."
+                )
             }
         }
     }
@@ -249,51 +255,44 @@ struct PharmacophoreEditorView: View {
     @ViewBuilder
     private var statusBar: some View {
         if !pendingMultiSelect.isEmpty {
-            HStack(spacing: 10) {
-                Image(systemName: "rectangle.dashed.badge.record").foregroundStyle(.orange)
+            HStack(spacing: DS.Space.m) {
+                Image(systemName: "rectangle.dashed.badge.record")
+                    .foregroundStyle(DS.Color.warning)
                 Text("\(pendingMultiSelect.count) atom\(pendingMultiSelect.count == 1 ? "" : "s") selected")
-                    .fontWeight(.medium).foregroundStyle(.orange)
-                Text("shift+click to add more, click to confirm group")
+                    .fontWeight(.medium)
+                    .monospacedDigit()
+                Text("Shift-click to add more, click to confirm group")
                     .foregroundStyle(.secondary)
             }
-            .font(.system(size: 10))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .padding(.bottom, 8)
+            .modifier(StructureStatusChrome())
         } else if let idx = hoveredAtom, let coords = coords2D, idx < coords.atomicNums.count {
             let elem = Element(rawValue: coords.atomicNums[idx]) ?? .C
             let existing = featureForAtom(idx)
             let isScaffold = mcsMatchedAtoms.isEmpty || mcsMatchedAtoms.contains(idx)
-            let isAro = atomHasAromaticBond(idx)
 
-            HStack(spacing: 10) {
-                HStack(spacing: 3) {
-                    Text("Atom \(idx)").fontWeight(.semibold)
-                    Text(elem.symbol).foregroundStyle(elementColor(coords.atomicNums[idx])).fontWeight(.bold)
+            HStack(spacing: DS.Space.m) {
+                HStack(spacing: DS.Space.xs) {
+                    Text("Atom \(idx)").fontWeight(.semibold).monospacedDigit()
+                    Text(elem.symbol).fontWeight(.bold).foregroundStyle(elementColor(coords.atomicNums[idx]))
                 }
-                if isAro { Text("aromatic").foregroundStyle(.purple) }
+                if atomHasAromaticBond(idx) {
+                    Text("aromatic").foregroundStyle(DS.Color.pocket)
+                }
                 if !mcsMatchedAtoms.isEmpty {
                     Text(isScaffold ? "scaffold" : "decoration")
-                        .foregroundStyle(isScaffold ? Color.green : Color.secondary)
+                        .foregroundStyle(isScaffold ? DS.Color.success : Color.secondary)
                 }
                 if let f = existing {
-                    HStack(spacing: 3) {
-                        Image(systemName: f.type.icon).foregroundStyle(swiftColor(f.type.color))
+                    HStack(spacing: DS.Space.xs) {
+                        Image(systemName: f.type.icon).foregroundStyle(f.type.dsColor)
                         Text(f.name).fontWeight(.medium)
-                        Text("(click to remove)").foregroundStyle(.red)
+                        Text("(click to remove)").foregroundStyle(DS.Color.danger)
                     }
                 } else {
-                    Text("click to add \u{2022} shift+click for group").foregroundStyle(.secondary)
+                    Text("Click to add • Shift-click for group").foregroundStyle(.secondary)
                 }
             }
-            .font(.system(size: 10))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .padding(.bottom, 8)
+            .modifier(StructureStatusChrome())
         }
     }
 
@@ -301,50 +300,51 @@ struct PharmacophoreEditorView: View {
     // MARK: - Right Panel
     // =========================================================================
 
-    @ViewBuilder
     private var rightPanel: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                sourcePanel
-                Divider()
-                toolsPanel
-                Divider()
-                featureListPanel
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                sourceCard
+                featuresCard
             }
-            .padding(10)
+            .padding(DS.Space.l)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .scrollIndicators(.automatic)
     }
 
-    @ViewBuilder
-    private var sourcePanel: some View {
-        switch sourceMode {
-        case .singleLigand: singleLigandPanel
-        case .commonScaffold: commonScaffoldPanel
-        case .smiles: smilesPanel
-        case .draw: drawPanel
+    private var sourceCard: some View {
+        let (title, icon): (String, String) = {
+            switch sourceMode {
+            case .singleLigand:   return ("Ligand", "list.bullet")
+            case .commonScaffold: return ("Common Scaffold", "square.on.square.intersection.dashed")
+            case .smiles:         return ("SMILES", "character.cursor.ibeam")
+            case .draw:           return (drawValidated ? "Drawn Structure" : "Draw Scaffold", "pencil.and.outline")
+            }
+        }()
+        return PanelCard(title, icon: icon) {
+            switch sourceMode {
+            case .singleLigand:   singleLigandPanel
+            case .commonScaffold: commonScaffoldPanel
+            case .smiles:         smilesPanel
+            case .draw:           drawPanel
+            }
         }
     }
 
     @ViewBuilder
     private var singleLigandPanel: some View {
         let entries = viewModel.ligandDB.entries
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Ligand", systemImage: "list.bullet")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            if entries.isEmpty {
-                Text("No ligands in database.\nImport ligands or use SMILES.")
-                    .font(.caption2).foregroundStyle(.tertiary)
-            } else {
-                Picker("", selection: $selectedEntryID) {
-                    Text("Select...").tag(nil as UUID?)
-                    ForEach(entries) { Text($0.name).tag($0.id as UUID?) }
-                }
-                .labelsHidden().controlSize(.small)
-                .onChange(of: selectedEntryID) { _, id in
-                    if let id, let e = entries.first(where: { $0.id == id }) {
-                        loadStructure(smiles: e.smiles)
-                    }
+        if entries.isEmpty {
+            PanelHint(text: "No ligands in the database. Import ligands or use SMILES.", icon: "info.circle")
+        } else {
+            Picker("Ligand", selection: $selectedEntryID) {
+                Text("Select…").tag(nil as UUID?)
+                ForEach(entries) { Text($0.name).tag($0.id as UUID?) }
+            }
+            .labelsHidden()
+            .controlSize(.small)
+            .onChange(of: selectedEntryID) { _, id in
+                if let id, let e = entries.first(where: { $0.id == id }) {
+                    loadStructure(smiles: e.smiles)
                 }
             }
         }
@@ -353,20 +353,21 @@ struct PharmacophoreEditorView: View {
     @ViewBuilder
     private var commonScaffoldPanel: some View {
         let entries = viewModel.ligandDB.entries
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Common Scaffold", systemImage: "square.on.square.intersection.dashed")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-
-            if entries.count < 2 {
-                Text("Need \u{2265}2 ligands.").font(.caption2).foregroundStyle(.tertiary)
-            } else {
+        if entries.count < 2 {
+            PanelHint(text: "Need at least 2 ligands in the database.", icon: "info.circle")
+        } else {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
                 HStack {
-                    Text("\(selectedForMCS.count)/\(entries.count)").font(.caption.monospaced())
+                    Text("\(selectedForMCS.count)/\(entries.count) selected")
+                        .font(DS.Font.monoSmall)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
                     Spacer()
                     Button(selectedForMCS.count == entries.count ? "None" : "All") {
                         selectedForMCS = selectedForMCS.count == entries.count ? [] : Set(entries.map(\.id))
                     }
-                    .font(.caption2).buttonStyle(.plain).foregroundStyle(.blue)
+                    .buttonStyle(.borderless)
+                    .font(DS.Font.secondary.weight(.medium))
                 }
 
                 ScrollView(.vertical) {
@@ -375,21 +376,23 @@ struct PharmacophoreEditorView: View {
                             mcsEntryRow(entry: entry)
                         }
                     }
+                    .padding(DS.Space.xs)
                 }
                 .frame(maxHeight: 120)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                        .fill(DS.Color.controlFill)
+                )
 
                 Button {
                     findMCS()
                 } label: {
-                    HStack {
+                    HStack(spacing: DS.Space.s) {
                         if isFindingMCS { ProgressView().controlSize(.mini) }
-                        Text("Find Common Scaffold").frame(maxWidth: .infinity)
+                        Text("Find Common Scaffold")
                     }
-                    .padding(.vertical, 2)
                 }
-                .buttonStyle(.borderedProminent).controlSize(.small)
+                .buttonStyle(.dsPrimary)
                 .disabled(selectedForMCS.count < 2 || isFindingMCS)
 
                 if let smarts = mcsSmarts {
@@ -399,60 +402,58 @@ struct PharmacophoreEditorView: View {
         }
     }
 
-    @ViewBuilder
     private func mcsEntryRow(entry: LigandEntry) -> some View {
-        HStack(spacing: 4) {
-            Toggle("", isOn: Binding(
-                get: { selectedForMCS.contains(entry.id) },
-                set: { on in
-                    if on { selectedForMCS.insert(entry.id) }
-                    else { selectedForMCS.remove(entry.id) }
-                }
-            ))
-            .toggleStyle(.checkbox).labelsHidden().controlSize(.small)
-            Text(entry.name).font(.system(size: 10)).lineLimit(1)
-            Spacer()
-        }
-        .padding(.vertical, 1).padding(.horizontal, 4)
-    }
-
-    @ViewBuilder
-    private func mcsResultView(smarts: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 3) {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
-                Text("\(mcsMatchedAtoms.count) shared atoms").font(.caption.weight(.medium))
+        Toggle(isOn: Binding(
+            get: { selectedForMCS.contains(entry.id) },
+            set: { on in
+                if on { selectedForMCS.insert(entry.id) }
+                else { selectedForMCS.remove(entry.id) }
             }
-            Text(smarts)
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary).lineLimit(2).textSelection(.enabled)
+        )) {
+            Text(entry.name)
+                .font(DS.Font.secondary)
+                .lineLimit(1)
+        }
+        .toggleStyle(.checkbox)
+        .controlSize(.small)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, DS.Space.xxs)
+        .padding(.horizontal, DS.Space.xs)
+    }
+
+    private func mcsResultView(smarts: String) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Label("\(mcsMatchedAtoms.count) shared atoms", systemImage: "checkmark.circle.fill")
+                .font(DS.Font.secondary.weight(.medium))
+                .foregroundStyle(DS.Color.success)
+            smilesText(smarts)
             Toggle("Highlight scaffold only", isOn: $showOnlyScaffold)
-                .font(.caption2).toggleStyle(.checkbox)
+                .font(DS.Font.secondary)
+                .toggleStyle(.checkbox)
         }
     }
 
-    @ViewBuilder
     private var smilesPanel: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("SMILES", systemImage: "character.cursor.ibeam")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: DS.Space.m) {
             TextField("SMILES", text: $smilesInput)
                 .textFieldStyle(.roundedBorder)
-                .font(.system(size: 10, design: .monospaced))
+                .font(DS.Font.monoSmall)
                 .onSubmit { loadStructure(smiles: smilesInput) }
-            HStack(spacing: 4) {
+            HStack(spacing: DS.Space.s) {
                 Button("Load") { loadStructure(smiles: smilesInput) }
-                    .buttonStyle(.borderedProminent).controlSize(.small)
+                    .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
                     .disabled(smilesInput.isEmpty)
                 Button {
                     if let s = NSPasteboard.general.string(forType: .string) {
                         smilesInput = s.trimmingCharacters(in: .whitespacesAndNewlines)
                     }
                 } label: { Image(systemName: "doc.on.clipboard") }
-                .buttonStyle(.bordered).controlSize(.small)
+                .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
+                .help("Paste SMILES from the clipboard")
+                .accessibilityLabel("Paste SMILES")
                 if let s = viewModel.molecules.ligand?.smiles, !s.isEmpty {
                     Button("Current Ligand") { smilesInput = s; loadStructure(smiles: s) }
-                        .buttonStyle(.bordered).controlSize(.small)
+                        .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
                 }
             }
         }
@@ -460,274 +461,211 @@ struct PharmacophoreEditorView: View {
 
     @ViewBuilder
     private var drawPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
             if drawValidated {
-                // After validation — show structure info and allow editing back
-                Label("Drawn Structure", systemImage: "pencil.and.outline")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
-                        Text("Structure validated").font(.caption.weight(.medium))
-                    }
-                    Text(activeSmiles)
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .textSelection(.enabled)
-                    if !drawnSmarts.isEmpty {
-                        HStack(spacing: 3) {
-                            Text("SMARTS:").font(.system(size: 9, weight: .semibold)).foregroundStyle(.purple)
-                            Text(drawnSmarts)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(2)
-                                .textSelection(.enabled)
-                        }
+                Label("Structure validated", systemImage: "checkmark.circle.fill")
+                    .font(DS.Font.secondary.weight(.medium))
+                    .foregroundStyle(DS.Color.success)
+                smilesText(activeSmiles)
+                if !drawnSmarts.isEmpty {
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        Text("SMARTS")
+                            .font(DS.Font.eyebrow)
+                            .tracking(0.6)
+                            .foregroundStyle(.tertiary)
+                        smilesText(drawnSmarts)
                     }
                 }
-
-                Button {
+                PanelSecondaryButton(title: "Edit in Drawer", icon: "pencil") {
                     drawValidated = false
                     features = []; featureOverlays = []; selectedFeatureID = nil
                     pendingMultiSelect = []
-                } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "pencil")
-                        Text("Edit in Drawer")
-                    }
-                    .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
                 }
-                .buttonStyle(.bordered).controlSize(.small)
             } else {
-                // Before validation — drawing mode
-                Label("Draw Scaffold", systemImage: "pencil.and.outline")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-
-                Text("Draw a chemical scaffold in the editor.\nThe structure will be used as a SMARTS query for pharmacophore enforcement.")
-                    .font(.caption2).foregroundStyle(.tertiary)
-
+                PanelHint(text: "Draw a chemical scaffold in the editor. It is used as a SMARTS query for pharmacophore enforcement.",
+                          icon: "info.circle")
                 if !activeSmiles.isEmpty {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
-                            Text("Structure loaded").font(.caption.weight(.medium))
-                        }
-                        Text(activeSmiles)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .textSelection(.enabled)
-                    }
+                    Label("Structure loaded", systemImage: "checkmark.circle.fill")
+                        .font(DS.Font.secondary.weight(.medium))
+                        .foregroundStyle(DS.Color.success)
+                    smilesText(activeSmiles)
                 }
-
                 Button {
                     validateDrawnStructure()
                 } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "checkmark.shield")
-                        Text("Validate Structure")
-                    }
-                    .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
+                    Label("Validate Structure", systemImage: "checkmark.shield")
                 }
-                .buttonStyle(.borderedProminent).controlSize(.small)
+                .buttonStyle(.dsPrimary)
                 .disabled(activeSmiles.isEmpty)
             }
         }
     }
 
-    // MARK: Tools
+    private func smilesText(_ text: String) -> some View {
+        Text(text)
+            .font(DS.Font.monoSmall)
+            .foregroundStyle(.secondary)
+            .lineLimit(3)
+            .truncationMode(.middle)
+            .textSelection(.enabled)
+    }
 
-    @ViewBuilder
-    private var toolsPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Multi-select confirmation bar
-            if !pendingMultiSelect.isEmpty {
-                HStack(spacing: 4) {
-                    Button {
-                        commitMultiSelect()
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "checkmark.circle.fill")
-                            Text("Confirm Group (\(pendingMultiSelect.count))")
+    // MARK: Features
+
+    private var featuresCard: some View {
+        PanelCard(
+            "Features",
+            icon: "list.number",
+            accessory: { DSTag("\(features.count)", tone: features.isEmpty ? .neutral : .accent, monospaced: true) }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                if !pendingMultiSelect.isEmpty {
+                    HStack(spacing: DS.Space.s) {
+                        Button {
+                            commitMultiSelect()
+                        } label: {
+                            Label("Confirm Group (\(pendingMultiSelect.count))", systemImage: "checkmark.circle.fill")
                         }
-                        .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
+                        .buttonStyle(DSPrimaryButtonStyle(tint: DS.Color.warning))
+                        Button("Cancel") { pendingMultiSelect = [] }
+                            .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
                     }
-                    .buttonStyle(.borderedProminent).controlSize(.small)
-                    .tint(.orange)
+                }
 
+                HStack(spacing: DS.Space.s) {
                     Button {
+                        autoDetectFeatures()
+                    } label: {
+                        HStack(spacing: DS.Space.xs) {
+                            if isDetecting { ProgressView().controlSize(.mini) }
+                            else { Image(systemName: "wand.and.stars") }
+                            Text("Auto-Detect")
+                        }
+                    }
+                    .buttonStyle(.dsSecondary)
+                    .disabled(coords2D == nil || isDetecting)
+                    .help("Detect donors, acceptors, aromatic rings and hydrophobic groups")
+
+                    PanelSecondaryButton(
+                        title: "Clear All", icon: "trash",
+                        isDisabled: features.isEmpty && pendingMultiSelect.isEmpty
+                    ) {
+                        features.removeAll(); featureOverlays = []; selectedFeatureID = nil
                         pendingMultiSelect = []
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "xmark")
-                            Text("Cancel")
+                    }
+                }
+
+                if !featureOverlays.isEmpty { featureLegend }
+
+                if features.isEmpty {
+                    PanelHint(text: "Click atoms on the structure or use Auto-Detect.", icon: "hand.point.up.left")
+                } else {
+                    HStack(spacing: DS.Space.s) {
+                        Button("All Essential") {
+                            for i in features.indices { features[i].isEssential = true }
                         }
-                        .font(.system(size: 10)).padding(.vertical, 2)
+                        Button("All Optional") {
+                            for i in features.indices { features[i].isEssential = false }
+                        }
+                        Spacer()
                     }
-                    .buttonStyle(.bordered).controlSize(.small)
+                    .buttonStyle(.borderless)
+                    .font(DS.Font.secondary.weight(.medium))
+
+                    VStack(spacing: DS.Space.s) {
+                        ForEach(features.indices, id: \.self) { idx in
+                            featureCard(idx: idx)
+                        }
+                    }
                 }
             }
-
-            HStack(spacing: 4) {
-                Button {
-                    autoDetectFeatures()
-                } label: {
-                    HStack(spacing: 3) {
-                        if isDetecting { ProgressView().controlSize(.mini) }
-                        else { Image(systemName: "wand.and.stars") }
-                        Text("Auto-Detect")
-                    }
-                    .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .disabled(coords2D == nil || isDetecting)
-
-                Button {
-                    features.removeAll(); featureOverlays = []; selectedFeatureID = nil
-                    pendingMultiSelect = []
-                } label: {
-                    HStack(spacing: 3) { Image(systemName: "trash"); Text("Clear All") }
-                    .font(.system(size: 10)).frame(maxWidth: .infinity).padding(.vertical, 2)
-                }
-                .buttonStyle(.bordered).controlSize(.small).disabled(features.isEmpty && pendingMultiSelect.isEmpty)
-            }
-
-            if !featureOverlays.isEmpty { featureLegend }
         }
     }
 
-    @ViewBuilder
     private var featureLegend: some View {
         let typeCounts = Dictionary(grouping: featureOverlays, by: \.type)
-        HStack(spacing: 8) {
+        return FlowLayout(spacing: DS.Space.s) {
             ForEach(Array(typeCounts.keys.sorted(by: { $0.rawValue < $1.rawValue })), id: \.self) { type in
-                HStack(spacing: 2) {
-                    Circle().fill(swiftColor(type.color).opacity(0.6)).frame(width: 7, height: 7)
-                    Text("\(typeCounts[type]!.count) \(shortTypeName(type))")
-                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                HStack(spacing: DS.Space.xs) {
+                    Circle().fill(type.dsColor).frame(width: 7, height: 7)
+                    Text("\(typeCounts[type]?.count ?? 0) \(shortTypeName(type))")
+                        .monospacedDigit()
                 }
-            }
-        }
-    }
-
-    // MARK: Feature List
-
-    @ViewBuilder
-    private var featureListPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Label("Features (\(features.count))", systemImage: "list.number")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-            }
-
-            if !features.isEmpty {
-                HStack(spacing: 4) {
-                    Button("All Essential") {
-                        for i in features.indices { features[i].isEssential = true }
-                    }
-                    .font(.system(size: 9)).buttonStyle(.bordered).controlSize(.mini)
-                    Button("All Optional") {
-                        for i in features.indices { features[i].isEssential = false }
-                    }
-                    .font(.system(size: 9)).buttonStyle(.bordered).controlSize(.mini)
-                    Spacer()
-                }
-            }
-
-            if features.isEmpty {
-                Text("Click atoms on the structure\nor use Auto-Detect.")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .center).padding(.vertical, 8)
-            } else {
-                ForEach(features.indices, id: \.self) { idx in
-                    featureCard(idx: idx)
-                }
+                .font(DS.Font.caption)
+                .foregroundStyle(.secondary)
             }
         }
     }
 
     // MARK: Feature Card (split into sub-views for type-checker)
 
-    @ViewBuilder
     private func featureCard(idx: Int) -> some View {
         let f = features[idx]
         let isSelected = selectedFeatureID == f.id
-        let typeColor = swiftColor(f.type.color)
+        let typeColor = f.type.dsColor
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
 
-        VStack(spacing: 5) {
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
             featureCardHeader(idx: idx, f: f, typeColor: typeColor)
-            featureCardControls(idx: idx, f: f)
+            featureCardControls(idx: idx)
             featureCardRadius(idx: idx, f: f)
         }
-        .padding(8)
-        .background(isSelected ? typeColor.opacity(0.06) : Color(nsColor: .controlBackgroundColor).opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isSelected ? typeColor.opacity(0.4) : Color.gray.opacity(0.08), lineWidth: 1)
-        )
-        .contentShape(Rectangle())
+        .padding(DS.Space.m)
+        .background(shape.fill(isSelected ? typeColor.opacity(0.08) : DS.Color.cardFill))
+        .overlay(shape.strokeBorder(isSelected ? typeColor.opacity(0.45) : DS.Color.hairline,
+                                    lineWidth: isSelected ? 1 : 0.5))
+        .contentShape(shape)
         .onTapGesture { selectedFeatureID = f.id }
         .opacity(f.isIgnored ? 0.5 : 1.0)
     }
 
-    @ViewBuilder
     private func featureCardHeader(idx: Int, f: PharmaFeature, typeColor: Color) -> some View {
-        HStack(spacing: 5) {
+        HStack(spacing: DS.Space.s) {
             Image(systemName: f.type.icon)
-                .font(.system(size: 12))
-                .foregroundStyle(f.isIgnored ? Color.gray : typeColor)
+                .font(DS.Font.label)
+                .foregroundStyle(f.isIgnored ? Color.secondary : typeColor)
                 .frame(width: 16)
-            Text(f.name).font(.system(size: 11, weight: .bold, design: .monospaced))
-            Text(f.expression).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+            Text(f.name)
+                .font(DS.Font.mono.weight(.bold))
+            Text(f.expression)
+                .font(DS.Font.monoSmall)
+                .foregroundStyle(.secondary)
             if f.atomIndices.count > 1 {
-                Text("(\(f.atomIndices.count))").font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                DSTag("\(f.atomIndices.count) atoms", monospaced: true)
             }
-            Spacer()
+            Spacer(minLength: DS.Space.xs)
             Button { features[idx].isIgnored.toggle() } label: {
-                Image(systemName: features[idx].isIgnored ? "eye.slash" : "eye")
-                    .font(.system(size: 10))
-                    .foregroundStyle(features[idx].isIgnored ? Color.red.opacity(0.7) : Color.secondary)
+                Image(systemName: f.isIgnored ? "eye.slash" : "eye")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(f.isIgnored ? DS.Color.danger : Color.secondary)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderless)
+            .help(f.isIgnored ? "Include this feature" : "Ignore this feature")
             Button { features.remove(at: idx); selectedFeatureID = nil } label: {
-                Image(systemName: "xmark").font(.system(size: 9)).foregroundStyle(Color.secondary.opacity(0.4))
+                Image(systemName: "xmark")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderless)
+            .help("Remove feature")
         }
     }
 
-    @ViewBuilder
-    private func featureCardControls(idx: Int, f: PharmaFeature) -> some View {
-        HStack(spacing: 4) {
-            HStack(spacing: 0) {
-                Button { features[idx].isEssential = false } label: {
-                    Text("Optional")
-                        .font(.system(size: 9, weight: .semibold))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(!f.isEssential ? Color.accentColor.opacity(0.15) : Color.clear)
-                        .foregroundStyle(!f.isEssential ? Color.primary : Color.secondary.opacity(0.5))
-                }
-                .buttonStyle(.plain)
-                Button { features[idx].isEssential = true } label: {
-                    Text("Essential")
-                        .font(.system(size: 9, weight: .semibold))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(f.isEssential ? Color.red.opacity(0.15) : Color.clear)
-                        .foregroundStyle(f.isEssential ? Color.red : Color.secondary.opacity(0.5))
-                }
-                .buttonStyle(.plain)
+    private func featureCardControls(idx: Int) -> some View {
+        HStack(spacing: DS.Space.s) {
+            Picker("Requirement", selection: $features[idx].isEssential) {
+                Text("Optional").tag(false)
+                Text("Essential").tag(true)
             }
-            .background(Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 5))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.gray.opacity(0.2), lineWidth: 0.5))
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
+            .help("Essential features become hard constraints; optional ones are soft")
 
-            Spacer()
+            Spacer(minLength: DS.Space.xs)
 
-            Picker("", selection: Binding(
+            Picker("Type", selection: Binding(
                 get: { features[idx].type },
                 set: { features[idx].type = $0; features[idx].expression = expressionLabel($0) }
             )) {
@@ -735,18 +673,24 @@ struct PharmacophoreEditorView: View {
                     Text(expressionLabel($0)).tag($0)
                 }
             }
-            .controlSize(.mini).frame(width: 80)
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
         }
     }
 
-    @ViewBuilder
     private func featureCardRadius(idx: Int, f: PharmaFeature) -> some View {
-        HStack(spacing: 4) {
-            Text("Radius").font(.system(size: 9)).foregroundStyle(.secondary).frame(width: 36, alignment: .leading)
-            Slider(value: $features[idx].radius, in: 0.5...4.0, step: 0.25)
-            Text("\(String(format: "%.1f", f.radius)) \u{00C5}")
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(.secondary).frame(width: 32)
+        HStack(spacing: DS.Space.s) {
+            Text("Radius")
+                .font(DS.Font.caption)
+                .foregroundStyle(.secondary)
+            Slider(value: snappedSliderBinding($features[idx].radius, range: 0.5...4.0, step: 0.25), in: 0.5...4.0)
+                .controlSize(.small)
+            Text(String(format: "%.1f Å", f.radius))
+                .font(DS.Font.monoSmall)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .fixedSize()
         }
     }
 
@@ -754,26 +698,22 @@ struct PharmacophoreEditorView: View {
     // MARK: - Footer
     // =========================================================================
 
-    @ViewBuilder
     private var footer: some View {
-        HStack {
-            Button("Cancel") { dismiss() }
-                .keyboardShortcut(.cancelAction)
+        let active = features.filter { !$0.isIgnored }
+        let essential = active.filter(\.isEssential).count
+        let optional = active.count - essential
+        return HStack(spacing: DS.Space.m) {
+            if essential > 0 { DSTag("\(essential) essential", tone: .danger, monospaced: true) }
+            if optional > 0 { DSTag("\(optional) optional", monospaced: true) }
             Spacer()
-            if !features.isEmpty {
-                let active = features.filter { !$0.isIgnored }
-                let essential = active.filter(\.isEssential).count
-                let optional = active.count - essential
-                HStack(spacing: 8) {
-                    if essential > 0 { Text("\(essential) essential").font(.footnote.weight(.medium)).foregroundStyle(.red) }
-                    if optional > 0 { Text("\(optional) optional").font(.footnote).foregroundStyle(.secondary) }
-                }
-            }
+            Button("Cancel", role: .cancel) { dismiss() }
+                .keyboardShortcut(.cancelAction)
             Button("Apply to Docking") { applyFeatures(); dismiss() }
-                .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-                .disabled(features.filter({ !$0.isIgnored }).isEmpty)
+                .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
+                .keyboardShortcut(.defaultAction)
+                .disabled(active.isEmpty)
         }
-        .padding(.horizontal, 16).padding(.vertical, 8)
+        .padding(DS.Space.l)
     }
 
     // =========================================================================
@@ -783,11 +723,11 @@ struct PharmacophoreEditorView: View {
     private func drawFeatureOverlayHalos(ctx: GraphicsContext, tx: StructureTransform) {
         for overlay in featureOverlays {
             let pt = tx.toView(overlay.centroid)
-            let color = swiftColor(overlay.type.color)
+            let color = overlay.type.dsColor
             let r: CGFloat = 20
             let rect = CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2)
             ctx.fill(Path(ellipseIn: rect), with: .color(color.opacity(0.1)))
-            ctx.stroke(Path(ellipseIn: rect), with: .color(color.opacity(0.25)),
+            ctx.stroke(Path(ellipseIn: rect), with: .color(color.opacity(0.3)),
                        style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
         }
     }
@@ -801,7 +741,7 @@ struct PharmacophoreEditorView: View {
             let p1 = tx.toView(coords.positions[a1])
             let p2 = tx.toView(coords.positions[a2])
             let inScaffold = !scaffoldDim || (mcsMatchedAtoms.contains(a1) && mcsMatchedAtoms.contains(a2))
-            let color = Color(nsColor: .labelColor).opacity(inScaffold ? 1.0 : 0.12)
+            let color = DS.Color.diagramInk.opacity(inScaffold ? 0.9 : 0.12)
 
             if order == 2 {
                 let dx = p2.x - p1.x, dy = p2.y - p1.y
@@ -831,6 +771,8 @@ struct PharmacophoreEditorView: View {
         }
     }
 
+    /// Skeletal-formula style: heteroatoms (and featured carbons) get their symbol on a
+    /// paper-coloured disc that masks the bonds; plain carbons are small ink dots.
     private func drawAtoms(ctx: GraphicsContext, tx: StructureTransform) {
         guard let coords = coords2D else { return }
         let scaffoldDim = !mcsMatchedAtoms.isEmpty && showOnlyScaffold
@@ -839,20 +781,23 @@ struct PharmacophoreEditorView: View {
             guard idx < coords.atomicNums.count else { continue }
             let vp = tx.toView(pos)
             let an = coords.atomicNums[idx]
-            let elem = Element(rawValue: an) ?? .C
             let inScaffold = !scaffoldDim || mcsMatchedAtoms.contains(idx)
             let hasFeature = featureForAtom(idx) != nil
-
-            let r: CGFloat = hasFeature ? 13 : 10
             let opacity: Double = inScaffold ? 1.0 : 0.12
-            let rect = CGRect(x: vp.x - r, y: vp.y - r, width: r * 2, height: r * 2)
-            ctx.fill(Path(ellipseIn: rect), with: .color(elementColor(an).opacity(opacity)))
 
             if an != 6 || hasFeature {
-                let label = Text(elem.symbol)
-                    .font(.system(size: hasFeature ? 11 : 10, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
+                let r: CGFloat = hasFeature ? 11 : 9
+                let rect = CGRect(x: vp.x - r, y: vp.y - r, width: r * 2, height: r * 2)
+                ctx.fill(Path(ellipseIn: rect), with: .color(DS.Color.diagramPaper))
+                let symbol = (Element(rawValue: an) ?? .C).symbol
+                let label = Text(symbol)
+                    .font(DS.Font.label.weight(.bold))
+                    .foregroundColor(elementColor(an).opacity(opacity))
                 ctx.draw(ctx.resolve(label), at: vp, anchor: .center)
+            } else {
+                let r: CGFloat = 2.5
+                let rect = CGRect(x: vp.x - r, y: vp.y - r, width: r * 2, height: r * 2)
+                ctx.fill(Path(ellipseIn: rect), with: .color(DS.Color.diagramInk.opacity(0.45 * opacity)))
             }
         }
     }
@@ -871,15 +816,15 @@ struct PharmacophoreEditorView: View {
             cx /= CGFloat(count); cy /= CGFloat(count)
             let vp = tx.toView(CGPoint(x: cx, y: cy))
 
-            let color = swiftColor(f.type.color)
+            let color = f.type.dsColor
             let ringR: CGFloat = 16 + CGFloat(f.radius) * 3
             let rect = CGRect(x: vp.x - ringR, y: vp.y - ringR, width: ringR * 2, height: ringR * 2)
             ctx.fill(Path(ellipseIn: rect), with: .color(color.opacity(f.isEssential ? 0.15 : 0.07)))
 
             if f.isEssential {
-                ctx.stroke(Path(ellipseIn: rect), with: .color(color.opacity(0.8)), lineWidth: 2.5)
+                ctx.stroke(Path(ellipseIn: rect), with: .color(color.opacity(0.85)), lineWidth: 2.5)
             } else {
-                ctx.stroke(Path(ellipseIn: rect), with: .color(color.opacity(0.5)),
+                ctx.stroke(Path(ellipseIn: rect), with: .color(color.opacity(0.6)),
                            style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
             }
 
@@ -889,7 +834,7 @@ struct PharmacophoreEditorView: View {
             let labelOffset: CGFloat = 5 + CGFloat(stackIdx) * 12
 
             let label = Text("\(f.name) \(f.expression)")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .font(DS.Font.canvasLabel.monospaced().weight(.bold))
                 .foregroundColor(color)
             ctx.draw(ctx.resolve(label), at: CGPoint(x: vp.x, y: vp.y - ringR - labelOffset), anchor: .bottom)
         }
@@ -1208,21 +1153,72 @@ struct PharmacophoreEditorView: View {
         }
     }
 
-    private func swiftColor(_ c: SIMD4<Float>) -> Color {
-        Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z))
-    }
-
+    /// Element ink for the 2D diagram (light/dark aware, legible on `diagramPaper`).
     private func elementColor(_ n: Int) -> Color {
         switch n {
-        case 6:  return Color(red: 0.35, green: 0.35, blue: 0.35)
-        case 7:  return Color(red: 0.2, green: 0.3, blue: 0.85)
-        case 8:  return Color(red: 0.85, green: 0.15, blue: 0.15)
-        case 16: return Color(red: 0.8, green: 0.7, blue: 0.1)
-        case 9:  return Color(red: 0.1, green: 0.7, blue: 0.3)
-        case 17: return Color(red: 0.1, green: 0.6, blue: 0.2)
-        case 35: return Color(red: 0.6, green: 0.1, blue: 0.1)
-        case 15: return Color(red: 0.7, green: 0.4, blue: 0.0)
-        default: return Color(red: 0.5, green: 0.5, blue: 0.5)
+        case 6:      return DS.Color.diagramInk
+        case 7:      return ElementInk.nitrogen
+        case 8:      return ElementInk.oxygen
+        case 16:     return ElementInk.sulfur
+        case 9, 17:  return ElementInk.lightHalogen
+        case 35, 53: return ElementInk.heavyHalogen
+        case 15:     return ElementInk.phosphorus
+        default:     return ElementInk.other
+        }
+    }
+}
+
+// MARK: - Status chip chrome (floats over the structure canvas)
+
+private struct StructureStatusChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(DS.Font.caption)
+            .padding(.horizontal, DS.Space.l)
+            .padding(.vertical, DS.Space.s)
+            .dsFloating(cornerRadius: DS.Radius.m)
+            .padding(.bottom, DS.Space.m)
+    }
+}
+
+// MARK: - Diagram palettes
+
+/// Element colours for the 2D structure (data palette, tuned per appearance).
+private enum ElementInk {
+    static let nitrogen     = DS.dynamic(light: 0x2F5BD1, dark: 0x7AA2FF)
+    static let oxygen       = DS.dynamic(light: 0xCF222E, dark: 0xFF7B72)
+    static let sulfur       = DS.dynamic(light: 0x9A6700, dark: 0xE3B341)
+    static let lightHalogen = DS.dynamic(light: 0x1A7F37, dark: 0x3FB950)
+    static let heavyHalogen = DS.dynamic(light: 0x9A2B1B, dark: 0xE0826B)
+    static let phosphorus   = DS.dynamic(light: 0xBC4C00, dark: 0xF0883E)
+    static let other        = DS.dynamic(light: 0x6E7781, dark: 0x8C959F)
+}
+
+extension ConstraintInteractionType {
+    /// UI colour for this constraint type (hues follow the 3D constraint markers).
+    var dsColor: Color {
+        switch self {
+        case .hbondDonor:        DS.Color.ligand
+        case .hbondAcceptor:     DS.Color.water
+        case .saltBridge:        DS.Color.interactionPiCation
+        case .piStacking:        DS.Color.pocket
+        case .halogen:           DS.Color.interactionPiStack
+        case .metalCoordination: DS.Color.interactionMetal
+        case .hydrophobic:       DS.Color.interactionHydrophobic
+        }
+    }
+}
+
+extension PharmacophoreFeatureType {
+    /// UI colour for this detected feature type (matches `ConstraintInteractionType.dsColor`).
+    var dsColor: Color {
+        switch self {
+        case .donor:             DS.Color.ligand
+        case .acceptor:          DS.Color.water
+        case .hydrophobic:       DS.Color.interactionHydrophobic
+        case .aromatic:          DS.Color.pocket
+        case .positiveIonizable: DS.Color.interactionHBond
+        case .negativeIonizable: DS.Color.interactionSaltBridge
         }
     }
 }

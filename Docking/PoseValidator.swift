@@ -9,7 +9,9 @@
 //
 //   1. Bond lengths   — each bond's length is within ±25% of the covalent
 //                        reference (sum of covalent radii).
-//   2. Bond angles    — each angle (a—b—c) is within [70°, 175°].
+//   2. Bond angles    — each angle (a—b—c) is within [70°, 175°]
+//                        (upper bound 180° at sp centres: triple or
+//                        cumulated double bonds, e.g. nitriles, alkynes).
 //   3. Internal clash — non-bonded heavy atom pairs (separation ≥ 4 bonds)
 //                        must not overlap below 0.7 × (vdw_i + vdw_j).
 //   4. Protein clash  — minimum ligand–protein heavy atom distance ≥ 2.0 Å
@@ -27,7 +29,101 @@ import simd
 
 enum PoseValidator {
 
+    /// Pose-independent ligand topology, built once per ligand and shared by every pose
+    /// of a batch (adjacency, bond-separation exclusions and connectivity only depend on bonds).
+    private struct Topology {
+        let atomCount: Int
+        let adjacency: [[Int]]
+        /// sp centres (incident triple bond, or two cumulated double bonds) whose
+        /// equilibrium bond angle is 180°, so the 175° upper bound does not apply.
+        let isLinearCenter: [Bool]
+        /// Pairs (i < j) separated by more than 3 bonds — the internal-clash candidates.
+        let nonBondedPairs: [(Int, Int)]
+        let isConnected: Bool
+
+        init(atomCount n: Int, bonds: [Bond]) {
+            atomCount = n
+            var adj: [[Int]] = Array(repeating: [], count: n)
+            var tripleBond = Array(repeating: false, count: n)
+            var doubleBondCount = Array(repeating: 0, count: n)
+            for b in bonds {
+                let a1 = b.atomIndex1, a2 = b.atomIndex2
+                guard a1 >= 0, a2 >= 0, a1 < n, a2 < n, a1 != a2, !adj[a1].contains(a2) else { continue }
+                adj[a1].append(a2)
+                adj[a2].append(a1)
+                switch b.order {
+                case .triple:
+                    tripleBond[a1] = true; tripleBond[a2] = true
+                case .double:
+                    doubleBondCount[a1] += 1; doubleBondCount[a2] += 1
+                default:
+                    break
+                }
+            }
+            adjacency = adj
+            // Two-coordinate only: sulfonyl S / phosphate P also carry two double bonds but are tetrahedral.
+            isLinearCenter = (0..<n).map { adj[$0].count == 2 && (tripleBond[$0] || doubleBondCount[$0] >= 2) }
+
+            // Bond-graph distance up to 3 hops (1-2, 1-3, 1-4 are excluded from the clash check).
+            var pairs: [(Int, Int)] = []
+            var depth = Array(repeating: -1, count: n)
+            for i in 0..<n {
+                var touched = [i]
+                depth[i] = 0
+                var frontier = [i]
+                for d in 1...3 {
+                    var next: [Int] = []
+                    for c in frontier {
+                        for nb in adj[c] where depth[nb] < 0 {
+                            depth[nb] = d
+                            next.append(nb)
+                            touched.append(nb)
+                        }
+                    }
+                    frontier = next
+                }
+                for j in (i + 1)..<n where depth[j] < 0 { pairs.append((i, j)) }
+                for t in touched { depth[t] = -1 }
+            }
+            nonBondedPairs = pairs
+
+            // Connectivity (BFS from atom 0)
+            if n == 0 {
+                isConnected = true
+            } else {
+                var visited = Array(repeating: false, count: n)
+                var stack = [0]
+                visited[0] = true
+                var visitedCount = 1
+                while let cur = stack.popLast() {
+                    for nb in adj[cur] where !visited[nb] {
+                        visited[nb] = true
+                        visitedCount += 1
+                        stack.append(nb)
+                    }
+                }
+                isConnected = visitedCount == n
+            }
+        }
+    }
+
     static func validate(
+        ligandHeavyAtoms: [Atom],
+        ligandHeavyBonds: [Bond],
+        ligandPositions: [SIMD3<Float>],
+        proteinHeavyAtoms: [Atom]
+    ) -> PoseValidity {
+        validate(
+            topology: Topology(atomCount: ligandHeavyAtoms.count, bonds: ligandHeavyBonds),
+            ligandHeavyAtoms: ligandHeavyAtoms,
+            ligandHeavyBonds: ligandHeavyBonds,
+            ligandPositions: ligandPositions,
+            proteinHeavyAtoms: proteinHeavyAtoms
+        )
+    }
+
+    private static func validate(
+        topology: Topology,
         ligandHeavyAtoms: [Atom],
         ligandHeavyBonds: [Bond],
         ligandPositions: [SIMD3<Float>],
@@ -35,7 +131,7 @@ enum PoseValidator {
     ) -> PoseValidity {
         var v = PoseValidity()
         let n = ligandHeavyAtoms.count
-        guard n > 0, ligandPositions.count == n else { return v }
+        guard n > 0, ligandPositions.count == n, topology.atomCount == n else { return v }
 
         // -- 1. Bond lengths --
         var worstRatio: Float = 1.0
@@ -58,16 +154,11 @@ enum PoseValidator {
         v.worstBondRatio = worstRatio
         if !v.bondLengthsOK { v.failures.append("bond length") }
 
-        // Build adjacency once.
-        var adj: [[Int]] = Array(repeating: [], count: n)
-        for b in ligandHeavyBonds {
-            guard b.atomIndex1 < n, b.atomIndex2 < n else { continue }
-            adj[b.atomIndex1].append(b.atomIndex2)
-            adj[b.atomIndex2].append(b.atomIndex1)
-        }
+        let adj = topology.adjacency
 
         // -- 2. Bond angles --
         for j in 0..<n where adj[j].count >= 2 {
+            let maxAngle: Float = topology.isLinearCenter[j] ? 180.0 : 175.0
             for ai in 0..<adj[j].count {
                 let i = adj[j][ai]
                 for bi in (ai + 1)..<adj[j].count {
@@ -80,7 +171,7 @@ enum PoseValidator {
                     let cos = simd_dot(v1, v2) / (len1 * len2)
                     let cosClamped = max(min(cos, 1.0), -1.0)
                     let angDeg = acosf(cosClamped) * 180.0 / .pi
-                    if angDeg < 70.0 || angDeg > 175.0 {
+                    if angDeg < 70.0 || angDeg > maxAngle {
                         v.bondAnglesOK = false
                     }
                 }
@@ -88,53 +179,18 @@ enum PoseValidator {
         }
         if !v.bondAnglesOK { v.failures.append("bond angle") }
 
-        // -- 5. Connectivity (BFS from atom 0) --
-        var visited = Array(repeating: false, count: n)
-        var stack = [0]
-        visited[0] = true
-        var visitedCount = 1
-        while let cur = stack.popLast() {
-            for nb in adj[cur] where !visited[nb] {
-                visited[nb] = true
-                visitedCount += 1
-                stack.append(nb)
-            }
-        }
-        v.connectedOK = (visitedCount == n)
+        // -- 5. Connectivity (pose-independent, from the bond graph) --
+        v.connectedOK = topology.isConnected
         if !v.connectedOK { v.failures.append("connectivity") }
 
-        // -- Bond-graph distance up to 4 hops, for internal clash exemption --
-        // BFS from each atom up to depth 3; we mark "near" any pair separated by
-        // ≤ 3 bonds (so 1-2, 1-3, 1-4 — exclude from non-bonded clash check).
-        var near = Array(repeating: Set<Int>(), count: n)
-        for i in 0..<n {
-            var depth = [i: 0]
-            var queue = [i]
-            while !queue.isEmpty {
-                var next: [Int] = []
-                for c in queue {
-                    let d = depth[c] ?? 0
-                    if d >= 3 { continue }
-                    for nb in adj[c] where depth[nb] == nil {
-                        depth[nb] = d + 1
-                        next.append(nb)
-                    }
-                }
-                queue = next
-            }
-            for k in depth.keys where k != i { near[i].insert(k) }
-        }
-
-        // -- 3. Internal clash --
+        // -- 3. Internal clash (pairs separated by ≥ 4 bonds) --
         var minInternal: Float = .greatestFiniteMagnitude
-        for i in 0..<n {
-            for j in (i + 1)..<n where !near[i].contains(j) {
-                let d = simd_distance(ligandPositions[i], ligandPositions[j])
-                if d < minInternal { minInternal = d }
-                let threshold = 0.7 * (ligandHeavyAtoms[i].element.vdwRadius
-                                       + ligandHeavyAtoms[j].element.vdwRadius)
-                if d < threshold { v.internalClashOK = false }
-            }
+        for (i, j) in topology.nonBondedPairs {
+            let d = simd_distance(ligandPositions[i], ligandPositions[j])
+            if d < minInternal { minInternal = d }
+            let threshold = 0.7 * (ligandHeavyAtoms[i].element.vdwRadius
+                                   + ligandHeavyAtoms[j].element.vdwRadius)
+            if d < threshold { v.internalClashOK = false }
         }
         v.minInternalDistance = minInternal
         if !v.internalClashOK { v.failures.append("internal clash") }
@@ -181,10 +237,12 @@ enum PoseValidator {
         ligandHeavyBonds: [Bond],
         proteinHeavyAtoms: [Atom]
     ) -> [DockingResult] {
-        results.map { r in
+        let topology = Topology(atomCount: ligandHeavyAtoms.count, bonds: ligandHeavyBonds)
+        return results.map { r in
             var out = r
             guard !r.transformedAtomPositions.isEmpty else { return out }
             out.validity = validate(
+                topology: topology,
                 ligandHeavyAtoms: ligandHeavyAtoms,
                 ligandHeavyBonds: ligandHeavyBonds,
                 ligandPositions: r.transformedAtomPositions,

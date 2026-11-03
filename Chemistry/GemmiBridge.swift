@@ -81,7 +81,7 @@ enum GemmiBridge {
                 position: SIMD3<Float>(atom.x, atom.y, atom.z),
                 name: atomName.isEmpty ? symbol : atomName,
                 residueName: residueName.isEmpty ? "UNK" : residueName,
-                residueSeq: atom.residueSeq == 0 ? 1 : Int(atom.residueSeq),
+                residueSeq: Int(atom.residueSeq),
                 chainID: chainID.isEmpty ? "A" : chainID,
                 charge: atom.charge,
                 formalCharge: Int(atom.formalCharge),
@@ -96,6 +96,9 @@ enum GemmiBridge {
         bonds.reserveCapacity(Int(parsed.bondCount))
         for index in 0..<Int(parsed.bondCount) {
             let bond = parsed.bonds[index]
+            let atom1 = Int(bond.atom1)
+            let atom2 = Int(bond.atom2)
+            guard atoms.indices.contains(atom1), atoms.indices.contains(atom2), atom1 != atom2 else { continue }
             let order: BondOrder = switch Int(bond.order) {
             case 2: .double
             case 3: .triple
@@ -103,9 +106,9 @@ enum GemmiBridge {
             default: .single
             }
             bonds.append(Bond(
-                id: index,
-                atomIndex1: Int(bond.atom1),
-                atomIndex2: Int(bond.atom2),
+                id: bonds.count,
+                atomIndex1: atom1,
+                atomIndex2: atom2,
                 order: order
             ))
         }

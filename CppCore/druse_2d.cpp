@@ -24,6 +24,7 @@ using namespace RDKit;
 Druse2DResult* druse_compute_2d_coords(const char *smiles) {
     if (!smiles || !smiles[0]) return nullptr;
 
+    Druse2DResult *res = nullptr;
     try {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) return nullptr;
@@ -39,7 +40,7 @@ Druse2DResult* druse_compute_2d_coords(const char *smiles) {
         const auto &conf = mol->getConformer(0);
         int natoms = (int)mol->getNumAtoms();
 
-        auto *res = new Druse2DResult();
+        res = new Druse2DResult();
         res->atomCount = natoms;
         res->coords = new float[natoms * 2];   // flat [x0, y0, x1, y1, ...]
         res->atomicNums = new int32_t[natoms];
@@ -79,6 +80,7 @@ Druse2DResult* druse_compute_2d_coords(const char *smiles) {
 
         return res;
     } catch (...) {
+        druse_free_2d_result(res);
         return nullptr;
     }
 }

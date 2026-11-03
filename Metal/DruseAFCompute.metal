@@ -394,7 +394,7 @@ kernel void druseAFEncode(
 
     // Out-of-grid penalty
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridParams.origin + float3(gridParams.dims - 1u) * gridParams.spacing;
     float oopTotal = 0.0f;
     for (uint a = 0; a < L; a++) {
         float3 r = ligPositions[a];

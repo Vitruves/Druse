@@ -80,8 +80,9 @@ kernel void faspr_self_energy(
             float  depB = backboneAtoms[b].depth;
 
             float3 diff = posS - posB;
+            // No zero-distance skip: coincident atoms get the full repulsion
+            // cap (dstar = 0 -> vdwRepCut), as in FASPR VDWEnergyAtomAndAtom.
             float dist = length(diff);
-            if (dist < 1e-6f) continue;
 
             float rij = radS + radB;
             float eij = sqrt(depS * depB);
@@ -138,8 +139,9 @@ kernel void faspr_pair_energy(
             float  depJ = site2Atoms[j].depth;
 
             float3 diff = posI - posJ;
+            // No zero-distance skip: coincident atoms get the full repulsion
+            // cap (dstar = 0 -> vdwRepCut), as in FASPR VDWEnergyAtomAndAtom.
             float dist = length(diff);
-            if (dist < 1e-6f) continue;
 
             float rij = radI + radJ;
             float eij = sqrt(depI * depJ);

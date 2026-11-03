@@ -33,6 +33,11 @@ struct PocketSelectionCandidate: Sendable {
 }
 
 enum PocketSelectionHeuristics {
+    /// Smallest cavity (Å³, ligand-accessible volume) treated as able to hold a drug-like
+    /// ligand. Both detectors report cavity volume (probe/voxel count × cell volume), on
+    /// which real binding sites measure roughly 200–1500 Å³.
+    private static let minDrugLikeVolume: Float = 150
+
     static func score(_ pocket: BindingPocket, method: PocketSelectionMethod) -> Float {
         let logVolume = log(max(pocket.volume, 1.0))
         let buriedness = max(pocket.buriedness, 0.05)
@@ -44,7 +49,7 @@ enum PocketSelectionHeuristics {
         var score = logVolume * buriedness * (1.0 + polarity) + residueBonus
 
         if pocket.buriedness < 0.12 { score -= 4.0 }
-        if pocket.volume < 1_500 { score -= 2.0 }
+        if pocket.volume < minDrugLikeVolume { score -= 2.0 }
         if minExtent < 5.0 { score -= 1.5 }
         if maxExtent > 18.0 { score -= 0.5 }
         if method == .geometric { score += 0.3 }
@@ -55,7 +60,7 @@ enum PocketSelectionHeuristics {
     static func isSuspicious(_ pocket: BindingPocket) -> Bool {
         let minExtent = min(pocket.size.x, min(pocket.size.y, pocket.size.z))
         return pocket.buriedness < 0.12 ||
-            pocket.volume < 1_500 ||
+            pocket.volume < minDrugLikeVolume ||
             minExtent < 5.0 ||
             pocket.residueIndices.isEmpty
     }
@@ -394,6 +399,9 @@ private final class PocketDetectionMetalAccelerator {
         distanceEncoder.endEncoding()
         distanceCommandBuffer.commit()
         distanceCommandBuffer.waitUntilCompleted()
+        // The distance/mask buffers are cached across runs: on a GPU fault they would hold a
+        // previous protein's data. Return nil so the caller uses the CPU path.
+        guard distanceCommandBuffer.status == .completed else { return nil }
 
         let candidateMask = candidateMaskBuffer.contents().bindMemory(to: UInt32.self, capacity: totalPoints)
         var probes: [PocketProbe] = []
@@ -429,6 +437,7 @@ private final class PocketDetectionMetalAccelerator {
         buriednessEncoder.endEncoding()
         buriednessCommandBuffer.commit()
         buriednessCommandBuffer.waitUntilCompleted()
+        guard buriednessCommandBuffer.status == .completed else { return nil }
 
         let scoredProbes = probeBuffer.contents().bindMemory(to: PocketProbe.self, capacity: probes.count)
         var buried: [BuriedProbe] = []
@@ -465,8 +474,8 @@ private final class PocketDetectionMetalAccelerator {
 /// ## Algorithm
 /// 1. Grid probing at ~1 angstrom spacing within bounding box + 6 angstrom padding
 /// 2. Spatial hash of protein atoms for O(1) neighbor queries
-/// 3. Filter probes: keep those 2.0-5.5 angstroms from nearest atom surface
-/// 4. Buriedness scoring: 26-direction ray casting, keep probes with buriedness > 0.4
+/// 3. Filter probes: keep those 1.2-5.5 angstroms from nearest atom surface
+/// 4. Buriedness scoring: 26-direction ray casting, keep probes with buriedness >= 0.45
 /// 5. DBSCAN clustering (eps=3.0, minPts=5) of buried probes
 /// 6. Pocket ranking by druggability = volume * buriedness * (1 + polarity)
 /// 7. Search box from max probe extent + 4 angstrom padding
@@ -475,7 +484,43 @@ private final class PocketDetectionMetalAccelerator {
 /// All heavy computation uses a `ProteinSnapshot` value type and is nonisolated.
 enum BindingSiteDetector {
 
+    /// Ray length (Å) used for every buriedness estimate.
+    private static let rayMaxDist: Float = 10.0
+
     // MARK: - Public API
+
+    /// Cavity volume and buriedness of an externally predicted pocket (ML voxels), measured
+    /// with the same geometry as the grid detector so both kinds of pocket are comparable.
+    /// Only points outside every heavy atom's vdW sphere count towards the volume.
+    nonisolated static func cavityDescriptors(
+        points: [SIMD3<Float>],
+        cellVolume: Float,
+        heavyAtomPositions: [SIMD3<Float>],
+        heavyAtomElements: [Element]
+    ) -> (volume: Float, buriedness: Float) {
+        guard !points.isEmpty, !heavyAtomPositions.isEmpty,
+              heavyAtomPositions.count == heavyAtomElements.count else { return (0, 0) }
+        let spatialHash = SpatialHash(positions: heavyAtomPositions, cellSize: 5.5)
+        var emptyCount = 0
+        var buriednessSum: Float = 0
+        for point in points {
+            let (nearDistSq, nearIdx) = spatialHash.nearestDistanceSquared(to: point, positions: heavyAtomPositions)
+            if nearIdx >= 0 {
+                let vdw = heavyAtomElements[nearIdx].vdwRadius
+                if nearDistSq <= vdw * vdw { continue }
+            }
+            emptyCount += 1
+            buriednessSum += buriednessAt(
+                point: point,
+                positions: heavyAtomPositions,
+                elements: heavyAtomElements,
+                spatialHash: spatialHash,
+                maxRayDist: rayMaxDist
+            )
+        }
+        guard emptyCount > 0 else { return (0, 0) }
+        return (Float(emptyCount) * cellVolume, buriednessSum / Float(emptyCount))
+    }
 
     /// Detect pockets geometrically using alpha-sphere probes and DBSCAN.
     @MainActor
@@ -544,8 +589,9 @@ enum BindingSiteDetector {
             for atomIdx in residue.atomIndices {
                 guard atomIdx < protein.atoms.count else { continue }
                 let atom = protein.atoms[atomIdx]
-                // Skip hydrogens
-                guard atom.element != .H else { continue }
+                // Skip hydrogens and crystallographic waters: waters are displaced by the
+                // ligand, so they must not fill (and hide) the cavity.
+                guard atom.element != .H, !residue.isWater else { continue }
                 // Skip excluded chains
                 if !excludedChainIDs.isEmpty && excludedChainIDs.contains(atom.chainID) { continue }
                 let snapshotIdx = positions.count
@@ -583,7 +629,10 @@ enum BindingSiteDetector {
 
         // ---- Step 2: Spatial hash (cell size = max probe distance) ----
         let maxProbeDist: Float = 5.5
-        let minProbeDist: Float = 2.0
+        // 1.2 Å from the vdW surface ≈ where a ligand heavy atom's centre sits in contact
+        // (r_lig ≈ 1.5–1.7 Å minus tolerated overlap). A larger value (2.0) carved away most
+        // of narrow clefts, leaving fragments of the real site.
+        let minProbeDist: Float = 1.2
         let spatialHash = SpatialHash(positions: positions, cellSize: maxProbeDist)
 
         let gridExtent = gridMax - gridMin
@@ -593,8 +642,7 @@ enum BindingSiteDetector {
         let dims = SIMD3<UInt32>(UInt32(nx), UInt32(ny), UInt32(nz))
         let radii = snap.elements.map(\.vdwRadius)
 
-        let buriednessThreshold: Float = 0.4
-        let rayMaxDist: Float = 10.0
+        let buriednessThreshold: Float = 0.45
         let gpuBuriedProbes = accelerator?.findBuriedProbes(
             positions: positions,
             radii: radii,
@@ -889,7 +937,7 @@ enum BindingSiteDetector {
             positions: positions,
             elements: snapshot.elements,
             spatialHash: spatialHash,
-            maxRayDist: 10.0
+            maxRayDist: rayMaxDist
         )
 
         // Polarity
@@ -968,7 +1016,7 @@ enum BindingSiteDetector {
             positions: positions,
             elements: snapshot.elements,
             spatialHash: spatialHash,
-            maxRayDist: 10.0
+            maxRayDist: rayMaxDist
         )
 
         let volume = 8.0 * halfSize.x * halfSize.y * halfSize.z

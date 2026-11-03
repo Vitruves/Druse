@@ -130,7 +130,10 @@ enum MMCIFParser {
                 continue
             }
 
-            let columnMap = Dictionary(uniqueKeysWithValues: columnNames.enumerated().map { ($0.element, $0.offset) })
+            let columnMap = Dictionary(columnNames.enumerated().map { ($0.element, $0.offset) },
+                                       uniquingKeysWith: { first, _ in first })
+            let modelColumn = columnMap["_atom_site.pdbx_PDB_model_num"]
+            var firstModel: String?
             var atoms: [Atom] = []
 
             while cursor < lines.count {
@@ -140,18 +143,28 @@ enum MMCIFParser {
                 }
 
                 let fields = tokenizeMMCIFRow(lines[cursor])
-                if fields.count >= columnNames.count,
-                   let atom = parseSimpleAtomSiteRow(fields: fields, columnMap: columnMap, atomID: atoms.count) {
+                cursor += 1
+                guard fields.count >= columnNames.count else { continue }
+
+                // Multi-model entries (NMR ensembles): keep only the first model,
+                // matching the Gemmi path.
+                if let modelColumn {
+                    let model = fields[modelColumn]
+                    if firstModel == nil { firstModel = model }
+                    guard model == firstModel else { continue }
+                }
+
+                if let atom = parseSimpleAtomSiteRow(fields: fields, columnMap: columnMap, atomID: atoms.count) {
                     atoms.append(atom)
                 }
-                cursor += 1
             }
 
             guard !atoms.isEmpty else { return nil }
 
-            let selectedIndices = preferredAtomIndices(in: atoms)
+            let resolved = ProteinPreparation.selectPreferredAltConformers(atoms: atoms, bonds: [])
+            let selectedIndices = preferredAtomIndices(in: resolved.atoms)
             let substructure = ProteinPreparation.remapSubstructure(
-                atoms: atoms,
+                atoms: resolved.atoms,
                 bonds: [],
                 selectedIndices: selectedIndices
             )
@@ -181,12 +194,20 @@ enum MMCIFParser {
             return nil
         }
 
-        let atomName = value("_atom_site.label_atom_id") ?? value("_atom_site.auth_atom_id") ?? "X"
-        let residueName = value("_atom_site.label_comp_id") ?? value("_atom_site.auth_comp_id") ?? "UNK"
-        let chainID = value("_atom_site.label_asym_id") ?? value("_atom_site.auth_asym_id") ?? "A"
-        let residueSeq = value("_atom_site.label_seq_id").flatMap(Int.init)
-            ?? value("_atom_site.auth_seq_id").flatMap(Int.init)
+        // Prefer author numbering/chain IDs (what gemmi and PDB-format files use);
+        // label_seq_id is "." for every non-polymer atom, which would otherwise mix
+        // label numbering for the protein with author numbering for ligands/waters.
+        let atomName = value("_atom_site.auth_atom_id") ?? value("_atom_site.label_atom_id") ?? "X"
+        let residueName = value("_atom_site.auth_comp_id") ?? value("_atom_site.label_comp_id") ?? "UNK"
+        let chainID = value("_atom_site.auth_asym_id") ?? value("_atom_site.label_asym_id") ?? "A"
+        let residueSeq = value("_atom_site.auth_seq_id").flatMap(Int.init)
+            ?? value("_atom_site.label_seq_id").flatMap(Int.init)
             ?? 1
+        let altLoc = value("_atom_site.label_alt_id") ?? ""
+        let insertionCode = value("_atom_site.pdbx_PDB_ins_code") ?? ""
+        let occupancy = value("_atom_site.occupancy").flatMap(Float.init) ?? 1.0
+        let tempFactor = value("_atom_site.B_iso_or_equiv").flatMap(Float.init) ?? 0.0
+        let formalCharge = value("_atom_site.pdbx_formal_charge").flatMap(Int.init) ?? 0
         let group = value("_atom_site.group_PDB")?.uppercased() ?? "ATOM"
         let elementSymbol = value("_atom_site.type_symbol")
             ?? Element.from(symbol: atomName.trimmingCharacters(in: .letters.inverted))?.symbol
@@ -201,29 +222,38 @@ enum MMCIFParser {
             residueName: residueName,
             residueSeq: residueSeq,
             chainID: chainID,
-            isHetAtom: group == "HETATM"
+            formalCharge: formalCharge,
+            isHetAtom: group == "HETATM",
+            occupancy: occupancy,
+            tempFactor: tempFactor,
+            altLoc: altLoc,
+            insertionCode: insertionCode
         )
     }
 
+    /// Split a CIF data row into tokens. Per the CIF grammar a quote only opens a
+    /// token at a token start and only closes it when followed by whitespace or the
+    /// end of the line, so primes inside names (e.g. `"O5'"`, unquoted `C1'`) survive.
     private static func tokenizeMMCIFRow(_ line: String) -> [String] {
         var fields: [String] = []
         var current = ""
         var quote: Character?
+        let characters = Array(line)
 
-        for character in line {
-            if let activeQuote = quote, character == activeQuote {
-                fields.append(current)
-                current = ""
-                quote = nil
+        for (index, character) in characters.enumerated() {
+            if let activeQuote = quote {
+                let nextIsBoundary = index + 1 >= characters.count || characters[index + 1].isWhitespace
+                if character == activeQuote && nextIsBoundary {
+                    fields.append(current)
+                    current = ""
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
                 continue
             }
 
-            if quote != nil {
-                current.append(character)
-                continue
-            }
-
-            if character == "'" || character == "\"" {
+            if current.isEmpty && (character == "'" || character == "\"") {
                 quote = character
                 continue
             }

@@ -23,139 +23,92 @@ struct ConstraintConfigSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    sourceInfoSection
-                    Divider()
-                    scopeSection
-                    Divider()
-                    interactionTypeSection
-                    Divider()
-                    strengthSection
-                    Divider()
-                    distanceSection
-                }
-                .padding()
+        DSSheetScaffold(
+            title: "Add Docking Constraint",
+            subtitle: "Bias docking toward a specific interaction at this position.",
+            systemImage: "scope"
+        ) {
+            Form {
+                targetSection
+                interactionSection
+                strengthSection
+                distanceSection
             }
-            Divider()
-            footer
+            .formStyle(.grouped)
+        } footer: {
+            Button("Cancel", role: .cancel) { dismiss() }
+                .keyboardShortcut(.cancelAction)
+            Button("Add Constraint") {
+                addConstraint()
+                dismiss()
+            }
+            .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
+            .keyboardShortcut(.defaultAction)
         }
-        .frame(width: 380, height: 440)
+        .frame(minWidth: 400, idealWidth: 420, minHeight: 420, idealHeight: 540)
         .onAppear { setDefaults() }
     }
 
-    // MARK: - Header
+    // MARK: - Target
 
-    @ViewBuilder
-    private var header: some View {
-        HStack {
-            Image(systemName: "scope")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(Color.accentColor)
-            Text("Add Docking Constraint")
-                .font(.body.weight(.semibold))
-            Spacer()
-            Button(action: { dismiss() }) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding()
-    }
-
-    // MARK: - Source Info
-
-    @ViewBuilder
-    private var sourceInfoSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sectionLabel("Target", icon: context.sourceType == .receptor ? "building.columns" : "hexagon")
-
-            HStack(spacing: 8) {
-                if let atomName = context.atomName, let resName = context.residueName {
-                    Text("\(atomName) @ \(resName)")
-                        .font(.callout.monospaced().weight(.medium))
-                } else if let resName = context.residueName {
-                    Text(resName)
-                        .font(.callout.monospaced().weight(.medium))
-                } else {
-                    Text("Selection")
-                        .font(.callout.weight(.medium))
+    private var targetSection: some View {
+        Section {
+            LabeledContent {
+                DSTag(context.sourceType == .receptor ? "Receptor" : "Ligand",
+                      tone: context.sourceType == .receptor ? .protein : .ligand)
+            } label: {
+                HStack(spacing: DS.Space.s) {
+                    Text(targetTitle)
+                        .font(context.residueName == nil ? DS.Font.body.weight(.medium) : DS.Font.mono.weight(.medium))
+                    if let chain = context.chainID, !chain.isEmpty {
+                        DSTag("Chain \(chain)", monospaced: true)
+                    }
                 }
-
-                if let chain = context.chainID, !chain.isEmpty {
-                    Text("Chain \(chain)")
-                        .font(.footnote)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                        .background(.quaternary)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                }
-
-                Spacer()
-
-                Text(context.sourceType == .receptor ? "Receptor" : "Ligand")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(context.sourceType == .receptor ? Color.blue.opacity(0.15) : Color.green.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
             }
-        }
-    }
-
-    // MARK: - Scope
-
-    @ViewBuilder
-    private var scopeSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Target Scope", icon: "scope")
-            Picker("", selection: $targetScope) {
+            Picker("Scope", selection: $targetScope) {
                 ForEach(TargetScope.allCases, id: \.self) { scope in
                     Text(scope.rawValue).tag(scope)
                 }
             }
             .pickerStyle(.segmented)
-
+        } header: {
+            Text("Target")
+        } footer: {
             Text(targetScope == .atom
                  ? "Constraint applies to the exact selected atom position."
                  : "Constraint is satisfied if ANY relevant atom in the residue interacts.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
         }
+    }
+
+    private var targetTitle: String {
+        if let atomName = context.atomName, let resName = context.residueName {
+            return "\(atomName) @ \(resName)"
+        }
+        return context.residueName ?? "Selection"
     }
 
     // MARK: - Interaction Type
 
-    @ViewBuilder
-    private var interactionTypeSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Interaction Type", icon: "arrow.triangle.branch")
-            Picker("", selection: $interactionType) {
+    private var interactionSection: some View {
+        Section {
+            Picker("Interaction", selection: $interactionType) {
                 ForEach(ConstraintInteractionType.allCases, id: \.self) { type in
                     Label(type.rawValue, systemImage: type.icon).tag(type)
                 }
             }
             .pickerStyle(.menu)
-
+        } header: {
+            Text("Interaction Type")
+        } footer: {
             Text(interactionTypeDescription)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
         }
     }
 
     // MARK: - Strength
 
-    @ViewBuilder
     private var strengthSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Constraint Strength", icon: "gauge.with.dots.needle.33percent")
-            Picker("", selection: $strengthMode) {
+        Section {
+            Picker("Strength", selection: $strengthMode) {
                 ForEach(StrengthMode.allCases, id: \.self) { mode in
                     Text(mode.rawValue).tag(mode)
                 }
@@ -163,66 +116,53 @@ struct ConstraintConfigSheet: View {
             .pickerStyle(.segmented)
 
             if strengthMode == .soft {
-                HStack {
-                    Text("Penalty")
-                        .font(.footnote)
-                    Slider(value: $softStrength, in: 1...50, step: 1)
-                    Text("\(String(format: "%.0f", softStrength)) kcal/mol/\u{00C5}\u{00B2}")
-                        .font(.footnote.monospaced())
-                        .frame(width: 90, alignment: .trailing)
+                LabeledContent("Penalty") {
+                    HStack(spacing: DS.Space.m) {
+                        Slider(value: snappedSliderBinding($softStrength, range: 1...50, step: 1), in: 1...50)
+                            .controlSize(.small)
+                            .frame(minWidth: 160)
+                        Text(String(format: "%.0f kcal/mol/Å²", softStrength))
+                            .font(DS.Font.monoSmall)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                    }
                 }
             } else {
-                Text("Mandatory — poses violating this constraint will be strongly penalized (effective rejection).")
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
+                Label("Mandatory — poses violating this constraint will be strongly penalized (effective rejection).",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(DS.Color.warning)
             }
+        } header: {
+            Text("Constraint Strength")
         }
     }
 
     // MARK: - Distance
 
-    @ViewBuilder
     private var distanceSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Distance Threshold", icon: "ruler")
-            HStack {
-                Slider(value: $distanceThreshold, in: 2.0...5.0, step: 0.1)
-                Text("\(String(format: "%.1f", distanceThreshold)) \u{00C5}")
-                    .font(.subheadline.monospaced())
-                    .frame(width: 45, alignment: .trailing)
+        Section {
+            LabeledContent("Threshold") {
+                HStack(spacing: DS.Space.m) {
+                    Slider(value: snappedSliderBinding($distanceThreshold, range: 2.0...5.0, step: 0.1), in: 2.0...5.0)
+                        .controlSize(.small)
+                        .frame(minWidth: 160)
+                    Text(String(format: "%.1f Å", distanceThreshold))
+                        .font(DS.Font.monoSmall)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
             }
+        } header: {
+            Text("Distance")
+        } footer: {
             Text("Maximum distance for the constraint to be considered satisfied.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
         }
-    }
-
-    // MARK: - Footer
-
-    @ViewBuilder
-    private var footer: some View {
-        HStack {
-            Button("Cancel") { dismiss() }
-                .keyboardShortcut(.cancelAction)
-            Spacer()
-            Button("Add Constraint") {
-                addConstraint()
-                dismiss()
-            }
-            .keyboardShortcut(.defaultAction)
-            .buttonStyle(.borderedProminent)
-        }
-        .padding()
     }
 
     // MARK: - Helpers
-
-    @ViewBuilder
-    private func sectionLabel(_ title: String, icon: String) -> some View {
-        Label(title, systemImage: icon)
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.primary)
-    }
 
     private var interactionTypeDescription: String {
         switch interactionType {

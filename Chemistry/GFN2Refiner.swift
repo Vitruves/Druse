@@ -239,11 +239,8 @@ enum GFN2Refiner {
         let solv = solvation.cConfig
         let cLevel = optLevel.cLevel
 
-        // Prepare freeze mask
-        var mask: [Bool]?
-        if let freezeMask {
-            mask = freezeMask
-        }
+        // Prepare freeze mask (the C API reads exactly n flags, so a mismatched mask is ignored)
+        let mask: [Bool]? = freezeMask.flatMap { $0.count == n ? $0 : nil }
 
         // Prepare reference positions for restraints
         var refPos: [Float]?
@@ -416,10 +413,10 @@ enum GFN2Refiner {
                 CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
                 CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar)
     ) -> String {
-        withUnsafePointer(to: buf) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: 512) {
-                String(cString: $0)
-            }
+        // Bounded read: the C buffer is not guaranteed to be NUL-terminated.
+        withUnsafeBytes(of: buf) { raw in
+            let bytes = raw.prefix { $0 != 0 }
+            return String(decoding: bytes, as: UTF8.self)
         }
     }
 }

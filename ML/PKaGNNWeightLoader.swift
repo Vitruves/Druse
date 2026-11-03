@@ -20,6 +20,20 @@ struct PKaGNNWeightLoader {
         let totalFloats: Int
     }
 
+    /// Per-tensor float counts read by PKaGNNCompute.metal (64 tensors; order =
+    /// EXPORT_WEIGHT_ORDER in train_pka.py).
+    static let expectedCounts: [Int] = {
+        let msgLayer: [Int] = [128 * 10, 128, 128 * 128, 128,   // edge_mlp
+                               128 * 128, 128, 128 * 128, 128,  // msg_mlp
+                               128 * 256, 128,                  // gate
+                               128, 128]                        // LayerNorm
+        let head: [Int] = [64 * 128, 64, 64, 1]
+        var counts: [Int] = [128 * 25, 128, 128 * 128, 128]    // atom encoder
+        for _ in 0..<4 { counts += msgLayer }
+        for _ in 0..<3 { counts += head }                       // ion, pKa, acid
+        return counts
+    }()
+
     static func loadFromBundle(device: MTLDevice) -> LoadedWeights? {
         guard let url = Bundle.main.url(forResource: "PkaGNN", withExtension: "weights") else {
             print("[PKaGNN] PkaGNN.weights not found in bundle")
@@ -71,6 +85,10 @@ struct PKaGNNWeightLoader {
             let count = data.withUnsafeBytes { $0.load(fromByteOffset: off + 4, as: UInt32.self) }
             entries.append(DruseAFWeightEntry(offset: offset, count: count))
         }
+
+        guard DruseAFWeightLoader.validateEntries(
+            entries, totalFloats: totalFloats, expectedCounts: expectedCounts, tag: "PKaGNN"
+        ) else { return nil }
 
         let weightBytes = totalFloats * MemoryLayout<Float>.stride
         guard let weightBuffer = data.withUnsafeBytes({ rawBuf -> MTLBuffer? in

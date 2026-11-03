@@ -3,160 +3,141 @@
 
 import SwiftUI
 
+/// Step 7 — Lead Optimization: generate analogs of a docked reference pose,
+/// filter them on ADMET rules, mini-dock them and hand them back to the pipeline.
 struct LeadOptimizationTabView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.openWindow) private var openWindow
+
+    /// Rows shown in the analog list before collapsing into a "+ N more" line.
+    private static let visibleAnalogLimit = 40
 
     var body: some View {
-        VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
-            if !viewModel.leadOpt.hasReference {
-                emptyStateCard
-            } else {
+        if viewModel.leadOpt.hasReference {
+            DSStepScaffold {
                 referenceCard
                 generationCard
                 admetFiltersCard
-                generateRunCard
+                // Results follow the settings that produced them.
                 if !viewModel.leadOpt.analogs.isEmpty {
                     analogsCard
-                    dockingControlsCard
+                    dockAndDeliverCard
                 }
-                if viewModel.leadOpt.selectedAnalogIndex != nil {
-                    comparisonCard
+            } footer: {
+                footer
+            }
+            .sheet(isPresented: Binding(
+                get: { viewModel.leadOpt.showComparison },
+                set: { viewModel.leadOpt.showComparison = $0 }
+            )) {
+                if let analog = selectedAnalog {
+                    LeadOptComparisonView(reference: viewModel.leadOpt, analog: analog)
+                        .environment(viewModel)
+                        .frame(minWidth: 560, idealWidth: 640, minHeight: 480, idealHeight: 620)
                 }
             }
-            Spacer(minLength: 0)
-        }
-        .padding(12)
-        .sheet(isPresented: Binding(
-            get: { viewModel.leadOpt.showComparison },
-            set: { viewModel.leadOpt.showComparison = $0 }
-        )) {
-            if let idx = viewModel.leadOpt.selectedAnalogIndex,
-               idx < viewModel.leadOpt.analogs.count {
-                LeadOptComparisonView(
-                    reference: viewModel.leadOpt,
-                    analog: viewModel.leadOpt.analogs[idx]
-                )
-                .environment(viewModel)
-                .frame(minWidth: 500, minHeight: 450)
+        } else {
+            // Point at the step that unblocks Lead Opt: Results once poses exist, Docking before that.
+            let hasPoses = !viewModel.docking.dockingResults.isEmpty
+            let target: SidebarTab = hasPoses ? .results : .dock
+            DSStepScaffold {
+                DSEmptyState(
+                    "No Reference Yet",
+                    systemImage: "arrow.triangle.branch",
+                    description: hasPoses
+                        ? "Pick a docked pose in Results and click its Optimize button to generate and rank analogs."
+                        : "Lead optimization starts from a docked pose. Run docking, then pick a pose in Results to optimize."
+                ) {
+                    Button {
+                        target.request(in: viewModel)
+                    } label: {
+                        Label("Go to \(target.rawValue)", systemImage: target.icon)
+                    }
+                    .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
+                }
+                .padding(.top, DS.Space.xxl)
             }
         }
     }
 
-    // MARK: - Empty state
-
-    @ViewBuilder
-    private var emptyStateCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.branch")
-                    .font(.system(size: 18))
-                    .foregroundStyle(.secondary)
-                Text("No Reference Ligand")
-                    .font(PanelStyle.titleFont)
-                    .foregroundStyle(.secondary)
-            }
-            Text("To start lead optimization:")
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 6) {
-                stepRow(number: "1", text: "Run docking in the Docking tab")
-                stepRow(number: "2", text: "Open the Results tab")
-                stepRow(number: "3", text: "Click the Optimize action on a pose")
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(PanelStyle.cardPadding)
-        .background(
-            RoundedRectangle(cornerRadius: PanelStyle.cardCornerRadius, style: .continuous)
-                .fill(Color.primary.opacity(PanelStyle.cardFillOpacity))
-        )
+    private var selectedAnalog: LeadOptAnalog? {
+        guard let idx = viewModel.leadOpt.selectedAnalogIndex,
+              idx < viewModel.leadOpt.analogs.count else { return nil }
+        return viewModel.leadOpt.analogs[idx]
     }
 
-    @ViewBuilder
-    private func stepRow(number: String, text: String) -> some View {
-        HStack(spacing: 6) {
-            Text(number)
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 18, height: 18)
-                .background(Circle().fill(Color.accentColor.opacity(0.15)))
-            Text(text)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    // MARK: - Reference card
+    // MARK: - Reference
 
     @ViewBuilder
     private var referenceCard: some View {
-        let sm = viewModel.docking.scoringMethod
+        let lead = viewModel.leadOpt
         PanelCard(
             "Reference",
             icon: "target",
             accessory: {
-                if let refResult = viewModel.leadOpt.referenceResult {
-                    HStack(alignment: .firstTextBaseline, spacing: 2) {
-                        Text(String(format: "%.1f", refResult.displayScore(method: sm)))
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        Text(sm.unitLabel)
-                            .font(PanelStyle.captionFont)
-                            .foregroundStyle(.secondary)
-                    }
+                if let score = lead.referenceScore {
+                    DSScoreBadge(score, method: lead.scoringMethod)
                 }
             }
         ) {
-            VStack(alignment: .leading, spacing: 8) {
-                PanelHighlightRow(color: .accentColor) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(viewModel.leadOpt.referenceName)
-                            .font(PanelStyle.bodyFont.weight(.medium))
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                HStack(alignment: .top, spacing: DS.Space.m) {
+                    Circle()
+                        .fill(DS.Color.ligand)
+                        .frame(width: 8, height: 8)
+                        .padding(.top, DS.Space.xs)
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        Text(lead.referenceName)
+                            .font(DS.Font.label.weight(.medium))
                             .lineLimit(1)
-                        Text(viewModel.leadOpt.referenceSMILES.prefix(60)
-                                + (viewModel.leadOpt.referenceSMILES.count > 60 ? "…" : ""))
-                            .font(PanelStyle.monoSmall)
+                        Text(lead.referenceSMILES)
+                            .font(DS.Font.monoSmall)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(lead.referenceSMILES)
                     }
+                    Spacer(minLength: 0)
                 }
-                if let desc = viewModel.leadOpt.referenceDescriptors {
-                    HStack(spacing: 6) {
-                        PanelStat(label: "MW", value: String(format: "%.0f", desc.molecularWeight))
-                        PanelStat(label: "LogP", value: String(format: "%.1f", desc.logP))
-                        PanelStat(label: "TPSA", value: String(format: "%.0f", desc.tpsa))
-                        PanelStat(label: "RotB", value: "\(desc.rotatableBonds)")
+
+                if let desc = lead.referenceDescriptors {
+                    DSMetricGrid(columns: 4) {
+                        DSMetric("MW", value: String(format: "%.1f", desc.molecularWeight))
+                        DSMetric("LogP", value: String(format: "%.1f", desc.logP))
+                        DSMetric("TPSA", value: String(format: "%.0f", desc.tpsa))
+                        DSMetric("RotB", value: "\(desc.rotatableBonds)")
                     }
-                    if desc.lipinski {
-                        HStack {
-                            Spacer()
-                            Text("✓ Lipinski")
-                                .font(.system(size: 10, weight: .semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Capsule().fill(Color.green.opacity(0.2)))
-                                .foregroundStyle(.green)
+                    HStack(spacing: DS.Space.xs) {
+                        if desc.lipinski {
+                            DSTag("Lipinski", tone: .success, systemImage: "checkmark")
+                        } else {
+                            DSTag("Lipinski violation", tone: .warning, systemImage: "exclamationmark.triangle")
                         }
+                        DSTag("HBD \(desc.hbd)", monospaced: true)
+                        DSTag("HBA \(desc.hba)", monospaced: true)
+                        Spacer(minLength: 0)
                     }
                 }
             }
         }
     }
 
-    // MARK: - Generation card
+    // MARK: - Generation
 
     @ViewBuilder
     private var generationCard: some View {
         @Bindable var vm = viewModel
-        PanelCard("Generation", icon: "wand.and.stars") {
-            VStack(alignment: .leading, spacing: 10) {
+        PanelCard("Generation", icon: "sparkles") {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
                 PanelLabeledRow("Count") {
-                    Picker("", selection: $vm.leadOpt.analogCount) {
-                        ForEach([10, 25, 50, 100], id: \.self) { Text("\($0)").tag($0) }
+                    Picker("Count", selection: $vm.leadOpt.analogCount) {
+                        ForEach([10, 25, 50, 100], id: \.self) { Text("\($0)").monospacedDigit().tag($0) }
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
                     .controlSize(.small)
-                    .frame(width: 160)
+                    .frame(maxWidth: .infinity)
                 }
                 PanelSliderRow(
                     label: "Similarity",
@@ -164,68 +145,75 @@ struct LeadOptimizationTabView: View {
                     range: 0.3...0.95, step: 0.05,
                     format: { String(format: "%.0f%%", $0 * 100) }
                 )
-                PanelToggleRow(
-                    title: "Keep scaffold",
-                    subtitle: "Modify R-groups only",
-                    isOn: $vm.leadOpt.keepScaffold
-                )
+                HStack(alignment: .center, spacing: DS.Space.m) {
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        Text("Keep scaffold")
+                            .font(DS.Font.label)
+                        Text("Modify R-groups only")
+                            .font(DS.Font.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Toggle("Keep scaffold", isOn: $vm.leadOpt.keepScaffold)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                        .accessibilityIdentifier(AccessibilityID.leadScaffoldToggle)
+                }
 
                 PanelLabeledDivider(title: "Property Direction", icon: "slider.horizontal.3")
-                directionSlider("Polarity",       value: $vm.leadOpt.polarityDirection,       low: "Less",        high: "More")
-                directionSlider("Rigidity",       value: $vm.leadOpt.rigidityDirection,       low: "Flexible",    high: "Rigid")
-                directionSlider("Lipophilicity",  value: $vm.leadOpt.lipophilicityDirection,  low: "Hydrophilic", high: "Lipophilic")
-                directionSlider("Size",           value: $vm.leadOpt.sizeDirection,           low: "Smaller",     high: "Larger")
+                directionSlider("Polarity",      value: $vm.leadOpt.polarityDirection,      low: "Less",        high: "More")
+                directionSlider("Rigidity",      value: $vm.leadOpt.rigidityDirection,      low: "Flexible",    high: "Rigid")
+                directionSlider("Lipophilicity", value: $vm.leadOpt.lipophilicityDirection, low: "Hydrophilic", high: "Lipophilic")
+                directionSlider("Size",          value: $vm.leadOpt.sizeDirection,          low: "Smaller",     high: "Larger")
             }
         }
     }
 
     @ViewBuilder
     private func directionSlider(_ label: String, value: Binding<Float>, low: String, high: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
+        let isNeutral = abs(value.wrappedValue) < 0.05
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack(alignment: .firstTextBaseline) {
                 Text(label)
-                    .font(PanelStyle.smallFont)
-                    .foregroundStyle(.secondary)
+                    .font(DS.Font.label)
                 Spacer()
                 Text(directionDescription(value.wrappedValue, low: low, high: high))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                    .font(DS.Font.caption.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(isNeutral ? AnyShapeStyle(.tertiary) : AnyShapeStyle(DS.Color.accent))
             }
-            HStack(spacing: 6) {
+            Slider(value: value, in: -1...1, step: 0.1)
+                .controlSize(.mini)
+                .accessibilityLabel(label)
+                .accessibilityValue(directionDescription(value.wrappedValue, low: low, high: high))
+            HStack {
                 Text(low)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 64, alignment: .leading)
-                    .lineLimit(1)
-                Slider(value: value, in: -1...1, step: 0.1)
-                    .controlSize(.mini)
+                Spacer()
                 Text(high)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 64, alignment: .trailing)
-                    .lineLimit(1)
             }
+            .font(DS.Font.caption)
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
         }
     }
 
     private func directionDescription(_ value: Float, low: String, high: String) -> String {
-        if abs(value) < 0.05 { return "neutral" }
-        let pct = Int(abs(value) * 100)
-        return value > 0 ? "+\(pct)% \(high.lowercased())" : "+\(pct)% \(low.lowercased())"
+        if abs(value) < 0.05 { return "Neutral" }
+        let pct = Int((abs(value) * 100).rounded())
+        return "+\(pct)% \((value > 0 ? high : low).lowercased())"
     }
 
-    // MARK: - ADMET filters card
+    // MARK: - ADMET filters
 
     @ViewBuilder
     private var admetFiltersCard: some View {
         @Bindable var vm = viewModel
         PanelCard("ADMET Filters", icon: "shield.checkered") {
-            VStack(alignment: .leading, spacing: 8) {
-                PanelChoiceGrid(columns: 2) {
-                    PanelToggleRow(title: "Lipinski", isOn: $vm.leadOpt.filterLipinski)
-                    PanelToggleRow(title: "Veber",    isOn: $vm.leadOpt.filterVeber)
-                }
-                PanelChoiceGrid(columns: 2) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                PanelChoiceGrid(columns: 2, spacing: DS.Space.m) {
+                    PanelToggleRow(title: "Lipinski",  isOn: $vm.leadOpt.filterLipinski)
+                    PanelToggleRow(title: "Veber",     isOn: $vm.leadOpt.filterVeber)
                     PanelToggleRow(title: "hERG safe", isOn: $vm.leadOpt.filterHERG)
                     PanelToggleRow(title: "CYP safe",  isOn: $vm.leadOpt.filterCYP)
                 }
@@ -239,300 +227,323 @@ struct LeadOptimizationTabView: View {
         }
     }
 
-    // MARK: - Generate run card
-
-    @ViewBuilder
-    private var generateRunCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            PanelRunButton(
-                title: viewModel.leadOpt.isGenerating ? "Generating…" : "Generate Analogs",
-                icon: "sparkles",
-                isDisabled: viewModel.leadOpt.isGenerating || !viewModel.leadOpt.hasReference
-            ) {
-                viewModel.generateOptimizedAnalogs()
-            }
-            .accessibilityIdentifier(AccessibilityID.leadGenerate)
-            if viewModel.leadOpt.isGenerating {
-                ProgressView(value: Double(viewModel.leadOpt.generationProgress))
-                    .controlSize(.small)
-                    .tint(.accentColor)
-            }
-        }
-    }
-
-    // MARK: - Analogs card
+    // MARK: - Analogs
 
     @ViewBuilder
     private var analogsCard: some View {
         let analogs = viewModel.leadOpt.analogs
-        let passed = analogs.filter { $0.status != .filtered && $0.status != .failed }.count
+        let passed = viewModel.leadOpt.passedFilterCount
         let filtered = analogs.filter { $0.status == .filtered }.count
         let failed = analogs.filter { $0.status == .failed }.count
+        let refScore = viewModel.leadOpt.referenceScore
+
         PanelCard(
             "Analogs",
             icon: "list.bullet",
-            accessory: {
-                Button("Clear") {
-                    viewModel.leadOpt.analogs.removeAll()
-                    viewModel.leadOpt.selectedAnalogIndex = nil
-                }
-                .font(PanelStyle.smallFont)
-                .buttonStyle(.plain)
-                .foregroundStyle(.red)
-                .accessibilityIdentifier(AccessibilityID.leadClear)
-            }
+            accessory: { DSTag("\(analogs.count)", monospaced: true) }
         ) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    PanelStat(label: "Passed",   value: "\(passed)", color: passed > 0 ? .primary : .secondary)
-                    PanelStat(label: "Filtered", value: "\(filtered)", color: filtered > 0 ? .orange : .secondary)
-                    PanelStat(label: "Failed",   value: "\(failed)",   color: failed > 0 ? .red : .secondary)
-                    PanelStat(label: "Total",    value: "\(analogs.count)")
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                DSMetricGrid(columns: 3) {
+                    DSMetric("Passed", value: "\(passed)", tone: passed > 0 ? .success : .neutral)
+                    DSMetric("Filtered", value: "\(filtered)", tone: filtered > 0 ? .warning : .neutral)
+                    DSMetric("Failed", value: "\(failed)", tone: failed > 0 ? .danger : .neutral)
                 }
-                .padding(8)
-                .frame(maxWidth: .infinity)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.primary.opacity(0.04))
-                )
-                ForEach(Array(analogs.prefix(40).enumerated()), id: \.element.id) { idx, analog in
-                    analogRow(index: idx, analog: analog)
+
+                VStack(spacing: DS.Space.xxs) {
+                    ForEach(Array(analogs.prefix(Self.visibleAnalogLimit).enumerated()), id: \.element.id) { idx, analog in
+                        analogRow(index: idx, analog: analog, refScore: refScore)
+                    }
+                    if analogs.count > Self.visibleAnalogLimit {
+                        Text("+ \(analogs.count - Self.visibleAnalogLimit) more")
+                            .font(DS.Font.secondary)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, DS.Space.xs)
+                    }
                 }
-                if analogs.count > 40 {
-                    Text("+ \(analogs.count - 40) more")
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
+
+                if let analog = selectedAnalog {
+                    selectionSummary(analog: analog, refScore: refScore)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func analogRow(index: Int, analog: LeadOptAnalog) -> some View {
+    private func analogRow(index: Int, analog: LeadOptAnalog, refScore: Float?) -> some View {
         let isSelected = viewModel.leadOpt.selectedAnalogIndex == index
-        HStack(spacing: 8) {
+        let method = viewModel.leadOpt.scoringMethod
+        HStack(alignment: .center, spacing: DS.Space.m) {
             Circle()
-                .fill(analog.status.color)
-                .frame(width: 6, height: 6)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 4) {
-                    Text(analog.name)
-                        .font(PanelStyle.smallFont.weight(.medium))
-                        .lineLimit(1)
-                    if let energy = analog.bestEnergy {
-                        Text(String(format: "%.1f", energy))
-                            .font(PanelStyle.monoSmall.weight(.semibold))
-                            .foregroundStyle(energy < -6 ? .green : energy < 0 ? .yellow : .red)
-                    }
-                }
-                HStack(spacing: 6) {
+                .fill(analog.status.tone.color)
+                .frame(width: 8, height: 8)
+                .help(analog.status.label)
+                .accessibilityLabel(analog.status.label)
+
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Text(analog.name)
+                    .font(DS.Font.label.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                HStack(spacing: DS.Space.xs) {
                     if let dMW = analog.deltaMW {
-                        deltaLabel("MW", dMW, format: "%+.0f")
+                        DSTag("MW \(String(format: "%+.0f", dMW))", tone: deltaTone(dMW), monospaced: true)
                     }
                     if let dLogP = analog.deltaLogP {
-                        deltaLabel("LogP", dLogP, format: "%+.1f")
+                        DSTag("LogP \(String(format: "%+.1f", dLogP))", tone: deltaTone(dLogP), monospaced: true)
                     }
-                    if analog.status == .filtered {
-                        Text("filtered")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.orange)
+                    if analog.status == .filtered || analog.status == .failed {
+                        DSTag(analog.status.label, tone: analog.status.tone)
                     }
                 }
             }
-            Spacer()
-            if analog.status == .docked {
-                Button(action: {
+
+            Spacer(minLength: DS.Space.xs)
+
+            if let score = analog.bestScore {
+                VStack(alignment: .trailing, spacing: DS.Space.xxs) {
+                    DSScoreBadge(score, method: method)
+                    if let ref = refScore {
+                        deltaScoreText(score, reference: ref, method: method)
+                    }
+                }
+            }
+
+            if analog.status != .failed {
+                let isDocked = analog.status == .docked
+                Button {
                     viewModel.leadOpt.selectedAnalogIndex = index
-                    viewModel.applyAnalogPose(at: index)
-                }) {
-                    Text("View")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
+                    if isDocked { viewModel.applyAnalogPose(at: index) }
+                } label: {
+                    Image(systemName: "eye")
+                        .font(DS.Font.secondary.weight(.medium))
+                        .foregroundStyle(DS.Color.accent)
+                        .frame(width: DS.Size.rowHeight, height: DS.Size.rowHeight)
                         .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(Color.accentColor.opacity(0.14))
+                            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                                .fill(DS.Color.accentSoft)
                         )
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .help(isDocked
+                      ? "Show the docked pose of \(analog.name) as an overlay in the viewer"
+                      : "Show the structure of \(analog.name) (dock it to see its pose)")
+                .accessibilityLabel("View \(analog.name)")
+                .accessibilityIdentifier(AccessibilityID.leadViewAnalog(index))
             }
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 6)
+        .padding(.vertical, DS.Space.s)
+        .padding(.horizontal, DS.Space.m)
         .background(
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.10) : Color.clear)
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(isSelected ? DS.Color.accentSoft : Color.clear)
         )
         .contentShape(Rectangle())
-        .onTapGesture {
-            viewModel.leadOpt.selectedAnalogIndex = index
+        .onTapGesture { viewModel.leadOpt.selectedAnalogIndex = index }
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    /// Δ vs the reference in the method's units: improvement → success, regression → scorePoor.
+    @ViewBuilder
+    private func deltaScoreText(_ score: Float, reference: Float, method: ScoringMethod) -> some View {
+        let delta = score - reference
+        let color: Color = abs(delta) <= 0.05 ? .secondary
+            : method.ranks(score, before: reference) ? DS.Color.success : DS.Color.scorePoor
+        Text("Δ \(String(format: "%+.1f", delta))")
+            .font(DS.Font.monoSmall)
+            .monospacedDigit()
+            .foregroundStyle(color)
+            .accessibilityLabel("Change versus reference \(String(format: "%+.1f", delta)) \(method.unitLabel)")
+    }
+
+    /// Property deltas carry no good/bad meaning on their own; tint only the direction.
+    private func deltaTone(_ value: Float) -> DSTone {
+        value > 0 ? .ligand : value < 0 ? .info : .neutral
+    }
+
+    @ViewBuilder
+    private func selectionSummary(analog: LeadOptAnalog, refScore: Float?) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            PanelLabeledDivider(title: "Selected Analog", icon: "hexagon")
+            LigandDepictionView(smiles: analog.smiles)
+                .frame(height: 170)
+                .frame(maxWidth: .infinity)
+            Text(analog.smiles)
+                .font(DS.Font.monoSmall)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            PanelLabeledDivider(title: "Selected vs Reference", icon: "arrow.left.arrow.right")
+            HStack(spacing: DS.Space.m) {
+                scoreColumn(title: "Reference", value: refScore, tone: .neutral)
+                Image(systemName: "arrow.right")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.tertiary)
+                scoreColumn(
+                    title: analog.name,
+                    value: analog.bestScore,
+                    tone: comparisonTone(analog.bestScore, ref: refScore)
+                )
+            }
         }
     }
 
     @ViewBuilder
-    private func deltaLabel(_ label: String, _ value: Float, format: String) -> some View {
-        let color: Color = value > 0 ? .orange : value < 0 ? .blue : .secondary
-        Text("\(label):\(String(format: format, value))")
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(color)
+    private func scoreColumn(title: String, value: Float?, tone: DSTone) -> some View {
+        DSMetric(
+            title,
+            value: value.map { String(format: "%.1f", $0) } ?? "—",
+            unit: value == nil ? nil : viewModel.leadOpt.scoringMethod.unitLabel,
+            tone: tone
+        )
     }
 
-    // MARK: - Docking controls card
+    private func comparisonTone(_ value: Float?, ref: Float?) -> DSTone {
+        guard let v = value, let r = ref else { return .neutral }
+        return viewModel.leadOpt.scoringMethod.ranks(v, before: r) ? .success : .warning
+    }
+
+    // MARK: - Dock & Deliver
 
     @ViewBuilder
-    private var dockingControlsCard: some View {
-        let canDockAll = !viewModel.leadOpt.analogs.filter({ $0.status == .generated }).isEmpty
-        let prog = viewModel.leadOpt.dockingProgress
+    private var dockAndDeliverCard: some View {
+        let lead = viewModel.leadOpt
+        let canDockAll = lead.analogs.contains { $0.status == .generated }
+        let prog = lead.dockingProgress
 
-        PanelCard("Dock & Deliver", icon: "arrow.triangle.merge") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
+        PanelCard(
+            "Dock & Deliver",
+            icon: "paperplane",
+            accessory: {
+                if lead.dockedAnalogCount > 0 {
+                    DSTag("\(lead.dockedAnalogCount) docked", tone: .success, monospaced: true)
+                }
+            }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                HStack(spacing: DS.Space.s) {
                     PanelSecondaryButton(
-                        title: viewModel.leadOpt.isDocking ? "Docking…" : "Dock All Analogs",
-                        icon: "arrow.triangle.merge",
-                        isDisabled: viewModel.leadOpt.isDocking || !canDockAll,
-                        help: "Mini-dock analogs in-place using the reference's grid maps"
+                        title: lead.isDocking ? "Docking…" : "Dock All Analogs",
+                        icon: "arrow.down.right.and.arrow.up.left",
+                        isDisabled: lead.isDocking || !canDockAll,
+                        help: "Mini-dock analogs into the reference pocket with the reference's scoring method"
                     ) { viewModel.dockAnalogs() }
                     .accessibilityIdentifier(AccessibilityID.leadDockAll)
 
-                    if viewModel.leadOpt.isDocking {
-                        PanelSecondaryButton(title: "Stop", icon: "stop.fill", tint: .red) {
-                            viewModel.cancelLeadOptimization()
-                        }
+                    if lead.isDocking {
+                        PanelSecondaryButton(
+                            title: "Stop",
+                            icon: "stop.fill",
+                            tint: DS.Color.danger,
+                            help: "Stop analog docking"
+                        ) { viewModel.cancelLeadOptimization() }
                         .accessibilityIdentifier(AccessibilityID.leadStop)
-                        .frame(width: 76)
+                        .fixedSize()
                     }
                 }
-                if viewModel.leadOpt.isDocking {
-                    ProgressView(value: Double(prog.current), total: Double(max(prog.total, 1)))
-                        .controlSize(.small)
-                    Text("Docking \(prog.current)/\(prog.total)")
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.secondary)
-                }
-                if viewModel.leadOpt.dockedAnalogCount > 0 {
-                    Text("\(viewModel.leadOpt.dockedAnalogCount) analog(s) docked")
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.secondary)
+
+                if lead.isDocking {
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        ProgressView(value: Double(prog.current), total: Double(max(prog.total, 1)))
+                            .controlSize(.small)
+                        Text("Docking \(prog.current) of \(prog.total)")
+                            .font(DS.Font.secondary)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 PanelLabeledDivider(title: "Send")
                 PanelChoiceGrid(columns: 2) {
                     PanelSecondaryButton(
-                        title: "To Database",
-                        icon: "tray.and.arrow.down",
-                        isDisabled: viewModel.leadOpt.analogs.isEmpty || viewModel.leadOpt.isDocking,
-                        help: "Copy these analogs into the main Ligand Database"
-                    ) { viewModel.addAnalogsToLigandDatabase() }
+                        title: "Ligand Database",
+                        icon: "tray.full",
+                        help: "Open the Ligand Database, where generated analogs are added automatically"
+                    ) { openWindow(id: "ligand-database") }
                     PanelSecondaryButton(
                         title: "To Docking",
                         icon: "arrow.right.circle",
-                        isDisabled: viewModel.leadOpt.analogs.isEmpty || viewModel.leadOpt.isDocking,
-                        help: "Add to Database and switch to Docking tab"
+                        isDisabled: lead.isDocking,
+                        help: "Add to the Ligand Database and switch to the Docking step"
                     ) { viewModel.sendAnalogsToDocking() }
                 }
             }
         }
     }
 
-    // MARK: - Comparison card
+    // MARK: - Footer
 
     @ViewBuilder
-    private var comparisonCard: some View {
-        if let idx = viewModel.leadOpt.selectedAnalogIndex,
-           idx < viewModel.leadOpt.analogs.count {
-            let analog = viewModel.leadOpt.analogs[idx]
-            let refEnergy = viewModel.leadOpt.referenceResult?.energy
-            let sm = viewModel.docking.scoringMethod
+    private var footer: some View {
+        let lead = viewModel.leadOpt
+        PanelRunButton(
+            title: lead.isGenerating ? "Generating…" : "Generate Analogs",
+            icon: "sparkles",
+            isDisabled: lead.isGenerating
+        ) {
+            viewModel.generateOptimizedAnalogs()
+        }
+        .accessibilityIdentifier(AccessibilityID.leadGenerate)
 
-            PanelCard(
-                "Comparison",
-                icon: "arrow.left.arrow.right",
-                accessory: {
-                    PanelSecondaryButton(
-                        title: "Full",
-                        icon: "rectangle.expand.vertical",
-                        isDisabled: analog.status != .docked
-                    ) {
-                        viewModel.leadOpt.showComparison = true
-                    }
-                    .accessibilityIdentifier(AccessibilityID.leadComparison)
-                    .frame(width: 70)
+        if lead.isGenerating {
+            ProgressView(value: Double(lead.generationProgress))
+                .controlSize(.small)
+        }
+
+        if !lead.analogs.isEmpty {
+            HStack(spacing: DS.Space.s) {
+                PanelSecondaryButton(
+                    title: "Clear",
+                    icon: "trash",
+                    tint: DS.Color.danger,
+                    isDisabled: lead.isGenerating || lead.isDocking,
+                    help: "Remove all generated analogs"
+                ) {
+                    viewModel.leadOpt.analogs.removeAll()
+                    viewModel.leadOpt.selectedAnalogIndex = nil
                 }
-            ) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 12) {
-                        comparisonColumn(title: "Reference", value: refEnergy, color: .secondary, unit: sm.unitLabel)
-                        Image(systemName: "arrow.right")
-                            .foregroundStyle(.secondary)
-                        comparisonColumn(
-                            title: analog.name,
-                            value: analog.bestEnergy,
-                            color: comparisonColor(analog.bestEnergy, ref: refEnergy, isAffinity: sm.isAffinityScore),
-                            unit: sm.unitLabel
-                        )
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.purple.opacity(0.08))
-                    )
-                    if let rmsd = analog.rmsdToReference {
-                        Text(String(format: "RMSD to reference: %.2f Å", rmsd))
-                            .font(PanelStyle.smallFont)
-                            .foregroundStyle(.secondary)
-                    }
+                .accessibilityIdentifier(AccessibilityID.leadClear)
+
+                PanelSecondaryButton(
+                    title: "Comparison",
+                    icon: "arrow.left.arrow.right",
+                    isDisabled: selectedAnalog == nil,
+                    help: selectedAnalog == nil
+                        ? "Select an analog to compare it with the reference"
+                        : "Open the full reference vs analog comparison"
+                ) {
+                    viewModel.leadOpt.showComparison = true
                 }
+                .accessibilityIdentifier(AccessibilityID.leadComparison)
             }
         }
-    }
-
-    @ViewBuilder
-    private func comparisonColumn(title: String, value: Float?, color: Color, unit: String) -> some View {
-        VStack(alignment: .center, spacing: 2) {
-            Text(title)
-                .font(PanelStyle.captionFont.weight(.medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            if let v = value {
-                Text(String(format: "%.1f", v))
-                    .font(.system(size: 16, weight: .bold, design: .monospaced))
-                    .foregroundStyle(color)
-            } else {
-                Text("—")
-                    .font(.system(size: 16, weight: .regular, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            Text(unit)
-                .font(PanelStyle.captionFont)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    private func comparisonColor(_ value: Float?, ref: Float?, isAffinity: Bool) -> Color {
-        guard let v = value, let r = ref else { return .secondary }
-        if isAffinity {
-            return v > r ? .green : .orange
-        }
-        return v < r ? .green : .orange
     }
 }
 
-// MARK: - Status color
+// MARK: - Status presentation
 
-extension LeadOptAnalog.Status {
-    var color: Color {
+private extension LeadOptAnalog.Status {
+    var tone: DSTone {
         switch self {
-        case .generated: .gray
-        case .prepared:  .blue
-        case .docked:    .green
-        case .filtered:  .orange
-        case .failed:    .red
+        case .generated: .neutral
+        case .prepared:  .info
+        case .docked:    .success
+        case .filtered:  .warning
+        case .failed:    .danger
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .generated: "Generated"
+        case .prepared:  "Prepared"
+        case .docked:    "Docked"
+        case .filtered:  "Filtered"
+        case .failed:    "Failed"
         }
     }
 }

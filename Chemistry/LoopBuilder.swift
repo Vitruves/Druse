@@ -165,18 +165,42 @@ enum LoopBuilder {
             return [String](repeating: "ALA", count: gapLength)
         }
 
-        // Find the offset: the first residue in this chain has some residueSeq
-        // and corresponds to index 0 in fullSeq
-        let chainAtoms = atoms.filter { $0.chainID == chainID && !$0.isHetAtom }
-        guard let firstResSeq = chainAtoms.map(\.residueSeq).min() else {
+        // Observed residues of this chain (residueSeq → name).
+        var observed: [Int: String] = [:]
+        for atom in atoms where atom.chainID == chainID && !atom.isHetAtom {
+            observed[atom.residueSeq] = atom.residueName
+        }
+        guard let firstResSeq = observed.keys.min() else {
             return [String](repeating: "ALA", count: gapLength)
+        }
+
+        // Find the residueSeq of SEQRES index 0. Assuming the first observed residue
+        // is SEQRES[0] is wrong whenever N-terminal residues are disordered (common),
+        // which shifts every gap residue name. Choose the offset that best matches
+        // the observed residue names; ties keep the first-observed assumption.
+        func agreement(_ offset: Int) -> Int {
+            var matches = 0
+            for (seq, name) in observed {
+                let idx = seq - offset
+                if idx >= 0, idx < fullSeq.count, fullSeq[idx] == name { matches += 1 }
+            }
+            return matches
+        }
+        var seqOffset = firstResSeq
+        var bestAgreement = agreement(firstResSeq)
+        for shift in 1..<max(1, fullSeq.count) {
+            let score = agreement(firstResSeq - shift)
+            if score > bestAgreement {
+                bestAgreement = score
+                seqOffset = firstResSeq - shift
+            }
         }
 
         var result: [String] = []
         result.reserveCapacity(gapLength)
 
         for seq in gapStart...gapEnd {
-            let seqIdx = seq - firstResSeq
+            let seqIdx = seq - seqOffset
             if seqIdx >= 0, seqIdx < fullSeq.count {
                 result.append(fullSeq[seqIdx])
             } else {
@@ -706,18 +730,25 @@ enum LoopBuilder {
             SIMD4(cov[0, 1] - cov[1, 0], cov[2, 0] + cov[0, 2], cov[1, 2] + cov[2, 1], -cov[0, 0] - cov[1, 1] + cov[2, 2])
         ]
 
-        var q = SIMD4<Float>(1, 0, 0, 0)
-        for _ in 0..<32 {
-            let next = SIMD4<Float>(
-                simd_dot(rows[0], q), simd_dot(rows[1], q),
-                simd_dot(rows[2], q), simd_dot(rows[3], q)
-            )
-            let len = simd_length(next)
-            guard len > 1e-8 else { break }
-            q = next / len
+        // Horn's optimal rotation is the eigenvector of the LARGEST (most positive)
+        // eigenvalue. Plain power iteration converges to the largest |λ|, which for
+        // the 3 coplanar N/CA/C anchors is a ± pair (λ and -λ) and never settles.
+        // Shift by the Frobenius norm (≥ spectral radius) so every eigenvalue is
+        // non-negative and the wanted one dominates, then square repeatedly
+        // (M^(2^k)) for fast convergence to the dominant eigenvector's projector.
+        let frobenius = rows.reduce(Float(0)) { $0 + simd_length_squared($1) }.squareRoot()
+        var m = simd_float4x4(rows: rows) + simd_float4x4(diagonal: SIMD4<Float>(repeating: frobenius))
+        for _ in 0..<16 {
+            m = m * m
+            let scale = max(simd_length(m.columns.0), simd_length(m.columns.1),
+                            simd_length(m.columns.2), simd_length(m.columns.3))
+            guard scale > 1e-20 else { break }
+            m = m * (1 / scale)
         }
+        let columns = [m.columns.0, m.columns.1, m.columns.2, m.columns.3]
+        let q = columns.max { simd_length_squared($0) < simd_length_squared($1) } ?? SIMD4<Float>(1, 0, 0, 0)
 
-        let rot = quaternionToMatrix(q)
+        let rot = simd_length_squared(q) > 1e-12 ? quaternionToMatrix(q) : matrix_identity_float3x3
         return SimpleOverlayTransform(rotation: rot, movingCenter: movCenter, referenceCenter: refCenter)
     }
 

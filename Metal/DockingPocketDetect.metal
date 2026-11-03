@@ -60,13 +60,16 @@ kernel void computePocketDistanceGrid(
     uint                        tid           [[thread_position_in_grid]],
     uint                        lid           [[thread_index_in_threadgroup]])
 {
-    if (tid >= params.totalPoints) return;
+    // Threads past the end must not return early: they still load their tile slot
+    // and reach every threadgroup barrier (the last threadgroup is partially filled).
+    bool active = tid < params.totalPoints;
+    uint pointIdx = active ? tid : 0u;
 
     uint nx = params.dims.x;
     uint ny = params.dims.y;
-    uint iz = tid / (nx * ny);
-    uint iy = (tid - iz * nx * ny) / nx;
-    uint ix = tid - iz * nx * ny - iy * nx;
+    uint iz = pointIdx / (nx * ny);
+    uint iy = (pointIdx - iz * nx * ny) / nx;
+    uint ix = pointIdx - iz * nx * ny - iy * nx;
     float3 gridPos = params.origin + float3(float(ix), float(iy), float(iz)) * params.spacing;
 
     float minSurface = 1e10f;
@@ -88,6 +91,7 @@ kernel void computePocketDistanceGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    if (!active) return;
     distanceGrid[tid] = minSurface;
     candidateMask[tid] = (minSurface >= params.minProbeDist && minSurface <= params.maxProbeDist) ? 1u : 0u;
 }

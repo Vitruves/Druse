@@ -68,7 +68,6 @@ enum PocketDetection {
 
         // Step 3: Generate probe grid and filter by distance
         var probes: [SIMD3<Float>] = []
-        var probeDistances: [Float] = []
 
         var x = gridMin.x
         while x <= gridMax.x {
@@ -82,7 +81,6 @@ enum PocketDetection {
 
                     if minDist >= params.minDistance && minDist <= params.maxDistance {
                         probes.append(probe)
-                        probeDistances.append(minDist)
                     }
                     z += params.gridSpacing
                 }
@@ -108,9 +106,11 @@ enum PocketDetection {
 
         // Step 5: Filter by buriedness
         var filteredProbes: [SIMD3<Float>] = []
+        var filteredBuriedness: [Float] = []
         for (i, probe) in probes.enumerated() {
             if buriedness[i] >= params.buriednessThreshold {
                 filteredProbes.append(probe)
+                filteredBuriedness.append(buriedness[i])
             }
         }
 
@@ -124,18 +124,15 @@ enum PocketDetection {
 
         // Step 7: Build pockets from clusters
         var pockets: [Pocket] = []
-        for (clusterId, clusterPoints) in clusters.enumerated() {
-            guard clusterPoints.count >= params.clusterMinPts else { continue }
+        for (clusterId, memberIndices) in clusters.enumerated() {
+            guard memberIndices.count >= params.clusterMinPts else { continue }
 
+            let clusterPoints = memberIndices.map { filteredProbes[$0] }
             let center = centroid(clusterPoints)
             let volume = Float(clusterPoints.count) * powf(params.gridSpacing, 3)
 
-            // Average buriedness of cluster probes
-            var totalBuriedness: Float = 0
-            for pt in clusterPoints {
-                totalBuriedness += computeBuriedness(pt, positions: positions,
-                                                      spatialHash: spatialHash, cellSize: cellSize)
-            }
+            // Average buriedness of cluster probes (already computed in step 4)
+            let totalBuriedness = memberIndices.reduce(Float(0)) { $0 + filteredBuriedness[$1] }
             let avgB = totalBuriedness / Float(clusterPoints.count)
 
             // Find nearby residues
@@ -230,6 +227,34 @@ enum PocketDetection {
         return minDist
     }
 
+    /// Early-exit test for "any atom closer than `radius`" (radius ≤ cellSize).
+    /// Buriedness only needs this predicate, not the exact nearest distance.
+    private static func hasAtomWithin(
+        _ point: SIMD3<Float>,
+        radius: Float,
+        positions: [SIMD3<Float>],
+        spatialHash: [SIMD3<Int32>: [Int]],
+        cellSize: Float
+    ) -> Bool {
+        let cell = SIMD3<Int32>(
+            Int32(floorf(point.x / cellSize)),
+            Int32(floorf(point.y / cellSize)),
+            Int32(floorf(point.z / cellSize))
+        )
+        let r2 = radius * radius
+        for dx: Int32 in -1...1 {
+            for dy: Int32 in -1...1 {
+                for dz: Int32 in -1...1 {
+                    guard let indices = spatialHash[SIMD3<Int32>(cell.x + dx, cell.y + dy, cell.z + dz)] else { continue }
+                    for i in indices where simd_distance_squared(point, positions[i]) < r2 {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
     // MARK: - Buriedness (26-direction ray casting)
 
     private static let rayDirections: [SIMD3<Float>] = {
@@ -262,9 +287,8 @@ enum PocketDetection {
             let steps = Int(maxRayDist / 2.0)
             for step in 1...steps {
                 let testPoint = point + dir * Float(step) * 2.0
-                let nearDist = nearestAtomDistance(testPoint, positions: positions,
-                                                    spatialHash: spatialHash, cellSize: cellSize)
-                if nearDist < 2.0 {
+                if hasAtomWithin(testPoint, radius: 2.0, positions: positions,
+                                 spatialHash: spatialHash, cellSize: cellSize) {
                     hit = true
                     break
                 }
@@ -278,15 +302,44 @@ enum PocketDetection {
 
     // MARK: - DBSCAN Clustering
 
-    private static func dbscan(points: [SIMD3<Float>], eps: Float, minPts: Int) -> [[SIMD3<Float>]] {
+    /// DBSCAN over probe points. Returns, per cluster, the indices into `points`.
+    /// Neighbourhood queries use a uniform grid with cell size `eps`, so each query
+    /// scans only the 27 surrounding cells instead of every probe (O(N·k) vs O(N²)).
+    private static func dbscan(points: [SIMD3<Float>], eps: Float, minPts: Int) -> [[Int]] {
         let n = points.count
         var labels = [Int](repeating: -1, count: n) // -1 = unvisited
         var clusterId = 0
 
+        var grid: [SIMD3<Int32>: [Int]] = [:]
+        for (i, p) in points.enumerated() {
+            grid[gridCell(p, cellSize: eps), default: []].append(i)
+        }
+        let eps2 = eps * eps
+
+        func regionQuery(_ pointIdx: Int) -> [Int] {
+            let p = points[pointIdx]
+            let cell = gridCell(p, cellSize: eps)
+            var neighbors: [Int] = []
+            for dx: Int32 in -1...1 {
+                for dy: Int32 in -1...1 {
+                    for dz: Int32 in -1...1 {
+                        guard let bucket = grid[SIMD3<Int32>(cell.x + dx, cell.y + dy, cell.z + dz)] else { continue }
+                        for j in bucket {
+                            let diff = p - points[j]
+                            if simd_dot(diff, diff) <= eps2 {
+                                neighbors.append(j)
+                            }
+                        }
+                    }
+                }
+            }
+            return neighbors
+        }
+
         for i in 0..<n {
             guard labels[i] == -1 else { continue }
 
-            let neighbors = regionQuery(points: points, pointIdx: i, eps: eps)
+            let neighbors = regionQuery(i)
             if neighbors.count < minPts {
                 labels[i] = -2 // noise
                 continue
@@ -299,42 +352,38 @@ enum PocketDetection {
 
             while seedIdx < seeds.count {
                 let j = seeds[seedIdx]
+                seedIdx += 1
                 if labels[j] == -2 { labels[j] = clusterId } // noise → border
-                if labels[j] != -1 { seedIdx += 1; continue } // already processed
+                if labels[j] != -1 { continue } // already processed
 
                 labels[j] = clusterId
-                let jNeighbors = regionQuery(points: points, pointIdx: j, eps: eps)
+                let jNeighbors = regionQuery(j)
                 if jNeighbors.count >= minPts {
-                    seeds.append(contentsOf: jNeighbors)
+                    // Only enqueue points that can still change label.
+                    seeds.append(contentsOf: jNeighbors.lazy.filter { labels[$0] < 0 })
                 }
-                seedIdx += 1
             }
 
             clusterId += 1
         }
 
-        // Group points by cluster
-        var clusters: [[SIMD3<Float>]] = Array(repeating: [], count: clusterId)
+        // Group point indices by cluster
+        var clusters: [[Int]] = Array(repeating: [], count: clusterId)
         for (i, label) in labels.enumerated() {
             if label >= 0 && label < clusterId {
-                clusters[label].append(points[i])
+                clusters[label].append(i)
             }
         }
 
         return clusters
     }
 
-    private static func regionQuery(points: [SIMD3<Float>], pointIdx: Int, eps: Float) -> [Int] {
-        let p = points[pointIdx]
-        let eps2 = eps * eps
-        var neighbors: [Int] = []
-        for (j, q) in points.enumerated() {
-            let diff = p - q
-            if simd_dot(diff, diff) <= eps2 {
-                neighbors.append(j)
-            }
-        }
-        return neighbors
+    private static func gridCell(_ p: SIMD3<Float>, cellSize: Float) -> SIMD3<Int32> {
+        SIMD3<Int32>(
+            Int32(floorf(p.x / cellSize)),
+            Int32(floorf(p.y / cellSize)),
+            Int32(floorf(p.z / cellSize))
+        )
     }
 
     // MARK: - Find Nearby Residues

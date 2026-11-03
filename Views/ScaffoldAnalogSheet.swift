@@ -46,300 +46,284 @@ struct ScaffoldAnalogSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Image(systemName: "atom")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.blue)
-                Text("Generate Analogs from Scaffold")
-                    .font(.headline)
-                Spacer()
-                Text("Draw a scaffold, mark attachment points with Ketcher's R-group tool, then generate.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        DSSheetScaffold(
+            title: "Generate Analogs from Scaffold",
+            subtitle: "Draw a scaffold, mark attachment points with Ketcher's R-group tool, then generate.",
+            systemImage: "atom"
+        ) {
+            VStack(spacing: 0) {
+                Divider()
+                HSplitView {
+                    editorPane
+                        .frame(minWidth: 520, idealWidth: 640)
+                    configAndResults
+                        .frame(minWidth: 380, idealWidth: 440)
+                }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-
-            Divider()
-
-            HSplitView {
-                // LEFT: Ketcher + live scaffold info
-                VStack(spacing: 0) {
-                    // Ketcher accepts SMILES paste natively (Cmd+V with a
-                    // SMILES on the clipboard), so we don't add our own load
-                    // field — just surface the hint.
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle")
-                            .foregroundStyle(.secondary)
-                        Text("Tip: paste a SMILES directly into the editor (⌘V) to load an existing structure instead of drawing from scratch.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    Divider()
-
-                    ChemDrawerView(initialSmiles: nil, mode: .molecule)
-                        .onScaffoldChanged { smi, _, mol in
-                            scaffoldSMILES = smi
-                            scaffoldMolfile = mol
-                        }
-                    Divider()
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Scaffold SMILES:")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(resolvedScaffoldSMILES.isEmpty
-                                 ? "— draw a structure —"
-                                 : resolvedScaffoldSMILES)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(resolvedScaffoldSMILES.isEmpty ? .secondary : .primary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                        }
-                        if !resolvedScaffoldSMILES.isEmpty {
-                            HStack(spacing: 6) {
-                                Image(systemName: attachmentPointCount > 0
-                                      ? "checkmark.circle.fill"
-                                      : "info.circle")
-                                    .foregroundStyle(attachmentPointCount > 0 ? .green : .orange)
-                                Text(attachmentPointCount > 0
-                                     ? "\(attachmentPointCount) attachment point\(attachmentPointCount == 1 ? "" : "s") detected"
-                                     : "No attachment points — use R-group tool for decoration mode, or switch to whole-molecule transforms.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                }
-                .frame(minWidth: 520)
-
-                // RIGHT: config + results
-                configAndResults
-                    .frame(minWidth: 380)
+        } footer: {
+            Button("Cancel") {
+                generationTask?.cancel()
+                dismiss()
             }
+            .keyboardShortcut(.cancelAction)
 
-            Divider()
-
-            // Footer
-            HStack(spacing: 12) {
-                if isGenerating {
-                    ProgressView(value: generationProgress)
-                        .progressViewStyle(.linear)
-                        .frame(width: 180)
-                    Button("Stop") { generationTask?.cancel() }
-                        .controlSize(.small)
-                }
-
-                if let err = errorMessage {
-                    Label(err, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(2)
-                }
-
-                Spacer()
-
-                Button("Cancel") {
-                    generationTask?.cancel()
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
-
-                Button {
-                    runGeneration()
-                } label: {
-                    Label("Generate", systemImage: "sparkles")
-                }
-                .disabled(isGenerating || resolvedScaffoldSMILES.isEmpty)
-
-                Button {
-                    addToDatabase()
-                } label: {
-                    Label("Add \(analogs.count) to Database", systemImage: "plus.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(analogs.isEmpty)
+            Button {
+                runGeneration()
+            } label: {
+                Label("Generate", systemImage: "sparkles")
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .disabled(isGenerating || resolvedScaffoldSMILES.isEmpty)
+
+            Button {
+                addToDatabase()
+            } label: {
+                Label("Add \(analogs.count) to Database", systemImage: "plus.circle.fill")
+                    .monospacedDigit()
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+            .disabled(analogs.isEmpty)
         }
-        .frame(minWidth: 1150, minHeight: 760)
+        .frame(minWidth: 980, idealWidth: 1100, minHeight: 640, idealHeight: 720)
     }
 
-    // MARK: - Config panel + results list
+    // MARK: - Editor pane (Ketcher + live scaffold info)
+
+    @ViewBuilder
+    private var editorPane: some View {
+        VStack(spacing: 0) {
+            // Ketcher accepts SMILES paste natively (⌘V with a SMILES on the
+            // clipboard), so we surface the hint instead of a separate load field.
+            PanelHint(
+                text: "Tip: paste a SMILES directly into the editor (⌘V) to load an existing structure instead of drawing from scratch.",
+                icon: "info.circle"
+            )
+            .padding(.horizontal, DS.Space.l)
+            .padding(.vertical, DS.Space.s)
+            Divider()
+
+            ChemDrawerView(initialSmiles: nil, mode: .molecule)
+                .onScaffoldChanged { smi, _, mol in
+                    scaffoldSMILES = smi
+                    scaffoldMolfile = mol
+                }
+
+            Divider()
+            scaffoldStatus
+                .padding(.horizontal, DS.Space.l)
+                .padding(.vertical, DS.Space.m)
+                .background(.bar)
+        }
+    }
+
+    @ViewBuilder
+    private var scaffoldStatus: some View {
+        let resolved = resolvedScaffoldSMILES
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.s) {
+                Text("Scaffold")
+                    .font(DS.Font.eyebrow)
+                    .tracking(0.6)
+                    .textCase(.uppercase)
+                    .foregroundStyle(.tertiary)
+                Text(resolved.isEmpty ? "Draw a structure" : resolved)
+                    .font(DS.Font.monoSmall)
+                    .foregroundStyle(resolved.isEmpty ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+            if !resolved.isEmpty {
+                let count = attachmentPointCount
+                HStack(spacing: DS.Space.s) {
+                    Image(systemName: count > 0 ? "checkmark.circle.fill" : "info.circle")
+                        .foregroundStyle(count > 0 ? DS.Color.success : DS.Color.warning)
+                    Text(count > 0
+                         ? "\(count) attachment point\(count == 1 ? "" : "s") detected"
+                         : "No attachment points — use the R-group tool for decoration mode, or switch to whole-molecule transforms.")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .font(DS.Font.secondary)
+            }
+        }
+    }
+
+    // MARK: - Config form + results list
 
     @ViewBuilder
     private var configAndResults: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    // --- Mode picker ---
-                    groupBox("Mode") {
-                        Picker("Mode", selection: $config.mode) {
-                            ForEach(ScaffoldGenerationMode.allCases, id: \.self) { m in
-                                Text(m.rawValue).tag(m)
-                            }
+        VStack(spacing: 0) {
+            Form {
+                Section("Mode") {
+                    Picker("Mode", selection: $config.mode) {
+                        ForEach(ScaffoldGenerationMode.allCases, id: \.self) { m in
+                            Text(m.rawValue).tag(m)
                         }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .controlSize(.small)
-
-                        Text(modeHint)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
 
-                    // --- Generation params ---
-                    groupBox("Generation") {
-                        HStack(spacing: 6) {
-                            Text("Max analogs")
-                            TextField("", value: $config.maxAnalogs, format: .number)
+                    Text(modeHint)
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Section {
+                    LabeledContent("Max analogs") {
+                        HStack(spacing: DS.Space.xs) {
+                            TextField("Max analogs", value: $config.maxAnalogs, format: .number)
+                                .labelsHidden()
                                 .textFieldStyle(.roundedBorder)
-                                .controlSize(.small)
-                                .frame(width: 60)
+                                .monospacedDigit()
                                 .multilineTextAlignment(.trailing)
+                                .frame(width: DS.Size.numberField)
                                 .onChange(of: config.maxAnalogs) { _, v in
                                     if v < 1 { config.maxAnalogs = 1 }
                                     if v > 10_000 { config.maxAnalogs = 10_000 }
                                 }
-                            Stepper("", value: $config.maxAnalogs, in: 1...10_000, step: 5)
+                            Stepper("Max analogs", value: $config.maxAnalogs, in: 1...10_000, step: 5)
                                 .labelsHidden()
-                                .controlSize(.small)
-                            Spacer()
-                            Text(candidatePoolHint)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
                         }
+                    }
+                    sliderRow("Min Tanimoto similarity", value: $config.minSimilarity, in: 0...0.95, step: 0.05, format: "%.2f")
+                    Toggle("Lipinski filter", isOn: $config.filterLipinski)
+                    sliderRow("Max LogP", value: $config.maxLogP, in: 1...10, step: 0.5, format: "%.1f")
+                    TextField("Name prefix", text: $scaffoldNamePrefix, prompt: Text("scaffold"))
+                } header: {
+                    Text("Generation")
+                } footer: {
+                    Text(candidatePoolHint)
+                        .font(DS.Font.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
 
-                        VStack(alignment: .leading, spacing: 2) {
+                // Allowed groups are only meaningful in R-group mode.
+                if config.mode == .rgroupDecoration {
+                    ForEach(FunctionalGroup.Category.allCases, id: \.self) { category in
+                        Section {
+                            groupCheckGrid(
+                                groups: FunctionalGroupCatalog.all.filter { $0.category == category },
+                                selection: allowedBinding
+                            )
+                        } header: {
                             HStack {
-                                Text("Min Tanimoto similarity")
+                                Text("Allowed — \(category.rawValue)")
                                 Spacer()
-                                Text(String(format: "%.2f", config.minSimilarity))
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                Button("All") { toggleCategoryAllow(category, enabled: true) }
+                                Button("None") { toggleCategoryAllow(category, enabled: false) }
                             }
-                            Slider(value: $config.minSimilarity, in: 0...0.95, step: 0.05)
-                        }
-
-                        Toggle("Lipinski filter", isOn: $config.filterLipinski)
+                            .buttonStyle(.borderless)
                             .controlSize(.small)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Max LogP")
-                                Spacer()
-                                Text(String(format: "%.1f", config.maxLogP))
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                            Slider(value: $config.maxLogP, in: 1...10, step: 0.5)
                         }
-
-                        HStack {
-                            Text("Name prefix")
-                            TextField("prefix", text: $scaffoldNamePrefix)
-                                .textFieldStyle(.roundedBorder)
-                                .controlSize(.small)
-                        }
-                    }
-
-                    // --- Allowed groups (per category, only meaningful in R-group mode) ---
-                    if config.mode == .rgroupDecoration {
-                        ForEach(FunctionalGroup.Category.allCases, id: \.self) { category in
-                            groupBox("Allowed — \(category.rawValue)") {
-                                let groups = FunctionalGroupCatalog.all.filter { $0.category == category }
-                                HStack {
-                                    Button("All") { toggleCategoryAllow(category, enabled: true) }
-                                        .controlSize(.mini)
-                                    Button("None") { toggleCategoryAllow(category, enabled: false) }
-                                        .controlSize(.mini)
-                                    Spacer()
-                                }
-                                groupCheckGrid(groups: groups, selection: allowedBinding)
-                            }
-                        }
-                    }
-
-                    // --- Denied substructures ---
-                    groupBox("Deny — exclude any analog containing…") {
-                        groupCheckGrid(groups: FunctionalGroupCatalog.all, selection: deniedBinding)
                     }
                 }
-                .padding(12)
+
+                Section("Deny — exclude any analog containing…") {
+                    groupCheckGrid(groups: FunctionalGroupCatalog.all, selection: deniedBinding)
+                }
             }
+            .formStyle(.grouped)
 
             Divider()
+            resultsSection
+        }
+    }
 
-            // Results preview
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Results")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text("\(analogs.count) analogs")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
+    @ViewBuilder
+    private func sliderRow(_ title: String, value: Binding<Float>, in range: ClosedRange<Float>,
+                           step: Float, format: String) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(String(format: format, value.wrappedValue))
+                    .font(DS.Font.monoSmall)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range, step: step)
+                .controlSize(.small)
+                .labelsHidden()
+                .accessibilityLabel(title)
+        }
+    }
 
-                if analogs.isEmpty {
-                    Text(isGenerating ? "Generating..." : "No analogs yet. Draw a scaffold and click Generate.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 24)
-                } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(analogs.enumerated()), id: \.offset) { idx, a in
-                                HStack {
-                                    Text("\(idx + 1).")
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 30, alignment: .trailing)
-                                    Text(a.smiles)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Spacer()
-                                    Text(a.label)
-                                        .font(.system(size: 9, design: .monospaced))
-                                        .foregroundStyle(.blue)
-                                        .frame(width: 90, alignment: .trailing)
-                                        .lineLimit(1)
-                                    Text(String(format: "T=%.2f", a.similarity))
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                    Text(String(format: "MW=%.0f", a.descriptors.molecularWeight))
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                    Text(String(format: "logP=%.1f", a.descriptors.logP))
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 2)
-                                .background(idx.isMultiple(of: 2) ? Color.gray.opacity(0.05) : Color.clear)
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 220)
+    @ViewBuilder
+    private var resultsSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Results", count: analogs.count) {
+                if isGenerating {
+                    ProgressView(value: generationProgress)
+                        .progressViewStyle(.linear)
+                        .controlSize(.small)
+                        .frame(width: 120)
+                    Button("Stop") { generationTask?.cancel() }
+                        .controlSize(.small)
                 }
             }
+            .padding(.horizontal, DS.Space.l)
+            .padding(.top, DS.Space.m)
+
+            if let err = errorMessage {
+                PanelHint(text: err, icon: "exclamationmark.triangle.fill", color: DS.Color.warning)
+                    .padding(.horizontal, DS.Space.l)
+            }
+
+            if analogs.isEmpty {
+                Text(isGenerating ? "Generating…" : "No analogs yet. Draw a scaffold and click Generate.")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, DS.Space.xxl)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(analogs.enumerated()), id: \.offset) { idx, a in
+                            resultRow(index: idx, analog: a)
+                        }
+                    }
+                }
+                .frame(maxHeight: 220)
+            }
         }
+        .padding(.bottom, DS.Space.s)
+    }
+
+    @ViewBuilder
+    private func resultRow(index: Int, analog a: ScaffoldAnalogGenerator.Analog) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack(spacing: DS.Space.s) {
+                Text("\(index + 1)")
+                    .font(DS.Font.monoSmall)
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 28, alignment: .trailing)
+                Text(a.smiles)
+                    .font(DS.Font.monoSmall)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(a.smiles)
+            }
+            HStack(spacing: DS.Space.xs) {
+                DSTag(a.label, tone: .info, monospaced: true)
+                Spacer(minLength: DS.Space.xs)
+                Text(String(format: "T %.2f · MW %.0f · logP %.1f",
+                            a.similarity, a.descriptors.molecularWeight, a.descriptors.logP))
+                    .font(DS.Font.monoSmall)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.leading, 28 + DS.Space.s)
+        }
+        .monospacedDigit()
+        .padding(.horizontal, DS.Space.l)
+        .padding(.vertical, DS.Space.xs)
+        .background(index.isMultiple(of: 2) ? DS.Color.cardFill : Color.clear)
     }
 
     // MARK: - Small helpers
@@ -353,16 +337,16 @@ struct ScaffoldAnalogSheet: View {
         case .rgroupDecoration:
             let sites = attachmentPointCount
             let n = config.allowedGroupIDs.count
-            guard sites > 0, n > 0 else { return "up to — candidates" }
+            guard sites > 0, n > 0 else { return "Up to — candidates" }
             // Safe exponentiation with a cap so huge scaffolds don't overflow.
             var total = 1
             for _ in 0..<sites {
                 total &*= n
-                if total > 1_000_000 || total < 0 { return "up to >1M candidates" }
+                if total > 1_000_000 || total < 0 { return "Up to >1M candidates" }
             }
-            return "up to \(total.formatted()) candidate\(total == 1 ? "" : "s")"
+            return "Up to \(total.formatted()) candidate\(total == 1 ? "" : "s")"
         case .wholeMolecule:
-            return "up to ~50 candidates"
+            return "Up to ~50 candidates"
         }
     }
 
@@ -399,42 +383,28 @@ struct ScaffoldAnalogSheet: View {
         }
     }
 
-    /// Two-column checkbox grid with left-aligned labels. Uses fixed GridItem
-    /// widths so toggles in the same row start at the same x-position.
+    /// Two-column checkbox grid with left-aligned labels. Uses flexible GridItem
+    /// minimums so toggles in the same row start at the same x-position.
     @ViewBuilder
     private func groupCheckGrid(groups: [FunctionalGroup],
-                                 selection: @escaping (FunctionalGroup) -> Binding<Bool>) -> some View {
+                                selection: @escaping (FunctionalGroup) -> Binding<Bool>) -> some View {
         let columns = [
             GridItem(.flexible(minimum: 120), alignment: .leading),
             GridItem(.flexible(minimum: 120), alignment: .leading),
         ]
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 3) {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: DS.Space.xs) {
             ForEach(groups) { g in
                 Toggle(isOn: selection(g)) {
                     Text(g.displayName)
-                        .font(.caption)
+                        .font(DS.Font.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
                 .toggleStyle(.checkbox)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-    }
-
-    @ViewBuilder
-    private func groupBox<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            content()
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.gray.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     private func toggleCategoryAllow(_ category: FunctionalGroup.Category, enabled: Bool) {

@@ -10,282 +10,315 @@ struct LeadOptComparisonView: View {
     let reference: LeadOptimizationState
     let analog: LeadOptAnalog
 
+    private let referenceColor = Color.secondary
+    private let analogColor = DS.Color.accent
+
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Text("Lead Optimization Comparison")
-                    .font(.system(size: 14, weight: .semibold))
-                Spacer()
-                Button("Done") { viewModel.leadOpt.showComparison = false }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-            }
-            .padding()
-
-            Divider()
-
+        DSSheetScaffold(
+            title: "Lead Optimization Comparison",
+            subtitle: "\(reference.referenceName) vs \(analog.name)",
+            systemImage: "arrow.left.arrow.right"
+        ) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: DS.Space.l) {
                     energyComparison
-                    Divider()
-                    propertyRadarChart
-                    Divider()
+                    propertyComparison
                     admetComparison
                 }
-                .padding()
+                .padding(.horizontal, DS.Space.xl)
+                .padding(.bottom, DS.Space.xl)
             }
+        } footer: {
+            Button("Done") { viewModel.leadOpt.showComparison = false }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
         }
     }
 
-    // MARK: - Energy Comparison
+    // MARK: - Energy
 
     @ViewBuilder
     private var energyComparison: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Docking Energy")
-                .font(.system(size: 12, weight: .semibold))
-
-            HStack(spacing: 0) {
-                compoundColumn(
-                    name: reference.referenceName,
-                    energy: reference.referenceResult?.energy,
-                    isReference: true
-                )
-                Divider().frame(height: 60)
-                compoundColumn(
-                    name: analog.name,
-                    energy: analog.bestEnergy,
-                    isReference: false
-                )
-            }
-
-            if let refE = reference.referenceResult?.energy, let analogE = analog.bestEnergy {
-                let delta = analogE - refE
-                let sm = viewModel.docking.scoringMethod
-                let label = sm.isAffinityScore ? "ΔpKi" : "ΔE"
-                let betterColor: Color = sm.isAffinityScore ? (delta > 0 ? .green : .red) : (delta < 0 ? .green : delta > 1 ? .red : .secondary)
-                HStack {
-                    Text("\(label) = \(String(format: "%+.2f", delta)) \(sm.unitLabel)")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(betterColor)
-                    if let rmsd = analog.rmsdToReference {
-                        Spacer()
-                        Text("RMSD = \(String(format: "%.2f", rmsd)) Å")
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
+        let refScore = reference.referenceScore
+        let anaScore = analog.bestScore
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            DSSectionHeader(method.isAffinityScore ? "Docking Affinity" : "Docking Energy") {
+                if let refScore, let anaScore {
+                    deltaTag(anaScore, reference: refScore)
                 }
             }
+            HStack(spacing: DS.Space.m) {
+                compoundColumn(role: "Reference", name: reference.referenceName, score: refScore, tone: .neutral, dot: referenceColor)
+                Image(systemName: "arrow.right")
+                    .font(DS.Font.sectionTitle)
+                    .foregroundStyle(.tertiary)
+                compoundColumn(role: "Analog", name: analog.name, score: anaScore, tone: analogTone(anaScore, ref: refScore), dot: analogColor)
+            }
+            if anaScore == nil {
+                PanelHint(text: "This analog has not been docked yet. Use Dock All Analogs to score it.", icon: "info.circle")
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
+    }
+
+    /// Scoring method shared by the reference pose and the analog mini-docking.
+    private var method: ScoringMethod { reference.scoringMethod }
+
+    @ViewBuilder
+    private func deltaTag(_ score: Float, reference ref: Float) -> some View {
+        let delta = score - ref
+        let tone: DSTone = abs(delta) <= 0.05 ? .neutral : method.ranks(score, before: ref) ? .success : .warning
+        DSTag("Δ \(String(format: "%+.2f", delta)) \(method.unitLabel)", tone: tone, monospaced: true)
     }
 
     @ViewBuilder
-    private func compoundColumn(name: String, energy: Float?, isReference: Bool) -> some View {
-        VStack(spacing: 4) {
-            Text(isReference ? "Reference" : "Analog")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.secondary)
+    private func compoundColumn(role: String, name: String, score: Float?, tone: DSTone, dot: Color) -> some View {
+        VStack(spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.xs) {
+                Circle().fill(dot).frame(width: 8, height: 8)
+                Text(role)
+                    .font(DS.Font.eyebrow)
+                    .tracking(0.6)
+                    .textCase(.uppercase)
+                    .foregroundStyle(.secondary)
+            }
             Text(name)
-                .font(.system(size: 10, weight: .semibold))
+                .font(DS.Font.label.weight(.semibold))
                 .lineLimit(1)
-            if let e = energy {
-                let sm = viewModel.docking.scoringMethod
-                let isBetter = sm.isAffinityScore
-                    ? e > (reference.referenceResult?.energy ?? 0)
-                    : e < (reference.referenceResult?.energy ?? 0)
-                Text(String(format: "%.2f", e))
-                    .font(.system(size: 16, weight: .bold, design: .monospaced))
-                    .foregroundColor(isReference ? .primary : (isBetter ? .green : .orange))
-                Text(sm.unitLabel)
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
+                .truncationMode(.middle)
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.xxs) {
+                Text(score.map { String(format: "%.2f", $0) } ?? "—")
+                    .font(DS.Font.metric)
+                    .foregroundStyle(tone == .neutral ? Color.primary : tone.color)
+                if score != nil {
+                    Text(method.unitLabel)
+                        .font(DS.Font.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
+        .padding(DS.Space.m)
         .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous).fill(DS.Color.controlFill))
+        .accessibilityElement(children: .combine)
     }
 
-    // MARK: - Property Radar Chart
+    private func analogTone(_ value: Float?, ref: Float?) -> DSTone {
+        guard let v = value, let r = ref else { return .neutral }
+        return method.ranks(v, before: r) ? .success : .warning
+    }
+
+    // MARK: - Properties
 
     @ViewBuilder
-    private var propertyRadarChart: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Molecular Properties")
-                .font(.system(size: 12, weight: .semibold))
-
-            let refDesc = reference.referenceDescriptors
-            let anaDesc = analog.descriptors
-
-            if let ref = refDesc, let ana = anaDesc {
-                // Normalized property values for radar chart
-                let axes = [
-                    ("MW", normalize(ref.molecularWeight, ana.molecularWeight, max: 600)),
-                    ("LogP", normalize(ref.logP, ana.logP, max: 6)),
-                    ("TPSA", normalize(ref.tpsa, ana.tpsa, max: 200)),
-                    ("HBD", normalize(Float(ref.hbd), Float(ana.hbd), max: 6)),
-                    ("HBA", normalize(Float(ref.hba), Float(ana.hba), max: 12)),
-                    ("RotB", normalize(Float(ref.rotatableBonds), Float(ana.rotatableBonds), max: 15)),
-                ]
-
-                Canvas { context, size in
-                    let center = CGPoint(x: size.width / 2, y: size.height / 2)
-                    let radius = min(size.width, size.height) / 2 - 30
-                    let n = axes.count
-
-                    // Draw axes
-                    for i in 0..<n {
-                        let angle = CGFloat(i) / CGFloat(n) * 2 * .pi - .pi / 2
-                        let end = CGPoint(
-                            x: center.x + cos(angle) * radius,
-                            y: center.y + sin(angle) * radius
-                        )
-                        var path = Path()
-                        path.move(to: center)
-                        path.addLine(to: end)
-                        context.stroke(path, with: .color(.gray.opacity(0.3)), lineWidth: 0.5)
-
-                        // Label
-                        let labelOffset = CGPoint(
-                            x: center.x + cos(angle) * (radius + 15),
-                            y: center.y + sin(angle) * (radius + 15)
-                        )
-                        context.draw(
-                            Text(axes[i].0).font(.system(size: 8)).foregroundStyle(.secondary),
-                            at: labelOffset
-                        )
-                    }
-
-                    // Draw polygons
-                    func polygon(values: [Float], color: Color, fill: Bool) {
-                        var path = Path()
-                        for (i, val) in values.enumerated() {
-                            let angle = CGFloat(i) / CGFloat(n) * 2 * .pi - .pi / 2
-                            let r = radius * CGFloat(min(max(val, 0), 1))
-                            let pt = CGPoint(x: center.x + cos(angle) * r, y: center.y + sin(angle) * r)
-                            if i == 0 { path.move(to: pt) } else { path.addLine(to: pt) }
-                        }
-                        path.closeSubpath()
-                        if fill {
-                            context.fill(path, with: .color(color.opacity(0.15)))
-                        }
-                        context.stroke(path, with: .color(color), lineWidth: fill ? 1.5 : 1.5)
-                    }
-
-                    polygon(values: axes.map(\.1.ref), color: .blue, fill: true)
-                    polygon(values: axes.map(\.1.ana), color: .purple, fill: true)
+    private var propertyComparison: some View {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            DSSectionHeader("Molecular Properties") {
+                HStack(spacing: DS.Space.m) {
+                    legendItem("Reference", color: referenceColor)
+                    legendItem("Analog", color: analogColor)
                 }
-                .frame(height: 200)
-
-                // Legend
-                HStack(spacing: 16) {
-                    HStack(spacing: 4) {
-                        Circle().fill(.blue).frame(width: 8, height: 8)
-                        Text("Reference").font(.system(size: 9))
-                    }
-                    HStack(spacing: 4) {
-                        Circle().fill(.purple).frame(width: 8, height: 8)
-                        Text("Analog").font(.system(size: 9))
-                    }
-                }
-
-                // Delta table
-                propertyDeltaTable(ref: ref, ana: ana)
-            } else {
-                Text("Property data not available")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
             }
+            if let ref = reference.referenceDescriptors, let ana = analog.descriptors {
+                HStack(alignment: .center, spacing: DS.Space.xl) {
+                    radarChart(ref: ref, ana: ana)
+                        .frame(width: 220, height: 200)
+                    propertyDeltaTable(ref: ref, ana: ana)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                PanelHint(text: "Property data not available.", icon: "info.circle")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
+    }
+
+    @ViewBuilder
+    private func legendItem(_ title: String, color: Color) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(title)
+                .font(DS.Font.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
-    private func normalize(_ ref: Float, _ ana: Float, max: Float) -> (ref: Float, ana: Float) {
-        (ref: min(ref / max, 1.0), ana: min(ana / max, 1.0))
+    @ViewBuilder
+    private func radarChart(ref: LigandDescriptors, ana: LigandDescriptors) -> some View {
+        let axes: [(label: String, ref: Float, ana: Float)] = [
+            radarAxis("MW", ref.molecularWeight, ana.molecularWeight, max: 600),
+            radarAxis("LogP", ref.logP, ana.logP, max: 6),
+            radarAxis("TPSA", ref.tpsa, ana.tpsa, max: 200),
+            radarAxis("HBD", Float(ref.hbd), Float(ana.hbd), max: 6),
+            radarAxis("HBA", Float(ref.hba), Float(ana.hba), max: 12),
+            radarAxis("RotB", Float(ref.rotatableBonds), Float(ana.rotatableBonds), max: 15),
+        ]
+        let refColor = referenceColor
+        let anaColor = analogColor
+
+        Canvas { context, size in
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+            let radius = min(size.width, size.height) / 2 - 22
+            let n = axes.count
+            let guide = Color.secondary.opacity(0.25)
+
+            func point(_ i: Int, _ r: CGFloat) -> CGPoint {
+                let angle = CGFloat(i) / CGFloat(n) * 2 * .pi - .pi / 2
+                return CGPoint(x: center.x + cos(angle) * r, y: center.y + sin(angle) * r)
+            }
+
+            // Concentric guide rings
+            for ring in 1...4 {
+                let r = radius * CGFloat(ring) / 4
+                var path = Path()
+                for i in 0..<n {
+                    if i == 0 { path.move(to: point(i, r)) } else { path.addLine(to: point(i, r)) }
+                }
+                path.closeSubpath()
+                context.stroke(path, with: .color(guide), lineWidth: 0.5)
+            }
+
+            // Spokes + labels
+            for i in 0..<n {
+                var spoke = Path()
+                spoke.move(to: center)
+                spoke.addLine(to: point(i, radius))
+                context.stroke(spoke, with: .color(guide), lineWidth: 0.5)
+                context.draw(
+                    Text(axes[i].label).font(DS.Font.caption).foregroundStyle(.secondary),
+                    at: point(i, radius + 12)
+                )
+            }
+
+            func polygon(_ values: [Float], color: Color) {
+                var path = Path()
+                for (i, val) in values.enumerated() {
+                    let p = point(i, radius * CGFloat(min(max(val, 0), 1)))
+                    if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                }
+                path.closeSubpath()
+                context.fill(path, with: .color(color.opacity(0.15)))
+                context.stroke(path, with: .color(color), lineWidth: 1.5)
+            }
+
+            polygon(axes.map(\.ref), color: refColor)
+            polygon(axes.map(\.ana), color: anaColor)
+        }
+        .accessibilityLabel("Property radar chart comparing reference and analog")
+    }
+
+    private func radarAxis(_ label: String, _ ref: Float, _ ana: Float, max: Float) -> (label: String, ref: Float, ana: Float) {
+        (label, min(ref / max, 1), min(ana / max, 1))
     }
 
     @ViewBuilder
     private func propertyDeltaTable(ref: LigandDescriptors, ana: LigandDescriptors) -> some View {
-        let rows: [(String, String, String, String)] = [
+        let rows: [(name: String, ref: String, ana: String, delta: Float, deltaText: String)] = [
             ("MW", String(format: "%.0f", ref.molecularWeight), String(format: "%.0f", ana.molecularWeight),
-             String(format: "%+.0f", ana.molecularWeight - ref.molecularWeight)),
+             ana.molecularWeight - ref.molecularWeight, String(format: "%+.0f", ana.molecularWeight - ref.molecularWeight)),
             ("LogP", String(format: "%.2f", ref.logP), String(format: "%.2f", ana.logP),
-             String(format: "%+.2f", ana.logP - ref.logP)),
+             ana.logP - ref.logP, String(format: "%+.2f", ana.logP - ref.logP)),
             ("TPSA", String(format: "%.0f", ref.tpsa), String(format: "%.0f", ana.tpsa),
-             String(format: "%+.0f", ana.tpsa - ref.tpsa)),
-            ("HBD", "\(ref.hbd)", "\(ana.hbd)", String(format: "%+d", ana.hbd - ref.hbd)),
-            ("HBA", "\(ref.hba)", "\(ana.hba)", String(format: "%+d", ana.hba - ref.hba)),
+             ana.tpsa - ref.tpsa, String(format: "%+.0f", ana.tpsa - ref.tpsa)),
+            ("HBD", "\(ref.hbd)", "\(ana.hbd)", Float(ana.hbd - ref.hbd), String(format: "%+d", ana.hbd - ref.hbd)),
+            ("HBA", "\(ref.hba)", "\(ana.hba)", Float(ana.hba - ref.hba), String(format: "%+d", ana.hba - ref.hba)),
             ("RotBonds", "\(ref.rotatableBonds)", "\(ana.rotatableBonds)",
+             Float(ana.rotatableBonds - ref.rotatableBonds),
              String(format: "%+d", ana.rotatableBonds - ref.rotatableBonds)),
         ]
 
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 3) {
+        Grid(alignment: .trailing, horizontalSpacing: DS.Space.l, verticalSpacing: DS.Space.s) {
             GridRow {
-                Text("").frame(width: 55)
-                Text("Ref").font(.system(size: 8, weight: .semibold)).foregroundStyle(.blue)
-                Text("Analog").font(.system(size: 8, weight: .semibold)).foregroundStyle(.purple)
-                Text("Δ").font(.system(size: 8, weight: .semibold))
+                columnHeader("Property").gridColumnAlignment(.leading)
+                columnHeader("Ref")
+                columnHeader("Analog")
+                columnHeader("Δ")
             }
-            ForEach(rows, id: \.0) { row in
+
+            Divider().gridCellUnsizedAxes(.horizontal)
+
+            ForEach(rows, id: \.name) { row in
                 GridRow {
-                    Text(row.0).font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
-                    Text(row.1).font(.system(size: 9, design: .monospaced))
-                    Text(row.2).font(.system(size: 9, design: .monospaced))
-                    Text(row.3).font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundStyle(row.3.hasPrefix("+") ? .orange : row.3.hasPrefix("-") ? .blue : .secondary)
+                    Text(row.name)
+                        .font(DS.Font.label)
+                        .foregroundStyle(.secondary)
+                    Text(row.ref).font(DS.Font.mono).monospacedDigit()
+                    Text(row.ana).font(DS.Font.mono).monospacedDigit()
+                    Text(row.deltaText)
+                        .font(DS.Font.mono.weight(.medium))
+                        .monospacedDigit()
+                        .foregroundStyle(propertyDeltaColor(row.delta))
                 }
             }
         }
     }
 
-    // MARK: - ADMET Comparison
+    private func columnHeader(_ title: String) -> some View {
+        Text(title)
+            .font(DS.Font.eyebrow)
+            .tracking(0.6)
+            .textCase(.uppercase)
+            .foregroundStyle(.tertiary)
+    }
+
+    /// Property deltas carry no good/bad meaning on their own; tint only the direction.
+    private func propertyDeltaColor(_ delta: Float) -> Color {
+        abs(delta) < 0.005 ? .secondary : delta > 0 ? DS.Color.ligand : DS.Color.info
+    }
+
+    // MARK: - ADMET
 
     @ViewBuilder
     private var admetComparison: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("ADMET Profile")
-                .font(.system(size: 12, weight: .semibold))
-
-            if let anaADMET = analog.admet {
-                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-                    admetRow("Lipinski", anaADMET.lipinski ? "Pass" : "Fail", anaADMET.lipinski)
-                    admetRow("Veber", anaADMET.veber ? "Pass" : "Fail", anaADMET.veber)
-                    if let herg = anaADMET.hergLiability {
-                        admetRow("hERG Risk", String(format: "%.0f%%", herg * 100), herg < 0.5)
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            DSSectionHeader("ADMET Profile")
+            if let admet = analog.admet {
+                Grid(alignment: .leading, horizontalSpacing: DS.Space.l, verticalSpacing: DS.Space.s) {
+                    admetRow("Lipinski", admet.lipinski ? "Pass" : "Fail", admet.lipinski)
+                    admetRow("Veber", admet.veber ? "Pass" : "Fail", admet.veber)
+                    if let herg = admet.hergLiability {
+                        admetRow("hERG risk", String(format: "%.0f%%", herg * 100), herg < 0.5)
                     }
-                    if let cyp = anaADMET.cyp2d6Inhibition {
-                        admetRow("CYP2D6 Inh.", String(format: "%.0f%%", cyp * 100), cyp < 0.5)
+                    if let cyp = admet.cyp2d6Inhibition {
+                        admetRow("CYP2D6 inhibition", String(format: "%.0f%%", cyp * 100), cyp < 0.5)
                     }
-                    if let cyp3a4 = anaADMET.cyp3a4Inhibition {
-                        admetRow("CYP3A4 Inh.", String(format: "%.0f%%", cyp3a4 * 100), cyp3a4 < 0.5)
+                    if let cyp3a4 = admet.cyp3a4Inhibition {
+                        admetRow("CYP3A4 inhibition", String(format: "%.0f%%", cyp3a4 * 100), cyp3a4 < 0.5)
                     }
-                    if let sol = anaADMET.aqueousSolubility {
-                        admetRow("Solubility", String(format: "%.1f", sol), sol > -4)
+                    if let sol = admet.aqueousSolubility {
+                        admetRow("Solubility (logS)", String(format: "%.1f", sol), sol > -4)
                     }
-                    if let bbb = anaADMET.bbbPermeability {
-                        admetRow("BBB Perm.", String(format: "%.0f%%", bbb * 100), bbb > 0.5)
+                    if let bbb = admet.bbbPermeability {
+                        admetRow("BBB permeability", String(format: "%.0f%%", bbb * 100), bbb > 0.5)
                     }
-                    admetRow("Drug-likeness", String(format: "%.0f%%", anaADMET.drugLikeness * 100), anaADMET.drugLikeness > 0.5)
+                    admetRow("Drug-likeness", String(format: "%.0f%%", admet.drugLikeness * 100), admet.drugLikeness > 0.5)
                 }
             } else {
-                Text("ADMET data not available — enable hERG/CYP filters during generation, or dock first")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                PanelHint(
+                    text: "ADMET data not available. Enable the hERG or CYP filters during generation, or dock first.",
+                    icon: "info.circle"
+                )
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
     }
 
     @ViewBuilder
     private func admetRow(_ label: String, _ value: String, _ good: Bool) -> some View {
         GridRow {
             Text(label)
-                .font(.system(size: 9, weight: .medium))
+                .font(DS.Font.label)
                 .foregroundStyle(.secondary)
-                .frame(width: 80, alignment: .leading)
             Text(value)
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                .foregroundStyle(good ? .green : .red)
-            Image(systemName: good ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 9))
-                .foregroundStyle(good ? .green : .red)
+                .font(DS.Font.mono.weight(.semibold))
+                .monospacedDigit()
+                .gridColumnAlignment(.trailing)
+            DSTag(good ? "Pass" : "Flag",
+                  tone: good ? .success : .danger,
+                  systemImage: good ? "checkmark" : "xmark")
         }
     }
 }

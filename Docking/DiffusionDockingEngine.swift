@@ -46,7 +46,7 @@ struct DiffusionSchedule: Sendable {
         var sigmas = [Float](repeating: 0, count: T)
 
         for t in 0..<T {
-            betas[t] = betaStart + (betaEnd - betaStart) * Float(t) / Float(T - 1)
+            betas[t] = betaStart + (betaEnd - betaStart) * Float(t) / Float(max(T - 1, 1))
             alphas[t] = 1 - betas[t]
             alphaCum[t] = t == 0 ? alphas[0] : alphaCum[t - 1] * alphas[t]
             sigmas[t] = sqrt(1 - alphaCum[t])
@@ -65,7 +65,7 @@ struct DiffusionSchedule: Sendable {
         let betaStart: Float = 0.0001
         let betaEnd: Float = 0.02
         for t in 0..<T {
-            let frac = Float(t) / Float(T - 1)
+            let frac = Float(t) / Float(max(T - 1, 1))
             betas[t] = betaStart + (betaEnd - betaStart) * frac * frac
             alphas[t] = 1 - betas[t]
             alphaCum[t] = t == 0 ? alphas[0] : alphaCum[t - 1] * alphas[t]
@@ -134,7 +134,8 @@ final class DiffusionDockingEngine {
     /// - Parameters:
     ///   - dockingEngine: Parent engine (for DruseAF setup/encode and Vina local search)
     ///   - gpuLigAtoms: Prepared GPU ligand atoms
-    ///   - numTorsions: Number of rotatable bonds
+    ///   - numTorsions: Torsions the search optimizes (must equal gaParams.numTorsions, as used by
+    ///     the encoder, the denoiser and pose extraction)
     ///   - config: Diffusion docking configuration
     ///   - druseAFBuffers: Pre-configured DruseAF buffers from DockingEngine
     ///   - gaParams: GA params (for atom count, torsion info)
@@ -174,9 +175,10 @@ final class DiffusionDockingEngine {
             return 0
         }
 
-        let T = config.numDenoisingSteps
+        let T = max(config.numDenoisingSteps, 1)
         let N = numPoses
         let L = numLigandAtoms
+        guard N > 0, L > 0 else { return 0 }
 
         // Build noise schedule
         let schedule: DiffusionSchedule
@@ -192,6 +194,10 @@ final class DiffusionDockingEngine {
             attnGradientBuffer = device.makeBuffer(length: gradBufSize, options: .storageModeShared)
         }
         guard let gradBuf = attnGradientBuffer else { return 0 }
+        // The score kernels only write gradients for atoms they cover (one per thread, up to the
+        // threadgroup width); the denoiser reads all L atoms. Clear so uncovered entries contribute
+        // no pull instead of stale data from a previous run with a different pose/atom layout.
+        memset(gradBuf.contents(), 0, gradBufSize)
 
         // Build diffusion params
         var diffParams = DiffusionParams(
@@ -224,9 +230,9 @@ final class DiffusionDockingEngine {
         diffParams.torsionNoise = .pi
         diffBuf.contents().copyMemory(from: &diffParams, byteCount: MemoryLayout<DiffusionParams>.stride)
 
-        dispatchSync(pipeline: initPipe, buffers: [
+        dispatchSync([(initPipe, [
             (populationBuffer, 0), (gridParamsBuffer, 1), (diffBuf, 2), (gaParamsBuffer, 3)
-        ], threadGroups: tgCount, threadGroupSize: tgSize)
+        ], tgCount, tgSize)])
 
         ActivityLog.shared.info("[DiffusionDocking] Initialized \(N) noise poses, running \(T) denoising steps", category: .dock)
 
@@ -247,8 +253,6 @@ final class DiffusionDockingEngine {
                 (torsionEdgeBuffer, 3), (movingIndicesBuffer, 4),
                 (druseAFParamsBuffer, 5), (druseAFIntermediateBuffer, 6), (gridParamsBuffer, 7)
             ]
-            dispatchSync(pipeline: druseAFEncodePipeline, buffers: encodeBuffers,
-                         threadGroups: tgCount, threadGroupSize: tgSize)
 
             // 2b: DruseAF score with gradient
             let scoreGradBuffers: [(MTLBuffer, Int)] = [
@@ -257,16 +261,21 @@ final class DiffusionDockingEngine {
                 (druseAFParamsBuffer, 4), (druseAFIntermediateBuffer, 5),
                 (druseAFSetupBuffer, 6), (gradBuf, 7)
             ]
-            dispatchSync(pipeline: scoreGradPipe, buffers: scoreGradBuffers,
-                         threadGroups: simdTgCount, threadGroupSize: simdTgSize)
 
             // 2c: Denoising step (use attention gradients to guide poses)
             let denoiseBuffers: [(MTLBuffer, Int)] = [
                 (populationBuffer, 0), (gradBuf, 1), (diffBuf, 2),
-                (gaParamsBuffer, 3), (gridParamsBuffer, 4), (ligandAtomBuffer, 5)
+                (gridParamsBuffer, 4), (ligandAtomBuffer, 5),
+                (torsionEdgeBuffer, 6), (movingIndicesBuffer, 7)
             ]
-            dispatchSync(pipeline: denoisePipe, buffers: denoiseBuffers,
-                         threadGroups: tgCount, threadGroupSize: tgSize)
+
+            // Encode, score and denoise run back-to-back in one command buffer (serial encoder
+            // ordering provides the dependencies), so each step costs a single GPU round trip.
+            dispatchSync([
+                (druseAFEncodePipeline, encodeBuffers, tgCount, tgSize),
+                (scoreGradPipe, scoreGradBuffers, simdTgCount, simdTgSize),
+                (denoisePipe, denoiseBuffers, tgCount, tgSize)
+            ])
 
             // Emit progress for live UI updates (in reverse order: T-1 → 0)
             let stepsCompleted = T - t
@@ -321,9 +330,10 @@ final class DiffusionDockingEngine {
             return 0
         }
 
-        let T = config.numDenoisingSteps
+        let T = max(config.numDenoisingSteps, 1)
         let N = numPoses
         let L = numLigandAtoms
+        guard N > 0, L > 0 else { return 0 }
 
         let schedule: DiffusionSchedule
         switch config.noiseSchedule {
@@ -337,6 +347,10 @@ final class DiffusionDockingEngine {
             attnGradientBuffer = device.makeBuffer(length: gradBufSize, options: .storageModeShared)
         }
         guard let gradBuf = attnGradientBuffer else { return 0 }
+        // The score kernels only write gradients for atoms they cover (one per thread, up to the
+        // threadgroup width); the denoiser reads all L atoms. Clear so uncovered entries contribute
+        // no pull instead of stale data from a previous run with a different pose/atom layout.
+        memset(gradBuf.contents(), 0, gradBufSize)
 
         var diffParams = DiffusionParams(
             numPoses: UInt32(N),
@@ -369,9 +383,9 @@ final class DiffusionDockingEngine {
         diffParams.torsionNoise = .pi
         diffBuf.contents().copyMemory(from: &diffParams, byteCount: MemoryLayout<DiffusionParams>.stride)
 
-        dispatchSync(pipeline: initPipe, buffers: [
+        dispatchSync([(initPipe, [
             (populationBuffer, 0), (gridParamsBuffer, 1), (diffBuf, 2), (gaParamsBuffer, 3)
-        ], threadGroups: tgCount, threadGroupSize: tgSize)
+        ], tgCount, tgSize)])
 
         ActivityLog.shared.info(
             "[DiffusionDocking-v4] Initialized \(N) noise poses, running \(T) denoising steps with PGN guidance",
@@ -395,8 +409,6 @@ final class DiffusionDockingEngine {
                 (torsionEdgeBuffer, 3), (movingIndicesBuffer, 4),
                 (afv4EncodeCompatParamsBuffer, 5), (druseAFIntermediateBuffer, 6), (gridParamsBuffer, 7)
             ]
-            dispatchSync(pipeline: druseAFEncodePipeline, buffers: encodeBuffers,
-                         threadGroups: tgCount, threadGroupSize: tgSize)
 
             // 2b: v4 score + per-ligand-atom attention gradient.
             let scoreGradBuffers: [(MTLBuffer, Int)] = [
@@ -408,16 +420,20 @@ final class DiffusionDockingEngine {
                 (druseAFIntermediateBuffer, 8), (gridParamsBuffer, 9),
                 (gradBuf, 10)
             ]
-            dispatchSync(pipeline: afv4ScoreWithGradPipeline, buffers: scoreGradBuffers,
-                         threadGroups: scoreTgCount, threadGroupSize: scoreTgSize)
 
             // 2c: denoising step (uses gradients to nudge poses).
             let denoiseBuffers: [(MTLBuffer, Int)] = [
                 (populationBuffer, 0), (gradBuf, 1), (diffBuf, 2),
-                (gaParamsBuffer, 3), (gridParamsBuffer, 4), (ligandAtomBuffer, 5)
+                (gridParamsBuffer, 4), (ligandAtomBuffer, 5),
+                (torsionEdgeBuffer, 6), (movingIndicesBuffer, 7)
             ]
-            dispatchSync(pipeline: denoisePipe, buffers: denoiseBuffers,
-                         threadGroups: tgCount, threadGroupSize: tgSize)
+
+            // Single command buffer per step (see v3 path).
+            dispatchSync([
+                (druseAFEncodePipeline, encodeBuffers, tgCount, tgSize),
+                (afv4ScoreWithGradPipeline, scoreGradBuffers, scoreTgCount, scoreTgSize),
+                (denoisePipe, denoiseBuffers, tgCount, tgSize)
+            ])
 
             let stepsCompleted = T - t
             onStep?(stepsCompleted, T)
@@ -431,18 +447,19 @@ final class DiffusionDockingEngine {
 
     // MARK: - GPU Dispatch Helper
 
+    /// Encode the given dispatches in order into one serial compute encoder and wait for completion.
     private func dispatchSync(
-        pipeline: MTLComputePipelineState,
-        buffers: [(MTLBuffer, Int)],
-        threadGroups: MTLSize,
-        threadGroupSize: MTLSize
+        _ stages: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)], threadGroups: MTLSize, threadGroupSize: MTLSize)]
     ) {
-        guard threadGroups.width > 0, threadGroupSize.width > 0 else { return }
-        guard let cmdBuf = commandQueue.makeCommandBuffer(),
+        let active = stages.filter { $0.threadGroups.width > 0 && $0.threadGroupSize.width > 0 }
+        guard !active.isEmpty,
+              let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pipeline)
-        for (buf, idx) in buffers { enc.setBuffer(buf, offset: 0, index: idx) }
-        enc.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
+        for stage in active {
+            enc.setComputePipelineState(stage.pipeline)
+            for (buf, idx) in stage.buffers { enc.setBuffer(buf, offset: 0, index: idx) }
+            enc.dispatchThreadgroups(stage.threadGroups, threadsPerThreadgroup: stage.threadGroupSize)
+        }
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()

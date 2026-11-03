@@ -194,16 +194,14 @@ kernel void loop_torsion_energy(
 
         float3 n1 = cross(b1, b2);
         float3 n2 = cross(b2, b3);
-        float ln1 = length(n1);
-        float ln2 = length(n2);
-        if (ln1 < 1e-8f || ln2 < 1e-8f) continue;
+        float ln1sq = dot(n1, n1);
+        float ln2sq = dot(n2, n2);
+        float lb2 = length(b2);
+        if (ln1sq < 1e-16f || ln2sq < 1e-16f || lb2 < 1e-8f) continue;
 
-        n1 /= ln1;
-        n2 /= ln2;
-
-        float cosPhi = clamp(dot(n1, n2), -1.0f, 1.0f);
-        float signPhi = sign(dot(cross(n1, n2), normalize(b2)));
-        float phi = signPhi * acos(cosPhi);
+        // phi = atan2(|b2| * b1·n2, n1·n2): IUPAC sign convention, numerically
+        // stable near 0 and ±pi (acos loses precision there).
+        float phi = atan2(lb2 * dot(b1, n2), dot(n1, n2));
 
         float n_f = float(torsions[t].periodicity);
         float phase = torsions[t].phase;
@@ -214,22 +212,20 @@ kernel void loop_torsion_energy(
             ei += kTors * (1.0f + cos(n_f * phi - phase));
         }
 
-        // Gradient via SHAKE-style numerical approximation
+        // Analytical gradient (Blondel & Karplus 1996; Bekker 1996), with the
+        // unnormalized plane normals n1 = b1 x b2 and n2 = b2 x b3.
         if (params.computeGrad) {
             float dEdPhi = -kTors * n_f * sin(n_f * phi - phase);
-            float lb2 = length(b2);
-            if (lb2 < 1e-8f) continue;
 
-            // Gradient on terminal atoms (simplified projection)
-            float3 dPhidI = -n1 * lb2 / (ln1 * ln1 + 1e-12f);
-            float3 dPhidL =  n2 * lb2 / (ln2 * ln2 + 1e-12f);
+            float3 dPhidI = -n1 * (lb2 / ln1sq);
+            float3 dPhidL =  n2 * (lb2 / ln2sq);
 
-            // Middle atoms by force balance
-            float r1 = dot(b1, normalize(b2)) / lb2;
-            float r2 = dot(b3, normalize(b2)) / lb2;
+            float invLb2sq = 1.0f / (lb2 * lb2);
+            float r1 = dot(b1, b2) * invLb2sq;
+            float r2 = dot(b3, b2) * invLb2sq;
 
-            float3 dPhidJ = -dPhidI + r1 * dPhidI - r2 * dPhidL;
-            float3 dPhidK = -dPhidL - r1 * dPhidI + r2 * dPhidL;
+            float3 dPhidJ = -(1.0f + r1) * dPhidI + r2 * dPhidL;
+            float3 dPhidK =  r1 * dPhidI - (1.0f + r2) * dPhidL;
 
             if (isI) gi += dEdPhi * dPhidI;
             if (isJ) gi += dEdPhi * dPhidJ;
@@ -301,12 +297,11 @@ kernel void loop_steric_restraint(
             float sr6 = sr * sr * sr * sr * sr * sr;
             float sr12 = sr6 * sr6;
 
-            // Upper triangle for energy
-            if (j > tid) {
-                ei += eps_ij * sr12;
-            }
+            // Each loop/non-loop pair is visited only by its loop atom's thread
+            // (non-loop threads skip this block), so every pair is counted here.
+            ei += eps_ij * sr12;
 
-            // Gradient: both atoms
+            // Gradient on the loop atom (non-loop atoms are restrained, not moved)
             if (params.computeGrad) {
                 float dEdr = -12.0f * eps_ij * sr12 / r;
                 gi += (dEdr / r) * diff;

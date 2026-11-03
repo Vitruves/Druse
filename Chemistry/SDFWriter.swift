@@ -8,7 +8,8 @@ import simd
 /// Used for exporting ligand databases and docking results.
 enum SDFWriter {
 
-    /// Write a single molecule as a V2000 MOL block.
+    /// Write a single molecule as a V2000 MOL block. The returned text always ends
+    /// with a newline, so blocks can be concatenated directly into a multi-molecule SDF.
     static func molBlock(
         name: String,
         atoms: [Atom],
@@ -19,7 +20,9 @@ enum SDFWriter {
         var lines: [String] = []
 
         // Header block (3 lines)
-        lines.append(name)                             // molecule name
+        // Molecule name: a single line (an embedded newline would shift the
+        // line-positional header and corrupt the counts line).
+        lines.append(String(name.split(whereSeparator: \.isNewline).first ?? ""))
         lines.append("  Druse   3D")                   // program/timestamp line
         lines.append("")                               // comment
 
@@ -92,7 +95,7 @@ enum SDFWriter {
             lines.append("$$$$")
         }
 
-        return lines.joined(separator: "\n")
+        return lines.joined(separator: "\n") + "\n"
     }
 
     /// Write a single Molecule object as V2000 SDF.
@@ -104,16 +107,27 @@ enum SDFWriter {
     /// Write all docking result poses as a multi-molecule SDF with score properties.
     @MainActor
     static func writeDockingResults(_ results: [DockingResult], ligand: Molecule) -> String {
-        writeDockingResults(results, ligandName: ligand.name,
-                           atoms: ligand.atoms.filter { $0.element != .H },
-                           bonds: ligand.bonds)
+        // Poses carry heavy-atom positions only; bond indices must be remapped from
+        // the full (hydrogen-containing) atom list onto the heavy-atom list.
+        var heavyIndex: [Int: Int] = [:]
+        var heavyAtoms: [Atom] = []
+        for (i, atom) in ligand.atoms.enumerated() where atom.element != .H {
+            heavyIndex[i] = heavyAtoms.count
+            heavyAtoms.append(atom)
+        }
+        var heavyBonds: [Bond] = []
+        for bond in ligand.bonds {
+            guard let a = heavyIndex[bond.atomIndex1], let b = heavyIndex[bond.atomIndex2] else { continue }
+            heavyBonds.append(Bond(id: heavyBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+        }
+        return writeDockingResults(results, ligandName: ligand.name, atoms: heavyAtoms, bonds: heavyBonds)
     }
 
     /// Write multiple molecules to an SDF string.
     static func write(molecules: [(name: String, atoms: [Atom], bonds: [Bond], properties: [String: String])]) -> String {
         molecules.map { mol in
             molBlock(name: mol.name, atoms: mol.atoms, bonds: mol.bonds, properties: mol.properties)
-        }.joined(separator: "\n")
+        }.joined()
     }
 
     /// Write docking results as SDF.
@@ -140,10 +154,10 @@ enum SDFWriter {
             let props: [String: String] = [
                 "Rank": "\(i + 1)",
                 "Energy": String(format: "%.2f", result.energy),
-                "VdW_Energy": String(format: "%.2f", result.vdwEnergy),
-                "Elec_Energy": String(format: "%.2f", result.elecEnergy),
+                "VdW_Energy": String(format: "%.2f", result.stericEnergy),
+                "Hydrophobic_Energy": String(format: "%.2f", result.hydrophobicEnergy),
                 "HBond_Energy": String(format: "%.2f", result.hbondEnergy),
-                "Desolv_Energy": String(format: "%.2f", result.desolvEnergy),
+                "Torsion_Energy": String(format: "%.2f", result.torsionPenalty),
                 "Cluster": "\(result.clusterID)",
                 "Generation": "\(result.generation)"
             ]
@@ -155,7 +169,7 @@ enum SDFWriter {
             ))
         }
 
-        return blocks.joined(separator: "\n")
+        return blocks.joined()
     }
 
     /// Export ligand database entries as SDF.
@@ -184,7 +198,7 @@ enum SDFWriter {
             ))
         }
 
-        return blocks.joined(separator: "\n")
+        return blocks.joined()
     }
 
     /// Write SDF string to a file URL.

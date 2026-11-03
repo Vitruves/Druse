@@ -3,7 +3,7 @@
 
 import SwiftUI
 
-// MARK: - Inline Color Swatch Picker
+// MARK: - Swatch palette (molecule coloring data palette, not UI chrome)
 
 private let swatchPresetColors: [Color] = [
     Color(red: 0.2, green: 0.5, blue: 1.0),   // blue
@@ -33,6 +33,58 @@ private func swatchColorMatches(_ a: Color, _ b: Color) -> Bool {
         && abs(c1.blueComponent - c2.blueComponent) < 0.05
 }
 
+private func swatchColor(_ v: SIMD3<Float>) -> Color {
+    Color(red: Double(v.x), green: Double(v.y), blue: Double(v.z))
+}
+
+private func swatchColor(_ v: SIMD4<Float>) -> Color {
+    swatchColor(SIMD3(v.x, v.y, v.z))
+}
+
+private func rgbComponents(_ color: Color) -> SIMD3<Float>? {
+    guard let comps = NSColor(color).usingColorSpace(.deviceRGB) else { return nil }
+    return SIMD3<Float>(Float(comps.redComponent), Float(comps.greenComponent), Float(comps.blueComponent))
+}
+
+/// A swatch: rounded square with a hairline so light colors stay visible on light backgrounds.
+private struct Swatch: View {
+    let color: Color
+    var size: CGFloat = 16
+    var isSelected: Bool = false
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+        shape
+            .fill(color)
+            .frame(width: size, height: size)
+            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+            .padding(isSelected ? 2 : 0)
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.xs + 2, style: .continuous)
+                    .strokeBorder(isSelected ? DS.Color.accent : Color.clear, lineWidth: 1.5)
+            )
+    }
+}
+
+/// 4×4 grid of preset swatches used by both color popovers.
+private struct SwatchGrid: View {
+    let isSelected: (Color) -> Bool
+    let onPick: (Color) -> Void
+
+    var body: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(24), spacing: DS.Space.xs), count: 4), spacing: DS.Space.xs) {
+            ForEach(Array(swatchPresetColors.enumerated()), id: \.offset) { _, preset in
+                Button { onPick(preset) } label: {
+                    Swatch(color: preset, size: 18, isSelected: isSelected(preset))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
 /// Chain color picker: CPK / Chain / Custom modes
 private struct ChainColorPicker: View {
     var chainID: String
@@ -48,12 +100,13 @@ private struct ChainColorPicker: View {
         Button(action: { showPopover.toggle() }) {
             swatchIcon
                 .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Chain color mode")
+        .help("Chain \(chainID) color")
+        .accessibilityLabel("Chain \(chainID) color")
         .popover(isPresented: $showPopover, arrowEdge: .leading) {
-            VStack(alignment: .leading, spacing: 8) {
-                // Mode buttons
+            VStack(alignment: .leading, spacing: DS.Space.m) {
                 modeButton("CPK", icon: "atom", isActive: mode == .cpk) {
                     mode = .cpk
                     onChange()
@@ -67,36 +120,20 @@ private struct ChainColorPicker: View {
 
                 Divider()
 
-                // Custom color grid
-                Text("Custom")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.secondary)
+                PanelSubheader(title: "Custom")
 
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22), spacing: 4), count: 4), spacing: 4) {
-                    ForEach(Array(swatchPresetColors.enumerated()), id: \.offset) { _, preset in
-                        let isSelected = mode == .custom && customColor != nil && swatchColorMatches(
-                            Color(red: Double(customColor!.x), green: Double(customColor!.y), blue: Double(customColor!.z)),
-                            preset
-                        )
-                        Button(action: {
-                            if let comps = NSColor(preset).usingColorSpace(.deviceRGB) {
-                                customColor = SIMD3<Float>(Float(comps.redComponent), Float(comps.greenComponent), Float(comps.blueComponent))
-                            }
-                            mode = .custom
-                            onChange()
-                            showPopover = false
-                        }) {
-                            Circle()
-                                .fill(preset)
-                                .frame(width: 20, height: 20)
-                                .overlay(
-                                    Circle()
-                                        .strokeBorder(Color.primary.opacity(isSelected ? 0.9 : 0), lineWidth: 2)
-                                )
-                        }
-                        .buttonStyle(.plain)
+                SwatchGrid(
+                    isSelected: { preset in
+                        guard mode == .custom, let customColor else { return false }
+                        return swatchColorMatches(swatchColor(customColor), preset)
+                    },
+                    onPick: { preset in
+                        if let rgb = rgbComponents(preset) { customColor = rgb }
+                        mode = .custom
+                        onChange()
+                        showPopover = false
                     }
-                }
+                )
 
                 Divider()
 
@@ -104,72 +141,69 @@ private struct ChainColorPicker: View {
                     get: { scope == .carbonsOnly },
                     set: { scope = $0 ? .carbonsOnly : .allAtoms; onChange() }
                 )) {
-                    Text("Carbons only")
-                        .font(.footnote)
+                    Text("Carbons only").font(DS.Font.secondary)
                 }
                 .toggleStyle(.checkbox)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(mode == .cpk)
                 .help("Apply color only to carbon atoms; heteroatoms keep CPK colors")
             }
-            .padding(8)
-            .frame(width: 140)
+            .padding(DS.Space.l)
+            .frame(width: 136)
         }
     }
 
     @ViewBuilder
     private var swatchIcon: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
         switch mode {
         case .cpk:
-            // Multi-color CPK indicator
+            // Multi-color CPK indicator (C gray, N blue, O red)
             ZStack {
-                Circle().fill(Color(red: 0.5, green: 0.5, blue: 0.5)).frame(width: 16, height: 16) // C gray
-                Circle().fill(Color(red: 0.0, green: 0.4, blue: 1.0)).frame(width: 8, height: 8).offset(x: -3, y: -3) // N blue
-                Circle().fill(Color(red: 1.0, green: 0.2, blue: 0.2)).frame(width: 6, height: 6).offset(x: 3, y: 3) // O red
+                Color(red: 0.5, green: 0.5, blue: 0.5)
+                Circle().fill(Color(red: 0.0, green: 0.4, blue: 1.0)).frame(width: 8, height: 8).offset(x: -3, y: -3)
+                Circle().fill(Color(red: 1.0, green: 0.2, blue: 0.2)).frame(width: 6, height: 6).offset(x: 3, y: 3)
             }
-            .clipShape(Circle())
-            .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
+            .frame(width: 16, height: 16)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
         case .chainDefault:
-            Circle()
-                .fill(Color(red: Double(paletteColor.x), green: Double(paletteColor.y), blue: Double(paletteColor.z)))
-                .frame(width: 16, height: 16)
-                .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
+            Swatch(color: swatchColor(paletteColor))
         case .custom:
-            let c = customColor ?? paletteColor
-            Circle()
-                .fill(Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z)))
-                .frame(width: 16, height: 16)
-                .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5))
+            Swatch(color: swatchColor(customColor ?? paletteColor))
         }
     }
 
-    private func modeButton(_ title: String, icon: String, isActive: Bool, swatchColor: SIMD3<Float>? = nil, action: @escaping () -> Void) -> some View {
+    private func modeButton(_ title: String, icon: String, isActive: Bool, swatchColor sc: SIMD3<Float>? = nil, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                if let sc = swatchColor {
-                    Circle()
-                        .fill(Color(red: Double(sc.x), green: Double(sc.y), blue: Double(sc.z)))
-                        .frame(width: 10, height: 10)
+            HStack(spacing: DS.Space.s) {
+                if let sc {
+                    Swatch(color: swatchColor(sc), size: 10)
+                        .frame(width: 14)
                 } else {
                     Image(systemName: icon)
-                        .font(.footnote)
-                        .frame(width: 10)
+                        .font(DS.Font.secondary)
+                        .frame(width: 14)
                 }
                 Text(title)
-                    .font(.footnote.weight(isActive ? .semibold : .regular))
+                    .font(DS.Font.label.weight(isActive ? .semibold : .regular))
                 Spacer()
                 if isActive {
                     Image(systemName: "checkmark")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Color.accentColor)
+                        .font(DS.Font.caption.weight(.bold))
+                        .foregroundStyle(DS.Color.accent)
                 }
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 4)
-            .background(isActive ? Color.accentColor.opacity(0.1) : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .padding(.horizontal, DS.Space.xs)
+            .padding(.vertical, DS.Space.xs)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                    .fill(isActive ? DS.Color.accentSoft : Color.clear)
+            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(isActive ? .isSelected : [])
     }
 }
 
@@ -185,129 +219,139 @@ private struct InlineColorPicker: View {
 
     var body: some View {
         Button(action: { showPopover.toggle() }) {
-            Circle()
-                .fill(color)
-                .frame(width: size, height: size)
-                .overlay(
-                    Circle()
-                        .strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.5)
-                )
+            Swatch(color: color, size: size)
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(label)
+        .accessibilityLabel(label)
         .popover(isPresented: $showPopover, arrowEdge: .leading) {
-            VStack(spacing: 8) {
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22), spacing: 4), count: 4), spacing: 4) {
-                    ForEach(Array(swatchPresetColors.enumerated()), id: \.offset) { _, preset in
-                        Button(action: {
-                            color = preset
-                            showPopover = false
-                        }) {
-                            Circle()
-                                .fill(preset)
-                                .frame(width: 20, height: 20)
-                                .overlay(
-                                    Circle()
-                                        .strokeBorder(Color.primary.opacity(swatchColorMatches(color, preset) ? 0.9 : 0), lineWidth: 2)
-                                )
-                        }
-                        .buttonStyle(.plain)
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                SwatchGrid(
+                    isSelected: { swatchColorMatches(color, $0) },
+                    onPick: { preset in
+                        color = preset
+                        showPopover = false
                     }
-                }
+                )
                 if let carbonsOnly {
                     Divider()
                     Toggle(isOn: carbonsOnly) {
-                        Text("Carbons only")
-                            .font(.footnote)
+                        Text("Carbons only").font(DS.Font.secondary)
                     }
                     .toggleStyle(.checkbox)
-                    .controlSize(.mini)
+                    .controlSize(.small)
                     .help("Apply color only to carbon atoms; heteroatoms keep CPK colors")
                 }
                 if let onReset {
                     Divider()
-                    Button(action: {
+                    Button {
                         onReset()
                         showPopover = false
-                    }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.counterclockwise")
-                                .font(.footnote)
-                            Text("Default")
-                                .font(.footnote)
-                        }
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 2)
+                    } label: {
+                        Label("Default", systemImage: "arrow.counterclockwise")
+                            .font(DS.Font.secondary)
+                            .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.borderless)
+                    .help("Reset to the color scheme's default")
                 }
             }
-            .padding(8)
+            .padding(DS.Space.l)
+            .frame(width: 136)
         }
     }
 }
+
+// MARK: - Inspector
 
 struct InspectorPanel: View {
     @Environment(AppViewModel.self) private var viewModel
     @Binding var showInspector: Bool
 
     private var selectionMode: WorkspaceState.SelectionMode {
-        get { viewModel.workspace.selectionMode }
+        viewModel.workspace.selectionMode
+    }
+
+    private var hasMolecule: Bool {
+        viewModel.molecules.protein != nil || viewModel.molecules.ligand != nil
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header with close button
-            HStack {
-                Image(systemName: "sidebar.right")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Text("Inspector")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showInspector = false } }) {
-                    Image(systemName: "xmark")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 18, height: 18)
-                        .background(Color.primary.opacity(0.06))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                }
-                .buttonStyle(.plain)
-                .help("Hide inspector")
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-
+            header
             Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
-                    selectionCard
-                    chainsCard
-                    subsetsCard
-                    statisticsCard
-                    Spacer(minLength: 0)
+            if hasMolecule {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DS.Space.m) {
+                        selectionCard
+                        chainsCard
+                        subsetsCard
+                        statisticsCard
+                    }
+                    .padding(DS.Space.l)
                 }
-                .padding(12)
+                .scrollIndicators(.automatic)
+            } else {
+                emptyInspector
             }
-            .scrollIndicators(.hidden)
         }
-        .frame(width: 260)
-        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    /// Sized for a 280 pt column: ContentUnavailableView's title2 headline reads as a
+    /// page-level message here.
+    private var emptyInspector: some View {
+        VStack(spacing: DS.Space.s) {
+            Image(systemName: "sidebar.squares.trailing")
+                .font(.system(size: 26, weight: .light))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.tertiary)
+                .padding(.bottom, DS.Space.xxs)
+            Text("No Structure Loaded")
+                .font(DS.Font.sectionTitle)
+                .foregroundStyle(.secondary)
+            Text("Chains, selection details and statistics appear here once a protein or ligand is open.")
+                .font(DS.Font.secondary)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, DS.Space.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var header: some View {
+        HStack(spacing: DS.Space.s) {
+            Text("Inspector")
+                .font(DS.Font.sectionTitle)
+            Spacer(minLength: DS.Space.xs)
+            Button {
+                showInspector = false
+            } label: {
+                Image(systemName: "xmark")
+                    .font(DS.Font.secondary.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help("Hide Inspector (⌥⌘0)")
+            .accessibilityLabel("Hide Inspector")
+            .accessibilityIdentifier(AccessibilityID.inspectorClose)
+        }
+        .padding(.horizontal, DS.Space.l)
+        .padding(.vertical, DS.Space.m)
     }
 
     // MARK: - Selection card
 
-    @ViewBuilder
     private var selectionCard: some View {
         PanelCard(
             "Selection",
             icon: "cursorarrow.click.2",
             accessory: {
-                Picker("", selection: Binding(
+                Picker("Selection mode", selection: Binding(
                     get: { viewModel.workspace.selectionMode },
                     set: { viewModel.workspace.selectionMode = $0 }
                 )) {
@@ -316,77 +360,66 @@ struct InspectorPanel: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .controlSize(.mini)
-                .frame(width: 110)
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
             }
         ) {
-            if selectionMode == .atom {
-                atomSelectionContent
-            } else {
-                residueSelectionContent
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                if selectionMode == .atom {
+                    atomSelectionContent
+                } else {
+                    residueSelectionContent
+                }
             }
         }
     }
 
     // MARK: - Empty selection placeholder
 
-    @ViewBuilder
-    private func emptySelectionContent(icon: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                Text("No Selection")
-                    .font(PanelStyle.titleFont)
-                    .foregroundStyle(.secondary)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                shortcutHint(keys: ["Click"],            description: "select an item")
-                shortcutHint(keys: ["⌥", "Click"],       description: "add to selection")
-                shortcutHint(keys: ["⌥", "Drag"],        description: "box-select")
-                shortcutHint(keys: ["Double-click"],     description: "select chain")
+    private var emptySelectionContent: some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            Text("No selection")
+                .font(DS.Font.label.weight(.medium))
+                .foregroundStyle(.secondary)
+            Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.xs) {
+                shortcutHint(keys: ["Click"], description: "select an item")
+                shortcutHint(keys: ["⌥", "Click"], description: "add to selection")
+                shortcutHint(keys: ["⌥", "Drag"], description: "box-select")
+                shortcutHint(keys: ["Double-click"], description: "select chain")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Renders one or more keys as separate pill chips joined by a small "+",
-    /// followed by the human-readable description. Splitting `⌥` into its
-    /// own chip makes the modifier visible at small font sizes (the previous
-    /// `⌥Click` glyph collapsed into a single barely-readable token).
-    @ViewBuilder
+    /// Keys rendered as separate keycaps joined by "+", then the description.
     private func shortcutHint(keys: [String], description: String) -> some View {
-        HStack(spacing: 4) {
-            ForEach(Array(keys.enumerated()), id: \.offset) { idx, key in
-                if idx > 0 {
-                    Text("+")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.tertiary)
+        GridRow {
+            HStack(spacing: DS.Space.xxs) {
+                ForEach(Array(keys.enumerated()), id: \.offset) { idx, key in
+                    if idx > 0 {
+                        Text("+")
+                            .font(DS.Font.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                    keyChip(key)
                 }
-                keyChip(key)
             }
             Text(description)
-                .font(PanelStyle.smallFont)
+                .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
-                .padding(.leading, 2)
         }
     }
 
     private func keyChip(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+        return Text(text)
+            .font(DS.Font.monoSmall.weight(.semibold))
             .foregroundStyle(.primary)
-            .padding(.horizontal, 5)
+            .padding(.horizontal, DS.Space.xs)
             .padding(.vertical, 1)
-            .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(Color.primary.opacity(0.10))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
-            )
+            .background(shape.fill(DS.Color.controlFill))
+            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
             .fixedSize()
     }
 
@@ -397,7 +430,7 @@ struct InspectorPanel: View {
         let selectedCount = viewModel.workspace.selectedAtomIndices.count
 
         if selectedCount == 0 {
-            emptySelectionContent(icon: "atom")
+            emptySelectionContent
         } else if selectedCount == 1, let atom = viewModel.selectedAtom {
             atomInspector(atom)
         } else {
@@ -412,9 +445,9 @@ struct InspectorPanel: View {
         let selectedCount = viewModel.workspace.selectedResidueIndices.count
 
         if selectedCount == 0 {
-            emptySelectionContent(icon: "rectangle.stack")
-        } else if selectedCount == 1, let prot = viewModel.molecules.protein {
-            let resIdx = viewModel.workspace.selectedResidueIndices.first!
+            emptySelectionContent
+        } else if selectedCount == 1, let prot = viewModel.molecules.protein,
+                  let resIdx = viewModel.workspace.selectedResidueIndices.first {
             if resIdx < prot.residues.count {
                 singleResidueInspector(prot.residues[resIdx], in: prot)
             }
@@ -427,67 +460,60 @@ struct InspectorPanel: View {
 
     @ViewBuilder
     private func atomInspector(_ atom: Atom) -> some View {
-        HStack(spacing: 10) {
-            ZStack {
-                Circle()
-                    .fill(Color(
-                        red: Double(atom.element.color.x),
-                        green: Double(atom.element.color.y),
-                        blue: Double(atom.element.color.z)
-                    ))
-                    .frame(width: 36, height: 36)
-                Text(atom.element.symbol)
-                    .font(.body.monospaced().weight(.bold))
-                    .foregroundStyle(.white)
-                    .shadow(radius: 1)
-            }
+        let elementColor = swatchColor(atom.element.color)
+        let tile = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+        HStack(spacing: DS.Space.m) {
+            Text(atom.element.symbol)
+                .font(DS.Font.sectionTitle.monospaced())
+                .foregroundStyle(.primary)
+                .frame(width: 36, height: 36)
+                .background(tile.fill(elementColor.opacity(0.22)))
+                .overlay(tile.strokeBorder(elementColor, lineWidth: 1.5))
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 Text(atom.element.name)
-                    .font(.headline)
+                    .font(DS.Font.sectionTitle)
                 Text(atom.name)
-                    .font(.subheadline.monospaced())
+                    .font(DS.Font.mono)
                     .foregroundStyle(.secondary)
             }
         }
 
-        infoRow("Residue", "\(atom.residueName) \(atom.residueSeq)")
-        infoRow("Chain", atom.chainID)
-        if atom.formalCharge != 0 {
-            infoRow("Formal charge", "\(atom.formalCharge > 0 ? "+" : "")\(atom.formalCharge)")
-        }
-        infoRow("Partial charge", String(format: "%.3f", atom.charge))
-        infoRow("VdW Radius", String(format: "%.2f \u{00C5}", atom.element.vdwRadius))
-        if atom.tempFactor > 0 {
-            infoRow("B-factor", String(format: "%.1f", atom.tempFactor))
-        }
-        if atom.occupancy < 1.0 {
-            infoRow("Occupancy", String(format: "%.2f", atom.occupancy))
+        VStack(spacing: DS.Space.xs) {
+            infoRow("Residue", "\(atom.residueName) \(atom.residueSeq)")
+            infoRow("Chain", atom.chainID)
+            if atom.formalCharge != 0 {
+                infoRow("Formal charge", "\(atom.formalCharge > 0 ? "+" : "")\(atom.formalCharge)")
+            }
+            infoRow("Partial charge", String(format: "%.3f", atom.charge))
+            infoRow("vdW radius", String(format: "%.2f \u{00C5}", atom.element.vdwRadius))
+            if atom.tempFactor > 0 {
+                infoRow("B-factor", String(format: "%.1f", atom.tempFactor))
+            }
+            if atom.occupancy < 1.0 {
+                infoRow("Occupancy", String(format: "%.2f", atom.occupancy))
+            }
         }
 
-        // Connected bonds
         let bonds = connectedBonds(for: atom)
         if !bonds.isEmpty {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Bonds (\(bonds.count))")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                PanelSubheader(title: "Bonds (\(bonds.count))")
                 ForEach(bonds, id: \.id) { bond in
                     let allAtoms = (viewModel.molecules.protein?.atoms ?? []) + (viewModel.molecules.ligand?.atoms ?? [])
                     let otherIdx = bond.atomIndex1 == atom.id ? bond.atomIndex2 : bond.atomIndex1
                     if otherIdx < allAtoms.count {
                         let other = allAtoms[otherIdx]
-                        HStack(spacing: 4) {
+                        HStack(spacing: DS.Space.xs) {
                             Circle()
-                                .fill(Color(red: Double(other.element.color.x),
-                                            green: Double(other.element.color.y),
-                                            blue: Double(other.element.color.z)))
-                                .frame(width: 6, height: 6)
+                                .fill(swatchColor(other.element.color))
+                                .overlay(Circle().strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+                                .frame(width: 7, height: 7)
                             Text("\(other.element.symbol) \(other.name)")
-                                .font(.footnote.monospaced())
+                                .font(DS.Font.monoSmall)
                             Spacer()
                             Text(bond.order == .aromatic ? "arom" : "\(bond.order.rawValue)\u{00D7}")
-                                .font(.footnote.monospaced())
+                                .font(DS.Font.monoSmall)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -495,15 +521,14 @@ struct InspectorPanel: View {
             }
         }
 
-        VStack(alignment: .leading, spacing: 3) {
-            Text("Position")
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(.secondary)
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            PanelSubheader(title: "Position")
+            HStack(spacing: DS.Space.m) {
                 coordLabel("X", atom.position.x)
                 coordLabel("Y", atom.position.y)
                 coordLabel("Z", atom.position.z)
             }
+            .textSelection(.enabled)
         }
     }
 
@@ -520,110 +545,80 @@ struct InspectorPanel: View {
         let selected = viewModel.workspace.selectedAtomIndices.compactMap { idx in
             idx < allAtoms.count ? allAtoms[idx] : nil
         }
-
-        // Element distribution
         let elementCounts = Dictionary(grouping: selected, by: \.element.symbol)
             .mapValues(\.count)
             .sorted { $0.value > $1.value }
 
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "atom")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.cyan)
-                Text("\(count) atoms selected")
-                    .font(PanelStyle.titleFont)
-            }
+        selectionTitle("\(count) atoms selected", icon: "atom")
 
-            // Element breakdown — wrap chips so they don't overflow
-            FlowLayout(spacing: 4) {
-                ForEach(elementCounts.prefix(8), id: \.key) { symbol, cnt in
-                    countChip(label: symbol, count: cnt)
-                }
+        FlowLayout(spacing: DS.Space.xs) {
+            ForEach(elementCounts.prefix(8), id: \.key) { symbol, cnt in
+                countChip(label: symbol, count: cnt)
             }
+        }
 
-            // Unique residues & chains
-            let residues = Set(selected.map { "\($0.residueName)\($0.residueSeq)" })
-            let chains = Set(selected.map(\.chainID))
+        let residues = Set(selected.map { "\($0.residueName)\($0.residueSeq)" })
+        let chains = Set(selected.map(\.chainID))
+        VStack(spacing: DS.Space.xs) {
             infoRow("Residues", "\(residues.count)")
             infoRow("Chains", chains.sorted().joined(separator: ", "))
-
-            // Average charge
             if !selected.isEmpty {
-                let avgCharge = selected.map(\.charge).reduce(0, +) / Float(selected.count)
                 let totalCharge = selected.map(\.charge).reduce(0, +)
-                infoRow("Avg charge", String(format: "%.3f", avgCharge))
+                infoRow("Avg charge", String(format: "%.3f", totalCharge / Float(selected.count)))
                 infoRow("Total charge", String(format: "%.2f", totalCharge))
             }
-
-            selectionActions
         }
+
+        selectionActions
     }
 
     // MARK: - Single Residue Inspector
 
     @ViewBuilder
     private func singleResidueInspector(_ residue: Residue, in prot: Molecule) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text(residue.name)
-                    .font(.title3.monospaced().weight(.bold))
-                Text("#\(residue.sequenceNumber)")
-                    .font(.callout.monospaced())
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("Chain \(residue.chainID)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.m) {
+            Text(residue.name)
+                .font(DS.Font.stepTitle.monospaced())
+            Text("#\(residue.sequenceNumber)")
+                .font(DS.Font.mono)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Spacer()
+            DSTag("Chain \(residue.chainID)", monospaced: true)
+        }
 
-            // Secondary structure
-            let ss = secondaryStructure(for: residue, in: prot)
-            if let ss {
-                HStack(spacing: 4) {
-                    Image(systemName: ss == .helix ? "arrow.trianglehead.turn.up.right.diamond"
-                          : ss == .sheet ? "arrow.right.to.line" : "scribble")
-                        .font(.footnote)
-                        .foregroundStyle(ss == .helix ? .red : ss == .sheet ? .cyan : .secondary)
-                    Text(ss == .helix ? "Alpha Helix" : ss == .sheet ? "Beta Sheet"
-                         : ss == .turn ? "Turn" : "Coil")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(ss == .helix ? .red : ss == .sheet ? .cyan : .secondary)
-                }
-            }
+        if let ss = secondaryStructure(for: residue, in: prot) {
+            DSTag(ss.ssDisplayName, tint: ss.ssTint, systemImage: ss.ssSymbol)
+        }
 
+        let heavyCount = residue.atomIndices.filter { idx in
+            idx < prot.atoms.count && prot.atoms[idx].element != .H
+        }.count
+        let totalCharge = residue.atomIndices.compactMap { idx in
+            idx < prot.atoms.count ? prot.atoms[idx].charge : nil
+        }.reduce(Float(0), +)
+        let bFactors = residue.atomIndices.compactMap { idx in
+            idx < prot.atoms.count ? prot.atoms[idx].tempFactor : nil
+        }
+        VStack(spacing: DS.Space.xs) {
             infoRow("Atoms", "\(residue.atomIndices.count)")
-            let heavyCount = residue.atomIndices.filter { idx in
-                idx < prot.atoms.count && prot.atoms[idx].element != .H
-            }.count
             infoRow("Heavy atoms", "\(heavyCount)")
-
-            // Element composition
-            let elements = Dictionary(grouping: residue.atomIndices.compactMap { idx in
-                idx < prot.atoms.count ? prot.atoms[idx].element : nil
-            }, by: \.symbol).mapValues(\.count).sorted { $0.value > $1.value }
-            FlowLayout(spacing: 4) {
-                ForEach(elements, id: \.key) { symbol, cnt in
-                    countChip(label: symbol, count: cnt)
-                }
-            }
-
-            // Total charge of residue
-            let totalCharge = residue.atomIndices.compactMap { idx in
-                idx < prot.atoms.count ? prot.atoms[idx].charge : nil
-            }.reduce(Float(0), +)
             infoRow("Net charge", String(format: "%.2f", totalCharge))
-
-            // Average B-factor
-            let bFactors = residue.atomIndices.compactMap { idx in
-                idx < prot.atoms.count ? prot.atoms[idx].tempFactor : nil
-            }
             if let avgB = bFactors.isEmpty ? nil : bFactors.reduce(0, +) / Float(bFactors.count), avgB > 0 {
                 infoRow("Avg B-factor", String(format: "%.1f", avgB))
             }
-
-            selectionActions
         }
+
+        let elements = Dictionary(grouping: residue.atomIndices.compactMap { idx in
+            idx < prot.atoms.count ? prot.atoms[idx].element : nil
+        }, by: \.symbol).mapValues(\.count).sorted { $0.value > $1.value }
+        FlowLayout(spacing: DS.Space.xs) {
+            ForEach(elements, id: \.key) { symbol, cnt in
+                countChip(label: symbol, count: cnt)
+            }
+        }
+
+        selectionActions
     }
 
     private func secondaryStructure(for residue: Residue, in prot: Molecule) -> SecondaryStructure? {
@@ -645,318 +640,308 @@ struct InspectorPanel: View {
             let residues = viewModel.workspace.selectedResidueIndices.compactMap { idx in
                 idx < prot.residues.count ? prot.residues[idx] : nil
             }
-
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "rectangle.stack")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.cyan)
-                Text("\(count) residues selected")
-                    .font(PanelStyle.titleFont)
-            }
-
-            // Residue type breakdown — wrap so labels are never split mid-token
             let typeCounts = Dictionary(grouping: residues, by: \.name)
                 .mapValues(\.count)
                 .sorted { $0.value > $1.value }
-            FlowLayout(spacing: 4) {
+
+            selectionTitle("\(count) residues selected", icon: "rectangle.stack")
+
+            FlowLayout(spacing: DS.Space.xs) {
                 ForEach(typeCounts.prefix(12), id: \.key) { name, cnt in
                     countChip(label: name, count: cnt)
                 }
             }
 
-            // Total atoms
             let totalAtoms = residues.reduce(0) { $0 + $1.atomIndices.count }
             let chains = Set(residues.map(\.chainID))
-            infoRow("Total atoms", "\(totalAtoms)")
-            infoRow("Chains", chains.sorted().joined(separator: ", "))
-
-            // Sequence range
             let seqNums = residues.map(\.sequenceNumber).sorted()
-            if let first = seqNums.first, let last = seqNums.last {
-                infoRow("Range", "\(first)\u{2013}\(last)")
+            VStack(spacing: DS.Space.xs) {
+                infoRow("Total atoms", "\(totalAtoms)")
+                infoRow("Chains", chains.sorted().joined(separator: ", "))
+                if let first = seqNums.first, let last = seqNums.last {
+                    infoRow("Range", "\(first)\u{2013}\(last)")
+                }
             }
 
             selectionActions
         }
+    }
+
+    private func selectionTitle(_ text: String, icon: String) -> some View {
+        Label {
+            Text(text)
+                .font(DS.Font.label.weight(.semibold))
+                .monospacedDigit()
+        } icon: {
+            Image(systemName: icon)
+                .foregroundStyle(DS.Color.accent)
         }
     }
 
     // MARK: - Selection Actions (shared between atom & residue summaries)
 
-    @ViewBuilder
     private var selectionActions: some View {
         let hasResidues = !viewModel.workspace.selectedResidueIndices.isEmpty
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
 
-        VStack(spacing: 6) {
+        return VStack(spacing: DS.Space.s) {
+            Divider()
             PanelChoiceGrid(columns: 2) {
                 Menu {
                     ForEach([5, 6, 8, 10] as [Float], id: \.self) { d in
-                        Button(String(format: "%.0f Å", d)) {
+                        Button(String(format: "Within %.0f Å", d)) {
                             viewModel.selectResiduesWithinDistance(d)
                         }
                     }
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: DS.Space.xs) {
                         Image(systemName: "circle.dashed")
-                            .font(.system(size: 11, weight: .medium))
-                        Text("Extend Nearby")
-                            .font(PanelStyle.bodyFont)
+                            .font(DS.Font.secondary.weight(.medium))
+                        Text("Nearby")
+                            .font(DS.Font.label)
                             .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
                     }
+                    .foregroundStyle(.primary)
                     .frame(maxWidth: .infinity)
-                    .frame(height: PanelStyle.buttonHeight)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.primary.opacity(PanelStyle.chipFillOpacity))
-                    )
-                    .contentShape(Rectangle())
+                    .frame(height: DS.Size.buttonHeight)
+                    .background(shape.fill(DS.Color.controlFill))
+                    .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+                    .contentShape(shape)
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .help("Extend selection to residues within a distance threshold")
 
                 PanelSecondaryButton(
-                    title: "+1 Res", icon: "arrow.left.and.right",
-                    isDisabled: !hasResidues
+                    title: "+1 Residue", icon: "arrow.left.and.right",
+                    isDisabled: !hasResidues,
+                    help: "Extend the selection by one residue on each side"
                 ) { viewModel.extendSelectionByOneResidue() }
-            }
-            PanelChoiceGrid(columns: 2) {
+
                 PanelSecondaryButton(
-                    title: "Invert", icon: "arrow.triangle.2.circlepath"
+                    title: "Invert", icon: "arrow.triangle.2.circlepath",
+                    help: "Invert the selection"
                 ) { viewModel.invertSelection() }
 
                 PanelSecondaryButton(
                     title: "Subset", icon: "plus.circle",
-                    isDisabled: !hasResidues
+                    isDisabled: !hasResidues,
+                    help: "Create a named subset from the selected residues"
                 ) { viewModel.createSubsetFromSelection() }
-            }
-            PanelChoiceGrid(columns: 2) {
+
                 PanelSecondaryButton(
-                    title: "Define Pocket", icon: "scope",
-                    isDisabled: !hasResidues
+                    title: "Pocket", icon: "scope",
+                    tint: DS.Color.pocket,
+                    isDisabled: !hasResidues,
+                    help: "Define the docking pocket from the selected residues"
                 ) { viewModel.definePocketFromSelection() }
 
                 PanelSecondaryButton(
                     title: "Clear", icon: "xmark.circle",
-                    tint: .red
+                    tint: DS.Color.danger,
+                    help: "Deselect everything"
                 ) { viewModel.deselectAll() }
             }
         }
     }
 
-    // MARK: - Chain Visibility
+    // MARK: - Chains & Display
 
-    @ViewBuilder
-    private var chainsCard: some View {
-        PanelCard("Chains & Display", icon: "link") {
-            chainVisibilitySection
-        }
+    /// Chains of the receptor. The active ligand is always normalized to chain "L"
+    /// (`setLigandForDocking`) and has its own row below; listing it here as well would
+    /// duplicate it with protein-only actions (hide/remove/extract work on the receptor).
+    private var proteinChains: [Chain] {
+        viewModel.molecules.protein?.chains ?? []
     }
 
-    @ViewBuilder
-    private var chainVisibilitySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if viewModel.allChains.isEmpty && viewModel.molecules.ligand == nil {
-                Text("No chains loaded")
-                    .font(PanelStyle.smallFont)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(Array(viewModel.allChains.enumerated()), id: \.element.id) { chainIndex, chain in
-                    let atomCount = chainAtomCount(chain)
-                    let palette = WorkspaceState.MoleculeColorScheme.chainPalette
-                    let paletteColor = palette[chainIndex % palette.count]
-                    // Default mode mirrors AppViewModel.pushToRenderer: only the
-                    // .chainColored scheme implies palette colors at startup;
-                    // every other scheme renders chains as CPK by default.
-                    let defaultMode: WorkspaceState.ChainColorMode =
-                        viewModel.workspace.colorScheme == .chainColored ? .chainDefault : .cpk
-                    HStack(spacing: 6) {
-                        ChainColorPicker(
-                            chainID: chain.id,
-                            paletteColor: paletteColor,
-                            mode: Binding(
-                                get: { viewModel.workspace.chainColorModes[chain.id] ?? defaultMode },
-                                set: { viewModel.workspace.chainColorModes[chain.id] = $0 }
-                            ),
-                            customColor: Binding(
-                                get: { viewModel.workspace.chainColorOverrides[chain.id] },
-                                set: { viewModel.workspace.chainColorOverrides[chain.id] = $0 }
-                            ),
-                            scope: Binding(
-                                get: { viewModel.workspace.chainColorScopes[chain.id] ?? .carbonsOnly },
-                                set: { viewModel.workspace.chainColorScopes[chain.id] = $0 }
-                            ),
-                            onChange: { viewModel.pushToRenderer() }
-                        )
-
-                        Text("\(chain.id)")
-                            .font(.callout.weight(.medium))
-                            .fixedSize()
-
-                        Text("\(chain.type.label) \(atomCount)")
-                            .font(.footnote.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-
-                        Spacer(minLength: 2)
-
-                        if chain.type != .protein {
-                            Button(action: { viewModel.extractChainAsLigand(chainID: chain.id) }) {
-                                Image(systemName: "arrow.right.circle")
-                                    .font(.footnote)
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.orange)
-                            .help("Extract as ligand")
-                        }
-
-                        Button(action: { viewModel.removeChain(chainID: chain.id) }) {
-                            Image(systemName: "trash")
-                                .font(.footnote)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.red.opacity(0.6))
-                        .help("Remove chain")
-
-                        Button(action: { showOnlyChain(chain.id) }) {
-                            Image(systemName: "eye")
-                                .font(.footnote)
-                        }
-                        .buttonStyle(.plain)
+    private var chainsCard: some View {
+        PanelCard(
+            "Chains & Display",
+            icon: "link",
+            accessory: {
+                if !proteinChains.isEmpty {
+                    DSTag("\(proteinChains.count)", monospaced: true)
+                }
+            }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                if proteinChains.isEmpty && viewModel.molecules.ligand == nil {
+                    Text("No chains loaded")
+                        .font(DS.Font.secondary)
                         .foregroundStyle(.secondary)
-                        .help("Show only this chain")
-
-                        Toggle("", isOn: Binding(
-                            get: { !viewModel.workspace.hiddenChainIDs.contains(chain.id) },
-                            set: { _ in viewModel.toggleChainVisibility(chain.id) }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .fixedSize()
+                } else {
+                    ForEach(Array(proteinChains.enumerated()), id: \.element.id) { chainIndex, chain in
+                        chainRow(chain, index: chainIndex)
                     }
-                }
 
-                if !viewModel.workspace.hiddenChainIDs.isEmpty {
-                    Text("Hidden chains excluded from pocket detection")
-                        .font(.footnote)
-                        .foregroundStyle(.orange.opacity(0.8))
-                        .padding(.top, 2)
-                }
+                    if !viewModel.workspace.hiddenChainIDs.isEmpty {
+                        PanelHint(
+                            text: "Hidden chains are excluded from pocket detection.",
+                            icon: "eye.slash",
+                            color: DS.Color.warning
+                        )
+                    }
 
-                if let lig = viewModel.molecules.ligand {
-                    Divider().padding(.vertical, 2)
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 8) {
-                            // Ligand carbon color picker (with CPK reset)
-                            InlineColorPicker(
-                                color: Binding(
-                                    get: {
-                                        // Reflect the effective rendered color: user override
-                                        // takes precedence, otherwise the scheme's ligand-carbon
-                                        // color, otherwise the CPK carbon gray.
-                                        let effective = viewModel.workspace.ligandCarbonColor
-                                            ?? viewModel.workspace.colorScheme.ligandCarbon
-                                            ?? SIMD3<Float>(0.56, 0.56, 0.56)
-                                        return Color(
-                                            red: Double(effective.x),
-                                            green: Double(effective.y),
-                                            blue: Double(effective.z)
-                                        )
-                                    },
-                                    set: { newColor in
-                                        if let comps = NSColor(newColor).usingColorSpace(.deviceRGB) {
-                                            viewModel.workspace.ligandCarbonColor = SIMD3<Float>(
-                                                Float(comps.redComponent),
-                                                Float(comps.greenComponent),
-                                                Float(comps.blueComponent)
-                                            )
-                                            viewModel.pushToRenderer()
-                                        }
-                                    }
-                                ),
-                                label: "Set ligand carbon color",
-                                carbonsOnly: Binding(
-                                    get: { viewModel.workspace.ligandColorCarbonsOnly },
-                                    set: {
-                                        viewModel.workspace.ligandColorCarbonsOnly = $0
-                                        viewModel.pushToRenderer()
-                                    }
-                                ),
-                                onReset: {
-                                    viewModel.workspace.ligandCarbonColor = nil
-                                    viewModel.pushToRenderer()
-                                }
-                            )
-
-                            Text("Ligand")
-                                .font(.callout.weight(.medium))
-                            Spacer()
-                            Text(lig.name)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-
-                        // Ligand render mode picker
-                        HStack(spacing: 4) {
-                            Text("Render")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Picker("", selection: Binding(
-                                get: { viewModel.workspace.effectiveLigandRenderMode },
-                                set: { newMode in
-                                    viewModel.setLigandRenderMode(newMode)
-                                }
-                            )) {
-                                Text("Stick").tag(RenderMode.wireframe)
-                                Text("B&S").tag(RenderMode.ballAndStick)
-                                Text("CPK").tag(RenderMode.spaceFilling)
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(width: 150)
-                        }
-
-                        HStack(spacing: 6) {
-                            Button(action: { viewModel.fitToLigand() }) {
-                                Image(systemName: "scope")
-                                    .font(.footnote)
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(Color.accentColor)
-                            .help("Focus camera on ligand")
-
-                            Spacer()
-
-                            Button(action: { viewModel.removeLigandFromView() }) {
-                                Image(systemName: "trash")
-                                    .font(.footnote)
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.red.opacity(0.6))
-                            .help("Remove ligand")
-
-                            Toggle("", isOn: Binding(
-                                get: { viewModel.workspace.showLigand },
-                                set: { newValue in
-                                    viewModel.workspace.showLigand = newValue
-                                    viewModel.pushToRenderer()
-                                }
-                            ))
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .fixedSize()
-                        }
+                    if let lig = viewModel.molecules.ligand {
+                        if !proteinChains.isEmpty { Divider() }
+                        ligandDisplaySection(lig)
                     }
                 }
             }
         }
     }
 
+    private func chainRow(_ chain: Chain, index chainIndex: Int) -> some View {
+        let palette = WorkspaceState.MoleculeColorScheme.chainPalette
+        let paletteColor = palette[chainIndex % palette.count]
+        // Default mode mirrors AppViewModel.pushToRenderer: only the
+        // .chainColored scheme implies palette colors at startup;
+        // every other scheme renders chains as CPK by default.
+        let defaultMode: WorkspaceState.ChainColorMode =
+            viewModel.workspace.colorScheme == .chainColored ? .chainDefault : .cpk
+        let isVisible = !viewModel.workspace.hiddenChainIDs.contains(chain.id)
+
+        return HStack(spacing: DS.Space.s) {
+            ChainColorPicker(
+                chainID: chain.id,
+                paletteColor: paletteColor,
+                mode: Binding(
+                    get: { viewModel.workspace.chainColorModes[chain.id] ?? defaultMode },
+                    set: { viewModel.workspace.chainColorModes[chain.id] = $0 }
+                ),
+                customColor: Binding(
+                    get: { viewModel.workspace.chainColorOverrides[chain.id] },
+                    set: { viewModel.workspace.chainColorOverrides[chain.id] = $0 }
+                ),
+                scope: Binding(
+                    get: { viewModel.workspace.chainColorScopes[chain.id] ?? .carbonsOnly },
+                    set: { viewModel.workspace.chainColorScopes[chain.id] = $0 }
+                ),
+                onChange: { viewModel.pushToRenderer() }
+            )
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Chain \(chain.id)")
+                    .font(DS.Font.label.weight(.semibold))
+                Text("\(chain.type.label) · \(chainAtomCount(chain)) atoms")
+                    .font(DS.Font.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .opacity(isVisible ? 1 : 0.5)
+
+            Spacer(minLength: DS.Space.xxs)
+
+            if chain.type != .protein {
+                rowIconButton("arrow.right.circle", tint: DS.Color.ligand, help: "Extract chain \(chain.id) as ligand") {
+                    viewModel.extractChainAsLigand(chainID: chain.id)
+                }
+            }
+            rowIconButton("eye", tint: .secondary, help: "Show only chain \(chain.id)") {
+                showOnlyChain(chain.id)
+            }
+            rowIconButton("trash", tint: .secondary, help: "Remove chain \(chain.id)") {
+                viewModel.removeChain(chainID: chain.id)
+            }
+
+            Toggle("Show chain \(chain.id)", isOn: Binding(
+                get: { isVisible },
+                set: { _ in viewModel.toggleChainVisibility(chain.id) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .labelsHidden()
+            .help(isVisible ? "Hide chain \(chain.id)" : "Show chain \(chain.id)")
+        }
+    }
+
+    private func ligandDisplaySection(_ lig: Molecule) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            HStack(spacing: DS.Space.s) {
+                InlineColorPicker(
+                    color: Binding(
+                        get: {
+                            // Effective rendered color: user override, else the scheme's
+                            // ligand-carbon color, else the CPK carbon gray.
+                            swatchColor(viewModel.workspace.ligandCarbonColor
+                                ?? viewModel.workspace.colorScheme.ligandCarbon
+                                ?? SIMD3<Float>(0.56, 0.56, 0.56))
+                        },
+                        set: { newColor in
+                            if let rgb = rgbComponents(newColor) {
+                                viewModel.workspace.ligandCarbonColor = rgb
+                                viewModel.pushToRenderer()
+                            }
+                        }
+                    ),
+                    label: "Set ligand carbon color",
+                    carbonsOnly: Binding(
+                        get: { viewModel.workspace.ligandColorCarbonsOnly },
+                        set: {
+                            viewModel.workspace.ligandColorCarbonsOnly = $0
+                            viewModel.pushToRenderer()
+                        }
+                    ),
+                    onReset: {
+                        viewModel.workspace.ligandCarbonColor = nil
+                        viewModel.pushToRenderer()
+                    }
+                )
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Ligand")
+                        .font(DS.Font.label.weight(.semibold))
+                    Text(lig.name)
+                        .font(DS.Font.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .opacity(viewModel.workspace.showLigand ? 1 : 0.5)
+
+                Spacer(minLength: DS.Space.xxs)
+
+                rowIconButton("scope", tint: .secondary, help: "Focus camera on ligand") {
+                    viewModel.fitToLigand()
+                }
+                rowIconButton("trash", tint: .secondary, help: "Remove ligand") {
+                    viewModel.removeLigandFromView()
+                }
+
+                Toggle("Show ligand", isOn: Binding(
+                    get: { viewModel.workspace.showLigand },
+                    set: { newValue in
+                        viewModel.workspace.showLigand = newValue
+                        viewModel.pushToRenderer()
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+                .help(viewModel.workspace.showLigand ? "Hide ligand" : "Show ligand")
+            }
+
+            Picker("Ligand style", selection: Binding(
+                get: { viewModel.workspace.effectiveLigandRenderMode },
+                set: { newMode in viewModel.setLigandRenderMode(newMode) }
+            )) {
+                Text("Stick").tag(RenderMode.wireframe)
+                Text("Ball & Stick").tag(RenderMode.ballAndStick)
+                Text("CPK").tag(RenderMode.spaceFilling)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .help("Ligand render style")
+        }
+    }
+
     // MARK: - Residue Subsets
 
-    @ViewBuilder
     private var subsetsCard: some View {
         PanelCard(
             "Subsets",
@@ -964,162 +949,161 @@ struct InspectorPanel: View {
             accessory: {
                 Button(action: { viewModel.createSubsetFromSelection() }) {
                     Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(DS.Font.secondary.weight(.semibold))
+                        .foregroundStyle(DS.Color.accent)
                         .frame(width: 22, height: 22)
                         .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(Color.accentColor.opacity(0.14))
+                            RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                                .fill(DS.Color.accentSoft)
                         )
-                        .foregroundStyle(Color.accentColor)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(viewModel.workspace.selectedResidueIndices.isEmpty)
+                .opacity(viewModel.workspace.selectedResidueIndices.isEmpty ? 0.4 : 1)
                 .help("Create subset from selected residues")
+                .accessibilityLabel("Create subset from selected residues")
             }
         ) {
-            residueSubsetsSection
-        }
-    }
-
-    @ViewBuilder
-    private var residueSubsetsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if viewModel.workspace.residueSubsets.isEmpty {
-                Text("Select residues and click + to create a subset")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(viewModel.workspace.residueSubsets) { subset in
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(Color(
-                                red: Double(subset.color.x),
-                                green: Double(subset.color.y),
-                                blue: Double(subset.color.z)
-                            ))
-                            .frame(width: 8, height: 8)
-                        Text(subset.name)
-                            .font(.subheadline.weight(.medium))
-                            .lineLimit(1)
-                        Text("\(subset.residueIndices.count)")
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button(action: { viewModel.selectSubset(id: subset.id) }) {
-                            Image(systemName: "selection.pin.in.out")
-                                .font(.subheadline)
-                                .padding(4)
-                                .background(Color.primary.opacity(0.05))
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Select all residues in this subset")
-                        Button(action: { viewModel.definePocketFromSubset(id: subset.id) }) {
-                            Image(systemName: "cube.transparent")
-                                .font(.subheadline)
-                                .padding(4)
-                                .background(Color.primary.opacity(0.05))
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Define docking pocket from this subset")
-                        Toggle("", isOn: Binding(
-                            get: { subset.isVisible },
-                            set: { _ in viewModel.toggleSubsetVisibility(id: subset.id) }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        Button(action: { viewModel.deleteSubset(id: subset.id) }) {
-                            Image(systemName: "trash")
-                                .font(.subheadline)
-                                .foregroundStyle(.red)
-                                .padding(4)
-                                .background(Color.red.opacity(0.06))
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Delete this subset")
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                if viewModel.workspace.residueSubsets.isEmpty {
+                    Text("Select residues, then click + to save them as a named subset.")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(viewModel.workspace.residueSubsets) { subset in
+                        subsetRow(subset)
                     }
                 }
             }
         }
     }
 
-    // MARK: - Statistics
+    private func subsetRow(_ subset: ResidueSubset) -> some View {
+        HStack(spacing: DS.Space.s) {
+            Swatch(color: swatchColor(subset.color), size: 10)
+            Text(subset.name)
+                .font(DS.Font.label.weight(.medium))
+                .lineLimit(1)
+            Text("\(subset.residueIndices.count)")
+                .font(DS.Font.monoSmall)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: DS.Space.xxs)
+            rowIconButton("selection.pin.in.out", tint: .secondary, help: "Select all residues in this subset") {
+                viewModel.selectSubset(id: subset.id)
+            }
+            rowIconButton("scope", tint: DS.Color.pocket, help: "Define docking pocket from this subset") {
+                viewModel.definePocketFromSubset(id: subset.id)
+            }
+            rowIconButton("trash", tint: .secondary, help: "Delete this subset") {
+                viewModel.deleteSubset(id: subset.id)
+            }
+            Toggle("Show subset \(subset.name)", isOn: Binding(
+                get: { subset.isVisible },
+                set: { _ in viewModel.toggleSubsetVisibility(id: subset.id) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .labelsHidden()
+            .help(subset.isVisible ? "Hide subset" : "Show subset")
+        }
+    }
 
-    @ViewBuilder
+    // MARK: - Statistics (single home for protein / ligand statistics)
+
     private var statisticsCard: some View {
         PanelCard("Statistics", icon: "chart.bar") {
-            statisticsSection
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                if let prot = viewModel.molecules.protein {
+                    let composition = ResidueComposition(prot)
+                    statsHeader("Protein", name: prot.name, color: DS.Color.protein)
+                    DSMetricGrid(columns: 2) {
+                        DSMetric("Atoms", value: prot.atomCount.formatted())
+                        DSMetric("Heavy atoms", value: prot.heavyAtomCount.formatted())
+                        DSMetric("Residues", value: composition.aminoAcids.formatted())
+                        DSMetric("Chains", value: "\(composition.polymerChains)")
+                        DSMetric("Bonds", value: prot.bondCount.formatted())
+                        if let mw = composition.sequenceMass {
+                            DSMetric("MW", value: String(format: "%.1f", mw / 1000), unit: "kDa")
+                        }
+                    }
+                    if composition.waters > 0 || !composition.hetNames.isEmpty {
+                        VStack(spacing: DS.Space.xs) {
+                            if composition.waters > 0 {
+                                infoRow("Waters", "\(composition.waters)")
+                            }
+                            if !composition.hetNames.isEmpty {
+                                infoRow("HET groups", composition.hetNames.joined(separator: ", "))
+                            }
+                        }
+                    }
+                }
+
+                if let lig = viewModel.molecules.ligand {
+                    if viewModel.molecules.protein != nil { Divider() }
+                    statsHeader("Ligand", name: lig.name, color: DS.Color.ligand)
+                    DSMetricGrid(columns: 2) {
+                        DSMetric("Atoms", value: "\(lig.atomCount)")
+                        DSMetric("Heavy atoms", value: "\(lig.heavyAtomCount)")
+                        DSMetric("Bonds", value: "\(lig.bondCount)")
+                        DSMetric("MW", value: String(format: "%.1f", RDKitBridge.parentMolecularWeight(of: lig)), unit: "Da")
+                    }
+                    conformerStepper
+                }
+            }
+        }
+    }
+
+    private func statsHeader(_ kind: String, name: String, color: Color) -> some View {
+        HStack(spacing: DS.Space.s) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(kind)
+                .font(DS.Font.label.weight(.semibold))
+            Text(name)
+                .font(DS.Font.secondary)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 
     @ViewBuilder
-    private var statisticsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let prot = viewModel.molecules.protein {
-                Text("Protein: \(prot.name)")
-                    .font(.subheadline.weight(.medium))
-                infoRow("Atoms", "\(prot.atomCount)")
-                infoRow("Heavy", "\(prot.heavyAtomCount)")
-                infoRow("Bonds", "\(prot.bondCount)")
-                infoRow("Residues", "\(prot.residues.count)")
-                infoRow("Chains", "\(prot.chains.count)")
-                infoRow("MW", String(format: "%.1f Da", prot.molecularWeight))
-            }
-
-            if let lig = viewModel.molecules.ligand {
-                if viewModel.molecules.protein != nil { Divider() }
-                Text("Ligand: \(lig.name)")
-                    .font(.subheadline.weight(.medium))
-                infoRow("Atoms", "\(lig.atomCount)")
-                infoRow("Heavy", "\(lig.heavyAtomCount)")
-                infoRow("Bonds", "\(lig.bondCount)")
-                infoRow("MW", String(format: "%.1f Da", lig.molecularWeight))
-
-                // Conformer picker
-                let confs = viewModel.workspace.ligandConformers
-                if confs.count > 1 {
-                    Divider()
-                    HStack(spacing: 8) {
-                        Text("Conformer")
-                            .font(.footnote.weight(.medium))
-                        Spacer()
-                        Button(action: {
-                            let prev = max(viewModel.workspace.activeConformerIndex - 1, 0)
-                            viewModel.switchConformer(to: prev)
-                        }) {
-                            Image(systemName: "chevron.left")
-                                .font(.footnote)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(viewModel.workspace.activeConformerIndex == 0)
-                        .help("Previous conformer")
-
-                        Text("\(viewModel.workspace.activeConformerIndex + 1) / \(confs.count)")
-                            .font(.footnote.monospaced().weight(.medium))
-
-                        Button(action: {
-                            let next = min(viewModel.workspace.activeConformerIndex + 1, confs.count - 1)
-                            viewModel.switchConformer(to: next)
-                        }) {
-                            Image(systemName: "chevron.right")
-                                .font(.footnote)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(viewModel.workspace.activeConformerIndex >= confs.count - 1)
-                        .help("Next conformer")
+    private var conformerStepper: some View {
+        let confs = viewModel.workspace.ligandConformers
+        if confs.count > 1 {
+            let activeIndex = viewModel.workspace.activeConformerIndex
+            VStack(spacing: DS.Space.xs) {
+                HStack(spacing: DS.Space.s) {
+                    Text("Conformer")
+                        .font(DS.Font.label)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        viewModel.switchConformer(to: max(activeIndex - 1, 0))
+                    } label: {
+                        Image(systemName: "chevron.left")
                     }
+                    .buttonStyle(.borderless)
+                    .disabled(activeIndex == 0)
+                    .help("Previous conformer")
 
-                    let active = confs[viewModel.workspace.activeConformerIndex]
-                    infoRow("Energy", String(format: "%.2f kcal/mol", active.energy))
+                    Text("\(activeIndex + 1) / \(confs.count)")
+                        .font(DS.Font.monoSmall.weight(.medium))
+                        .monospacedDigit()
+
+                    Button {
+                        viewModel.switchConformer(to: min(activeIndex + 1, confs.count - 1))
+                    } label: {
+                        Image(systemName: "chevron.right")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(activeIndex >= confs.count - 1)
+                    .help("Next conformer")
                 }
-            }
-
-            if viewModel.molecules.protein == nil && viewModel.molecules.ligand == nil {
-                Text("No molecules loaded")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                if activeIndex < confs.count {
+                    infoRow("Energy", String(format: "%.2f kcal/mol", confs[activeIndex].energy))
+                }
             }
         }
     }
@@ -1127,49 +1111,63 @@ struct InspectorPanel: View {
     // MARK: - Helpers
 
     private func infoRow(_ label: String, _ value: String) -> some View {
-        HStack {
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.m) {
             Text(label)
-                .font(PanelStyle.smallFont)
+                .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
-                .frame(width: 76, alignment: .leading)
+                .lineLimit(1)
+            Spacer(minLength: DS.Space.xs)
             Text(value)
-                .font(PanelStyle.monoSmall)
+                .font(DS.Font.monoSmall)
+                .monospacedDigit()
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-            Spacer()
+                .textSelection(.enabled)
         }
     }
 
-    /// Single-line chip "LABEL : N" with a fixed intrinsic width so SwiftUI
-    /// never breaks the label across lines (was producing "LE\nU :3" in the
-    /// previous wrapping HStack).
+    /// Compact icon-only row action.
+    private func rowIconButton(_ systemImage: String, tint: Color, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(DS.Font.secondary)
+                .foregroundStyle(tint)
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    /// Single-line "LABEL N" chip with a fixed intrinsic width so labels never wrap mid-token.
     private func countChip(label: String, count: Int) -> some View {
-        HStack(spacing: 3) {
+        HStack(spacing: DS.Space.xxs) {
             Text(label)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .font(DS.Font.monoSmall.weight(.semibold))
                 .foregroundStyle(.primary)
             Text("\(count)")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(DS.Font.monoSmall)
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2)
+        .padding(.horizontal, DS.Space.s)
+        .padding(.vertical, DS.Space.xxs)
         .background(
-            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .fill(Color.primary.opacity(0.06))
+            RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                .fill(DS.Color.controlFill)
         )
         .fixedSize()
     }
 
     private func coordLabel(_ axis: String, _ value: Float) -> some View {
-        HStack(spacing: 2) {
+        HStack(spacing: DS.Space.xxs) {
             Text(axis)
-                .font(.footnote.weight(.bold))
-                .foregroundStyle(.secondary)
-            Text(String(format: "%7.3f", value))
-                .font(.footnote.monospaced())
-                .foregroundStyle(.primary)
+                .font(DS.Font.caption.weight(.bold))
+                .foregroundStyle(.tertiary)
+            Text(String(format: "%.3f", value))
+                .font(DS.Font.monoSmall)
+                .monospacedDigit()
         }
     }
 
@@ -1182,8 +1180,46 @@ struct InspectorPanel: View {
     }
 
     private func showOnlyChain(_ chainID: String) {
-        let allIDs = Set(viewModel.allChains.map(\.id))
+        let allIDs = Set(proteinChains.map(\.id))
         viewModel.workspace.hiddenChainIDs = allIDs.subtracting([chainID])
         viewModel.pushToRenderer()
+    }
+}
+
+// MARK: - Residue composition
+
+/// Polymer vs solvent vs HET breakdown of a receptor. `Molecule.residues` holds every
+/// residue record (waters, caps, ions), so its raw count overstates the protein length.
+@MainActor
+private struct ResidueComposition {
+    /// Average residue masses (Da) of the 20 standard amino acids, anhydrous (ExPASy ProtParam).
+    private static let residueMass: [String: Double] = [
+        "ALA": 71.0788, "ARG": 156.1875, "ASN": 114.1038, "ASP": 115.0886, "CYS": 103.1388,
+        "GLN": 128.1307, "GLU": 129.1155, "GLY": 57.0519, "HIS": 137.1411, "ILE": 113.1594,
+        "LEU": 113.1594, "LYS": 128.1741, "MET": 131.1926, "PHE": 147.1766, "PRO": 97.1167,
+        "SER": 87.0782, "THR": 101.1051, "TRP": 186.2132, "TYR": 163.1760, "VAL": 99.1326,
+    ]
+    private static let waterMass = 18.01524
+
+    let aminoAcids: Int
+    let polymerChains: Int
+    let waters: Int
+    let hetNames: [String]
+    /// Sequence mass of the modelled protein (residue masses + one water per chain), the
+    /// ProtParam convention: independent of hydrogens, waters and capping groups present.
+    let sequenceMass: Float?
+
+    init(_ prot: Molecule) {
+        let standard = prot.residues.filter(\.isStandard)
+        let proteinChains = Set(standard.map(\.chainID))
+        let nucleicIndices = Set(prot.chains.filter { $0.type == .nucleicAcid }.flatMap(\.residueIndices))
+        aminoAcids = standard.count
+        polymerChains = proteinChains.count + prot.chains.filter { $0.type == .nucleicAcid }.count
+        waters = prot.residues.filter(\.isWater).count
+        hetNames = Array(Set(prot.residues.enumerated().filter { idx, res in
+            !res.isStandard && !res.isWater && !nucleicIndices.contains(idx)
+        }.map(\.element.name))).sorted()
+        let residueSum = standard.reduce(0.0) { $0 + (Self.residueMass[$1.name] ?? 0) }
+        sequenceMass = standard.isEmpty ? nil : Float(residueSum + Self.waterMass * Double(proteinChains.count))
     }
 }

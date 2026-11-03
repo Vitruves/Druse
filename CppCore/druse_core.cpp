@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "druse_core_internal.h"
+#include <GraphMol/MolStandardize/Charge.h>
 
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -13,7 +15,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <numeric>
 #include <algorithm>
 
 using namespace RDKit;
@@ -185,29 +186,93 @@ DruseMoleculeResult* make_error(const char *msg) {
     return res;
 }
 
-void mmff_minimize_single(RWMol &mol, int confId) {
-    MMFF::MMFFOptimizeMolecule(mol, 1000, "MMFF94", 10.0, confId);
-}
-
-void mmff_minimize_confs_pick_best(RWMol &mol) {
-    std::vector<std::pair<int, double>> results;
-    MMFF::MMFFOptimizeMoleculeConfs(mol, results);
-    if (results.empty()) return;
-
-    double bestE = 1e10;
-    int bestC = 0;
-    for (int i = 0; i < (int)results.size(); i++) {
-        if (results[i].first >= 0 && results[i].second < bestE) {
-            bestE = results[i].second;
-            bestC = i;
+bool conformer_is_collapsed(const ROMol &mol, const Conformer &conf) {
+    const unsigned n = mol.getNumAtoms();
+    const double *topo = MolOps::getDistanceMat(mol);
+    const double minSq = kCollapsedHeavyAtomDistance * kCollapsedHeavyAtomDistance;
+    for (unsigned a = 0; a < n; a++) {
+        const auto &pa = conf.getAtomPos(a);
+        if (!std::isfinite(pa.x) || !std::isfinite(pa.y) || !std::isfinite(pa.z)) return true;
+        if (mol.getAtomWithIdx(a)->getAtomicNum() <= 1) continue;
+        for (unsigned b = a + 1; b < n; b++) {
+            if (mol.getAtomWithIdx(b)->getAtomicNum() <= 1) continue;
+            if (topo[a * n + b] < 3.0) continue;  // bonded or 1-3 pair
+            if ((pa - conf.getAtomPos(b)).lengthSq() < minSq) return true;
         }
     }
-    if (bestC != 0 && mol.getNumConformers() > (unsigned)bestC) {
-        const auto &bp = mol.getConformer(bestC);
-        auto &fp = mol.getConformer(0);
-        for (unsigned int a = 0; a < mol.getNumAtoms(); a++)
-            fp.setAtomPos(a, bp.getAtomPos(a));
+    return false;
+}
+
+/// Position (in conformer iteration order) of the lowest-energy non-collapsed conformer
+/// after MMFFOptimizeMoleculeConfs, or -1 when every conformer collapsed.
+static int lowest_energy_valid_conformer(const ROMol &mol, const std::vector<std::pair<int, double>> &mmffResults) {
+    int best = -1;
+    double bestE = std::numeric_limits<double>::quiet_NaN();
+    int ci = 0;
+    for (auto it = mol.beginConformers(); it != mol.endConformers(); ++it, ++ci) {
+        if (conformer_is_collapsed(mol, **it)) continue;
+        double e = conformer_mmff_energy(mmffResults, ci);
+        if (best < 0 || energy_less_nan_last({ci, e}, {best, bestE})) {
+            best = ci;
+            bestE = e;
+        }
     }
+    return best;
+}
+
+static const Conformer &conformer_at(const ROMol &mol, int position) {
+    auto it = mol.beginConformers();
+    std::advance(it, position);
+    return **it;
+}
+
+static void copy_positions(const Conformer &from, Conformer &to) {
+    for (unsigned a = 0; a < from.getNumAtoms(); a++) to.setAtomPos(a, from.getAtomPos(a));
+}
+
+bool reembed_valid_conformer(RWMol &mol, int confId, double *energy) {
+    constexpr int kAttempts = 3;
+    constexpr int kTrialConformers = 4;
+    for (int attempt = 1; attempt <= kAttempts; attempt++) {
+        RWMol trial(mol);
+        DGeomHelpers::EmbedParameters params = DGeomHelpers::ETKDGv3;
+        params.randomSeed = 42 + 7919 * attempt;
+        params.useRandomCoords = true;
+        params.numThreads = 1;
+        auto cids = DGeomHelpers::EmbedMultipleConfs(trial, kTrialConformers, params);
+        if (cids.empty()) continue;
+        std::vector<std::pair<int, double>> results;
+        try { MMFF::MMFFOptimizeMoleculeConfs(trial, results, 1, 1000); } catch (...) { results.clear(); }
+        int best = lowest_energy_valid_conformer(trial, results);
+        if (best < 0) continue;
+        copy_positions(conformer_at(trial, best), mol.getConformer(confId));
+        if (energy) *energy = conformer_mmff_energy(results, best);
+        return true;
+    }
+    fprintf(stderr, "[druse] every MMFF conformer collapsed (non-bonded heavy atoms < %.1f A) for %s\n",
+            kCollapsedHeavyAtomDistance, MolToSmiles(mol).c_str());
+    return false;
+}
+
+bool mmff_minimize_single(RWMol &mol, int confId, double *energy) {
+    auto res = MMFF::MMFFOptimizeMolecule(mol, 1000, "MMFF94", 10.0, confId);
+    double e = res.first >= 0 ? res.second : std::numeric_limits<double>::quiet_NaN();
+    if (conformer_is_collapsed(mol, mol.getConformer(confId))) {
+        return reembed_valid_conformer(mol, confId, energy);
+    }
+    if (energy) *energy = e;
+    return true;
+}
+
+bool mmff_minimize_confs_pick_best(RWMol &mol) {
+    if (mol.getNumConformers() == 0) return false;
+    std::vector<std::pair<int, double>> results;
+    MMFF::MMFFOptimizeMoleculeConfs(mol, results);
+    Conformer &first = **mol.beginConformers();
+    int best = lowest_energy_valid_conformer(mol, results);
+    if (best < 0) return reembed_valid_conformer(mol, (int)first.getId());
+    if (best != 0) copy_positions(conformer_at(mol, best), first);
+    return true;
 }
 
 int embed_molecule(RWMol &mol) {
@@ -340,6 +405,19 @@ DruseMoleculeResult* mol_to_result(RWMol &mol, const char *name) {
 // SMILES → 3D
 // ============================================================================
 
+static constexpr const char *kCollapsedConformerError =
+    "Conformer generation failed: every MMFF minimum had collapsed geometry";
+
+/// MMFF minimization for the SMILES→3D entry points. An MMFF exception keeps the ETKDG
+/// geometry (as before), but that geometry must still pass the collapse check.
+static bool minimize_and_pick_valid(RWMol &mol, int numConformers) {
+    try {
+        return numConformers > 1 ? mmff_minimize_confs_pick_best(mol) : mmff_minimize_single(mol);
+    } catch (...) {
+        return !conformer_is_collapsed(mol, **mol.beginConformers());
+    }
+}
+
 DruseMoleculeResult* druse_smiles_to_3d(const char *smiles, const char *name) {
     return druse_smiles_to_3d_conformers(smiles, name, 1, true);
 }
@@ -367,14 +445,8 @@ DruseMoleculeResult* druse_smiles_to_3d_conformers(
 
         if (confId < 0) return make_error("3D embedding failed");
 
-        if (mmffMinimize) {
-            try {
-                if (numConformers > 1)
-                    mmff_minimize_confs_pick_best(*mol);
-                else
-                    mmff_minimize_single(*mol);
-            } catch (...) {}
-        }
+        if (mmffMinimize && !minimize_and_pick_valid(*mol, numConformers))
+            return make_error(kCollapsedConformerError);
 
         return mol_to_result(*mol, name);
     } catch (const std::exception &e) {
@@ -398,6 +470,8 @@ DruseMoleculeResult* druse_add_hydrogens(const char *smiles, const char *name) {
         return mol_to_result(*mol, name);
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error adding hydrogens");
     }
 }
 
@@ -412,6 +486,8 @@ DruseMoleculeResult* druse_compute_gasteiger_charges(const char *smiles, const c
         return mol_to_result(*mol, name);
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error computing Gasteiger charges");
     }
 }
 
@@ -470,14 +546,8 @@ DruseMoleculeResult* druse_prepare_ligand(
             if (cids.empty()) return make_error("Conformer generation failed");
         }
 
-        if (minimize) {
-            try {
-                if (numConformers > 1)
-                    mmff_minimize_confs_pick_best(*mol);
-                else
-                    mmff_minimize_single(*mol);
-            } catch (...) {}
-        }
+        if (minimize && !minimize_and_pick_valid(*mol, numConformers))
+            return make_error(kCollapsedConformerError);
 
         if (computeCharges) {
             try { computeGasteigerCharges(*mol); } catch (...) {}
@@ -486,6 +556,8 @@ DruseMoleculeResult* druse_prepare_ligand(
         return mol_to_result(*mol, name);
     } catch (const std::exception &e) {
         return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error in ligand preparation");
     }
 }
 
@@ -502,8 +574,13 @@ DruseDescriptors druse_compute_descriptors(const char *smiles) {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) return desc;
 
-        desc.molecularWeight = (float)Descriptors::calcAMW(*mol);
-        desc.exactMW = (float)Descriptors::calcExactMW(*mol);
+        // Molecular weight is that of the neutral parent (charges neutralised by adding /
+        // removing H, heavy atoms + implicit H, average masses), so every protonation
+        // state of a compound reports the same MW.
+        RWMol neutralParent(*mol);
+        MolStandardize::Uncharger().unchargeInPlace(neutralParent);
+        desc.molecularWeight = (float)Descriptors::calcAMW(neutralParent);
+        desc.exactMW = (float)Descriptors::calcExactMW(neutralParent);
         desc.logP = (float)Descriptors::calcClogP(*mol);
         desc.tpsa = (float)Descriptors::calcTPSA(*mol);
         desc.hbd = Descriptors::calcNumHBD(*mol);
@@ -530,6 +607,7 @@ DruseMoleculeResult** druse_batch_process(
     const char **smiles_array, const char **name_array,
     int32_t count, bool addHydrogens, bool minimize, bool computeCharges
 ) {
+    if (!smiles_array || count <= 0) return nullptr;
     auto **results = new DruseMoleculeResult*[count];
     for (int32_t i = 0; i < count; i++) {
         const char *smi = smiles_array[i];
@@ -555,7 +633,11 @@ DruseMoleculeResult* mol_to_result_conf(RWMol &mol, const char *name, int confId
         strncpy(res->smiles, smi.c_str(), sizeof(res->smiles) - 1);
     } catch (...) {}
 
-    if ((unsigned)confId >= mol.getNumConformers()) {
+    bool hasConformer = false;
+    for (auto it = mol.beginConformers(); it != mol.endConformers(); ++it) {
+        if ((int)(*it)->getId() == confId) { hasConformer = true; break; }
+    }
+    if (!hasConformer) {
         res->atomCount = 0;
         res->bondCount = 0;
         return res;
@@ -633,22 +715,30 @@ DruseConformerSet* druse_generate_conformers(
             }
         }
 
-        // Sort conformers by energy
-        std::vector<int> sorted_indices(cids.size());
-        std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+        // Drop collapsed minima (their MMFF energy is deceptively low), then sort by energy.
+        std::vector<int> sorted_indices;
+        for (int i = 0; i < (int)cids.size(); i++) {
+            if (!conformer_is_collapsed(*mol, mol->getConformer(cids[i]))) sorted_indices.push_back(i);
+        }
+        if (sorted_indices.empty()) {
+            double e = 0.0;
+            if (!reembed_valid_conformer(*mol, cids[0], &e)) return set;
+            if (minimize) energies[0] = e;
+            sorted_indices.push_back(0);
+        }
         std::sort(sorted_indices.begin(), sorted_indices.end(),
             [&energies](int a, int b) { return energies[a] < energies[b]; });
 
         int count = (int)sorted_indices.size();
+        set->conformers = new DruseMoleculeResult*[count]();
+        set->energies = new double[count]();
         set->count = count;
-        set->conformers = new DruseMoleculeResult*[count];
-        set->energies = new double[count];
 
         try { computeGasteigerCharges(*mol); } catch (...) {}
 
         for (int i = 0; i < count; i++) {
             int confIdx = sorted_indices[i];
-            set->conformers[i] = mol_to_result_conf(*mol, name, confIdx);
+            set->conformers[i] = mol_to_result_conf(*mol, name, cids[confIdx]);
             set->energies[i] = energies[confIdx];
         }
     } catch (...) {}

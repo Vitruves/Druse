@@ -74,10 +74,17 @@ final class FlexDockingEngine {
         var flexTorsionEdges: [FlexTorsionEdge]
         var flexMovingIndices: [Int32]
         var chiSlotCount: Int
+        var flexResidueCount: Int
     }
 
     // Backbone atom names that should NOT be made flexible
-    private static let backboneAtomNames: Set<String> = ["N", "CA", "C", "O", "H", "HA"]
+    private static let backboneAtomNames: Set<String> = ["N", "CA", "C", "O", "H", "HA", "OXT"]
+
+    /// Capacity of the per-thread arrays in FlexDocking.metal (`flexPositions[64]`,
+    /// `DockPose.chiAngles[24]`). Edges whose pivot/axis index exceeds these bounds would
+    /// read past the thread-local arrays, so residues that do not fit are kept rigid.
+    static let maxKernelFlexAtoms = 64
+    static let maxKernelChiSlots = 24
 
     /// Separate flex sidechain atoms from the rigid protein.
     /// - Parameter vinaTypes: Per-atom Vina XS type for each protein atom (from DockingEngine's typing logic).
@@ -93,133 +100,134 @@ final class FlexDockingEngine {
         guard !flexConfig.flexibleResidueIndices.isEmpty else {
             return FlexExclusion(
                 rigidAtoms: proteinAtoms, rigidBonds: proteinBonds,
-                flexAtoms: [], flexTorsionEdges: [], flexMovingIndices: [], chiSlotCount: 0
+                flexAtoms: [], flexTorsionEdges: [], flexMovingIndices: [],
+                chiSlotCount: 0, flexResidueCount: 0
             )
         }
 
         let flexResidueSet = Set(flexConfig.flexibleResidueIndices)
 
-        // Identify sidechain atom indices for each flexible residue
-        var flexAtomIndices = Set<Int>()
-        var residueAtomMap: [Int: [Int]] = [:] // residueSeq → [atom indices]
+        // Residues are selected by sequence number only, which is ambiguous across chains and
+        // with HETATM groups (waters, ligands) sharing the number. Bind each selected number to
+        // the first polymer residue carrying it, and keep only one alternate location.
+        struct ResidueKey: Hashable { let chainID: String; let insertionCode: String }
+        var residueOwner: [Int: ResidueKey] = [:]
+        var residueAltLoc: [Int: String] = [:]
+        var sidechainIndices: [Int: [Int]] = [:]   // residueSeq → sidechain atom indices (incl. H)
+        var otherAltSidechain: [Int: [Int]] = [:]  // sidechain atoms of the non-selected altLocs
+        var backboneNameToGlobal: [Int: [String: Int]] = [:]
 
         for (i, atom) in proteinAtoms.enumerated() {
-            if flexResidueSet.contains(atom.residueSeq) &&
-               !Self.backboneAtomNames.contains(atom.name) {
-                flexAtomIndices.insert(i)
-                residueAtomMap[atom.residueSeq, default: []].append(i)
+            guard flexResidueSet.contains(atom.residueSeq), !atom.isHetAtom else { continue }
+            let seq = atom.residueSeq
+            let key = ResidueKey(chainID: atom.chainID, insertionCode: atom.insertionCode)
+            if let owner = residueOwner[seq] {
+                guard owner == key else { continue }
+            } else {
+                residueOwner[seq] = key
             }
-        }
-
-        // Log per-residue flex atom counts
-        for (residueSeq, atomIndices) in residueAtomMap {
-            Task { @MainActor in ActivityLog.shared.debug("Flex residue \(residueSeq): \(atomIndices.count) sidechain atoms excluded", category: .dock) }
-        }
-
-        // Build rigid atom list (everything except flex sidechain atoms)
-        var rigidIndices: [Int] = []
-        for i in proteinAtoms.indices {
-            if !flexAtomIndices.contains(i) {
-                rigidIndices.append(i)
+            if !atom.altLoc.isEmpty {
+                if let alt = residueAltLoc[seq] {
+                    guard alt == atom.altLoc else {
+                        // Not scored, but must leave the rigid receptor along with the moving copy.
+                        if !Self.backboneAtomNames.contains(atom.name) {
+                            otherAltSidechain[seq, default: []].append(i)
+                        }
+                        continue
+                    }
+                } else {
+                    residueAltLoc[seq] = atom.altLoc
+                }
             }
-        }
-
-        let rigidAtoms = rigidIndices.map { proteinAtoms[$0] }
-
-        // Remap bonds
-        var oldToNew: [Int: Int] = [:]
-        for (newIdx, oldIdx) in rigidIndices.enumerated() {
-            oldToNew[oldIdx] = newIdx
-        }
-        var rigidBonds: [Bond] = []
-        for bond in proteinBonds {
-            if let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] {
-                rigidBonds.append(Bond(id: rigidBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
+            if Self.backboneAtomNames.contains(atom.name) {
+                if backboneNameToGlobal[seq]?[atom.name] == nil {
+                    backboneNameToGlobal[seq, default: [:]][atom.name] = i
+                }
+            } else {
+                sidechainIndices[seq, default: []].append(i)
             }
         }
 
         // Build flex sidechain atoms
         var gpuFlexAtoms: [FlexSidechainAtom] = []
-        var flexLocalIndexMap: [Int: Int] = [:] // global atom index → local flex index
+        var flexAtomIndices = Set<Int>()
 
         // Sort residues for deterministic chi slot assignment
         let sortedFlexResidues = flexConfig.flexibleResidueIndices.sorted()
 
         var chiSlot = 0
+        var flexResidueCount = 0
         var allFlexEdges: [FlexTorsionEdge] = []
         var allFlexMoving: [Int32] = []
+        var skippedForCapacity: [Int] = []
 
-        for (resIdx, residueSeq) in sortedFlexResidues.enumerated() {
-            guard let atomIndices = residueAtomMap[residueSeq] else { continue }
+        for residueSeq in sortedFlexResidues {
+            guard let sidechain = sidechainIndices[residueSeq],
+                  let firstAtom = sidechain.first,
+                  let rotDef = RotamerLibrary.rotamers(for: proteinAtoms[firstAtom].residueName)
+            else { continue }
 
-            // Get residue name
-            guard let firstAtom = atomIndices.first else { continue }
-            let residueName = proteinAtoms[firstAtom].residueName
+            // Hydrogens carry VINA_OTHER (unsupported by the flex pair potential) and are never
+            // scored, so only heavy atoms are uploaded; they would otherwise exhaust the
+            // 64-atom kernel budget without contributing energy.
+            let heavyIndices = sidechain.filter { proteinAtoms[$0].element != .H }
+            let backbone = backboneNameToGlobal[residueSeq] ?? [:]
+            let nameToGlobal: [String: Int] = Dictionary(
+                heavyIndices.map { (proteinAtoms[$0].name, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
 
-            // Build local flex atom entries
-            let localStart = gpuFlexAtoms.count
-            for globalIdx in atomIndices {
-                let atom = proteinAtoms[globalIdx]
-                let localIdx = gpuFlexAtoms.count
-                flexLocalIndexMap[globalIdx] = localIdx
+            // Resolve chi definitions whose pivot/axis atoms are present.
+            let chis = rotDef.chiAngles.filter { chi in
+                (nameToGlobal[chi.atomNames.1] != nil || backbone[chi.atomNames.1] != nil) &&
+                nameToGlobal[chi.atomNames.2] != nil
+            }
+            guard !chis.isEmpty else { continue }
 
-                var fa = FlexSidechainAtom()
-                fa.referencePosition = SIMD3<Float>(atom.position.x, atom.position.y, atom.position.z)
-                fa.charge = atom.charge
-                fa.vinaType = vinaTypes?[globalIdx] ?? -1
-                fa.residueIndex = Int32(resIdx)
-                gpuFlexAtoms.append(fa)
+            let backbonePivots = Set(chis.compactMap { chi -> String? in
+                nameToGlobal[chi.atomNames.1] == nil ? chi.atomNames.1 : nil
+            })
+            if gpuFlexAtoms.count + heavyIndices.count + backbonePivots.count > Self.maxKernelFlexAtoms ||
+               chiSlot + chis.count > Self.maxKernelChiSlots {
+                skippedForCapacity.append(residueSeq)
+                continue
             }
 
-            // Build chi angle torsion edges
-            guard let rotDef = RotamerLibrary.rotamers(for: residueName) else { continue }
+            let resIdx = Int32(flexResidueCount)
+            flexResidueCount += 1
+            flexAtomIndices.formUnion(sidechain)
+            flexAtomIndices.formUnion(otherAltSidechain[residueSeq] ?? [])
 
-            // Map atom names to local flex indices for this residue
-            let nameToLocal: [String: Int] = Dictionary(
-                atomIndices.compactMap { globalIdx -> (String, Int)? in
-                    guard let localIdx = flexLocalIndexMap[globalIdx] else { return nil }
-                    return (proteinAtoms[globalIdx].name, localIdx)
-                },
-                uniquingKeysWith: { first, _ in first }
-            )
+            func appendFlexAtom(_ globalIdx: Int, scored: Bool) -> Int {
+                let atom = proteinAtoms[globalIdx]
+                var fa = FlexSidechainAtom()
+                fa.referencePosition = atom.position
+                fa.charge = atom.charge
+                fa.vinaType = scored ? (vinaTypes.flatMap { globalIdx < $0.count ? $0[globalIdx] : nil } ?? -1) : -1
+                fa.residueIndex = resIdx
+                gpuFlexAtoms.append(fa)
+                return gpuFlexAtoms.count - 1
+            }
 
-            // Also include backbone atoms that may be needed as dihedral references
-            // (they won't move, but they define the rotation axis)
-            let backboneNameToGlobal: [String: Int] = Dictionary(
-                proteinAtoms.indices.compactMap { i -> (String, Int)? in
-                    let a = proteinAtoms[i]
-                    guard a.residueSeq == residueSeq,
-                          Self.backboneAtomNames.contains(a.name) else { return nil }
-                    return (a.name, i)
-                },
-                uniquingKeysWith: { first, _ in first }
-            )
-
-            for chi in rotDef.chiAngles {
-                // Find pivot and axis atoms (atoms 1 and 2 of the dihedral definition = atoms.1, atoms.2)
-                let pivotName = chi.atomNames.1
-                let axisName = chi.atomNames.2
-
-                // Pivot might be backbone (e.g., "CA") — need to handle that
-                let pivotLocal: Int?
-                if let p = nameToLocal[pivotName] {
-                    pivotLocal = p
-                } else if let globalIdx = backboneNameToGlobal[pivotName] {
-                    // Add backbone atom as a "pseudo" flex atom (won't actually move, just defines rotation axis)
-                    let localIdx = gpuFlexAtoms.count
-                    let atom = proteinAtoms[globalIdx]
-                    var fa = FlexSidechainAtom()
-                    fa.referencePosition = SIMD3<Float>(atom.position.x, atom.position.y, atom.position.z)
-                    fa.charge = atom.charge
-                    fa.vinaType = -1  // backbone pivot: excluded from pairwise scoring
-                    fa.residueIndex = Int32(resIdx)
-                    gpuFlexAtoms.append(fa)
-                    pivotLocal = localIdx
-                } else {
-                    continue
+            let localStart = gpuFlexAtoms.count
+            var nameToLocal: [String: Int] = [:]
+            for globalIdx in heavyIndices {
+                let localIdx = appendFlexAtom(globalIdx, scored: true)
+                if nameToLocal[proteinAtoms[globalIdx].name] == nil {
+                    nameToLocal[proteinAtoms[globalIdx].name] = localIdx
                 }
+            }
+            // Backbone pivots (e.g. CA for chi1) never move; they only define the rotation axis
+            // and are excluded from pairwise scoring (vinaType = -1).
+            for name in backbonePivots.sorted() {
+                if let globalIdx = backbone[name] {
+                    nameToLocal[name] = appendFlexAtom(globalIdx, scored: false)
+                }
+            }
 
-                guard let axisLocal = nameToLocal[axisName], let pivotLocal else { continue }
+            for chi in chis {
+                guard let pivotLocal = nameToLocal[chi.atomNames.1],
+                      let axisLocal = nameToLocal[chi.atomNames.2] else { continue }
 
                 // Find downstream atoms (everything past the axis atom in the sidechain)
                 let downstream = findDownstreamLocalIndices(
@@ -229,18 +237,39 @@ final class FlexDockingEngine {
                     atoms: gpuFlexAtoms
                 )
 
-                let movingStart = Int32(allFlexMoving.count)
-                allFlexMoving.append(contentsOf: downstream.map { Int32($0) })
-
                 var edge = FlexTorsionEdge()
                 edge.pivotAtom = Int32(pivotLocal)
                 edge.axisAtom = Int32(axisLocal)
-                edge.movingStart = movingStart
+                edge.movingStart = Int32(allFlexMoving.count)
                 edge.movingCount = Int32(downstream.count)
                 edge.chiSlot = Int32(chiSlot)
+                allFlexMoving.append(contentsOf: downstream.map { Int32($0) })
                 allFlexEdges.append(edge)
 
                 chiSlot += 1
+            }
+        }
+
+        if !skippedForCapacity.isEmpty {
+            let message = "Flex residue(s) \(skippedForCapacity.map(String.init).joined(separator: ", ")) kept rigid: " +
+                "GPU flex kernel limit of \(Self.maxKernelFlexAtoms) atoms / \(Self.maxKernelChiSlots) chi angles reached"
+            Task { @MainActor in ActivityLog.shared.warn(message, category: .dock) }
+        }
+
+        // Build rigid atom list (everything except flex sidechain atoms)
+        var oldToNew = [Int](repeating: -1, count: proteinAtoms.count)
+        var rigidAtoms: [Atom] = []
+        rigidAtoms.reserveCapacity(proteinAtoms.count - flexAtomIndices.count)
+        for (i, atom) in proteinAtoms.enumerated() where !flexAtomIndices.contains(i) {
+            oldToNew[i] = rigidAtoms.count
+            rigidAtoms.append(atom)
+        }
+        var rigidBonds: [Bond] = []
+        for bond in proteinBonds {
+            guard bond.atomIndex1 < oldToNew.count, bond.atomIndex2 < oldToNew.count else { continue }
+            let a = oldToNew[bond.atomIndex1], b = oldToNew[bond.atomIndex2]
+            if a >= 0, b >= 0 {
+                rigidBonds.append(Bond(id: rigidBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
             }
         }
 
@@ -250,7 +279,8 @@ final class FlexDockingEngine {
             flexAtoms: gpuFlexAtoms,
             flexTorsionEdges: allFlexEdges,
             flexMovingIndices: allFlexMoving,
-            chiSlotCount: chiSlot
+            chiSlotCount: chiSlot,
+            flexResidueCount: flexResidueCount
         )
     }
 
@@ -327,7 +357,7 @@ final class FlexDockingEngine {
         var params = FlexParams()
         params.numFlexAtoms = UInt32(numFlexAtoms)
         params.numFlexTorsions = UInt32(numFlexTorsions)
-        params.numFlexResidues = UInt32(flexConfig?.flexibleResidueIndices.count ?? 0)
+        params.numFlexResidues = UInt32(exclusion.flexResidueCount)
         params.flexWeight = flexWeight
         params.chiStep = chiStep
         flexParamsBuffer = device.makeBuffer(
@@ -458,17 +488,5 @@ final class FlexDockingEngine {
         enc.dispatchThreadgroups(tgc, threadsPerThreadgroup: tgs)
         enc.endEncoding()
         cmdBuf.commit()
-    }
-}
-
-// MARK: - Atom Extension for Vina Type
-
-private extension Atom {
-    /// Quick lookup for the Vina XS type assigned during preparation.
-    /// Returns the stored vinaType if available, otherwise -1 (untyped).
-    var vinaType: Int? {
-        // vinaType is typically set during protein preparation on the formalCharge field
-        // or via the Vina type assignment pass. Return nil if not assigned.
-        return nil
     }
 }

@@ -7,6 +7,8 @@
 // Computes pairwise VDW energy (LJ 6-12) and region-based positional restraints
 // for structure preparation minimization:
 //   - Pairwise Lennard-Jones 6-12 with Lorentz-Berthelot mixing rules
+//   - Bonded exclusions from a host-built list: 1-2 and 1-3 pairs are skipped,
+//     1-4 pairs are scaled (as in AMBER-style force fields)
 //   - Harmonic positional restraints per region (backbone, sidechain, reconstructed, H)
 //
 // One thread per atom. Per-atom partials accumulated without atomics, summed on CPU.
@@ -23,14 +25,21 @@ using namespace metal;
 // ============================================================================
 
 /// Compute pairwise LJ 6-12 energy and harmonic positional restraint per atom.
-/// E_vdw = 4 * eps_ij * [(sig_ij/r)^12 - (sig_ij/r)^6]
+/// E_vdw = scale_ij * 4 * eps_ij * [(sig_ij/r)^12 - (sig_ij/r)^6]
 /// E_restraint = 0.5 * K[region] * |pos - refPos|^2
+///
+/// Exclusions are CSR-encoded: the partners of atom i are
+/// exclusionPartners[exclusionOffsets[i] ..< exclusionOffsets[i+1]], sorted by
+/// ascending index, with exclusionScales giving the LJ scale (0 = fully excluded).
 kernel void prep_vdw_restraint(
-    device const PrepMinAtom    *atoms     [[buffer(0)]],
-    device const PrepMinAtom    *refAtoms  [[buffer(1)]],
-    constant PrepMinParams      &params    [[buffer(2)]],
-    device float                *energies  [[buffer(3)]],
-    device float3               *gradients [[buffer(4)]],
+    device const PrepMinAtom    *atoms             [[buffer(0)]],
+    device const PrepMinAtom    *refAtoms          [[buffer(1)]],
+    constant PrepMinParams      &params            [[buffer(2)]],
+    device float                *energies          [[buffer(3)]],
+    device float3               *gradients         [[buffer(4)]],
+    device const uint           *exclusionOffsets  [[buffer(5)]],
+    device const uint           *exclusionPartners [[buffer(6)]],
+    device const float          *exclusionScales   [[buffer(7)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= params.atomCount) return;
@@ -43,9 +52,20 @@ kernel void prep_vdw_restraint(
 
     float cutoff2 = params.stericCutoff * params.stericCutoff;
 
+    // Partners are sorted, so a single cursor advances alongside j.
+    uint exclCursor = exclusionOffsets[tid];
+    uint exclEnd = exclusionOffsets[tid + 1];
+
     // --- Pairwise LJ 6-12 ---
     for (uint j = 0; j < params.atomCount; j++) {
         if (j == tid) continue;
+
+        float pairScale = 1.0f;
+        while (exclCursor < exclEnd && exclusionPartners[exclCursor] < j) exclCursor++;
+        if (exclCursor < exclEnd && exclusionPartners[exclCursor] == j) {
+            pairScale = exclusionScales[exclCursor];
+            if (pairScale <= 0.0f) continue;
+        }
 
         float3 diff = pi - atoms[j].position;
         float r2 = dot(diff, diff);
@@ -53,7 +73,7 @@ kernel void prep_vdw_restraint(
 
         // Lorentz-Berthelot mixing
         float sigma_ij = 0.5f * (sigma_i + atoms[j].sigma);
-        float epsilon_ij = sqrt(epsilon_i * atoms[j].epsilon);
+        float epsilon_ij = pairScale * sqrt(epsilon_i * atoms[j].epsilon);
         if (epsilon_ij < 1e-12f) continue;
 
         float inv_r2 = 1.0f / r2;

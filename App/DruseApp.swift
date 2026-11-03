@@ -7,15 +7,14 @@ import MetalKit
 @main
 struct DruseApp: App {
     @State private var viewModel = AppViewModel()
-    @Environment(\.openWindow) private var openWindow
-    @AppStorage("appTheme") private var appTheme: String = AppTheme.dark.rawValue
+    @AppStorage("appTheme") private var appTheme: String = AppTheme.auto.rawValue
 
     private var selectedColorScheme: ColorScheme? {
-        (AppTheme(rawValue: appTheme) ?? .dark).colorScheme
+        (AppTheme(rawValue: appTheme) ?? .auto).colorScheme
     }
 
     var body: some Scene {
-        WindowGroup {
+        Window("Druse", id: "main") {
             ContentView()
                 .environment(viewModel)
                 .preferredColorScheme(selectedColorScheme)
@@ -24,70 +23,13 @@ struct DruseApp: App {
                     // Speed up tooltip display (default macOS delay is ~1.5 seconds)
                     UserDefaults.standard.set(300, forKey: "NSInitialToolTipDelay")
                 }
-                .frame(minWidth: 1100, minHeight: 700)
+                .frame(minWidth: DS.Size.windowMin.width, minHeight: DS.Size.windowMin.height)
         }
-        .windowStyle(.titleBar)
-        .defaultSize(width: 1400, height: 900)
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(DS.Size.windowDefault)
         .defaultLaunchBehavior(.automatic)
         .commands {
-            // File menu
-            CommandGroup(after: .newItem) {
-                Button("Open...") { viewModel.importFile() }
-                    .keyboardShortcut("o", modifiers: .command)
-                Divider()
-                Button("Save Project...") { saveProject() }
-                    .keyboardShortcut("s", modifiers: .command)
-                Button("Open Project...") { openProject() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
-                Divider()
-                Button("Load Ligand Database") {
-                    viewModel.ligandDB.load()
-                }
-                Button("Save Ligand Database") {
-                    viewModel.ligandDB.save()
-                    viewModel.log.success("Saved \(viewModel.ligandDB.count) ligands", category: .molecule)
-                }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
-            }
-
-            // View menu additions
-            CommandGroup(after: .toolbar) {
-                Divider()
-                Button("Ball & Stick") { viewModel.setRenderMode(.ballAndStick) }
-                    .keyboardShortcut("1", modifiers: .command)
-                Button("Space Filling") { viewModel.setRenderMode(.spaceFilling) }
-                    .keyboardShortcut("2", modifiers: .command)
-                Button("Wireframe") { viewModel.setRenderMode(.wireframe) }
-                    .keyboardShortcut("3", modifiers: .command)
-                Divider()
-                Button("Toggle Hydrogens") { viewModel.toggleHydrogens() }
-                    .keyboardShortcut("h", modifiers: .command)
-                Button("Recenter") {
-                    viewModel.renderer?.fitToContent()
-                }
-                .keyboardShortcut(" ", modifiers: [])
-                Divider()
-                Button("Ligand Database") {
-                    openWindow(id: "ligand-database")
-                }
-                .keyboardShortcut("l", modifiers: .command)
-                Button("Results Database") {
-                    openWindow(id: "results-database")
-                }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-            }
-
-            // Help menu
-            CommandGroup(replacing: .help) {
-                Button("Druse Help") {
-                    openWindow(id: "druse-help")
-                }
-                .keyboardShortcut("?", modifiers: .command)
-                Divider()
-                Button("Report Bug…") {
-                    openWindow(id: "bug-report")
-                }
-            }
+            DruseCommands(viewModel: viewModel)
         }
 
         Settings {
@@ -96,18 +38,17 @@ struct DruseApp: App {
                 .preferredColorScheme(selectedColorScheme)
         }
 
-        // Ligand Database window
         Window("Ligand Database", id: "ligand-database") {
             LigandDatabaseWindow()
                 .environment(viewModel)
                 .preferredColorScheme(selectedColorScheme)
+                .frame(minWidth: 1040, minHeight: 680)
         }
-        .defaultSize(width: 1200, height: 700)
+        .defaultSize(width: 1280, height: 820)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
-        // Help window
         Window("Druse Help", id: "druse-help") {
             DruseHelpView()
                 .preferredColorScheme(selectedColorScheme)
@@ -117,18 +58,16 @@ struct DruseApp: App {
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
-        // Bug report window
         Window("Report Bug", id: "bug-report") {
             BugReportWindow()
                 .preferredColorScheme(selectedColorScheme)
         }
-        .defaultSize(width: 600, height: 620)
         .windowStyle(.titleBar)
         .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
-        // Interaction Diagram window — 2D protein-ligand interaction view
+        // 2D protein–ligand interaction view
         Window("Interaction Diagram", id: "interaction-diagram") {
             InteractionDiagramWindow()
                 .environment(viewModel)
@@ -139,20 +78,22 @@ struct DruseApp: App {
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
-        // Results Database window — full pose analysis, interaction diagrams, correlation
+        // Full pose analysis, interaction diagrams, correlation
         Window("Results Database", id: "results-database") {
             ResultsDatabaseWindow()
                 .environment(viewModel)
                 .preferredColorScheme(selectedColorScheme)
+                .frame(minWidth: 1000, minHeight: 640)
         }
-        .defaultSize(width: 1300, height: 800)
+        .defaultSize(width: 1320, height: 820)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
-
     }
 
-    private func saveProject() {
+    /// The single Save Project implementation (File menu and toolbar).
+    @MainActor
+    static func saveProject(_ viewModel: AppViewModel) {
         let panel = NSSavePanel()
         panel.title = "Save Druse Project"
         panel.allowedContentTypes = [.folder]
@@ -165,24 +106,6 @@ struct DruseApp: App {
                     try DruseProjectIO.save(to: url, viewModel: viewModel)
                 } catch {
                     viewModel.log.error("Save failed: \(error.localizedDescription)", category: .system)
-                }
-            }
-        }
-    }
-
-    private func openProject() {
-        let panel = NSOpenPanel()
-        panel.title = "Open Druse Project"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowedContentTypes = [.folder]
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in
-                do {
-                    try await DruseProjectIO.load(from: url, into: viewModel)
-                } catch {
-                    viewModel.log.error("Load failed: \(error.localizedDescription)", category: .system)
                 }
             }
         }
@@ -215,15 +138,7 @@ struct DruseApp: App {
             return
         }
 
-        // Apply persisted theme immediately so renderer doesn't flash dark on relaunch
-        let theme = AppTheme(rawValue: appTheme) ?? .dark
-        switch theme {
-        case .light: renderer.themeMode = 1
-        case .dark:  renderer.themeMode = 0
-        case .auto:
-            let systemIsDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            renderer.themeMode = systemIsDark ? 0 : 1
-        }
+        // Theme is synced by ContentView (onAppear / colorScheme changes).
         renderer.backgroundOpacity = viewModel.workspace.backgroundOpacity
         renderer.surfaceOpacity = viewModel.workspace.surfaceOpacity
 
@@ -242,6 +157,87 @@ struct DruseApp: App {
             XTBMetalAccelerator.shared = xtbGPU
             xtbGPU.installGPUContext()
             viewModel.log.info("GFN2-xTB Metal GPU acceleration enabled", category: .system)
+        }
+    }
+}
+
+// MARK: - Menu commands
+
+private struct DruseCommands: Commands {
+    let viewModel: AppViewModel
+    @Environment(\.openWindow) private var openWindow
+    @FocusedValue(\.selectedStep) private var selectedStep
+    @AppStorage("ui.navigatorOpen") private var showNavigator = true
+    @AppStorage("ui.inspectorOpen") private var showInspector = false
+    @AppStorage("ui.consoleOpen") private var showConsole = false
+
+    private var currentStep: SidebarTab { selectedStep?.wrappedValue ?? .search }
+
+    var body: some Commands {
+        // File ▸ New Window would create a second window sharing one renderer.
+        CommandGroup(replacing: .newItem) { }
+
+        CommandGroup(after: .newItem) {
+            Button("Open…") { viewModel.importFile() }
+                .keyboardShortcut("o", modifiers: .command)
+            Button("Open Project…") { viewModel.openProject() }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
+            Button("Save Project") { DruseApp.saveProject(viewModel) }
+                .keyboardShortcut("s", modifiers: .command)
+            Divider()
+            Button("Import Ligand Database…") {
+                viewModel.ligandDB.load()
+            }
+            Button("Export Ligand Database…") {
+                viewModel.ligandDB.save()
+                viewModel.log.success("Saved \(viewModel.ligandDB.count) ligands", category: .molecule)
+            }
+        }
+
+        CommandMenu("Workflow") {
+            ForEach(SidebarTab.allCases, id: \.self) { tab in
+                Button("\(tab.shortcutNumber). \(tab.rawValue)") { tab.request(in: viewModel) }
+                    .keyboardShortcut(KeyEquivalent(Character(String(tab.shortcutNumber))), modifiers: .command)
+            }
+            Divider()
+            Button("Next Step") { currentStep.nextStep?.request(in: viewModel) }
+                .keyboardShortcut("]", modifiers: .command)
+                .disabled(currentStep.nextStep == nil)
+            Button("Previous Step") { currentStep.previousStep?.request(in: viewModel) }
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(currentStep.previousStep == nil)
+        }
+
+        CommandGroup(after: .toolbar) {
+            Divider()
+            ForEach(Array(RenderMode.allCases.enumerated()), id: \.element) { index, mode in
+                Button(mode.rawValue) { viewModel.setRenderMode(mode) }
+                    .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: [.control, .command])
+            }
+            Divider()
+            Button("Toggle Hydrogens") { viewModel.toggleHydrogens() }
+                .keyboardShortcut("h", modifiers: [.control, .command])
+            Button("Fit to View") { viewModel.fitToView() }
+                .keyboardShortcut("0", modifiers: .command)
+            Divider()
+            Button(showNavigator ? "Hide Navigator" : "Show Navigator") { showNavigator.toggle() }
+                .keyboardShortcut("s", modifiers: [.control, .command])
+            Button(showInspector ? "Hide Inspector" : "Show Inspector") { showInspector.toggle() }
+                .keyboardShortcut("0", modifiers: [.option, .command])
+            Button(showConsole ? "Hide Console" : "Show Console") { showConsole.toggle() }
+                .keyboardShortcut("y", modifiers: [.shift, .command])
+            Divider()
+            Button("Ligand Database") { openWindow(id: "ligand-database") }
+                .keyboardShortcut("l", modifiers: .command)
+            Button("Results Database") { openWindow(id: "results-database") }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+        }
+
+        CommandGroup(replacing: .help) {
+            Button("Druse Help") { openWindow(id: "druse-help") }
+                .keyboardShortcut("?", modifiers: .command)
+            Divider()
+            Button("Report Bug…") { openWindow(id: "bug-report") }
         }
     }
 }

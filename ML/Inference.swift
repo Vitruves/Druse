@@ -297,8 +297,9 @@ struct DruseScoreFeatureExtractor {
             // [10] Aromatic
             features[10] = isAromatic ? 1.0 : 0.0
 
-            // [11] Partial charge (Gasteiger — same as MOL2 training data)
-            features[11] = atom.charge
+            // [11] Partial charge (Gasteiger — same as MOL2 training data),
+            // clipped to [-1, 1] as in mol2_atom_features (trainDruseAFv4/v5.py).
+            features[11] = min(max(atom.charge, -1.0), 1.0)
 
             // [12] H-bond donor — chemistry-aware (formal charge + implicit H
             // from bond order). Computed once per molecule by
@@ -719,13 +720,13 @@ final class PocketDetectorInference {
     /// Extract above-threshold voxels from the probability grid and convert to world coordinates.
     private nonisolated static func extractPocketPoints(
         probGrid: MLMultiArray, center: SIMD3<Float>, threshold: Float
-    ) -> [(position: SIMD3<Float>, probability: Float)] {
+    ) -> [SIMD3<Float>] {
         let gs = gridSize
         let res = resolution
         let half = Float(gs) * res / 2.0
 
         let ptr = probGrid.dataPointer.bindMemory(to: Float16.self, capacity: gs * gs * gs)
-        var points: [(position: SIMD3<Float>, probability: Float)] = []
+        var points: [SIMD3<Float>] = []
 
         let strideX = gs * gs
         let strideY = gs
@@ -740,7 +741,7 @@ final class PocketDetectorInference {
                             Float(y) * res - half + center.y,
                             Float(z) * res - half + center.z
                         )
-                        points.append((worldPos, prob))
+                        points.append(worldPos)
                     }
                 }
             }
@@ -753,14 +754,16 @@ final class PocketDetectorInference {
 
     /// Cluster pocket points into BindingPocket objects using connected-component flood fill.
     private nonisolated static func clusterIntoPockets(
-        _ points: [(position: SIMD3<Float>, probability: Float)],
+        _ positions: [SIMD3<Float>],
         residues: [Residue],
         atoms: [Atom]
     ) -> [BindingPocket] {
         let eps: Float = 4.0
         let contactDistance: Float = 4.5
-        let positions = points.map(\.position)
-        var labels = [Int](repeating: -1, count: points.count)
+        let heavyAtoms = atoms.filter { $0.element != .H && !$0.isHetAtom }
+        let heavyPositions = heavyAtoms.map(\.position)
+        let heavyElements = heavyAtoms.map(\.element)
+        var labels = [Int](repeating: -1, count: positions.count)
         var clusterId = 0
         var atomResidueMap: [Int: Int] = [:]
 
@@ -770,32 +773,53 @@ final class PocketDetectorInference {
             }
         }
 
-        for i in 0..<points.count {
+        // Spatial hash with cell size `eps`: every point within `eps` of a point
+        // lies in one of the 27 surrounding cells, so the flood fill only scans
+        // those instead of all points (the all-pairs scan was O(n²) in the
+        // number of above-threshold voxels).
+        func cellKey(_ p: SIMD3<Float>) -> SIMD3<Int32> {
+            SIMD3<Int32>(Int32((p.x / eps).rounded(.down)),
+                         Int32((p.y / eps).rounded(.down)),
+                         Int32((p.z / eps).rounded(.down)))
+        }
+        var cells: [SIMD3<Int32>: [Int]] = [:]
+        for (idx, p) in positions.enumerated() {
+            cells[cellKey(p), default: []].append(idx)
+        }
+
+        var clusterMembers: [[Int]] = []
+        for i in 0..<positions.count {
             guard labels[i] == -1 else { continue }
             labels[i] = clusterId
             var queue = [i]
             var qIdx = 0
             while qIdx < queue.count {
                 let cur = queue[qIdx]; qIdx += 1
-                for j in 0..<points.count {
-                    guard labels[j] == -1 else { continue }
-                    if simd_distance(positions[cur], positions[j]) < eps {
-                        labels[j] = clusterId
-                        queue.append(j)
+                let c = cellKey(positions[cur])
+                for dx in Int32(-1)...1 {
+                    for dy in Int32(-1)...1 {
+                        for dz in Int32(-1)...1 {
+                            guard let bucket = cells[c &+ SIMD3<Int32>(dx, dy, dz)] else { continue }
+                            for j in bucket where labels[j] == -1 {
+                                if simd_distance(positions[cur], positions[j]) < eps {
+                                    labels[j] = clusterId
+                                    queue.append(j)
+                                }
+                            }
+                        }
                     }
                 }
             }
+            clusterMembers.append(queue.sorted())
             clusterId += 1
         }
 
         var pockets: [BindingPocket] = []
-        for cid in 0..<clusterId {
-            let members = (0..<points.count).filter { labels[$0] == cid }
+        for members in clusterMembers {
             guard members.count >= 3 else { continue }
 
             let clusterPos = members.map { positions[$0] }
             let center = clusterPos.reduce(.zero, +) / Float(clusterPos.count)
-            let avgProb = members.map { points[$0].probability }.reduce(0, +) / Float(members.count)
 
             // Compute half-extents
             var maxExt = SIMD3<Float>.zero
@@ -803,7 +827,16 @@ final class PocketDetectorInference {
                 maxExt = simd_max(maxExt, simd_abs(p - center))
             }
             let halfSize = maxExt + SIMD3<Float>(repeating: 4.0)
-            let volume = 8.0 * halfSize.x * halfSize.y * halfSize.z
+            // Report the cavity itself (empty voxels × voxel volume) and its geometric
+            // buriedness, measured like the grid detector's pockets. The padded search-box
+            // volume and the mean voxel probability are not pocket properties.
+            let cavity = BindingSiteDetector.cavityDescriptors(
+                points: clusterPos,
+                cellVolume: resolution * resolution * resolution,
+                heavyAtomPositions: heavyPositions,
+                heavyAtomElements: heavyElements
+            )
+            guard cavity.volume > 0 else { continue }
 
             let searchRadius = max(maxExt.x, max(maxExt.y, maxExt.z)) + contactDistance
             let contactDistSq = contactDistance * contactDistance
@@ -858,8 +891,8 @@ final class PocketDetectorInference {
                 id: pockets.count,
                 center: center,
                 size: halfSize,
-                volume: volume,
-                buriedness: avgProb,
+                volume: cavity.volume,
+                buriedness: cavity.buriedness,
                 polarity: localPolarity,
                 druggability: 0,
                 residueIndices: Array(residueSet).sorted(),

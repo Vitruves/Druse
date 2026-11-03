@@ -42,6 +42,10 @@ constant uint CRS_RBF = 24;    // CROSS_RBF_BINS
 constant float RBF_G  = 2.0f;  // RBF_GAMMA
 constant float MSG_CUT = 8.0f; // MSG_CUTOFF
 constant float CRS_CUT = 8.0f; // CROSS_CUTOFF
+// Per-pose stride of `ligTransformed`, written by druseAFEncode
+// (DruseAFCompute.metal, DAF_POSE_LIG_POS_FLOATS = DAF_MAX_LIG * 3). The stride
+// is fixed at 64 atoms regardless of the actual ligand size L.
+constant uint POSE_POS_STRIDE = 64 * 3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -194,10 +198,11 @@ kernel void druseAFv4MsgAggregate(
     // (We store logits in a small array since P ≤ 256)
     float attn_logits[256];
     for (uint j = 0; j < P; j++) {
-        if (j == tid) { attn_logits[j] = -1e9f; continue; }
         float3 j_pos = float3(protPos[j*3], protPos[j*3+1], protPos[j*3+2]);
         float d = distance(my_pos, j_pos);
-        if (d > MSG_CUT) { attn_logits[j] = -1e9f; continue; }
+        // Training mask: (dist < cutoff) & (dist > 0.01) — excludes self and
+        // coincident atoms.
+        if (d >= MSG_CUT || d <= 0.01f) { attn_logits[j] = -1e9f; continue; }
 
         // RBF → attn_mlp: Linear(16→32, GELU) → Linear(32→1)
         float rbf[MSG_RBF];
@@ -223,8 +228,13 @@ kernel void druseAFv4MsgAggregate(
         max_attn = max(max_attn, logit);
     }
 
-    // Pass 2: softmax + weighted sum
+    // Pass 2: softmax + weighted sum. Masked entries have zero weight whenever
+    // at least one neighbour exists, so skip their 128-wide accumulation. With
+    // no neighbour at all every logit is the mask value and the softmax is
+    // uniform, as in the reference masked_fill + softmax.
+    bool has_neighbor = max_attn > -1e9f;
     for (uint j = 0; j < P; j++) {
+        if (has_neighbor && attn_logits[j] <= -1e9f) continue;
         float w = exp(attn_logits[j] - max_attn);
         attn_sum += w;
         for (uint dd = 0; dd < H; dd++)
@@ -312,12 +322,16 @@ kernel void druseAFv4Score(
     device const float*             weights      [[buffer(5)]],
     device const DruseAFWeightEntry* entries     [[buffer(6)]],
     constant DruseAFv4Params&       params       [[buffer(7)]],
-    device const float*             ligTransformed [[buffer(8)]],  // [numPoses, L, 3]
+    device const float*             ligTransformed [[buffer(8)]],  // [numPoses, 64, 3]
     constant GridParams&            gridParams   [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     uint gid [[threadgroup_position_in_grid]]
 ) {
     uint pose_idx = gid;
+    // Callers may round the threadgroup count up past the population; padded
+    // groups would read past the per-pose ligTransformed stride and write foreign
+    // poses. The whole group exits together, so later barriers stay uniform.
+    if (pose_idx >= params.numPoses) return;
     uint P = params.numProteinAtoms;
     uint L = params.numLigandAtoms;
     bool valid = (tid < L);
@@ -344,7 +358,7 @@ kernel void druseAFv4Score(
     // Get transformed ligand position
     float3 my_pos = float3(0);
     if (valid) {
-        uint base = pose_idx * L * 3 + tid * 3;
+        uint base = pose_idx * POSE_POS_STRIDE + tid * 3;
         my_pos = float3(ligTransformed[base], ligTransformed[base+1], ligTransformed[base+2]);
     }
 
@@ -519,7 +533,7 @@ kernel void druseAFv4Score(
         // Out-of-grid penalty: penalize if ligand centroid is far from grid center
         float3 lig_center = float3(0);
         for (uint i = 0; i < L; i++) {
-            uint b = pose_idx * L * 3 + i * 3;
+            uint b = pose_idx * POSE_POS_STRIDE + i * 3;
             lig_center += float3(ligTransformed[b], ligTransformed[b+1], ligTransformed[b+2]);
         }
         lig_center /= float(L);
@@ -562,13 +576,17 @@ kernel void druseAFv4ScoreWithGradient(
     device const float*             weights        [[buffer(5)]],
     device const DruseAFWeightEntry* entries       [[buffer(6)]],
     constant DruseAFv4Params&       params         [[buffer(7)]],
-    device const float*             ligTransformed [[buffer(8)]],   // [numPoses, L, 3]
+    device const float*             ligTransformed [[buffer(8)]],   // [numPoses, 64, 3]
     constant GridParams&            gridParams     [[buffer(9)]],
     device AttentionGradient*       attnGradients  [[buffer(10)]],  // [numPoses × L]
     uint tid [[thread_index_in_threadgroup]],
     uint gid [[threadgroup_position_in_grid]]
 ) {
     uint pose_idx = gid;
+    // Callers may round the threadgroup count up past the population; padded
+    // groups would read past the per-pose ligTransformed stride and write foreign
+    // poses. The whole group exits together, so later barriers stay uniform.
+    if (pose_idx >= params.numPoses) return;
     uint P = params.numProteinAtoms;
     uint L = params.numLigandAtoms;
     bool valid = (tid < L);
@@ -592,7 +610,7 @@ kernel void druseAFv4ScoreWithGradient(
 
     float3 my_pos = float3(0);
     if (valid) {
-        uint base = pose_idx * L * 3 + tid * 3;
+        uint base = pose_idx * POSE_POS_STRIDE + tid * 3;
         my_pos = float3(ligTransformed[base], ligTransformed[base+1], ligTransformed[base+2]);
     }
 
@@ -767,7 +785,7 @@ kernel void druseAFv4ScoreWithGradient(
 
         float3 lig_center = float3(0);
         for (uint i = 0; i < L; i++) {
-            uint b = pose_idx * L * 3 + i * 3;
+            uint b = pose_idx * POSE_POS_STRIDE + i * 3;
             lig_center += float3(ligTransformed[b], ligTransformed[b+1], ligTransformed[b+2]);
         }
         lig_center /= float(L);

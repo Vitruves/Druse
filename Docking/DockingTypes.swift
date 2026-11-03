@@ -349,10 +349,12 @@ struct DockingResult: Identifiable, Sendable {
     /// Confidence score from DruseAF (0–1), stored in hydrophobicEnergy field.
     var afConfidence: Float { hydrophobicEnergy }
 
-    // Backward-compatible aliases
-    var vdwEnergy: Float { stericEnergy }
-    var elecEnergy: Float { hydrophobicEnergy }
-    var desolvEnergy: Float { torsionPenalty }
+    /// The part of `energy` not shown as an intermolecular term or torsion: ligand
+    /// intramolecular energy (relative to the reference conformer), out-of-box and
+    /// constraint penalties, and Drusina corrections. Makes the breakdown sum to the total.
+    var intraAndOtherEnergy: Float {
+        energy - stericEnergy - hydrophobicEnergy - hbondEnergy - torsionPenalty
+    }
 }
 
 // MARK: - Pose Validity (PoseBusters-style checks)
@@ -417,6 +419,8 @@ struct LigandGAData {
     var ligandRadius: Float
     var centroid: SIMD3<Float>
     var heavyAtoms: [Atom]
+    /// Bonds re-indexed onto `heavyAtoms` (the source molecule's bonds index the H-containing atom list).
+    var heavyBonds: [Bond]
 }
 
 // MARK: - Interaction Detection

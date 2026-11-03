@@ -16,7 +16,6 @@ using namespace metal;
 // 4. For each surviving placement, grow next fragment by sampling torsion angles
 // 5. Score partial ligand, prune again
 // 6. Repeat until all fragments placed
-// 7. Reconstruct full DockPose from fragment placement chain
 // ============================================================================
 
 // Reuse Vina scoring helpers from DockingCompute.metal (linked in same Metal library)
@@ -91,7 +90,8 @@ kernel void initAnchorPlacements(
     p.energy = 1e10f;
     p.connectingTorsion = 0.0f;
     p.parentPlacementIdx = -1;
-    p.fragmentIdx = 0; // anchor
+    // The host sets currentFragment to the anchor fragment for the initial placement pass.
+    p.fragmentIdx = int(searchParams.currentFragment < searchParams.numFragments ? searchParams.currentFragment : 0u);
     p.valid = 1;
 }
 
@@ -273,11 +273,11 @@ kernel void growFragment(
     device const FragmentPlacement  *parentPlacements [[buffer(1)]],
     constant FragmentAtom           *fragAtoms        [[buffer(2)]],
     constant FragmentDef            *fragDefs         [[buffer(3)]],
-    constant DockLigandAtom         *fullLigAtoms     [[buffer(4)]],
     device const half               *affinityMaps     [[buffer(5)]],
     device const int32_t            *typeIndexLookup  [[buffer(6)]],
     constant GridParams             &gridParams       [[buffer(7)]],
     constant FragmentSearchParams   &searchParams     [[buffer(8)]],
+    device const FragmentPlacement  *beamHistory      [[buffer(9)]],
     uint                             tid              [[thread_position_in_grid]])
 {
     uint numParents = searchParams.numPlacements;
@@ -306,43 +306,52 @@ kernel void growFragment(
     float jitter = (fragRandom(seed, 0) - 0.5f) * (2.0f * M_PI_F / float(torsionSamples));
     float torsionAngle = baseTorsion + jitter;
 
-    // The child fragment is placed relative to the parent by rotating around the connecting bond axis.
-    // For simplicity, we place the child fragment's centroid at:
-    // parent_translation + rotation of (child_centroid_offset) by torsion angle around bond axis
-    //
-    // In the full implementation, the connecting bond atoms define the axis.
-    // Here we use the fragment centroid direction from parent centroid as an approximation.
+    // Fragments are numbered in growth order with the anchor at 0, so beam level k holds the
+    // placements of fragment k (beamHistory[k * beamWidth + i]). The previous level is not
+    // necessarily this fragment's tree parent (e.g. siblings on the anchor), so walk the
+    // placement chain back to the level of the real parent fragment.
+    int parentFragIdx = childFrag.parentFragmentIdx;
+    FragmentPlacement frame = parent;
+    bool traced = parentFragIdx >= 0 && uint(parentFragIdx) < childFragIdx;
+    for (uint level = childFragIdx - 1u; traced && int(level) > parentFragIdx; level--) {
+        int idx = frame.parentPlacementIdx;
+        if (idx < 0 || uint(idx) >= searchParams.beamWidth) { traced = false; break; }
+        frame = beamHistory[(level - 1u) * searchParams.beamWidth + uint(idx)];
+    }
+    if (!traced) {
+        child.valid = 0;
+        child.energy = 1e10f;
+        return;
+    }
 
-    constant FragmentDef &parentFrag = fragDefs[parent.fragmentIdx];
-    float3 parentCentroid = parentFrag.centroid;
-    float3 childCentroid = childFrag.centroid;
-
-    // Direction from parent to child in molecular frame
-    float3 growDir = childCentroid - parentCentroid;
-    float growDist = length(growDir);
-    if (growDist < 0.1f) growDist = 3.0f; // fallback typical bond length
-    growDir = normalize(growDir);
-
-    // Rotate grow direction by torsion angle around parent's orientation
-    float3 axis = quatRotate(parent.rotation, growDir);
-    // Apply torsion rotation around axis
-    float halfAngle = torsionAngle * 0.5f;
-    float4 torsionQuat = float4(axis * sin(halfAngle), cos(halfAngle));
-
-    // Child position: parent position + rotated growth vector
-    float3 growVec = axis * growDist;
-    // Rotate growVec by torsion quaternion
-    float3 rotatedGrow = quatRotate(torsionQuat, growVec);
-    child.translation = parent.translation + rotatedGrow;
-
-    // Child orientation: parent orientation composed with torsion rotation
-    float4 pq = parent.rotation;
-    child.rotation = normalize(float4(
-        torsionQuat.w*pq.x + torsionQuat.x*pq.w + torsionQuat.y*pq.z - torsionQuat.z*pq.y,
-        torsionQuat.w*pq.y - torsionQuat.x*pq.z + torsionQuat.y*pq.w + torsionQuat.z*pq.x,
-        torsionQuat.w*pq.z + torsionQuat.x*pq.y - torsionQuat.y*pq.x + torsionQuat.z*pq.w,
-        torsionQuat.w*pq.w - torsionQuat.x*pq.x - torsionQuat.y*pq.y - torsionQuat.z*pq.z
-    ));
+    // Torsion about the real connecting bond. In the ligand frame the child atoms rotate by
+    // Q(θ) about the axis u = (b_child − b_parent) through b_child, x' = b_child + Q(x − b_child).
+    // The parent frame maps x ↦ R_p(x − c_p) + t_p, so the child frame x ↦ R_c(x − c_c) + t_c is
+    //   R_c = R_p·Q = Q_w·R_p   (Q_w: rotation by θ about the world axis R_p·u)
+    //   t_c = t_p + R_p(b_child − c_p) + Q_w·R_p(c_c − b_child).
+    // At θ = 0 the child lands exactly where the rigid input conformer puts it.
+    constant FragmentDef &parentFrag = fragDefs[parentFragIdx];
+    float4 pq = frame.rotation;
+    float3 bondVec = childFrag.bondChildAtom - childFrag.bondParentAtom;
+    float bondLen = length(bondVec);
+    float4 rq = pq;
+    if (bondLen > 1e-4f) {
+        float3 axis = quatRotate(pq, bondVec / bondLen);
+        float halfAngle = torsionAngle * 0.5f;
+        float4 tq = float4(axis * sin(halfAngle), cos(halfAngle));
+        // Child orientation: world-axis torsion rotation composed with parent orientation
+        rq = normalize(float4(
+            tq.w*pq.x + tq.x*pq.w + tq.y*pq.z - tq.z*pq.y,
+            tq.w*pq.y - tq.x*pq.z + tq.y*pq.w + tq.z*pq.x,
+            tq.w*pq.z + tq.x*pq.y - tq.y*pq.x + tq.z*pq.w,
+            tq.w*pq.w - tq.x*pq.x - tq.y*pq.y - tq.z*pq.z
+        ));
+    }
+    // Degenerate bond (coincident atoms): no defined torsion axis, inherit the parent orientation.
+    child.rotation = rq;
+    child.translation = frame.translation
+        + quatRotate(pq, childFrag.bondChildAtom - parentFrag.centroid)
+        + quatRotate(rq, childFrag.centroid - childFrag.bondChildAtom);
 
     child.connectingTorsion = torsionAngle;
     child.parentPlacementIdx = int(parentIdx);
@@ -400,79 +409,4 @@ kernel void growFragment(
     }
 
     child.energy = energy + 10.0f * outOfGridPenalty;
-}
-
-// ============================================================================
-// MARK: - Reconstruct Full Pose from Fragment Placement Chain
-// ============================================================================
-
-/// Convert a chain of fragment placements back to a single DockPose.
-/// One thread per final placement. Traces back through parentPlacementIdx chain
-/// to collect all torsion angles and compute the anchor-relative full pose.
-kernel void reconstructFullPose(
-    device DockPose                 *outputPoses     [[buffer(0)]],
-    device const FragmentPlacement  *finalPlacements [[buffer(1)]],
-    constant FragmentDef            *fragDefs        [[buffer(2)]],
-    constant FragmentSearchParams   &searchParams    [[buffer(3)]],
-    constant GridParams             &gridParams      [[buffer(4)]],
-    uint                             tid             [[thread_position_in_grid]])
-{
-    uint numFinal = searchParams.numPlacements;
-    if (tid >= numFinal) return;
-
-    device const FragmentPlacement &fp = finalPlacements[tid];
-    if (!fp.valid) {
-        outputPoses[tid].energy = 1e10f;
-        return;
-    }
-
-    device DockPose &pose = outputPoses[tid];
-
-    // Trace back to anchor to collect torsion angles
-    // The anchor placement provides translation and rotation
-    // Each intermediate placement provides a connecting torsion angle
-
-    // Walk the chain backwards
-    // Collect torsion angles from leaf to root
-    // We'll reverse them later
-    float chainTorsions[16]; // max fragments
-    int chainLength = 0;
-
-    device const FragmentPlacement *current = &finalPlacements[tid];
-    while (current->parentPlacementIdx >= 0 && chainLength < 16) {
-        chainTorsions[chainLength++] = current->connectingTorsion;
-        // Note: parent placement is in the PREVIOUS level's buffer
-        // For reconstruction, we store torsions in order from anchor outward
-        // Since we're tracing backward, we'll reverse
-        break; // In the beam search, parent indices point into the same buffer
-               // For full chain reconstruction, the Swift code handles multi-level tracing
-    }
-
-    // The anchor placement gives us the global translation and rotation
-    // For the simplified single-level case:
-    pose.translation = fp.translation;
-    pose.rotation = fp.rotation;
-    pose.energy = fp.energy;
-    pose.numTorsions = 0; // Will be set by Swift after full reconstruction
-
-    // Zero out torsions
-    for (int i = 0; i < 32; i++) {
-        pose.torsions[i] = 0.0f;
-    }
-
-    // Store the connecting torsion
-    if (chainLength > 0) {
-        pose.torsions[0] = chainTorsions[0];
-        pose.numTorsions = int(chainLength);
-    }
-
-    pose.generation = 0;
-    pose.stericEnergy = 0.0f;
-    pose.hydrophobicEnergy = 0.0f;
-    pose.hbondEnergy = 0.0f;
-    pose.torsionPenalty = 0.0f;
-    pose.clashPenalty = 0.0f;
-    pose.drusinaCorrection = 0.0f;
-    pose.constraintPenalty = 0.0f;
-    pose.numChiAngles = 0;
 }

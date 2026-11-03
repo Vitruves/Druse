@@ -107,6 +107,7 @@ struct MetalView: NSViewRepresentable {
         }
 
         nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+            guard size.width > 0, size.height > 0 else { return }
             MainActor.assumeIsolated {
                 renderer.camera.aspectRatio = Float(size.width / size.height)
             }

@@ -53,80 +53,70 @@ struct ImportMappingSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Image(systemName: "tablecells")
-                    .foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Column Mapping")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("\(preview?.rowCount ?? 0) rows from \(preview?.fileURL.lastPathComponent ?? "file")")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding()
-
-            Divider()
-
-            // Column list
-            if let preview {
-                ScrollView {
-                    VStack(spacing: 1) {
-                        // Table header
-                        HStack(spacing: 0) {
-                            Text("Source Column")
-                                .frame(width: 140, alignment: .leading)
-                            Text("Sample Values")
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Text("Assign To")
-                                .frame(width: 140, alignment: .trailing)
-                        }
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-
+        DSSheetScaffold(
+            title: "Column Mapping",
+            subtitle: subtitle,
+            systemImage: "tablecells"
+        ) {
+            Form {
+                if let preview {
+                    Section {
                         ForEach(preview.columns.indices, id: \.self) { idx in
                             columnRow(idx)
                         }
+                    } header: {
+                        HStack {
+                            Text("Source Column")
+                            Spacer()
+                            Text("Import As")
+                        }
+                    } footer: {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(requirementText)
+                                .foregroundStyle(hasRequiredMapping ? AnyShapeStyle(.secondary) : AnyShapeStyle(DS.Color.warning))
+                            Spacer()
+                            Text("\(assignedCount) of \(preview.columns.count) columns will be imported")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(DS.Font.caption)
                     }
-                    .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 300)
             }
-
-            Divider()
-
-            // Actions
-            HStack {
-                let assignedCount = preview?.columns.filter { $0.target != .doNotImport }.count ?? 0
-                Text("\(assignedCount) column(s) will be imported")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Button("Cancel") {
-                    dismiss()
-                }
+            .formStyle(.grouped)
+        } footer: {
+            Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
-
-                Button("Import") {
-                    if let p = preview {
-                        onImport(p)
-                    }
-                    dismiss()
+            Button("Import") {
+                if let p = preview {
+                    onImport(p)
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(preview == nil || !hasRequiredMapping)
+                dismiss()
             }
-            .padding()
+            .keyboardShortcut(.defaultAction)
+            .disabled(preview == nil || !hasRequiredMapping)
         }
-        .frame(width: 640)
-        .frame(minHeight: 200)
+        .frame(minWidth: 600, idealWidth: 680, minHeight: 360, idealHeight: 520)
+    }
+
+    private var subtitle: String {
+        let rows = preview?.rowCount ?? 0
+        let file = preview?.fileURL.lastPathComponent ?? "file"
+        return "\(rows) \(rows == 1 ? "row" : "rows") from \(file). Choose how each column is stored; unmatched columns become custom table columns."
+    }
+
+    private var assignedCount: Int {
+        preview?.columns.filter { $0.target != .doNotImport }.count ?? 0
+    }
+
+    private var requirementText: String {
+        guard let preview else { return "" }
+        if preview.fileType == .sdf {
+            return "SDF records carry their own structures; property mappings are optional."
+        }
+        return hasRequiredMapping
+            ? "Rows without a SMILES or name are skipped."
+            : "Assign at least one column to SMILES or Name."
     }
 
     private var hasRequiredMapping: Bool {
@@ -143,41 +133,35 @@ struct ImportMappingSheet: View {
     private func columnRow(_ idx: Int) -> some View {
         if let preview, idx < preview.columns.count {
             let col = preview.columns[idx]
-            HStack(spacing: 0) {
-                Text(col.sourceHeader)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .frame(width: 140, alignment: .leading)
-                    .lineLimit(1)
-
-                Text(col.sampleValues.prefix(3).joined(separator: ", "))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .lineLimit(1)
-
-                Picker("", selection: bindingForColumn(idx)) {
-                    ForEach(ImportTargetField.allCases) { field in
-                        Text(field.rawValue).tag(field)
+            LabeledContent {
+                HStack(spacing: DS.Space.s) {
+                    if col.target == .customColumn {
+                        TextField("Column name", text: customNameBinding(idx))
+                            .textFieldStyle(.roundedBorder)
+                            .font(DS.Font.mono)
+                            .frame(width: 150)
                     }
+                    Picker("Import As", selection: bindingForColumn(idx)) {
+                        ForEach(ImportTargetField.allCases) { field in
+                            Text(field.rawValue).tag(field)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
                 }
-                .frame(width: 130)
-                .controlSize(.small)
-
-                // Editable name appears only for custom-column targets
-                if col.target == .customColumn {
-                    TextField("Column name", text: customNameBinding(idx))
-                        .textFieldStyle(.roundedBorder)
-                        .controlSize(.small)
-                        .font(.system(size: 11, design: .monospaced))
-                        .frame(width: 140)
-                        .padding(.leading, 6)
-                } else {
-                    Color.clear.frame(width: 146, height: 1)
+            } label: {
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text(col.sourceHeader)
+                        .font(DS.Font.mono.weight(.medium))
+                        .foregroundStyle(col.target == .doNotImport ? .secondary : .primary)
+                        .lineLimit(1)
+                    Text(col.sampleValues.isEmpty ? "No sample values" : col.sampleValues.prefix(3).joined(separator: ", "))
+                        .font(DS.Font.monoSmall)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-            .background(idx % 2 == 0 ? Color.clear : Color.primary.opacity(0.03))
         }
     }
 

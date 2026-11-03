@@ -5,12 +5,17 @@ import SwiftUI
 
 // MARK: - Demo Overlay
 //
-// A narrated banner shown during the guided demo, displaying the current step
-// description, progress indicator, and pipeline stage. Positioned at the bottom
-// of the Metal viewport, above the render controls.
+// A narrated glass card shown during the guided demo: the pipeline stages as
+// progress dots, the current step and its narration, live docking stats, and
+// Stop / Explore. It sits at the bottom of the viewport, above the display
+// cluster (the docking HUD is hidden while the demo runs).
 
 struct DemoOverlay: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Vertical room left free for the canvas display cluster below the card.
+    private static let clusterClearance = DS.Size.toolButton + DS.Space.xs * 2 + DS.Space.l + DS.Space.m
 
     var body: some View {
         let step = viewModel.demoStep
@@ -21,131 +26,134 @@ struct DemoOverlay: View {
             Spacer()
 
             if isRunning || isComplete {
-                VStack(spacing: 0) {
-                    // Progress dots (pipeline stages)
-                    if isRunning {
-                        demoProgressDots
-                            .padding(.bottom, 8)
-                    }
-
-                    // Main narration card
-                    narrationCard(step: step, isRunning: isRunning, isComplete: isComplete)
-                }
-                .padding(.horizontal, 30)
-                .padding(.bottom, 8)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                narrationCard(step: step, isComplete: isComplete)
+                    .frame(maxWidth: 420)
+                    .padding(.horizontal, DS.Space.xl)
+                    .padding(.bottom, Self.clusterClearance)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: step)
+        .frame(maxWidth: .infinity)
+        .animation(DS.Motion.respecting(reduceMotion), value: step)
     }
 
     // MARK: - Narration Card
 
-    @ViewBuilder
-    private func narrationCard(step: AppViewModel.DemoStep, isRunning: Bool, isComplete: Bool) -> some View {
-        HStack(spacing: 12) {
-            // Left: status indicator
-            if isComplete {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.title3)
-                    .foregroundStyle(.green)
-            } else {
-                ZStack {
-                    Circle()
-                        .fill(currentStageColor.opacity(0.2))
-                        .frame(width: 32, height: 32)
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(currentStageColor)
-                }
+    private func narrationCard(step: AppViewModel.DemoStep, isComplete: Bool) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            HStack(spacing: DS.Space.s) {
+                Text(eyebrow(isComplete: isComplete))
+                    .font(DS.Font.eyebrow)
+                    .tracking(0.6)
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                demoProgressDots
             }
 
-            // Center: narration text
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
+            HStack(alignment: .top, spacing: DS.Space.l) {
+                statusIndicator(isComplete: isComplete)
+
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text(step.rawValue)
-                        .font(.callout.bold())
+                        .font(DS.Font.sectionTitle)
                         .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if !viewModel.demoNarration.isEmpty {
+                        Text(viewModel.demoNarration)
+                            .font(DS.Font.secondary)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
 
                     if isDockingPhase {
-                        // Live stats
                         dockingLiveStats
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                if !viewModel.demoNarration.isEmpty {
-                    Text(viewModel.demoNarration)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            // Right: cancel/dismiss button
-            if isComplete {
-                Button("Explore") {
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        viewModel.demoStep = .idle
-                        viewModel.demoNarration = ""
+                if isComplete {
+                    Button("Explore") {
+                        withAnimation(DS.Motion.respecting(reduceMotion)) {
+                            viewModel.demoStep = .idle
+                            viewModel.demoNarration = ""
+                        }
                     }
+                    .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
+                    .help("End the demo and explore the results")
+                } else {
+                    Button("Stop") {
+                        viewModel.cancelDemo()
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
+                    .help("Stop the guided demo")
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.accentColor)
-                .controlSize(.small)
-            } else {
-                Button("Stop") {
-                    viewModel.cancelDemo()
-                }
-                .controlSize(.small)
-                .buttonStyle(.bordered)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(currentStageColor.opacity(0.25), lineWidth: 1)
-                )
-                .shadow(color: Color(nsColor: .shadowColor).opacity(0.2), radius: 8, y: 3)
-        )
+        .padding(.horizontal, DS.Space.xl)
+        .padding(.vertical, DS.Space.l)
+        .dsFloating(cornerRadius: DS.Radius.floating)
+    }
+
+    private func eyebrow(isComplete: Bool) -> String {
+        if isComplete { return "GUIDED DEMO · DONE" }
+        guard let stage = currentStage else { return "GUIDED DEMO" }
+        return "GUIDED DEMO · \(stage.title.uppercased())"
+    }
+
+    @ViewBuilder
+    private func statusIndicator(isComplete: Bool) -> some View {
+        ZStack {
+            Circle()
+                .fill(isComplete ? DS.Color.success.opacity(0.14) : DS.Color.accentSoft)
+            if isComplete {
+                Image(systemName: "checkmark")
+                    .font(DS.Font.body.weight(.semibold))
+                    .foregroundStyle(DS.Color.success)
+            } else {
+                Image(systemName: currentStage?.icon ?? "sparkles")
+                    .font(DS.Font.body.weight(.medium))
+                    .foregroundStyle(DS.Color.accent)
+                    .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
+            }
+        }
+        .frame(width: DS.Size.primaryButtonHeight, height: DS.Size.primaryButtonHeight)
+        .accessibilityHidden(true)
     }
 
     // MARK: - Progress Dots
 
     private var demoProgressDots: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: DS.Space.xs) {
             ForEach(DemoStage.allCases, id: \.self) { stage in
                 let state = stageState(stage)
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(dotColor(state))
-                        .frame(width: 8, height: 8)
-                        .overlay {
-                            if state == .active {
-                                Circle()
-                                    .stroke(dotColor(state), lineWidth: 1.5)
-                                    .frame(width: 14, height: 14)
-                                    .opacity(0.5)
-                            }
-                        }
-
-                    Text(stage.rawValue)
-                        .font(.footnote.weight(state == .active ? .bold : .medium))
-                        .foregroundStyle(state == .upcoming ? .secondary : .primary)
-                }
+                Capsule()
+                    .fill(dotFill(state))
+                    .overlay(
+                        Capsule().strokeBorder(state == .upcoming ? DS.Color.hairline : .clear, lineWidth: 1)
+                    )
+                    .frame(width: state == .active ? DS.Space.xl : DS.Space.s, height: DS.Space.s)
+                    .help(stage.title)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            Capsule()
-                .fill(.ultraThinMaterial)
-        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(progressAccessibilityLabel)
+    }
+
+    private var progressAccessibilityLabel: String {
+        guard let stage = currentStage, let index = DemoStage.allCases.firstIndex(of: stage) else {
+            return "Demo progress"
+        }
+        return "Stage \(index + 1) of \(DemoStage.allCases.count): \(stage.title)"
+    }
+
+    private func dotFill(_ state: StageState) -> Color {
+        switch state {
+        case .completed: DS.Color.accent.opacity(0.55)
+        case .active: DS.Color.accent
+        case .upcoming: DS.Color.controlFill
+        }
     }
 
     // MARK: - Docking Live Stats
@@ -157,37 +165,51 @@ struct DemoOverlay: View {
         let energy = viewModel.docking.dockingBestEnergy
 
         if viewModel.docking.isDocking {
-            HStack(spacing: 8) {
+            HStack(spacing: DS.Space.m) {
                 Text("Gen \(gen)/\(total)")
-                    .font(.footnote.weight(.medium).monospaced())
-                    .foregroundStyle(.cyan)
+                    .font(DS.Font.monoSmall)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+
+                ProgressView(value: Double(min(gen, max(total, 1))), total: Double(max(total, 1)))
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    .tint(DS.Color.accent)
+                    .frame(maxWidth: 120)
 
                 if energy < .infinity {
-                    let sm = viewModel.docking.scoringMethod
-                    Text(String(format: "%.1f %@", energy, sm.unitLabel))
-                        .font(.footnote.bold().monospaced())
-                        .foregroundStyle(energy < -6 ? .green : energy < -3 ? .yellow : .orange)
+                    DSScoreBadge(energy: energy, unit: viewModel.docking.scoringMethod.unitLabel)
                 }
-
-                ProgressView(value: Double(gen), total: Double(max(total, 1)))
-                    .progressViewStyle(.linear)
-                    .frame(width: 60)
-                    .tint(.cyan)
             }
+            .padding(.top, DS.Space.xxs)
         }
     }
 
     // MARK: - Demo Stage Mapping
 
-    private enum DemoStage: String, CaseIterable {
-        case load = "Load"
-        case explore = "Explore"
-        case pocket = "Pocket"
-        case dock = "Dock"
-        case results = "Results"
+    /// Demo stages, titled after the workflow steps they exercise.
+    private enum DemoStage: CaseIterable {
+        case load, explore, pocket, dock, results
+
+        var tab: SidebarTab? {
+            switch self {
+            case .load: .search
+            case .explore: nil
+            case .pocket: .bindingSite
+            case .dock: .dock
+            case .results: .results
+            }
+        }
+
+        var title: String { tab?.rawValue ?? "Explore" }
+        var icon: String { tab?.icon ?? "rotate.3d" }
     }
 
     private enum StageState { case completed, active, upcoming }
+
+    private var currentStage: DemoStage? {
+        DemoStage.allCases.first { stageState($0) == .active }
+    }
 
     private func stageState(_ stage: DemoStage) -> StageState {
         let step = viewModel.demoStep
@@ -205,8 +227,8 @@ struct DemoOverlay: View {
             if [.dockingStart, .dockingRun, .dockingConverge].contains(step) { return .active }
             return stepsAfterDock.contains(step) ? .completed : .upcoming
         case .results:
-            if [.scoring, .bestPose, .interactions, .complete].contains(step) { return .active }
-            return .upcoming
+            if [.scoring, .bestPose, .interactions].contains(step) { return .active }
+            return step == .complete ? .completed : .upcoming
         }
     }
 
@@ -227,24 +249,5 @@ struct DemoOverlay: View {
 
     private var isDockingPhase: Bool {
         [.dockingStart, .dockingRun, .dockingConverge].contains(viewModel.demoStep)
-    }
-
-    private var currentStageColor: Color {
-        let step = viewModel.demoStep
-        if [.fetching, .parsing].contains(step) { return .cyan }
-        if [.overview, .ribbon].contains(step) { return .blue }
-        if [.pocketScan, .pocketFound, .gridSetup].contains(step) { return .orange }
-        if [.dockingStart, .dockingRun, .dockingConverge].contains(step) { return .purple }
-        if [.scoring, .bestPose, .interactions].contains(step) { return .green }
-        if step == .complete { return .green }
-        return .secondary
-    }
-
-    private func dotColor(_ state: StageState) -> Color {
-        switch state {
-        case .completed: .green
-        case .active: currentStageColor
-        case .upcoming: .secondary.opacity(0.3)
-        }
     }
 }

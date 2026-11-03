@@ -248,6 +248,7 @@ extension AppViewModel {
         docking.dockingBestPKi = nil
         docking.dockingStartTime = Date()
         docking.dockingDuration = 0
+        docking.dockingPosesEvaluated = 0
         docking.selectedPoseIndices = []
         let cfg = docking.dockingConfig
         log.info("Starting docking: pop=\(cfg.populationSize), gen=\(cfg.numGenerations) (\(cfg.numRuns)×\(cfg.generationsPerRun)), grid=\(String(format: "%.3f", cfg.gridSpacing)) Å", category: .dock)
@@ -368,9 +369,11 @@ extension AppViewModel {
             engine.onPoseUpdate = { [weak self] result, interactions in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.docking.dockingBestEnergy = result.energy
+                    // Each run restarts its population, so keep the best across runs.
+                    self.docking.dockingBestEnergy = min(self.docking.dockingBestEnergy, result.energy)
                     if self.docking.scoringMethod.isAffinityScore {
-                        self.docking.dockingBestPKi = result.stericEnergy  // pKd stored by DruseAF shader
+                        let pKd = result.stericEnergy  // pKd stored by DruseAF shader
+                        self.docking.dockingBestPKi = max(self.docking.dockingBestPKi ?? pKd, pKd)
                     }
                     self.docking.currentInteractions = interactions
                     // Use lightweight ghost pose pipeline — avoids full pushToRenderer() rebuild
@@ -506,6 +509,7 @@ extension AppViewModel {
             docking.dockingResults = rankedResults
             docking.isDocking = false
             docking.dockingDuration = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
+            docking.dockingPosesEvaluated = engine.lastEvaluatedPoseCount
 
             if let best = docking.dockingResults.first {
                 applyDockingPose(best, originalLigand: origLig)
@@ -536,14 +540,14 @@ extension AppViewModel {
                 let unit = method.unitLabel
                 if method == .drusina {
                     let drCorr = best.drusinaCorrection
-                    log.success(String(format: "Docking complete (Drusina): best %.1f %@ (correction: %.2f), %d poses, %d clusters (%.1fs)",
-                                       bestDisplay, unit, drCorr, rankedResults.count, clusterCount, elapsed), category: .dock)
+                    log.success(String(format: "Docking complete (Drusina): best %.1f %@ (correction: %.2f), %d/%d poses kept, %d clusters (%.1fs)",
+                                       bestDisplay, unit, drCorr, rankedResults.count, docking.dockingPosesEvaluated, clusterCount, elapsed), category: .dock)
                 } else if method.isAffinityScore {
-                    log.success(String(format: "Docking complete (DruseAF): best pKi %.1f (conf: %.0f%%), %d poses, %d clusters (%.1fs)",
-                                       bestDisplay, best.afConfidence * 100, rankedResults.count, clusterCount, elapsed), category: .dock)
+                    log.success(String(format: "Docking complete (DruseAF): best pKi %.1f (conf: %.0f%%), %d/%d poses kept, %d clusters (%.1fs)",
+                                       bestDisplay, best.afConfidence * 100, rankedResults.count, docking.dockingPosesEvaluated, clusterCount, elapsed), category: .dock)
                 } else {
-                    log.success(String(format: "Docking complete: best %.1f %@, %d poses, %d clusters (%.1fs)",
-                                       bestDisplay, unit, rankedResults.count, clusterCount, elapsed), category: .dock)
+                    log.success(String(format: "Docking complete: best %.1f %@, %d/%d poses kept, %d clusters (%.1fs)",
+                                       bestDisplay, unit, rankedResults.count, docking.dockingPosesEvaluated, clusterCount, elapsed), category: .dock)
                 }
                 workspace.statusMessage = String(format: "Best: %.1f %@", bestDisplay, unit)
                 if docking.currentInteractions.count > 0 {
@@ -726,12 +730,9 @@ extension AppViewModel {
             }
         }
 
-        refinedResults.sort { lhs, rhs in
-            let lhsScore = lhs.refinementEnergy ?? lhs.energy
-            let rhsScore = rhs.refinementEnergy ?? rhs.energy
-            return lhsScore < rhsScore
-        }
-
+        // Ranking stays on the docking score (`energy`, the active scoring method's primary
+        // score). The OpenMM interaction energy is a force-field quantity on a different
+        // scale than Vina-style scores, so it is kept as an annotation only.
         let bestProteinHeavyPositions = refinedResults.first.flatMap { refinedProteinByResultID[$0.id] }
         return (refinedResults, bestProteinHeavyPositions)
     }
@@ -810,7 +811,7 @@ extension AppViewModel {
                 "\(i+1)",
                 "\(r.clusterID)",
                 String(format: "%.2f", r.energy),
-                String(format: "%.2f", r.vdwEnergy),
+                String(format: "%.2f", r.stericEnergy),
                 String(format: "%.2f", r.hbondEnergy),
                 String(format: "%.2f", r.torsionPenalty),
                 r.strainEnergy.map { String(format: "%.2f", $0) } ?? "",

@@ -16,8 +16,52 @@ extension ProteinPreparation {
     private struct ReconstructionResidueKey: Hashable {
         let chainID: String
         let residueSeq: Int
+        let insertionCode: String
         let residueName: String
         let isHetAtom: Bool
+
+        var lookupKey: ResidueLookupKey {
+            ResidueLookupKey(chainID: chainID, residueSeq: residueSeq,
+                             insertionCode: insertionCode, residueName: residueName)
+        }
+    }
+
+    /// Residue identity used to collect a residue's atom indices (HETATM flag ignored).
+    private struct ResidueLookupKey: Hashable {
+        let chainID: String
+        let residueSeq: Int
+        let insertionCode: String
+        let residueName: String
+
+        init(chainID: String, residueSeq: Int, insertionCode: String, residueName: String) {
+            self.chainID = chainID
+            self.residueSeq = residueSeq
+            self.insertionCode = insertionCode
+            self.residueName = residueName
+        }
+
+        init(atom: Atom) {
+            self.init(
+                chainID: atom.chainID,
+                residueSeq: atom.residueSeq,
+                insertionCode: ProteinPreparation.normalizedInsertionCode(atom),
+                residueName: ProteinResidueTemplateStore.normalizeAtomName(atom.residueName)
+            )
+        }
+    }
+
+    private static func normalizedInsertionCode(_ atom: Atom) -> String {
+        atom.insertionCode.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Atom indices per residue, built once so per-residue lookups are O(1)
+    /// instead of an O(N) scan of the whole structure for every residue.
+    private static func residueIndexMap(atoms: [Atom]) -> [ResidueLookupKey: [Int]] {
+        var map: [ResidueLookupKey: [Int]] = [:]
+        for index in atoms.indices {
+            map[ResidueLookupKey(atom: atoms[index]), default: []].append(index)
+        }
+        return map
     }
 
     private struct OverlayTransform {
@@ -49,12 +93,15 @@ extension ProteinPreparation {
         var workAtoms = reconstructed.atoms
         var workBonds = reconstructed.bonds
         if DunbrackRotamerLibrary.shared.isLoaded {
-            logSync("[Phase2b] FASPR sidechain packing (\(workAtoms.count) atoms)...")
+            logSync("[Phase2b] FASPR sidechain packing (\(reconstructed.sidechainRebuiltResidueKeys.count) rebuilt residues)...")
+            // Only residues whose sidechain was rebuilt from the template are repacked;
+            // crystal sidechain conformations (incl. the binding site) are kept as-is.
             let packed = FASPRSidechainPacker.packSidechains(
                 atoms: workAtoms,
                 bonds: workBonds,
                 device: device,
-                onlyIncomplete: true
+                onlyIncomplete: true,
+                reconstructedResidueKeys: reconstructed.sidechainRebuiltResidueKeys
             )
             workAtoms = packed.atoms
             workBonds = packed.bonds
@@ -66,8 +113,8 @@ extension ProteinPreparation {
             logSync("[Phase2c] Preparation minimization (\(workAtoms.count) atoms)...")
             let regions: [PreparationMinimizer.AtomRegion] = workAtoms.map { atom in
                 if atom.element == .H { return .hydrogen }
-                let name = atom.name.padding(toLength: 4, withPad: " ", startingAt: 0)
-                if name == " N  " || name == " CA " || name == " C  " || name == " O  " {
+                let name = ProteinResidueTemplateStore.normalizeAtomName(atom.name)
+                if name == "N" || name == "CA" || name == "C" || name == "O" {
                     return .backbone
                 }
                 return .existingSidechain
@@ -77,9 +124,7 @@ extension ProteinPreparation {
                 input: PreparationMinimizer.MinimizationInput(
                     atoms: workAtoms,
                     bonds: workBonds,
-                    atomRegions: regions,
-                    angles: [],
-                    torsions: []
+                    atomRegions: regions
                 ),
                 maxIterations: 100
             )
@@ -129,7 +174,7 @@ extension ProteinPreparation {
             atoms: network.atoms,
             bonds: network.bonds,
             report: report,
-            protonation: protonation
+            protonation: network.predictions
         )
     }
 
@@ -140,13 +185,16 @@ extension ProteinPreparation {
         return (hi << 32) | lo
     }
 
+    /// - Returns: `sidechainRebuiltResidueKeys` holds `FASPRSidechainPacker.residueKey`
+    ///   keys of residues that received at least one new sidechain heavy atom.
     static func reconstructMissingHeavyAtoms(
         atoms: [Atom],
         bonds: [Bond]
-    ) -> (atoms: [Atom], bonds: [Bond], addedAtomCount: Int) {
+    ) -> (atoms: [Atom], bonds: [Bond], addedAtomCount: Int, sidechainRebuiltResidueKeys: Set<String>) {
         var workingAtoms = atoms
         var workingBonds = bonds
         var addedAtomCount = 0
+        var sidechainRebuiltResidueKeys: Set<String> = []
 
         // Tier 3: Build Set<UInt64> for O(1) bond existence checks
         var bondSet = Set<UInt64>(minimumCapacity: bonds.count)
@@ -156,13 +204,18 @@ extension ProteinPreparation {
 
         let residueOrder = residueKeys(in: workingAtoms)
         let externalBondedAtoms = externalBondedAtomNamesByResidue(atoms: workingAtoms, bonds: workingBonds)
+        var residueAtomIndices = residueIndexMap(atoms: workingAtoms)
 
         for residueKey in residueOrder {
             guard let template = ProteinResidueReferenceTemplateStore.template(for: residueKey.residueName) else {
                 continue
             }
 
-            let atomIndices = atomIndexMap(for: residueKey, atoms: workingAtoms, template: template)
+            let atomIndices = atomIndexMap(
+                indices: residueAtomIndices[residueKey.lookupKey, default: []],
+                atoms: workingAtoms,
+                template: template
+            )
             let filteredAtomNames = template.filteredAtomNames(
                 externalBondedAtoms: externalBondedAtoms[residueKey, default: []],
                 includeHydrogens: false
@@ -185,6 +238,7 @@ extension ProteinPreparation {
                     continue
                 }
 
+                residueAtomIndices[residueKey.lookupKey, default: []].append(workingAtoms.count)
                 workingAtoms.append(Atom(
                     id: workingAtoms.count,
                     element: atomTemplate.element,
@@ -194,12 +248,25 @@ extension ProteinPreparation {
                     residueSeq: residueKey.residueSeq,
                     chainID: residueKey.chainID,
                     formalCharge: atomTemplate.formalCharge,
-                    isHetAtom: residueKey.isHetAtom
+                    isHetAtom: residueKey.isHetAtom,
+                    insertionCode: residueKey.insertionCode
                 ))
                 addedAtomCount += 1
+                // CCD pdbx_backbone_atom_flag marks N/CA/C/O/OXT; anything else is sidechain.
+                if !atomTemplate.isBackbone {
+                    sidechainRebuiltResidueKeys.insert(FASPRSidechainPacker.residueKey(
+                        chainID: residueKey.chainID,
+                        residueSeq: residueKey.residueSeq,
+                        insertionCode: residueKey.insertionCode
+                    ))
+                }
             }
 
-            let refreshedAtomIndices = atomIndexMap(for: residueKey, atoms: workingAtoms, template: template)
+            let refreshedAtomIndices = atomIndexMap(
+                indices: residueAtomIndices[residueKey.lookupKey, default: []],
+                atoms: workingAtoms,
+                template: template
+            )
             for bondTemplate in template.bonds {
                 guard let atomIndex1 = refreshedAtomIndices[bondTemplate.atomName1],
                       let atomIndex2 = refreshedAtomIndices[bondTemplate.atomName2],
@@ -219,7 +286,7 @@ extension ProteinPreparation {
             }
         }
 
-        return (workingAtoms, workingBonds, addedAtomCount)
+        return (workingAtoms, workingBonds, addedAtomCount, sidechainRebuiltResidueKeys)
     }
 
     /// Builds a pre-computed adjacency list from bonds, for O(1) neighbor lookup per atom.
@@ -255,8 +322,9 @@ extension ProteinPreparation {
 
         let residueOrder = residueKeys(in: workingAtoms)
         let externalBondedAtoms = externalBondedAtomNamesByResidue(atoms: workingAtoms, bonds: workingBonds)
+        var residueAtomIndices = residueIndexMap(atoms: workingAtoms)
         let predictionMap = Dictionary(uniqueKeysWithValues: protonation.map {
-            ("\($0.chainID):\($0.residueSeq):\($0.residueName)", $0)
+            ("\($0.chainID):\($0.residueSeq):\($0.insertionCode):\($0.residueName)", $0)
         })
 
         for residueKey in residueOrder {
@@ -265,7 +333,11 @@ extension ProteinPreparation {
             }
 
             let residueExternalBondedAtoms = externalBondedAtoms[residueKey, default: []]
-            let atomIndices = atomIndexMap(for: residueKey, atoms: workingAtoms, template: template)
+            let atomIndices = atomIndexMap(
+                indices: residueAtomIndices[residueKey.lookupKey, default: []],
+                atoms: workingAtoms,
+                template: template
+            )
             let anchorNames = template.filteredAtomNames(
                 externalBondedAtoms: residueExternalBondedAtoms,
                 includeHydrogens: false
@@ -280,9 +352,10 @@ extension ProteinPreparation {
                 continue
             }
 
-            let directPrediction = predictionMap["\(residueKey.chainID):\(residueKey.residueSeq):\(residueKey.residueName)"]
-            let nTermPrediction = predictionMap["\(residueKey.chainID):\(residueKey.residueSeq):*N-term*"]
-            let cTermPrediction = predictionMap["\(residueKey.chainID):\(residueKey.residueSeq):*C-term*"]
+            let residuePrefix = "\(residueKey.chainID):\(residueKey.residueSeq):\(residueKey.insertionCode)"
+            let directPrediction = predictionMap["\(residuePrefix):\(residueKey.residueName)"]
+            let nTermPrediction = predictionMap["\(residuePrefix):*N-term*"]
+            let cTermPrediction = predictionMap["\(residuePrefix):*C-term*"]
             let freeNTerminus = !residueExternalBondedAtoms.contains("N")
             let freeCTerminus = !residueExternalBondedAtoms.contains("C")
             let directTitratableAtoms = titratableParentAtoms(for: residueKey.residueName)
@@ -350,6 +423,7 @@ extension ProteinPreparation {
                     hPosition = placeHydrogenLike(on: parentPos, awayFrom: neighborPositions, distance: 1.0)
                 }
 
+                residueAtomIndices[residueKey.lookupKey, default: []].append(hydrogenIndex)
                 workingAtoms.append(Atom(
                     id: hydrogenIndex,
                     element: .H,
@@ -358,7 +432,8 @@ extension ProteinPreparation {
                     residueName: residueKey.residueName,
                     residueSeq: residueKey.residueSeq,
                     chainID: residueKey.chainID,
-                    isHetAtom: residueKey.isHetAtom
+                    isHetAtom: residueKey.isHetAtom,
+                    insertionCode: residueKey.insertionCode
                 ))
                 workingBonds.append(Bond(
                     id: workingBonds.count,
@@ -375,7 +450,7 @@ extension ProteinPreparation {
             }
 
             if freeNTerminus, nTermPrediction?.state == .protonated, let nitrogenIndex = atomIndices["N"] {
-                let existingHydrogenNames = Set(residueIndices(for: residueKey, atoms: workingAtoms).map { index in
+                let existingHydrogenNames = Set(residueAtomIndices[residueKey.lookupKey, default: []].map { index in
                     ProteinResidueTemplateStore.normalizeAtomName(workingAtoms[index].name)
                 })
                 if let extraHydrogenName = nextTerminalHydrogenName(existingHydrogenNames: existingHydrogenNames) {
@@ -389,6 +464,7 @@ extension ProteinPreparation {
                         awayFrom: nitrogenNeighborPositions,
                         distance: 1.01
                     )
+                    residueAtomIndices[residueKey.lookupKey, default: []].append(extraHydrogenIndex)
                     workingAtoms.append(Atom(
                         id: extraHydrogenIndex,
                         element: .H,
@@ -397,7 +473,8 @@ extension ProteinPreparation {
                         residueName: residueKey.residueName,
                         residueSeq: residueKey.residueSeq,
                         chainID: residueKey.chainID,
-                        isHetAtom: residueKey.isHetAtom
+                        isHetAtom: residueKey.isHetAtom,
+                        insertionCode: residueKey.insertionCode
                     ))
                     workingBonds.append(Bond(
                         id: workingBonds.count,
@@ -446,6 +523,7 @@ extension ProteinPreparation {
             let key = ReconstructionResidueKey(
                 chainID: atom.chainID,
                 residueSeq: atom.residueSeq,
+                insertionCode: normalizedInsertionCode(atom),
                 residueName: residueName,
                 isHetAtom: atom.isHetAtom
             )
@@ -461,31 +539,22 @@ extension ProteinPreparation {
             if lhs.residueSeq != rhs.residueSeq {
                 return lhs.residueSeq < rhs.residueSeq
             }
+            if lhs.insertionCode != rhs.insertionCode {
+                return lhs.insertionCode < rhs.insertionCode
+            }
             return lhs.residueName < rhs.residueName
         }
     }
 
-    private static func residueIndices(
-        for residueKey: ReconstructionResidueKey,
-        atoms: [Atom]
-    ) -> [Int] {
-        atoms.indices.filter { index in
-            let atom = atoms[index]
-            return atom.chainID == residueKey.chainID &&
-                atom.residueSeq == residueKey.residueSeq &&
-                ProteinResidueTemplateStore.normalizeAtomName(atom.residueName) == residueKey.residueName
-        }
-    }
-
     private static func atomIndexMap(
-        for residueKey: ReconstructionResidueKey,
+        indices: [Int],
         atoms: [Atom],
-        template: ProteinResidueReferenceTemplateStore.Template? = nil
+        template: ProteinResidueReferenceTemplateStore.Template
     ) -> [String: Int] {
         var map: [String: Int] = [:]
-        for index in residueIndices(for: residueKey, atoms: atoms) {
+        for index in indices {
             let normalizedName = ProteinResidueTemplateStore.normalizeAtomName(atoms[index].name)
-            let canonicalName = template?.canonicalAtomName(normalizedName) ?? normalizedName
+            let canonicalName = template.canonicalAtomName(normalizedName)
             map[canonicalName] = index
         }
         return map
@@ -504,12 +573,14 @@ extension ProteinPreparation {
             let residueKey1 = ReconstructionResidueKey(
                 chainID: atom1.chainID,
                 residueSeq: atom1.residueSeq,
+                insertionCode: normalizedInsertionCode(atom1),
                 residueName: ProteinResidueTemplateStore.normalizeAtomName(atom1.residueName),
                 isHetAtom: atom1.isHetAtom
             )
             let residueKey2 = ReconstructionResidueKey(
                 chainID: atom2.chainID,
                 residueSeq: atom2.residueSeq,
+                insertionCode: normalizedInsertionCode(atom2),
                 residueName: ProteinResidueTemplateStore.normalizeAtomName(atom2.residueName),
                 isHetAtom: atom2.isHetAtom
             )
@@ -602,19 +673,25 @@ extension ProteinPreparation {
             SIMD4(mxy - myx, mzx + mxz, myz + mzy, -mxx - myy + mzz)
         ]
 
-        var quaternion = SIMD4<Float>(1, 0, 0, 0)
-        for _ in 0..<32 {
-            let next = SIMD4<Float>(
-                simd_dot(rows[0], quaternion),
-                simd_dot(rows[1], quaternion),
-                simd_dot(rows[2], quaternion),
-                simd_dot(rows[3], quaternion)
-            )
-            let length = simd_length(next)
-            guard length > 1e-8 else {
-                return matrix_identity_float3x3
-            }
-            quaternion = next / length
+        // Horn's optimal rotation is the eigenvector of the LARGEST (most positive)
+        // eigenvalue. Plain power iteration converges to the largest |λ| instead,
+        // which can be a strongly negative eigenvalue (e.g. a ± pair for coplanar
+        // anchors). Shift by the Frobenius norm (≥ spectral radius) so every
+        // eigenvalue is non-negative and the wanted one dominates, then square
+        // repeatedly (M^(2^k)) to converge to the dominant eigenvector's projector.
+        let frobenius = rows.reduce(Float(0)) { $0 + simd_length_squared($1) }.squareRoot()
+        var shifted = simd_float4x4(rows: rows) + simd_float4x4(diagonal: SIMD4<Float>(repeating: frobenius))
+        for _ in 0..<16 {
+            shifted = shifted * shifted
+            let scale = max(simd_length(shifted.columns.0), simd_length(shifted.columns.1),
+                            simd_length(shifted.columns.2), simd_length(shifted.columns.3))
+            guard scale > 1e-20 else { return matrix_identity_float3x3 }
+            shifted = shifted * (1 / scale)
+        }
+        let columns = [shifted.columns.0, shifted.columns.1, shifted.columns.2, shifted.columns.3]
+        guard let quaternion = columns.max(by: { simd_length_squared($0) < simd_length_squared($1) }),
+              simd_length_squared(quaternion) > 1e-12 else {
+            return matrix_identity_float3x3
         }
 
         return rotationMatrix(from: quaternion)

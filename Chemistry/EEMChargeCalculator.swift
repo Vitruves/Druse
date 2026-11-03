@@ -72,7 +72,7 @@ final class EEMChargeCalculator: ChargeCalculator, @unchecked Sendable {
         .Cl:     (chi: 11.308, eta: 9.8620),
         // Bromine
         .Br:     (chi: 10.175, eta: 8.4122),
-        // Note: Iodine (I, Z=53) not in Element enum (max Kr=36). Uses Br fallback.
+        // No EEM parameters for iodine in this set: I is typed as Br (closest halogen).
         // Metals (fallback values from extended EEM)
         .Zn:     (chi: 5.106,  eta: 10.59),
         .Fe:     (chi: 4.670,  eta: 8.860),
@@ -326,7 +326,7 @@ final class EEMChargeCalculator: ChargeCalculator, @unchecked Sendable {
 
         case .F:  return .F
         case .Cl: return .Cl
-        case .Br: return .Br
+        case .Br, .I: return .Br
 
         case .P:  return .P_sp3
 

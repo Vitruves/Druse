@@ -85,6 +85,15 @@ enum ProteinPreparation {
         let isHetAtom: Bool
     }
 
+    /// Residue identity for altloc selection; insertion codes keep e.g. 52 and 52A apart.
+    private struct AltConformerResidueKey: Hashable {
+        let chainID: String
+        let residueSeq: Int
+        let insertionCode: String
+        let residueName: String
+        let isHetAtom: Bool
+    }
+
     private struct WaterResidueKey: Hashable {
         let chainID: String
         let residueSeq: Int
@@ -105,14 +114,15 @@ enum ProteinPreparation {
         atoms: [Atom],
         bonds: [Bond]
     ) -> (atoms: [Atom], bonds: [Bond], removedAtomCount: Int) {
-        var residueIndices: [ResidueKey: [Int]] = [:]
-        var residueOrder: [ResidueKey] = []
+        var residueIndices: [AltConformerResidueKey: [Int]] = [:]
+        var residueOrder: [AltConformerResidueKey] = []
 
         for index in atoms.indices {
             let atom = atoms[index]
-            let key = ResidueKey(
+            let key = AltConformerResidueKey(
                 chainID: atom.chainID,
                 residueSeq: atom.residueSeq,
+                insertionCode: atom.insertionCode.trimmingCharacters(in: .whitespaces),
                 residueName: atom.residueName,
                 isHetAtom: atom.isHetAtom
             )
@@ -433,75 +443,6 @@ enum ProteinPreparation {
         return report
     }
 
-    // MARK: - Disulfide Bond Detection
-
-    struct DisulfideBond: Sendable {
-        let cys1ChainID: String
-        let cys1ResSeq: Int
-        let cys2ChainID: String
-        let cys2ResSeq: Int
-        let sgDistance: Float
-    }
-
-    /// Detect disulfide bonds between CYS residues (SG-SG distance < 2.5 Å).
-    /// Returns detected bonds and adds them to the molecule's bond array.
-    static func detectDisulfideBonds(atoms: [Atom]) -> [DisulfideBond] {
-        let sgAtoms = atoms.enumerated().filter { _, atom in
-            atom.residueName == "CYS"
-                && atom.name.trimmingCharacters(in: .whitespaces) == "SG"
-                && !atom.isHetAtom
-        }
-        var bonds: [DisulfideBond] = []
-        for i in 0..<sgAtoms.count {
-            for j in (i + 1)..<sgAtoms.count {
-                let (_, a1) = sgAtoms[i]
-                let (_, a2) = sgAtoms[j]
-                let dist = simd_distance(a1.position, a2.position)
-                if dist < 2.5 {
-                    bonds.append(DisulfideBond(
-                        cys1ChainID: a1.chainID, cys1ResSeq: a1.residueSeq,
-                        cys2ChainID: a2.chainID, cys2ResSeq: a2.residueSeq,
-                        sgDistance: dist
-                    ))
-                }
-            }
-        }
-        return bonds
-    }
-
-    /// Add disulfide bonds to the bond array and return indices of bonded SG atoms
-    /// (so protonation can skip adding HG to these cysteines).
-    static func applyDisulfideBonds(
-        atoms: [Atom],
-        bonds: inout [Bond],
-        disulfides: [DisulfideBond]
-    ) -> Set<Int> {
-        var bondedSGIndices = Set<Int>()
-        for ss in disulfides {
-            let sg1 = atoms.firstIndex(where: {
-                $0.chainID == ss.cys1ChainID && $0.residueSeq == ss.cys1ResSeq
-                    && $0.name.trimmingCharacters(in: .whitespaces) == "SG"
-            })
-            let sg2 = atoms.firstIndex(where: {
-                $0.chainID == ss.cys2ChainID && $0.residueSeq == ss.cys2ResSeq
-                    && $0.name.trimmingCharacters(in: .whitespaces) == "SG"
-            })
-            if let i1 = sg1, let i2 = sg2 {
-                // Check if bond already exists
-                let exists = bonds.contains {
-                    ($0.atomIndex1 == i1 && $0.atomIndex2 == i2)
-                        || ($0.atomIndex1 == i2 && $0.atomIndex2 == i1)
-                }
-                if !exists {
-                    bonds.append(Bond(id: bonds.count, atomIndex1: i1, atomIndex2: i2, order: .single))
-                }
-                bondedSGIndices.insert(i1)
-                bondedSGIndices.insert(i2)
-            }
-        }
-        return bondedSGIndices
-    }
-
     // MARK: - Detect Chain Breaks
 
     static func detectChainBreaks(in atoms: [Atom]) -> [ChainBreak] {
@@ -682,179 +623,6 @@ enum ProteinPreparation {
         let finalChargedAtoms = report.nonZeroChargeAtoms
         Task { @MainActor in ActivityLog.shared.info("[Prep] Docking prep done in \(String(format: "%.0f", totalMs))ms: \(finalAtomCount) atoms, \(finalHAdded) H added, \(finalChargedAtoms) charged atoms (\(chargeMethod))", category: .prep) }
         return (workingAtoms, workingBonds, report)
-    }
-
-    // MARK: - Add Polar Hydrogens (preserves all PDB residue info)
-
-    /// Add polar hydrogens (N-H, O-H) to protein backbone and sidechains.
-    /// Places H atoms at standard bond distances along estimated bond vectors.
-    /// Preserves all existing atom properties (residueName, chainID, residueSeq, etc).
-    static func addPolarHydrogens(atoms: [Atom], bonds: [Bond]) -> (atoms: [Atom], bonds: [Bond]) {
-        // Build adjacency map
-        var neighbors: [Int: [Int]] = [:]
-        for bond in bonds {
-            neighbors[bond.atomIndex1, default: []].append(bond.atomIndex2)
-            neighbors[bond.atomIndex2, default: []].append(bond.atomIndex1)
-        }
-
-        var newAtoms = atoms
-        var newBonds = bonds
-        var addedCount = 0
-
-        // Standard N-H bond distance: 1.01 Å, O-H: 0.96 Å
-        let nhDist: Float = 1.01
-        let ohDist: Float = 0.96
-
-        for (idx, atom) in atoms.enumerated() {
-            let trimmedName = atom.name.trimmingCharacters(in: .whitespaces)
-
-            // Backbone amide N-H (every residue except PRO N-terminus)
-            if trimmedName == "N" && atom.element == .N && atom.residueName != "PRO" {
-                let nNeighbors = (neighbors[idx] ?? []).filter { atoms[$0].element != .H }
-                // Backbone N has 2 heavy neighbors (CA and C of previous residue) or 1 if N-terminus
-                if nNeighbors.count <= 2 {
-                    let hPos = placeHydrogen(on: atom.position, awayFrom: nNeighbors.map { atoms[$0].position }, distance: nhDist)
-                    let hAtom = Atom(
-                        id: newAtoms.count, element: .H, position: hPos,
-                        name: "H", residueName: atom.residueName, residueSeq: atom.residueSeq,
-                        chainID: atom.chainID, charge: 0, formalCharge: 0, isHetAtom: atom.isHetAtom
-                    )
-                    newBonds.append(Bond(id: newBonds.count, atomIndex1: idx, atomIndex2: newAtoms.count, order: .single))
-                    newAtoms.append(hAtom)
-                    addedCount += 1
-                }
-            }
-
-            // Sidechain N-H: NZ (Lys), NE/NH1/NH2 (Arg), ND2 (Asn), NE2 (Gln), ND1/NE2 (His)
-            if atom.element == .N && !["N", ""].contains(trimmedName) {
-                let donors: Set<String> = ["NZ", "NE", "NH1", "NH2", "ND2", "NE2", "ND1", "NE1"]
-                if donors.contains(trimmedName) {
-                    let nNeighbors = (neighbors[idx] ?? []).filter { atoms[$0].element != .H }
-                    let hPos = placeHydrogen(on: atom.position, awayFrom: nNeighbors.map { atoms[$0].position }, distance: nhDist)
-                    let hAtom = Atom(
-                        id: newAtoms.count, element: .H, position: hPos,
-                        name: "HN", residueName: atom.residueName, residueSeq: atom.residueSeq,
-                        chainID: atom.chainID, charge: 0, formalCharge: 0, isHetAtom: atom.isHetAtom
-                    )
-                    newBonds.append(Bond(id: newBonds.count, atomIndex1: idx, atomIndex2: newAtoms.count, order: .single))
-                    newAtoms.append(hAtom)
-                    addedCount += 1
-                }
-            }
-
-            // Hydroxyl O-H: OG (Ser), OG1 (Thr), OH (Tyr)
-            // These are sp3 oxygens — H should be placed at ~109.5° from the C-O bond,
-            // not 180° opposite (which would be linear / sp geometry).
-            if atom.element == .O {
-                let hydroxyls: Set<String> = ["OG", "OG1", "OH"]
-                if hydroxyls.contains(trimmedName) {
-                    let oNeighbors = (neighbors[idx] ?? []).filter { atoms[$0].element != .H }
-                    let hPos = placeTetrahedralHydrogen(
-                        on: atom.position,
-                        neighbors: oNeighbors.map { atoms[$0].position },
-                        distance: ohDist
-                    )
-                    let hAtom = Atom(
-                        id: newAtoms.count, element: .H, position: hPos,
-                        name: "HO", residueName: atom.residueName, residueSeq: atom.residueSeq,
-                        chainID: atom.chainID, charge: 0, formalCharge: 0, isHetAtom: atom.isHetAtom
-                    )
-                    newBonds.append(Bond(id: newBonds.count, atomIndex1: idx, atomIndex2: newAtoms.count, order: .single))
-                    newAtoms.append(hAtom)
-                    addedCount += 1
-                }
-            }
-        }
-
-        return (newAtoms, newBonds)
-    }
-
-    /// Place a hydrogen atom at `distance` from `center`, in the direction opposite to the average
-    /// of neighbor positions (so it points away from existing bonds).
-    private static func placeHydrogen(on center: SIMD3<Float>, awayFrom neighbors: [SIMD3<Float>], distance: Float) -> SIMD3<Float> {
-        if neighbors.isEmpty {
-            // No neighbors — place along +Y
-            return center + SIMD3<Float>(0, distance, 0)
-        }
-
-        // Average direction of neighbors from center
-        let avg = neighbors.reduce(SIMD3<Float>.zero) { $0 + ($1 - center) } / Float(neighbors.count)
-        let len = simd_length(avg)
-        if len < 1e-6 {
-            return center + SIMD3<Float>(0, distance, 0)
-        }
-
-        // Place H opposite to average neighbor direction
-        let dir = -simd_normalize(avg)
-        return center + dir * distance
-    }
-
-    /// Place a hydrogen at tetrahedral (sp3) geometry from `center`.
-    ///
-    /// - 1 neighbor: place H at 109.5° from the neighbor-center bond, with an arbitrary
-    ///   dihedral rotation. The exact dihedral will be refined later by H-bond network
-    ///   optimization, so any consistent choice is fine.
-    /// - 2 neighbors: place H in the direction that makes ~109.5° with both existing bonds
-    ///   (i.e. between the two lone-pair positions of a tetrahedral center).
-    /// - 0 or 3+ neighbors: falls back to the linear (opposite) placement.
-    private static func placeTetrahedralHydrogen(
-        on center: SIMD3<Float>,
-        neighbors: [SIMD3<Float>],
-        distance: Float
-    ) -> SIMD3<Float> {
-        let tetrahedralAngle: Float = 109.5 * .pi / 180.0  // radians
-
-        if neighbors.count == 1 {
-            // Single neighbor (e.g. C-O-H): place H at 109.5° from the C-O bond direction
-            let bondDir = simd_normalize(center - neighbors[0])  // O←C direction, i.e. away from C
-
-            // Find a vector perpendicular to bondDir
-            let candidate: SIMD3<Float> = abs(bondDir.x) < 0.9
-                ? SIMD3<Float>(1, 0, 0)
-                : SIMD3<Float>(0, 1, 0)
-            let perp = simd_normalize(simd_cross(bondDir, candidate))
-
-            // Rotate bondDir by (180° - 109.5°) = 70.5° around the perpendicular axis
-            // This gives the H direction at 109.5° from the neighbor bond (measuring C-O-H angle)
-            let rotAngle = Float.pi - tetrahedralAngle  // 70.5°
-            let hDir = rotateVector(bondDir, around: perp, by: rotAngle)
-
-            return center + hDir * distance
-
-        } else if neighbors.count == 2 {
-            // Two neighbors: place H so it makes ~109.5° with both existing bonds.
-            // The H goes roughly opposite to the average neighbor direction, but tilted
-            // to maintain tetrahedral angles.
-            let dir1 = simd_normalize(neighbors[0] - center)
-            let dir2 = simd_normalize(neighbors[1] - center)
-            let avgNeighborDir = simd_normalize(dir1 + dir2)
-
-            // The H direction is opposite to the average, which for ideal tetrahedral
-            // geometry already gives the correct angle. For two neighbors in a tetrahedron,
-            // the third position is in the plane defined by the two bonds, pointing away.
-            let hDir = -avgNeighborDir
-
-            // Verify: for a perfect tetrahedral with 2 neighbors, placing opposite to
-            // their average naturally yields ~109.5° angles when the neighbor-center-neighbor
-            // angle is also ~109.5°. This is the standard approach.
-            return center + hDir * distance
-
-        } else {
-            // Fallback to linear placement for 0 or 3+ neighbors
-            return placeHydrogen(on: center, awayFrom: neighbors, distance: distance)
-        }
-    }
-
-    /// Rotate a vector around an axis by a given angle (Rodrigues' rotation formula).
-    private static func rotateVector(
-        _ v: SIMD3<Float>,
-        around axis: SIMD3<Float>,
-        by angle: Float
-    ) -> SIMD3<Float> {
-        let k = simd_normalize(axis)
-        let cosA = cos(angle)
-        let sinA = sin(angle)
-        return v * cosA + simd_cross(k, v) * sinA + k * simd_dot(k, v) * (1 - cosA)
     }
 
     private struct ProteinAtomIdentity: Hashable {

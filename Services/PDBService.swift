@@ -43,9 +43,18 @@ enum PDBServiceError: LocalizedError {
 
 // MARK: - PDB Service
 
+/// Shared session for RCSB requests. `URLSession.shared` has a 7-day resource timeout, so a
+/// stalled or trickling connection would leave the loading UI spinning indefinitely.
+private let rcsbSession: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 20
+    config.timeoutIntervalForResource = 300
+    return URLSession(configuration: config)
+}()
+
 actor PDBService {
     static let shared = PDBService()
-    private let session = URLSession.shared
+    private let session = rcsbSession
 
     // MARK: - Fetch PDB File
 
@@ -311,7 +320,7 @@ struct ChemicalComponentTemplate: Sendable {
 }
 
 enum ChemicalComponentStore {
-    private static let session = URLSession.shared
+    private static let session = rcsbSession
     private static let lock = NSLock()
     nonisolated(unsafe) private static var templates: [String: ChemicalComponentTemplate] = [:]
     nonisolated(unsafe) private static var inFlight: Set<String> = []
@@ -321,7 +330,10 @@ enum ChemicalComponentStore {
         guard !componentIDs.isEmpty else { return }
 
         await withTaskGroup(of: Void.self) { group in
-            for componentID in componentIDs where beginFetchIfNeeded(componentID) {
+            // Templates already cached on disk are loaded locally; only missing ones hit the
+            // network (otherwise every load of a cached PDB re-downloads its CCD templates and
+            // stalls on the network timeout when offline).
+            for componentID in componentIDs where template(for: componentID) == nil && beginFetchIfNeeded(componentID) {
                 group.addTask {
                     await fetchAndCacheTemplate(componentID: componentID)
                 }

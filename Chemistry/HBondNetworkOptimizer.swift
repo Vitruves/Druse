@@ -21,12 +21,13 @@ enum HBondNetworkOptimizer {
         case rotatableSH   // Cys SG-HG
         case rotatableNH3  // Lys NZ-HZ1/HZ2/HZ3 (3-fold symmetric)
         case flipAmide     // Asn OD1↔ND2, Gln OE1↔NE2
-        case flipHis       // His ring: 6 states (3 tautomers × 2 flip orientations)
+        case flipHis       // His ring: reachable tautomers × 2 flip orientations
     }
 
     struct ResidueID: Hashable, Sendable {
         let chainID: String
         let residueSeq: Int
+        let insertionCode: String
         let residueName: String
     }
 
@@ -223,6 +224,7 @@ enum HBondNetworkOptimizer {
             let key = ResidueID(
                 chainID: atom.chainID,
                 residueSeq: atom.residueSeq,
+                insertionCode: atom.insertionCode.trimmingCharacters(in: .whitespaces),
                 residueName: atom.residueName
             )
             if map[key] == nil { order.append(key) }
@@ -248,7 +250,8 @@ enum HBondNetworkOptimizer {
     ) -> [ResidueID: Protonation.ResiduePrediction] {
         var map: [ResidueID: Protonation.ResiduePrediction] = [:]
         for p in predictions {
-            let key = ResidueID(chainID: p.chainID, residueSeq: p.residueSeq, residueName: p.residueName)
+            let key = ResidueID(chainID: p.chainID, residueSeq: p.residueSeq,
+                                insertionCode: p.insertionCode, residueName: p.residueName)
             map[key] = p
         }
         return map
@@ -507,12 +510,10 @@ enum HBondNetworkOptimizer {
 
         let oPos = atoms[oIndex].position
         let nPos = atoms[nIndex].position
-        let cPos = atoms[cIndex].position
-        let anchorPos = atoms[anchorIndex].position
 
         // Rotation axis: anchor → carbon (the bond we rotate around)
-        let axisOrigin = anchorPos
-        let axisEnd = cPos
+        let axisOrigin = atoms[anchorIndex].position
+        let axisEnd = atoms[cIndex].position
 
         // State 0: original (O at oxygenName, N at nitrogenName)
         var originalPositions: [String: SIMD3<Float>] = [
@@ -522,17 +523,12 @@ enum HBondNetworkOptimizer {
         if let h1 = h1Index { originalPositions[h1Name] = atoms[h1].position }
         if let h2 = h2Index { originalPositions[h2Name] = atoms[h2].position }
 
-        // State 1: flipped — 180° rotation of terminal group around anchor-carbon axis
-        let flippedPositions = flipTerminalGroup(
-            positions: originalPositions,
-            axisOrigin: axisOrigin,
-            axisEnd: axisEnd,
-            oxygenName: oxygenName,
-            nitrogenName: nitrogenName,
-            carbonPosition: cPos,
-            h1Name: h1Name,
-            h2Name: h2Name
-        )
+        // State 1: flipped — the terminal O/N/H atoms rotated rigidly by 180° about the
+        // anchor→carbon (χ) axis, as in Reduce. Each atom keeps its identity: the oxygen
+        // lands where the nitrogen was and the amide hydrogens follow their nitrogen.
+        let flippedPositions = originalPositions.mapValues { position in
+            rotatePoint(position, around: axisOrigin, axis: axisEnd, angle: .pi)
+        }
 
         let state0 = GroupState(
             label: "original",
@@ -561,7 +557,7 @@ enum HBondNetworkOptimizer {
         )]
     }
 
-    // MARK: - Flip His (6 states)
+    // MARK: - Flip His (tautomer × ring-flip states)
 
     private static func makeFlipHis(
         residueID: ResidueID,
@@ -595,128 +591,86 @@ enum HBondNetworkOptimizer {
         let axisOrigin = cbPos
         let axisEnd = cgPos
 
-        // Place protons at ideal geometry on ring nitrogens
-        let hd1Pos = hd1Index.map { atoms[$0].position }
-            ?? placeRingHydrogen(on: nd1Pos, ring: [cgPos, ce1Pos], distance: 0.86)
-        let he2Pos = he2Index.map { atoms[$0].position }
-            ?? placeRingHydrogen(on: ne2Pos, ring: [cd2Pos, ce1Pos], distance: 0.86)
+        // Ring hydrogens are placed at the CCD ideal bond lengths (N–H 1.01 Å, C–H 1.08 Å),
+        // matching the template-built hydrogens used for the unflipped states.
+        let nhLength: Float = 1.01
+        let chLength: Float = 1.08
 
-        // Build the 6 states:
-        // Unflipped: δ-tautomer (HD1 only), ε-tautomer (HE2 only), doubly protonated (both)
-        // Flipped:   same 3 but with ring rotated 180°
+        let hd1Pos = hd1Index.map { atoms[$0].position }
+            ?? placeRingHydrogen(on: nd1Pos, ring: [cgPos, ce1Pos], distance: nhLength)
+        let he2Pos = he2Index.map { atoms[$0].position }
+            ?? placeRingHydrogen(on: ne2Pos, ring: [cd2Pos, ce1Pos], distance: nhLength)
+
+        // Only tautomers reachable from the protons present are offered: the charge state
+        // (HIP vs neutral) was fixed by protonation and hydrogens are never created here.
+        // A neutral histidine may move its single proton between ND1 and NE2.
+        let tautomers: [(label: String, hd1: Bool, he2: Bool)]
+        switch (hd1Index != nil, he2Index != nil) {
+        case (true, true):
+            tautomers = [("doubly-protonated", true, true)]
+        case (true, false):
+            tautomers = [("δ-tautomer", true, false), ("ε-tautomer", false, true)]
+        case (false, true):
+            tautomers = [("ε-tautomer", false, true), ("δ-tautomer", true, false)]
+        case (false, false):
+            tautomers = [("ring", false, false)]
+        }
+
+        // --- Flipped ring: 180° rotation around CB–CG, so ND1 moves to where CD2 was
+        // and CE1 to where NE2 was (and vice versa); atom identities are kept.
+        let flippedRing: [String: SIMD3<Float>] = [
+            "ND1": rotatePoint(nd1Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
+            "CD2": rotatePoint(cd2Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
+            "CE1": rotatePoint(ce1Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
+            "NE2": rotatePoint(ne2Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
+        ]
+        let fND1 = flippedRing["ND1"]!
+        let fCD2 = flippedRing["CD2"]!
+        let fCE1 = flippedRing["CE1"]!
+        let fNE2 = flippedRing["NE2"]!
+
+        let hd1PosFlipped = placeRingHydrogen(on: fND1, ring: [fCE1, cgPos], distance: nhLength)
+        let he2PosFlipped = placeRingHydrogen(on: fNE2, ring: [fCD2, fCE1], distance: nhLength)
+        let he1PosFlipped: SIMD3<Float>? = he1Index != nil
+            ? placeRingHydrogen(on: fCE1, ring: [fND1, fNE2], distance: chLength)
+            : nil
+        let hd2PosFlipped: SIMD3<Float>? = hd2Index != nil
+            ? placeRingHydrogen(on: fCD2, ring: [fNE2, cgPos], distance: chLength)
+            : nil
 
         var states: [GroupState] = []
 
-        // --- Unflipped states ---
+        // Unflipped states first (state 0 is the input tautomer and orientation)
         let unflippedRing: [String: SIMD3<Float>] = [
             "ND1": nd1Pos, "CD2": cd2Pos, "CE1": ce1Pos, "NE2": ne2Pos,
         ]
+        for tautomer in tautomers {
+            var positions = unflippedRing
+            if tautomer.hd1 { positions["HD1"] = hd1Pos }
+            if tautomer.he2 { positions["HE2"] = he2Pos }
+            if let hi = he1Index { positions["HE1"] = atoms[hi].position }
+            if let hi = hd2Index { positions["HD2"] = atoms[hi].position }
+            states.append(GroupState(
+                label: tautomer.label,
+                atomPositions: positions,
+                penalty: 0.0,
+                isFlipped: false
+            ))
+        }
 
-        // δ-tautomer: HD1 present, no HE2
-        var deltaPosU = unflippedRing
-        deltaPosU["HD1"] = hd1Pos
-        if let hi = he1Index { deltaPosU["HE1"] = atoms[hi].position }
-        if let hi = hd2Index { deltaPosU["HD2"] = atoms[hi].position }
-        states.append(GroupState(
-            label: "δ-tautomer",
-            atomPositions: deltaPosU,
-            penalty: 0.0,
-            isFlipped: false
-        ))
-
-        // ε-tautomer: HE2 present, no HD1
-        var epsilonPosU = unflippedRing
-        epsilonPosU["HE2"] = he2Pos
-        if let hi = he1Index { epsilonPosU["HE1"] = atoms[hi].position }
-        if let hi = hd2Index { epsilonPosU["HD2"] = atoms[hi].position }
-        states.append(GroupState(
-            label: "ε-tautomer",
-            atomPositions: epsilonPosU,
-            penalty: 0.0,
-            isFlipped: false
-        ))
-
-        // Doubly protonated: both HD1 and HE2
-        var doublyPosU = unflippedRing
-        doublyPosU["HD1"] = hd1Pos
-        doublyPosU["HE2"] = he2Pos
-        if let hi = he1Index { doublyPosU["HE1"] = atoms[hi].position }
-        if let hi = hd2Index { doublyPosU["HD2"] = atoms[hi].position }
-        states.append(GroupState(
-            label: "doubly-protonated",
-            atomPositions: doublyPosU,
-            penalty: 0.05,
-            isFlipped: false
-        ))
-
-        // --- Flipped states (180° rotation around CB-CG axis) ---
-        // Flip swaps ND1↔CD2 and CE1↔NE2 positions
-        let flippedRing: [String: SIMD3<Float>] = [
-            "ND1": rotatePoint(cd2Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
-            "CD2": rotatePoint(nd1Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
-            "CE1": rotatePoint(ne2Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
-            "NE2": rotatePoint(ce1Pos, around: axisOrigin, axis: axisEnd, angle: .pi),
-        ]
-
-        let hd1PosFlipped = placeRingHydrogen(
-            on: flippedRing["ND1"]!,
-            ring: [flippedRing["CE1"]!, cgPos],
-            distance: 0.86
-        )
-        let he2PosFlipped = placeRingHydrogen(
-            on: flippedRing["NE2"]!,
-            ring: [flippedRing["CD2"]!, flippedRing["CE1"]!],
-            distance: 0.86
-        )
-
-        // Flipped carbon H positions
-        let he1PosFlipped: SIMD3<Float>? = he1Index != nil ? placeRingHydrogen(
-            on: flippedRing["CE1"]!,
-            ring: [flippedRing["ND1"]!, flippedRing["NE2"]!],
-            distance: 0.93
-        ) : nil
-        let hd2PosFlipped: SIMD3<Float>? = hd2Index != nil ? placeRingHydrogen(
-            on: flippedRing["CD2"]!,
-            ring: [flippedRing["NE2"]!, cgPos],
-            distance: 0.93
-        ) : nil
-
-        // Flipped δ-tautomer
-        var deltaPosF = flippedRing
-        deltaPosF["HD1"] = hd1PosFlipped
-        if let p = he1PosFlipped { deltaPosF["HE1"] = p }
-        if let p = hd2PosFlipped { deltaPosF["HD2"] = p }
-        states.append(GroupState(
-            label: "flipped δ-tautomer",
-            atomPositions: deltaPosF,
-            penalty: 0.5,
-            isFlipped: true
-        ))
-
-        // Flipped ε-tautomer
-        var epsilonPosF = flippedRing
-        epsilonPosF["HE2"] = he2PosFlipped
-        if let p = he1PosFlipped { epsilonPosF["HE1"] = p }
-        if let p = hd2PosFlipped { epsilonPosF["HD2"] = p }
-        states.append(GroupState(
-            label: "flipped ε-tautomer",
-            atomPositions: epsilonPosF,
-            penalty: 0.5,
-            isFlipped: true
-        ))
-
-        // Flipped doubly protonated
-        var doublyPosF = flippedRing
-        doublyPosF["HD1"] = hd1PosFlipped
-        doublyPosF["HE2"] = he2PosFlipped
-        if let p = he1PosFlipped { doublyPosF["HE1"] = p }
-        if let p = hd2PosFlipped { doublyPosF["HD2"] = p }
-        states.append(GroupState(
-            label: "flipped doubly-protonated",
-            atomPositions: doublyPosF,
-            penalty: 0.55,
-            isFlipped: true
-        ))
+        for tautomer in tautomers {
+            var positions = flippedRing
+            if tautomer.hd1 { positions["HD1"] = hd1PosFlipped }
+            if tautomer.he2 { positions["HE2"] = he2PosFlipped }
+            if let p = he1PosFlipped { positions["HE1"] = p }
+            if let p = hd2PosFlipped { positions["HD2"] = p }
+            states.append(GroupState(
+                label: "flipped \(tautomer.label)",
+                atomPositions: positions,
+                penalty: 0.5,
+                isFlipped: true
+            ))
+        }
 
         var moveableIndices = [nd1Index, cd2Index, ce1Index, ne2Index]
         if let i = hd1Index { moveableIndices.append(i) }
@@ -892,58 +846,6 @@ enum HBondNetworkOptimizer {
         return states
     }
 
-    // MARK: - Amide flip geometry
-
-    /// Flips the terminal amide group by 180° around the anchor-carbon axis.
-    /// After geometric rotation, swaps atom names (O↔N) so the oxygen is now
-    /// where the nitrogen was and vice versa. Re-places hydrogens on the new N position.
-    private static func flipTerminalGroup(
-        positions: [String: SIMD3<Float>],
-        axisOrigin: SIMD3<Float>,
-        axisEnd: SIMD3<Float>,
-        oxygenName: String,
-        nitrogenName: String,
-        carbonPosition: SIMD3<Float>,
-        h1Name: String,
-        h2Name: String
-    ) -> [String: SIMD3<Float>] {
-        guard let oPos = positions[oxygenName],
-              let nPos = positions[nitrogenName] else {
-            return positions
-        }
-
-        // 180° rotation around anchor-carbon axis
-        let oRotated = rotatePoint(oPos, around: axisOrigin, axis: axisEnd, angle: .pi)
-        let nRotated = rotatePoint(nPos, around: axisOrigin, axis: axisEnd, angle: .pi)
-
-        // After rotation, the O and N have swapped sides. The atom identities swap:
-        // what was the O position becomes the N position and vice versa.
-        var flipped: [String: SIMD3<Float>] = [:]
-        flipped[oxygenName] = nRotated   // N went to where O should be
-        flipped[nitrogenName] = oRotated  // O went to where N should be
-
-        // Re-place hydrogens on the new nitrogen position (which is at oRotated)
-        let newNPos = oRotated
-        let h1Pos = placeAmideHydrogen(
-            nitrogenPosition: newNPos,
-            carbonPosition: carbonPosition,
-            angle: 120.0,
-            dihedral: 0.0,
-            distance: 0.86
-        )
-        let h2Pos = placeAmideHydrogen(
-            nitrogenPosition: newNPos,
-            carbonPosition: carbonPosition,
-            angle: 120.0,
-            dihedral: 180.0,
-            distance: 0.86
-        )
-        flipped[h1Name] = h1Pos
-        flipped[h2Name] = h2Pos
-
-        return flipped
-    }
-
     // MARK: - Conflict graph construction
 
     /// Two groups conflict if any of their moveable atoms can come within VDW contact
@@ -1113,30 +1015,6 @@ enum HBondNetworkOptimizer {
         return nitrogenPos + direction * distance
     }
 
-    /// Places an amide hydrogen (NH2) with specified angle and dihedral relative to C-N bond.
-    private static func placeAmideHydrogen(
-        nitrogenPosition: SIMD3<Float>,
-        carbonPosition: SIMD3<Float>,
-        angle: Float,
-        dihedral: Float,
-        distance: Float
-    ) -> SIMD3<Float> {
-        let cnAxis = normalized(nitrogenPosition - carbonPosition)
-
-        // Get a perpendicular reference direction
-        let seed = abs(cnAxis.x) < 0.9 ? SIMD3<Float>(1, 0, 0) : SIMD3<Float>(0, 1, 0)
-        let perp1 = normalized(simd_cross(cnAxis, seed))
-        let perp2 = simd_cross(cnAxis, perp1)
-
-        let angleRad = angle * .pi / 180.0
-        let dihedralRad = dihedral * .pi / 180.0
-
-        let direction = cnAxis * cos(.pi - angleRad)
-            + (perp1 * cos(dihedralRad) + perp2 * sin(dihedralRad)) * sin(.pi - angleRad)
-
-        return nitrogenPosition + normalized(direction) * distance
-    }
-
     /// Finds nearby N/O acceptor atoms within radius, excluding atoms in the same residue.
     private static func findNearbyAcceptors(
         center: SIMD3<Float>,
@@ -1175,13 +1053,14 @@ enum HBondNetworkOptimizer {
     // MARK: - Phase 4.2 & 4.3: Scoring, Optimization, and Finalization
 
     /// Full Phase 4 pipeline: enumerate → score → optimize → apply.
-    /// Returns modified atoms/bonds with optimized H-bond network.
+    /// Returns modified atoms/bonds with optimized H-bond network, and the protonation
+    /// predictions updated for any neutral His whose tautomer (HID ↔ HIE) was switched.
     static func optimizeNetwork(
         atoms: [Atom],
         bonds: [Bond],
         predictions: [Protonation.ResiduePrediction],
         device: MTLDevice? = nil
-    ) -> (atoms: [Atom], bonds: [Bond], report: NetworkReport) {
+    ) -> (atoms: [Atom], bonds: [Bond], report: NetworkReport, predictions: [Protonation.ResiduePrediction]) {
         let logSync = { (msg: String) in
             _ = Task { @MainActor in ActivityLog.shared.debug(msg, category: .prep) }
         }
@@ -1197,7 +1076,7 @@ enum HBondNetworkOptimizer {
         logSync("[Phase4.1] Enumeration: \(graph.groups.count) groups, \(graph.cliques.count) cliques in \(String(format: "%.1f", enumTime * 1000))ms")
 
         guard !graph.groups.isEmpty else {
-            return (atoms, bonds, report)
+            return (atoms, bonds, report, predictions)
         }
 
         // Phase 4.2: Score and optimize
@@ -1232,7 +1111,14 @@ enum HBondNetworkOptimizer {
         let applyTime = CFAbsoluteTimeGetCurrent() - applyStart
         logSync("[Phase4.3] Applied optimal states in \(String(format: "%.1f", applyTime * 1000))ms — \(report.flipsAccepted) flips, \(report.rotationsOptimized) rotations")
 
-        return (result.atoms, result.bonds, report)
+        let updatedPredictions = predictions.map { prediction in
+            let id = ResidueID(chainID: prediction.chainID, residueSeq: prediction.residueSeq,
+                               insertionCode: prediction.insertionCode, residueName: prediction.residueName)
+            guard let newState = result.histidineTautomers[id] else { return prediction }
+            return prediction.withNeutralHistidineTautomer(newState)
+        }
+
+        return (result.atoms, result.bonds, report, updatedPredictions)
     }
 
     // MARK: - GPU Scoring (Batched)
@@ -1264,6 +1150,7 @@ enum HBondNetworkOptimizer {
 
         let numEnv = envAtomData.count
         let maskStride = (numEnv + 31) / 32
+        let envIndexByAtom = environmentIndexMap(atomCount: atoms.count, excludeIndices: moveableIndices)
 
         // --- Phase A: Pre-compute ALL candidates from ALL group-state combos into flat arrays ---
         var allCandidates: [HBondCandidateAtom] = []
@@ -1277,17 +1164,12 @@ enum HBondNetworkOptimizer {
         }
         var slices: [BatchSlice] = []
 
-        // Pre-build same-residue env indices per group (reused across states)
-        var groupSameResIndices: [[Int]] = []
-        groupSameResIndices.reserveCapacity(graph.groups.count)
-        for group in graph.groups {
-            groupSameResIndices.append(
-                findSameResidueEnvIndices(group: group, atoms: atoms, envAtoms: envAtomData)
-            )
-        }
-
         for (gi, group) in graph.groups.enumerated() {
-            let sameResIndices = groupSameResIndices[gi]
+            // Same-residue exclusion mask, identical for every candidate of this group
+            var groupMaskWords = [UInt32](repeating: 0, count: maskStride)
+            for ei in findSameResidueEnvIndices(group: group, atoms: atoms, envIndexByAtom: envIndexByAtom) {
+                groupMaskWords[ei / 32] |= (1 << (ei & 31))
+            }
 
             for (si, state) in group.states.enumerated() {
                 let startOffset = allCandidates.count
@@ -1333,13 +1215,9 @@ enum HBondNetworkOptimizer {
                     ))
                 }
 
-                // Build exclusion mask for these candidates
+                // Exclusion mask rows for these candidates
                 for _ in 0..<candidatesForState.count {
-                    var maskWords = [UInt32](repeating: 0, count: maskStride)
-                    for ei in sameResIndices {
-                        maskWords[ei / 32] |= (1 << (ei & 31))
-                    }
-                    allExcludeMask.append(contentsOf: maskWords)
+                    allExcludeMask.append(contentsOf: groupMaskWords)
                 }
 
                 slices.append(BatchSlice(
@@ -1448,6 +1326,7 @@ enum HBondNetworkOptimizer {
     ) -> [Int] {
         let moveableIndices = Set(graph.groups.flatMap(\.moveableAtomIndices))
         let envAtoms = buildEnvironmentAtoms(atoms: atoms, excludeIndices: moveableIndices)
+        let envIndexByAtom = environmentIndexMap(atomCount: atoms.count, excludeIndices: moveableIndices)
 
         var groupStateScores: [[Float]] = []
         let params = HBondScoringParams(
@@ -1460,7 +1339,7 @@ enum HBondNetworkOptimizer {
         for group in graph.groups {
             var stateScores: [Float] = []
             let sameResIndices = findSameResidueEnvIndices(
-                group: group, atoms: atoms, envAtoms: envAtoms
+                group: group, atoms: atoms, envIndexByAtom: envIndexByAtom
             )
 
             for state in group.states {
@@ -1625,30 +1504,33 @@ enum HBondNetworkOptimizer {
         return envAtoms
     }
 
+    /// Maps each atom index to its position in `buildEnvironmentAtoms` output
+    /// (same ordering and exclusions), or -1 when the atom is not an environment atom.
+    private static func environmentIndexMap(atomCount: Int, excludeIndices: Set<Int>) -> [Int] {
+        var map = [Int](repeating: -1, count: atomCount)
+        var next = 0
+        for index in 0..<atomCount where !excludeIndices.contains(index) {
+            map[index] = next
+            next += 1
+        }
+        return map
+    }
+
     private static func findSameResidueEnvIndices(
         group: MoveableGroup,
         atoms: [Atom],
-        envAtoms: [HBondEnvAtom]
+        envIndexByAtom: [Int]
     ) -> [Int] {
-        // Find env atom indices that belong to the same residue as the group
+        // Env atom indices of the group's own non-moveable residue atoms
         let groupResChain = group.residueID.chainID
         let groupResSeq = group.residueID.residueSeq
 
-        let moveableSet = Set(group.moveableAtomIndices)
-        var sameResPositions = Set<SIMD3<Float>>()
-        for idx in group.allAtomIndices where !moveableSet.contains(idx) {
-            if atoms[idx].chainID == groupResChain && atoms[idx].residueSeq == groupResSeq {
-                sameResPositions.insert(atoms[idx].position)
-            }
+        return group.allAtomIndices.compactMap { idx in
+            guard atoms[idx].chainID == groupResChain,
+                  atoms[idx].residueSeq == groupResSeq else { return nil }
+            let envIndex = envIndexByAtom[idx]
+            return envIndex >= 0 ? envIndex : nil
         }
-
-        var indices: [Int] = []
-        for (ei, envAtom) in envAtoms.enumerated() {
-            if sameResPositions.contains(envAtom.position) {
-                indices.append(ei)
-            }
-        }
-        return indices
     }
 
     // MARK: - Pairwise interaction scoring
@@ -1955,9 +1837,16 @@ enum HBondNetworkOptimizer {
         atoms: [Atom],
         bonds: [Bond],
         report: inout NetworkReport
-    ) -> (atoms: [Atom], bonds: [Bond]) {
+    ) -> (atoms: [Atom], bonds: [Bond], histidineTautomers: [ResidueID: Protonation.StateKind]) {
         var workingAtoms = atoms
-        var indicesToRemove: Set<Int> = []
+        var workingBonds = bonds
+        var histidineTautomers: [ResidueID: Protonation.StateKind] = [:]
+
+        func groupAtomIndex(_ group: MoveableGroup, named name: String) -> Int? {
+            group.moveableAtomIndices.first { idx in
+                workingAtoms[idx].name.trimmingCharacters(in: .whitespaces).uppercased() == name
+            }
+        }
 
         for (groupIdx, group) in graph.groups.enumerated() {
             let stateIdx = optimalStates[groupIdx]
@@ -1965,90 +1854,42 @@ enum HBondNetworkOptimizer {
 
             // Apply position updates for each moveable atom
             for (atomName, newPosition) in state.atomPositions {
-                // Find the atom in moveableAtomIndices by name
-                if let atomIdx = group.moveableAtomIndices.first(where: { idx in
-                    workingAtoms[idx].name.trimmingCharacters(in: .whitespaces).uppercased() == atomName
-                }) {
+                if let atomIdx = groupAtomIndex(group, named: atomName) {
                     workingAtoms[atomIdx].position = newPosition
-
-                    // For His flips, also update donor/acceptor identity via formal charge
-                    if group.kind == .flipHis && state.isFlipped {
-                        // ND1 and NE2 swap roles — update charges if needed
-                        if atomName == "ND1" || atomName == "NE2" ||
-                           atomName == "CD2" || atomName == "CE1" {
-                            // Positions already swapped; charges handled by protonation state
-                        }
-                    }
                 }
             }
 
-            // For amide flips, swap element types (O↔N) at the swapped positions
-            if group.kind == .flipAmide && state.isFlipped {
-                let oxygenName: String
-                let nitrogenName: String
-                switch group.residueID.residueName {
-                case "ASN":
-                    oxygenName = "OD1"; nitrogenName = "ND2"
-                case "GLN":
-                    oxygenName = "OE1"; nitrogenName = "NE2"
-                default:
-                    continue
-                }
-
-                if let oIdx = group.moveableAtomIndices.first(where: { idx in
-                    workingAtoms[idx].name.trimmingCharacters(in: .whitespaces).uppercased() == oxygenName
-                }),
-                   let nIdx = group.moveableAtomIndices.first(where: { idx in
-                    workingAtoms[idx].name.trimmingCharacters(in: .whitespaces).uppercased() == nitrogenName
-                }) {
-                    // Swap elements: what was O is now N and vice versa
-                    workingAtoms[oIdx].element = .N
-                    workingAtoms[oIdx].name = nitrogenName
-                    workingAtoms[nIdx].element = .O
-                    workingAtoms[nIdx].name = oxygenName
-                }
+            // Neutral His tautomer switch: move the single ring proton to the other
+            // nitrogen (rename, reposition and re-bond it). The proton count is unchanged.
+            guard group.kind == .flipHis,
+                  let nd1 = groupAtomIndex(group, named: "ND1"),
+                  let ne2 = groupAtomIndex(group, named: "NE2") else { continue }
+            let transfer: (from: String, to: String, fromParent: Int, toParent: Int)?
+            if state.atomPositions["HD1"] != nil, state.atomPositions["HE2"] == nil {
+                transfer = ("HE2", "HD1", ne2, nd1)
+            } else if state.atomPositions["HE2"] != nil, state.atomPositions["HD1"] == nil {
+                transfer = ("HD1", "HE2", nd1, ne2)
+            } else {
+                transfer = nil
             }
+            guard let transfer,
+                  groupAtomIndex(group, named: transfer.to) == nil,
+                  let protonIdx = groupAtomIndex(group, named: transfer.from),
+                  let target = state.atomPositions[transfer.to] else { continue }
 
-            // For His flips with tautomer changes, mark unwanted protons for removal
-            if group.kind == .flipHis {
-                let hasHD1 = state.atomPositions["HD1"] != nil
-                let hasHE2 = state.atomPositions["HE2"] != nil
-
-                for atomIdx in group.moveableAtomIndices {
-                    let name = workingAtoms[atomIdx].name.trimmingCharacters(in: .whitespaces).uppercased()
-                    if name == "HD1" && !hasHD1 {
-                        indicesToRemove.insert(atomIdx)
-                    }
-                    if name == "HE2" && !hasHE2 {
-                        indicesToRemove.insert(atomIdx)
-                    }
+            workingAtoms[protonIdx].name = transfer.to
+            workingAtoms[protonIdx].position = target
+            histidineTautomers[group.residueID] = transfer.to == "HD1" ? .histidineDelta : .histidineEpsilon
+            for bondIdx in workingBonds.indices {
+                let bond = workingBonds[bondIdx]
+                if bond.atomIndex1 == protonIdx && bond.atomIndex2 == transfer.fromParent {
+                    workingBonds[bondIdx].atomIndex2 = transfer.toParent
+                } else if bond.atomIndex2 == protonIdx && bond.atomIndex1 == transfer.fromParent {
+                    workingBonds[bondIdx].atomIndex1 = transfer.toParent
                 }
             }
         }
 
-        // Actually remove marked atoms and remap bond indices
-        if !indicesToRemove.isEmpty {
-            var newAtoms: [Atom] = []
-            var oldToNew: [Int: Int] = [:]
-            for (oldIdx, atom) in workingAtoms.enumerated() {
-                if indicesToRemove.contains(oldIdx) { continue }
-                oldToNew[oldIdx] = newAtoms.count
-                newAtoms.append(Atom(
-                    id: newAtoms.count, element: atom.element, position: atom.position,
-                    name: atom.name, residueName: atom.residueName, residueSeq: atom.residueSeq,
-                    chainID: atom.chainID, charge: atom.charge, formalCharge: atom.formalCharge,
-                    isHetAtom: atom.isHetAtom, occupancy: atom.occupancy, tempFactor: atom.tempFactor
-                ))
-            }
-            var newBonds: [Bond] = []
-            for bond in bonds {
-                if let a = oldToNew[bond.atomIndex1], let b = oldToNew[bond.atomIndex2] {
-                    newBonds.append(Bond(id: newBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
-                }
-            }
-            return (newAtoms, newBonds)
-        }
-
-        return (workingAtoms, bonds)
+        return (workingAtoms, workingBonds, histidineTautomers)
     }
 }

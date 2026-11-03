@@ -30,6 +30,9 @@ enum PKaGNNPredictor {
 
     private enum InitState { case pending, initialized, failed }
 
+    /// Must match PKA_MAXN in PKaGNNCompute.metal.
+    private static let maxAtoms = 128
+
     /// Lazy initialization — called automatically on first predict().
     @discardableResult
     private static func ensureInitialized() -> Bool {
@@ -106,6 +109,10 @@ enum PKaGNNPredictor {
 
         let N = Int(graph.numAtoms)
         let E = Int(graph.numEdges)
+        // pkaGNNFull keeps per-atom state in fixed [PKA_MAXN = 128] arrays;
+        // larger molecules would leave atoms unpredicted, so report no result
+        // and let the caller fall back to the non-GNN pKa path.
+        guard N <= maxAtoms, E > 0 else { return [] }
         let atomFeatDim = 25
         let bondFeatDim = 10
 
@@ -164,6 +171,10 @@ enum PKaGNNPredictor {
         encoder.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        guard cmdBuf.status == .completed else {
+            print("[PKaGNN] Command buffer failed: \(cmdBuf.error?.localizedDescription ?? "unknown error")")
+            return []
+        }
 
         // 4. Read results
         let outPtr = outputBuf.contents().bindMemory(to: Float.self, capacity: N * 4)

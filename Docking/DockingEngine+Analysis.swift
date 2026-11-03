@@ -51,33 +51,15 @@ extension DockingEngine {
         }
 
         if let edgeBuf = torsionEdgeBuffer, let idxBuf = movingIndicesBuffer {
-            let edges = edgeBuf.contents().bindMemory(to: TorsionEdge.self, capacity: Int(pose.numTorsions))
-            let moving = idxBuf.contents().bindMemory(to: Int32.self, capacity: idxBuf.length / MemoryLayout<Int32>.stride)
-
-            for t in 0..<Int(pose.numTorsions) {
-                let angle = withUnsafePointer(to: pose.torsions) {
-                    $0.withMemoryRebound(to: Float.self, capacity: 32) { $0[t] }
-                }
-                if abs(angle) < 1e-6 { continue }
-
-                let edge = edges[t]
-                let pivotIdx = Int(edge.atom1)
-                let axisIdx = Int(edge.atom2)
-                guard pivotIdx < positions.count, axisIdx < positions.count else { continue }
-
-                let pivot = positions[pivotIdx]
-                let axis = simd_normalize(positions[axisIdx] - pivot)
-                let cosA = cos(angle)
-                let sinA = sin(angle)
-
-                for i in 0..<Int(edge.movingCount) {
-                    let atomIdx = Int(moving[Int(edge.movingStart) + i])
-                    guard atomIdx >= 0, atomIdx < positions.count else { continue }
-                    let v = positions[atomIdx] - pivot
-                    let rotated = v * cosA + simd_cross(axis, v) * sinA + axis * simd_dot(axis, v) * (1.0 - cosA)
-                    positions[atomIdx] = pivot + rotated
-                }
-            }
+            let edgeCount = edgeBuf.length / MemoryLayout<TorsionEdge>.stride
+            let movingCount = idxBuf.length / MemoryLayout<Int32>.stride
+            let edges = UnsafeBufferPointer(
+                start: edgeBuf.contents().bindMemory(to: TorsionEdge.self, capacity: edgeCount),
+                count: edgeCount)
+            let moving = UnsafeBufferPointer(
+                start: idxBuf.contents().bindMemory(to: Int32.self, capacity: movingCount),
+                count: movingCount)
+            applyTorsionRotations(to: &positions, angles: torsions(from: pose), edges: edges, moving: moving)
         }
 
         return positions
@@ -167,138 +149,203 @@ extension DockingEngine {
         return sortByEnergy ? results.sorted { $0.energy < $1.energy } : results
     }
 
-    // MARK: - RMSD Clustering
+    // MARK: - Output Selection & RMSD Clustering
 
+    /// AutoDock Vina's `energy_range` default: poses scoring more than this above the best
+    /// are not reported. Most GA walkers of a multi-run search never reach the binding
+    /// basin, so the raw final populations are dominated by unconverged poses.
+    nonisolated static let outputEnergyRangeKcal: Float = 3.0
+
+    /// AutoDock Vina's `min_rmsd` for reported poses: within a cluster, a pose closer than
+    /// this to a better pose already kept is a duplicate of that minimum.
+    nonisolated static let outputDuplicateRMSD: Float = 1.0
+
+    /// Leader-clustering radius for binding-mode clusters.
+    nonisolated static let clusterRMSD: Float = 2.0
+
+    /// Vina's `num_modes` analogue: only the best-scoring binding modes are reported. Vina's
+    /// default is 9; Druse keeps more so the explicit rerank of the top
+    /// `DockingConfig.explicitRerankTopClusters` clusters always has candidates to reorder.
+    nonisolated static let outputMaxClusters = 20
+
+    /// `outputEnergyRangeKcal` in the units of `DockingResult.energy` for `scoringMethod`:
+    /// kcal/mol for Vina, Drusina and PIGNet2; −pKd for DruseAF, where ΔG = −RT·ln10·pKd.
+    static func outputEnergyWindow(for scoringMethod: ScoringMethod) -> Float {
+        let rtLn10Kcal: Float = 0.0019872 * 298.15 * Float(M_LN10)
+        return scoringMethod.isAffinityScore ? outputEnergyRangeKcal / rtLn10Kcal : outputEnergyRangeKcal
+    }
+
+    /// Poses whose score lies within the output energy window of the best one.
+    static func withinOutputEnergyWindow(_ results: [DockingResult], scoringMethod: ScoringMethod) -> [DockingResult] {
+        guard let best = results.map(\.energy).min() else { return [] }
+        let cutoff = best + outputEnergyWindow(for: scoringMethod)
+        return results.filter { $0.energy <= cutoff }
+    }
+
+    /// Vina's conformation-independent rotor weight (`wRotEntropy` in DockingCommon.h).
+    nonisolated static let vinaRotEntropyWeight: Float = 0.05846
+
+    /// AutoDock Vina reports each pose against the intramolecular energy of the best pose
+    /// (Vina 1.1/1.2 `model::eval_adjusted`: E_i = conf_independent(inter_i + intra_i − intra_best)),
+    /// so the top pose scores its intermolecular energy alone. The GPU kernels subtract the
+    /// input conformer's intra energy instead, which makes absolute scores depend on the
+    /// input geometry (a strained input inflates every score). The two references differ
+    /// by a per-run constant, so re-referencing is a uniform shift: ranking, the energy
+    /// window and clustering are unchanged. Valid only for energies of the form
+    /// (inter + intra − inputIntra)·norm + penalties (plain Vina scoring, rigid receptor).
+    func rereferencedToBestPoseIntra(
+        _ results: [DockingResult],
+        ligandAtoms: [DockLigandAtom],
+        pairList: [UInt32],
+        inputReferenceIntra: Float,
+        numTorsions: Int
+    ) -> [DockingResult] {
+        guard let best = results.min(by: { $0.energy < $1.energy }),
+              let shift = bestPoseReferenceShift(
+                  best, ligandAtoms: ligandAtoms, pairList: pairList,
+                  inputReferenceIntra: inputReferenceIntra, numTorsions: numTorsions
+              ) else { return results }
+        ActivityLog.shared.info(
+            "[Engine] Vina intra reference: input conformer \(String(format: "%.3f", inputReferenceIntra)), " +
+            "best pose \(String(format: "%.3f", shift.bestIntra)) → score shift \(String(format: "%+.3f", shift.energy)) kcal/mol",
+            category: .dock
+        )
+        return results.map { shift.applied(to: $0) }
+    }
+
+    /// Score shift that moves a Vina result from the input-conformer intra reference to
+    /// `best`'s own intra energy. Also used for the live "best so far" pose, so the readout
+    /// matches the final ranking. Nil when the pose has no per-atom positions.
+    func bestPoseReferenceShift(
+        _ best: DockingResult,
+        ligandAtoms: [DockLigandAtom],
+        pairList: [UInt32],
+        inputReferenceIntra: Float,
+        numTorsions: Int
+    ) -> VinaReferenceShift? {
+        guard best.transformedAtomPositions.count == ligandAtoms.count else { return nil }
+        var posed = ligandAtoms
+        for i in posed.indices { posed[i].position = best.transformedAtomPositions[i] }
+        let bestIntra = intramolecularReferenceEnergy(ligandAtoms: posed, pairList: pairList)
+        let norm = 1 / (1 + Self.vinaRotEntropyWeight * Float(numTorsions))
+        let delta = inputReferenceIntra - bestIntra
+        // torsionPenalty is normalized(inter + intraDelta) − inter − intraDelta; moving the
+        // reference changes intraDelta by `delta`, so the normalization term moves by
+        // delta·(norm − 1) and the breakdown keeps summing to the shifted total.
+        return VinaReferenceShift(energy: delta * norm, torsion: delta * (norm - 1), bestIntra: bestIntra)
+    }
+
+    struct VinaReferenceShift {
+        let energy: Float
+        let torsion: Float
+        let bestIntra: Float
+
+        func applied(to result: DockingResult) -> DockingResult {
+            var r = result
+            r.energy += energy
+            r.torsionPenalty += torsion
+            return r
+        }
+    }
+
+    /// Greedy leader clustering in energy order (Vina-style): the lowest-energy unassigned
+    /// pose becomes a cluster leader and absorbs every unassigned pose within
+    /// `clusterRMSD`. Absorbed poses closer than `outputDuplicateRMSD` to a better pose of
+    /// the same cluster are dropped as duplicates (many walkers converge to the same minimum),
+    /// and clustering stops after `outputMaxClusters` modes.
+    /// Only leader-vs-unassigned RMSDs are evaluated (with early exit once the bound is
+    /// exceeded), instead of materialising the full n(n-1)/2 matrix.
+    /// The RMSD work runs off the main actor; the result is identical to running it inline.
     func clusterPoses(_ results: [DockingResult]) async -> [DockingResult] {
         guard !results.isEmpty else { return [] }
-        let threshold: Float = 2.0
-        var out = results.sorted { $0.energy < $1.energy }
-        let n = out.count
+        return await Task.detached(priority: .userInitiated) {
+            DockingEngine.leaderClusters(results)
+        }.value
+    }
 
-        for i in 0..<n {
-            out[i].clusterID = -1
-            out[i].clusterRank = 0
-        }
+    private nonisolated static func leaderClusters(_ results: [DockingResult]) -> [DockingResult] {
+        let sorted = results.sorted { $0.energy < $1.energy }
+        let positions = sorted.map(\.transformedAtomPositions)
+        let duplicateSumSq = { (atomCount: Int) in outputDuplicateRMSD * outputDuplicateRMSD * Float(atomCount) }
 
-        let rmsdMatrix = await computeRMSDMatrixGPU(out) ?? computeRMSDMatrixCPU(out)
-
+        var out: [DockingResult] = []
+        out.reserveCapacity(sorted.count)
+        var unassigned = Array(0..<sorted.count)
         var clusterID = 0
-        for i in 0..<n {
-            guard out[i].clusterID == -1 else { continue }
-            out[i].clusterID = clusterID
-            out[i].clusterRank = 0
-            var rank = 1
-            for j in (i+1)..<n {
-                guard out[j].clusterID == -1 else { continue }
-                let idx = i * n - i * (i + 1) / 2 + j - i - 1
-                if rmsdMatrix[idx] < threshold {
-                    out[j].clusterID = clusterID
-                    out[j].clusterRank = rank
-                    rank += 1
+
+        while clusterID < outputMaxClusters, let leader = unassigned.first {
+            var leaderResult = sorted[leader]
+            leaderResult.clusterID = clusterID
+            leaderResult.clusterRank = 0
+            out.append(leaderResult)
+
+            let candidates = Array(unassigned.dropFirst())
+            let within = withinRMSDFlags(
+                leader: positions[leader], candidates: candidates,
+                positions: positions, threshold: clusterRMSD
+            )
+
+            var kept = [leader]
+            var remaining: [Int] = []
+            remaining.reserveCapacity(candidates.count)
+            for (c, j) in candidates.enumerated() {
+                guard within[c] else {
+                    remaining.append(j)
+                    continue
                 }
+                let maxSumSq = duplicateSumSq(positions[j].count)
+                if kept.contains(where: { isWithinRMSD(positions[$0], positions[j], maxSumSq: maxSumSq) }) {
+                    continue
+                }
+                var member = sorted[j]
+                member.clusterID = clusterID
+                member.clusterRank = kept.count
+                out.append(member)
+                kept.append(j)
             }
+            unassigned = remaining
             clusterID += 1
         }
-        return out
+        return out.sorted { $0.energy < $1.energy }
     }
 
-    private func rmsd(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return .infinity }
-        let s = zip(a, b).reduce(Float(0)) { $0 + simd_distance_squared($1.0, $1.1) }
-        return sqrt(s / Float(a.count))
-    }
-
-    private func computeRMSDMatrixGPU(_ results: [DockingResult]) async -> [Float]? {
-        guard let pipeline = pairwiseRMSDPipeline,
-              let first = results.first,
-              !first.transformedAtomPositions.isEmpty else { return nil }
-
-        let n = results.count
-        let numAtoms = first.transformedAtomPositions.count
-        guard n > 1 else { return [] }
-
-        var positions: [SIMD3<Float>] = []
-        positions.reserveCapacity(n * numAtoms)
-        for r in results {
-            guard r.transformedAtomPositions.count == numAtoms else { return nil }
-            positions.append(contentsOf: r.transformedAtomPositions)
-        }
-
-        let matrixSize = n * (n - 1) / 2
-        var params = RMSDParams(numPoses: UInt32(n), numAtoms: UInt32(numAtoms), _pad0: 0, _pad1: 0)
-
-        guard let posBuffer = device.makeBuffer(
-                    bytes: &positions,
-                    length: positions.count * MemoryLayout<SIMD3<Float>>.stride,
-                    options: .storageModeShared),
-              let matrixBuffer = device.makeBuffer(
-                    length: matrixSize * MemoryLayout<Float>.stride,
-                    options: .storageModeShared),
-              let paramsBuffer = device.makeBuffer(
-                    bytes: &params,
-                    length: MemoryLayout<RMSDParams>.stride,
-                    options: .storageModeShared),
-              let cmdBuf = commandQueue.makeCommandBuffer(),
-              let enc = cmdBuf.makeComputeCommandEncoder()
-        else { return nil }
-
-        enc.setComputePipelineState(pipeline)
-        enc.setBuffer(posBuffer, offset: 0, index: 0)
-        enc.setBuffer(matrixBuffer, offset: 0, index: 1)
-        enc.setBuffer(paramsBuffer, offset: 0, index: 2)
-
-        let totalPairs = n * (n - 1) / 2
-        let threadWidth = 256
-        let tgSize = MTLSize(width: threadWidth, height: 1, depth: 1)
-        let tgCount = MTLSize(width: (totalPairs + threadWidth - 1) / threadWidth, height: 1, depth: 1)
-        enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-        enc.endEncoding()
-        await withCheckedContinuation { continuation in
-            cmdBuf.addCompletedHandler { _ in
-                continuation.resume()
-            }
-            cmdBuf.commit()
-        }
-
-        let ptr = matrixBuffer.contents().bindMemory(to: Float.self, capacity: matrixSize)
-        return Array(UnsafeBufferPointer(start: ptr, count: matrixSize))
-    }
-
-    /// CPU fallback for pairwise RMSD matrix (parallelized with concurrentPerform).
-    private func computeRMSDMatrixCPU(_ results: [DockingResult]) -> [Float] {
-        let n = results.count
-        let matrixSize = n * (n - 1) / 2
-        var matrix = [Float](repeating: 0, count: matrixSize)
-        // Parallel computation for large result sets
-        if n > 50 {
-            // Parallel RMSD computation using raw pointer to avoid inout capture issues
-            let storage = UnsafeMutablePointer<Float>.allocate(capacity: matrixSize)
-            storage.initialize(repeating: 0, count: matrixSize)
-            nonisolated(unsafe) let base = storage
-            DispatchQueue.concurrentPerform(iterations: n) { i in
-                for j in (i+1)..<n {
-                    let idx = i * n - i * (i + 1) / 2 + j - i - 1
-                    let posA = results[i].transformedAtomPositions
-                    let posB = results[j].transformedAtomPositions
-                    guard posA.count == posB.count, !posA.isEmpty else {
-                        base[idx] = .infinity
-                        continue
-                    }
-                    let s = zip(posA, posB).reduce(Float(0)) { $0 + simd_distance_squared($1.0, $1.1) }
-                    base[idx] = sqrt(s / Float(posA.count))
+    /// For each candidate pose, whether its RMSD to `leader` is below `threshold`.
+    /// Parallelised across worker threads for large candidate sets.
+    private nonisolated static func withinRMSDFlags(
+        leader: [SIMD3<Float>],
+        candidates: [Int],
+        positions: [[SIMD3<Float>]],
+        threshold: Float
+    ) -> [Bool] {
+        let maxSumSq = threshold * threshold * Float(leader.count)
+        var flags = [Bool](repeating: false, count: candidates.count)
+        if candidates.count >= 2048 {
+            flags.withUnsafeMutableBufferPointer { buf in
+                nonisolated(unsafe) let out = buf
+                DispatchQueue.concurrentPerform(iterations: candidates.count) { c in
+                    out[c] = isWithinRMSD(leader, positions[candidates[c]], maxSumSq: maxSumSq)
                 }
             }
-            for i in 0..<matrixSize { matrix[i] = storage[i] }
-            storage.deallocate()
         } else {
-            for i in 0..<n {
-                for j in (i+1)..<n {
-                    let idx = i * n - i * (i + 1) / 2 + j - i - 1
-                    matrix[idx] = rmsd(results[i].transformedAtomPositions, results[j].transformedAtomPositions)
-                }
+            for c in candidates.indices {
+                flags[c] = isWithinRMSD(leader, positions[candidates[c]], maxSumSq: maxSumSq)
             }
         }
-        return matrix
+        return flags
+    }
+
+    /// RMSD(a, b) < threshold, expressed as Σ|a_i - b_i|² < threshold² · N, with early exit.
+    /// Poses with mismatched or empty atom lists never cluster together.
+    private nonisolated static func isWithinRMSD(
+        _ a: [SIMD3<Float>], _ b: [SIMD3<Float>], maxSumSq: Float
+    ) -> Bool {
+        guard a.count == b.count, !a.isEmpty else { return false }
+        var sum: Float = 0
+        for i in 0..<a.count {
+            sum += simd_distance_squared(a[i], b[i])
+            if sum >= maxSumSq { return false }
+        }
+        return true
     }
 
     // MARK: - Docking Diagnostics
@@ -309,7 +356,11 @@ extension DockingEngine {
         heavyBonds: [Bond]
     ) -> DockingDiagnostics {
         let gridOrigin = SIMD3<Float>(gridParams.origin.x, gridParams.origin.y, gridParams.origin.z)
-        let gridEnd = gridOrigin + SIMD3<Float>(Float(gridParams.dims.x), Float(gridParams.dims.y), Float(gridParams.dims.z)) * gridParams.spacing
+        // The last grid node sits at origin + (dims - 1) * spacing (gridUpperBound in DockingCommon.h).
+        let nodeSpans = SIMD3<Float>(
+            Float(max(gridParams.dims.x, 1) - 1), Float(max(gridParams.dims.y, 1) - 1), Float(max(gridParams.dims.z, 1) - 1)
+        )
+        let gridEnd = gridOrigin + nodeSpans * gridParams.spacing
         let gridCenter = (gridOrigin + gridEnd) * 0.5
 
         let validResults = results.filter { $0.energy.isFinite && $0.energy < 1e9 }
@@ -326,6 +377,24 @@ extension DockingEngine {
         var centroidDistances: [Float] = []
         var minProteinDistances: [Float] = []
 
+        // Bin protein atoms into contactCutoff-sized cells: any atom closer than the cutoff
+        // lies in the 27-cell neighbourhood, so in-contact poses (the common case) get an
+        // exact minimum without scanning the whole receptor. Poses with no atom within the
+        // cutoff fall back to the exhaustive scan so the reported mean stays exact.
+        let contactCutoff: Float = 4.0
+        struct Cell: Hashable { let x, y, z: Int32 }
+        func cell(_ p: SIMD3<Float>) -> Cell? {
+            let q = (p / contactCutoff).rounded(.down)
+            let limit = Float(Int32.max / 2)
+            guard q.x.isFinite, q.y.isFinite, q.z.isFinite,
+                  abs(q.x) < limit, abs(q.y) < limit, abs(q.z) < limit else { return nil }
+            return Cell(x: Int32(q.x), y: Int32(q.y), z: Int32(q.z))
+        }
+        var proteinCells: [Cell: [SIMD3<Float>]] = [:]
+        for pa in proteinAtoms {
+            if let c = cell(pa.position) { proteinCells[c, default: []].append(pa.position) }
+        }
+
         for r in validResults {
             let positions = r.transformedAtomPositions
             let allInside = positions.allSatisfy { p in
@@ -340,14 +409,20 @@ extension DockingEngine {
                 centroidDistances.append(simd_distance(centroid, gridCenter))
 
                 if !proteinAtoms.isEmpty {
-                    var minDist: Float = .infinity
+                    var minDistSq: Float = .infinity
                     for lp in positions {
-                        for pa in proteinAtoms {
-                            let d = simd_distance(lp, pa.position)
-                            if d < minDist { minDist = d }
+                        guard let c = cell(lp) else { continue }
+                        for dx: Int32 in -1...1 { for dy: Int32 in -1...1 { for dz: Int32 in -1...1 {
+                            guard let bucket = proteinCells[Cell(x: c.x + dx, y: c.y + dy, z: c.z + dz)] else { continue }
+                            for pp in bucket { minDistSq = min(minDistSq, simd_distance_squared(lp, pp)) }
+                        }}}
+                    }
+                    if minDistSq >= contactCutoff * contactCutoff {
+                        for lp in positions {
+                            for pa in proteinAtoms { minDistSq = min(minDistSq, simd_distance_squared(lp, pa.position)) }
                         }
                     }
-                    minProteinDistances.append(minDist)
+                    minProteinDistances.append(sqrt(minDistSq))
                 }
             }
         }
@@ -355,7 +430,7 @@ extension DockingEngine {
         let meanCentroidDist = centroidDistances.isEmpty ? 0 : centroidDistances.reduce(0, +) / Float(centroidDistances.count)
         let meanProteinDist = minProteinDistances.isEmpty ? 0 : minProteinDistances.reduce(0, +) / Float(minProteinDistances.count)
 
-        let contactPoses = minProteinDistances.filter { $0 < 4.0 }.count
+        let contactPoses = minProteinDistances.filter { $0 < contactCutoff }.count
 
         var bondDeviations: [Float] = []
         for r in validResults.prefix(10) {
@@ -405,6 +480,44 @@ extension DockingEngine {
             gridSpacing: gridParams.spacing,
             gridBoxSize: gridEnd - gridOrigin
         )
+    }
+}
+
+// MARK: - Torsion Application
+
+/// Rotate the moving atoms of each torsion edge about its bond axis, in edge order.
+/// CPU mirror of `applyTorsions()` in DockingCommon.h so CPU-reconstructed poses match
+/// what the GPU scored. Edge and moving-index lookups are bounds-checked.
+func applyTorsionRotations(
+    to positions: inout [SIMD3<Float>],
+    angles: [Float],
+    edges: UnsafeBufferPointer<TorsionEdge>,
+    moving: UnsafeBufferPointer<Int32>
+) {
+    for t in 0..<min(angles.count, edges.count) {
+        let angle = angles[t]
+        if abs(angle) < 1e-6 { continue }
+
+        let edge = edges[t]
+        let pivotIdx = Int(edge.atom1)
+        let axisIdx = Int(edge.atom2)
+        guard pivotIdx >= 0, axisIdx >= 0, pivotIdx < positions.count, axisIdx < positions.count else { continue }
+
+        let pivot = positions[pivotIdx]
+        let axis = simd_normalize(positions[axisIdx] - pivot)
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+
+        let start = Int(edge.movingStart)
+        let end = min(start + Int(edge.movingCount), moving.count)
+        guard start >= 0, start < end else { continue }
+        for m in start..<end {
+            let atomIdx = Int(moving[m])
+            guard atomIdx >= 0, atomIdx < positions.count else { continue }
+            let v = positions[atomIdx] - pivot
+            let rotated = v * cosA + simd_cross(axis, v) * sinA + axis * simd_dot(axis, v) * (1.0 - cosA)
+            positions[atomIdx] = pivot + rotated
+        }
     }
 }
 
@@ -614,8 +727,8 @@ enum InteractionDetector {
             atoms: ligandAtoms, bonds: ligandBonds)
         let proteinHasH: [Bool] = proteinAtoms.map(proteinHBondDonorFlag)
 
-        if let gpu = InteractionDetectorGPU.shared {
-            let gpuResults = gpu.detect(
+        if let gpu = InteractionDetectorGPU.shared,
+           let gpuResults = gpu.detect(
                 ligandAtoms: ligandAtoms,
                 ligandPositions: ligandPositions,
                 proteinAtoms: proteinAtoms,
@@ -624,7 +737,7 @@ enum InteractionDetector {
                 positiveResAtoms: positiveResAtoms,
                 negativeResAtoms: negativeResAtoms,
                 metals: metals
-            )
+           ) {
             for gi in gpuResults {
                 result.append(MolecularInteraction(
                     id: idCounter,
@@ -638,7 +751,7 @@ enum InteractionDetector {
                 idCounter += 1
             }
         } else {
-            // CPU fallback with spatial grid
+            // CPU fallback with spatial grid (also used when the GPU path fails)
             var ligandHasStrongInteraction: Set<Int> = []
             let cellSize: Float = 6.0
             let invCell: Float = 1.0 / cellSize
@@ -883,7 +996,7 @@ final class InteractionDetectorGPU {
         positiveResAtoms: Set<String>,
         negativeResAtoms: Set<String>,
         metals: Set<Element>
-    ) -> [GPUInteraction] {
+    ) -> [GPUInteraction]? {
         let nLig = ligandAtoms.count
         let nProt = proteinAtoms.count
         guard nLig > 0, nProt > 0, ligandPositions.count >= nLig else { return [] }
@@ -929,7 +1042,7 @@ final class InteractionDetectorGPU {
               let paramBuffer = device.makeBuffer(bytes: &params, length: MemoryLayout<InteractionDetectParams>.stride, options: .storageModeShared),
               let cmdBuf = commandQueue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder()
-        else { return [] }
+        else { return nil }
 
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(protBuffer, offset: 0, index: 0)
@@ -945,6 +1058,9 @@ final class InteractionDetectorGPU {
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        // A faulted command buffer leaves the counter/output undefined: let the caller
+        // fall back to the CPU detector instead of reporting no interactions.
+        guard cmdBuf.status == .completed else { return nil }
 
         let count = min(Int(ctrBuffer.contents().load(as: UInt32.self)), maxInteractions)
         guard count > 0 else { return [] }

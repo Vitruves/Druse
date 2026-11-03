@@ -25,54 +25,64 @@ struct MultiPoseAnalysisSheet: View {
     private var indices: [Int] { viewModel.sortedSelectedPoseIndices }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
-            Picker("", selection: $mode) {
-                ForEach(Mode.allCases) { m in Text(m.rawValue).tag(m) }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            Divider()
-            Group {
-                switch mode {
-                case .rmsd:         RMSDMatrixView(indices: indices)
-                case .interactions: InteractionFingerprintView(indices: indices)
+        DSSheetScaffold(
+            title: "Multi-Pose Analysis",
+            subtitle: subtitle,
+            systemImage: "square.stack.3d.up"
+        ) {
+            VStack(spacing: 0) {
+                Picker("Analysis", selection: $mode) {
+                    ForEach(Mode.allCases) { m in Text(m.rawValue).tag(m) }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.horizontal, DS.Space.xl)
+                .padding(.bottom, DS.Space.l)
+                Divider()
+                Group {
+                    switch mode {
+                    case .rmsd:         RMSDMatrixView(indices: indices)
+                    case .interactions: InteractionFingerprintView(indices: indices)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } footer: {
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.defaultAction)
         }
-        .frame(minWidth: 540, minHeight: 460)
+        .frame(minWidth: 560, idealWidth: 680, minHeight: 480, idealHeight: 620)
     }
 
-    private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "square.stack.3d.up")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text("Multi-Pose Analysis")
-                .font(.system(size: 14, weight: .semibold))
-            Text("\(indices.count) poses")
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color.primary.opacity(0.08)))
-            Spacer()
-            Button(action: { dismiss() }) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 22, height: 22)
-                    .background(Color.primary.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 5))
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut(.cancelAction)
+    private var subtitle: String {
+        let poses = indices.map { "#\($0 + 1)" }.joined(separator: ", ")
+        return "\(indices.count) poses selected · \(poses)"
+    }
+}
+
+// MARK: - Shared chrome
+
+private struct AnalysisWarning: View {
+    let text: String
+    var body: some View {
+        PanelHighlightRow(color: DS.Color.warning) {
+            PanelHint(text: text, icon: "exclamationmark.triangle.fill", color: DS.Color.warning)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+    }
+}
+
+private struct HeatmapSwatch: View {
+    let text: String
+    let color: Color
+    var body: some View {
+        HStack(spacing: DS.Space.xs) {
+            RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                .fill(color)
+                .frame(width: 12, height: 12)
+            Text(text)
+                .font(DS.Font.secondary)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -91,48 +101,34 @@ private struct RMSDMatrixView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: DS.Space.l) {
                 summary
                 if matrix.isEmpty {
-                    Text(atomCountConsistent
+                    AnalysisWarning(text: atomCountConsistent
                          ? "Need at least 2 poses with transformed coordinates."
                          : "Selected poses have mismatching atom counts (different ligands?). Cannot compute RMSD.")
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.orange)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.10)))
                 } else {
                     matrixGrid
                     legend
+                    bindingModes
                 }
             }
-            .padding(16)
+            .padding(DS.Space.xl)
         }
         .onAppear { recompute() }
         .onChange(of: indices) { _, _ in recompute() }
     }
 
     private var summary: some View {
-        HStack(spacing: 8) {
-            PanelStat(label: "Min RMSD",
-                      value: minRMSD.map { String(format: "%.2f", $0) } ?? "—",
-                      unit: "Å",
-                      color: .green)
-            PanelStat(label: "Max RMSD",
-                      value: maxRMSD.map { String(format: "%.2f", $0) } ?? "—",
-                      unit: "Å",
-                      color: .red)
-            PanelStat(label: "Mean",
-                      value: meanRMSD.map { String(format: "%.2f", $0) } ?? "—",
-                      unit: "Å")
-            PanelStat(label: "Convergent",
-                      value: "\(convergentPairs)/\(totalPairs)",
-                      color: convergentPairs == totalPairs ? .green : .secondary)
+        DSMetricGrid(columns: 4) {
+            DSMetric("Min RMSD", value: minRMSD.map { String(format: "%.2f", $0) } ?? "—", unit: "Å",
+                     tone: minRMSD.map { RMSDBand($0).tone } ?? .neutral)
+            DSMetric("Max RMSD", value: maxRMSD.map { String(format: "%.2f", $0) } ?? "—", unit: "Å",
+                     tone: maxRMSD.map { RMSDBand($0).tone } ?? .neutral)
+            DSMetric("Mean RMSD", value: meanRMSD.map { String(format: "%.2f", $0) } ?? "—", unit: "Å")
+            DSMetric("Convergent", value: "\(convergentPairs)/\(totalPairs)",
+                     tone: totalPairs > 0 && convergentPairs == totalPairs ? .success : .neutral)
         }
-        .padding(10)
-        .frame(maxWidth: .infinity)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
     }
 
     private var matrixGrid: some View {
@@ -146,7 +142,7 @@ private struct RMSDMatrixView: View {
                     Color.clear.frame(width: labelWidth, height: cellSize)
                     ForEach(0..<n, id: \.self) { j in
                         Text(poseLabels[j])
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(DS.Font.monoSmall.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: cellSize, height: cellSize)
                     }
@@ -154,7 +150,7 @@ private struct RMSDMatrixView: View {
                 ForEach(0..<n, id: \.self) { i in
                     HStack(spacing: 0) {
                         Text(poseLabels[i])
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(DS.Font.monoSmall.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: labelWidth, height: cellSize)
                         ForEach(0..<n, id: \.self) { j in
@@ -167,41 +163,84 @@ private struct RMSDMatrixView: View {
             .padding(2)
         }
         .frame(maxHeight: 360)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.03)))
+        .dsCard(padding: DS.Space.s)
     }
 
     @ViewBuilder
     private func cell(i: Int, j: Int) -> some View {
         if i == j {
             Rectangle()
-                .fill(Color.primary.opacity(0.05))
-                .overlay(Text("—").font(.system(size: 10)).foregroundStyle(.tertiary))
+                .fill(DS.Color.controlFill)
+                .overlay(Text("—").font(DS.Font.monoSmall).foregroundStyle(.tertiary))
         } else {
             let value = matrix[i][j]
             Rectangle()
-                .fill(rmsdColor(value))
+                .fill(RMSDBand(value).fill(value))
                 .overlay(
                     Text(String(format: "%.2f", value))
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(value > 4.0 ? .white : .primary)
+                        .font(DS.Font.monoSmall.weight(.medium))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
                 )
                 .help(String(format: "Pose #%d ↔ #%d : %.2f Å", indices[i] + 1, indices[j] + 1, value))
         }
     }
 
     private var legend: some View {
-        HStack(spacing: 12) {
-            legendChip(text: "≤ 2.0 Å (same mode)", color: rmsdColor(1.5))
-            legendChip(text: "2–4 Å (similar)", color: rmsdColor(3.0))
-            legendChip(text: "> 4 Å (distinct)", color: rmsdColor(5.0))
+        HStack(spacing: DS.Space.l) {
+            ForEach(RMSDBand.allCases, id: \.self) { band in
+                HeatmapSwatch(text: band.legend, color: band.fill(band.legendSample))
+            }
         }
     }
 
-    private func legendChip(text: String, color: Color) -> some View {
-        HStack(spacing: 4) {
-            RoundedRectangle(cornerRadius: 3).fill(color).frame(width: 14, height: 14)
-            Text(text).font(PanelStyle.smallFont).foregroundStyle(.secondary)
+    /// Binding modes = groups of poses linked by ≤ 2 Å RMSD (single linkage), the
+    /// question a multi-pose RMSD check is really asking.
+    @ViewBuilder
+    private var bindingModes: some View {
+        let modes = bindingModeGroups
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Binding modes") {
+                DSTag("\(modes.count)", monospaced: true)
+            }
+            Text(modes.count == 1
+                 ? "All selected poses share one binding mode (linked by ≤ 2 Å RMSD)."
+                 : "\(modes.count) distinct binding modes — poses within a mode are linked by ≤ 2 Å RMSD.")
+                .font(DS.Font.secondary)
+                .foregroundStyle(.secondary)
+            FlowLayout(spacing: DS.Space.s) {
+                ForEach(Array(modes.enumerated()), id: \.offset) { number, members in
+                    DSTag(
+                        "Mode \(number + 1): " + members.map { "#\(indices[$0] + 1)" }.joined(separator: ", "),
+                        tone: members.count > 1 ? .success : .neutral,
+                        monospaced: true
+                    )
+                }
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
+    }
+
+    /// Connected components of the ≤ 2 Å graph, in pose-rank order.
+    private var bindingModeGroups: [[Int]] {
+        let n = matrix.count
+        var mode = Array(repeating: -1, count: n)
+        var groups: [[Int]] = []
+        for start in 0..<n where mode[start] < 0 {
+            var members: [Int] = []
+            var stack = [start]
+            mode[start] = groups.count
+            while let i = stack.popLast() {
+                members.append(i)
+                for j in 0..<n where mode[j] < 0 && matrix[i][j] <= RMSDBand.sameModeCutoff {
+                    mode[j] = groups.count
+                    stack.append(j)
+                }
+            }
+            groups.append(members.sorted())
+        }
+        return groups
     }
 
     private func recompute() {
@@ -234,14 +273,55 @@ private struct RMSDMatrixView: View {
         guard !pairs.isEmpty else { return nil }
         return pairs.reduce(0, +) / Float(pairs.count)
     }
-    private var convergentPairs: Int { pairs.filter { $0 <= 2.0 }.count }
+    private var convergentPairs: Int { pairs.filter { $0 <= RMSDBand.sameModeCutoff }.count }
     private var totalPairs: Int { pairs.count }
+}
 
-    private func rmsdColor(_ v: Float) -> Color {
-        if v <= 2.0  { return Color.green.opacity(0.20 + 0.30 * Double(v / 2.0)) }
-        if v <= 4.0  { return Color.yellow.opacity(0.30 + 0.30 * Double((v - 2.0) / 2.0)) }
-        if v <= 6.0  { return Color.orange.opacity(0.45 + 0.25 * Double((v - 4.0) / 2.0)) }
-        return Color.red.opacity(min(1.0, 0.55 + 0.20 * Double((v - 6.0) / 4.0)))
+/// The three RMSD bands of the legend; cells, legend swatches and summary tints all derive
+/// from this one mapping so a 5 Å cell can never read as "similar".
+private enum RMSDBand: CaseIterable {
+    case sameMode, similar, distinct
+
+    static let sameModeCutoff: Float = 2.0
+    static let similarCutoff: Float = 4.0
+
+    init(_ rmsd: Float) {
+        self = rmsd <= Self.sameModeCutoff ? .sameMode : rmsd <= Self.similarCutoff ? .similar : .distinct
+    }
+
+    var tone: DSTone {
+        switch self {
+        case .sameMode: .success
+        case .similar:  .warning
+        case .distinct: .danger
+        }
+    }
+
+    var legend: String {
+        switch self {
+        case .sameMode: "≤ 2 Å (same mode)"
+        case .similar:  "2–4 Å (similar)"
+        case .distinct: "> 4 Å (distinct)"
+        }
+    }
+
+    /// A representative value inside the band, for the legend swatch.
+    var legendSample: Float {
+        switch self {
+        case .sameMode: 1.0
+        case .similar:  3.0
+        case .distinct: 8.0
+        }
+    }
+
+    /// Translucent band color, a little stronger toward the band's far end; text on top
+    /// stays `.primary`, readable in both appearances.
+    func fill(_ rmsd: Float) -> Color {
+        switch self {
+        case .sameMode: tone.color.opacity(0.20 + 0.15 * Double(rmsd / Self.sameModeCutoff))
+        case .similar:  tone.color.opacity(0.25 + 0.15 * Double((rmsd - Self.sameModeCutoff) / (Self.similarCutoff - Self.sameModeCutoff)))
+        case .distinct: tone.color.opacity(0.30 + 0.20 * Double(min((rmsd - Self.similarCutoff) / 8, 1)))
+        }
     }
 }
 
@@ -257,21 +337,16 @@ private struct InteractionFingerprintView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: DS.Space.l) {
                 if residueKeys.isEmpty {
-                    Text(noContactsMessage)
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.orange)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.10)))
+                    AnalysisWarning(text: noContactsMessage)
                 } else {
                     consensusSummary
                     heatmap
                     legend
                 }
             }
-            .padding(16)
+            .padding(DS.Space.xl)
         }
         .onAppear { recompute() }
         .onChange(of: indices) { _, _ in recompute() }
@@ -293,22 +368,21 @@ private struct InteractionFingerprintView: View {
             let count = fingerprints.reduce(0) { $0 + (($1[key]?.isEmpty == false) ? 1 : 0) }
             return count > total / 2 && count < total
         }
-        return HStack(spacing: 8) {
-            PanelStat(label: "Consensus", value: "\(consensus.count)", color: .green)
-            PanelStat(label: "Majority", value: "\(majority.count)", color: .yellow)
-            PanelStat(label: "Residues", value: "\(residueKeys.count)")
-            PanelStat(label: "Poses", value: "\(total)")
+        return DSMetricGrid(columns: 4) {
+            DSMetric("Consensus", value: "\(consensus.count)", tone: .success)
+            DSMetric("Majority", value: "\(majority.count)", tone: .warning)
+            DSMetric("Residues", value: "\(residueKeys.count)")
+            DSMetric("Poses", value: "\(total)")
         }
-        .padding(10)
-        .frame(maxWidth: .infinity)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
     }
 
     private var heatmap: some View {
-        let cellWidth: CGFloat = 28
+        let cellWidth: CGFloat = 24
         let cellHeight: CGFloat = 28
         let headerHeight: CGFloat = 96
         let leftLabelWidth: CGFloat = 64
+        // Labels rotated -55° from the bottom-left of the last column reach this far past it.
+        let headerOverhang = headerHeight / tan(55 * .pi / 180)
         return ScrollView([.horizontal, .vertical]) {
             VStack(alignment: .leading, spacing: 0) {
                 // Column header: residues, rotated -55° around the bottom of
@@ -320,7 +394,7 @@ private struct InteractionFingerprintView: View {
                         ZStack(alignment: .bottomLeading) {
                             Color.clear
                             Text(residueLabels[key] ?? key)
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .font(DS.Font.monoSmall.weight(.medium))
                                 .foregroundStyle(.secondary)
                                 .fixedSize()
                                 .rotationEffect(.degrees(-55), anchor: .bottomLeading)
@@ -333,11 +407,11 @@ private struct InteractionFingerprintView: View {
                 // Rows: one per pose
                 ForEach(Array(indices.enumerated()), id: \.offset) { row, idx in
                     HStack(spacing: 0) {
-                        Text("Pose #\(idx + 1)")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        Text(verbatim: "Pose #\(idx + 1)")
+                            .font(DS.Font.monoSmall.weight(.semibold))
                             .foregroundStyle(.secondary)
+                            .padding(.leading, DS.Space.xs)
                             .frame(width: leftLabelWidth, height: cellHeight, alignment: .leading)
-                            .padding(.leading, 4)
                         ForEach(residueKeys, id: \.self) { key in
                             cell(types: fingerprints[row][key] ?? [])
                                 .frame(width: cellWidth, height: cellHeight)
@@ -346,25 +420,26 @@ private struct InteractionFingerprintView: View {
                 }
             }
             .padding(2)
+            .padding(.trailing, headerOverhang)
         }
         .frame(maxHeight: 360)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.03)))
+        .dsCard(padding: DS.Space.s)
     }
 
     @ViewBuilder
     private func cell(types: Set<MolecularInteraction.InteractionType>) -> some View {
         if types.isEmpty {
-            Rectangle().fill(Color.primary.opacity(0.04))
+            Rectangle().fill(DS.Color.controlFill)
         } else if types.count == 1, let t = types.first {
             Rectangle()
-                .fill(typeColor(t).opacity(0.7))
+                .fill(t.themeColor.opacity(0.7))
                 .help(t.label)
         } else {
             // Multiple interaction types: split cell vertically with up to 3 stripes
             let sorted = Array(types).sorted { $0.rawValue < $1.rawValue }
             HStack(spacing: 0) {
                 ForEach(sorted.prefix(3), id: \.self) { t in
-                    Rectangle().fill(typeColor(t).opacity(0.7))
+                    Rectangle().fill(t.themeColor.opacity(0.7))
                 }
             }
             .help(sorted.map(\.label).joined(separator: ", "))
@@ -374,22 +449,11 @@ private struct InteractionFingerprintView: View {
     private var legend: some View {
         let presentTypes = Set(fingerprints.flatMap { $0.values.flatMap { $0 } })
         let sorted = Array(presentTypes).sorted { $0.rawValue < $1.rawValue }
-        return FlowLayout(spacing: 6) {
+        return FlowLayout(spacing: DS.Space.l) {
             ForEach(sorted, id: \.self) { t in
-                HStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 3).fill(typeColor(t).opacity(0.7))
-                        .frame(width: 12, height: 12)
-                    Text(t.label).font(PanelStyle.smallFont).foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                HeatmapSwatch(text: t.label, color: t.themeColor.opacity(0.7))
             }
         }
-    }
-
-    private func typeColor(_ t: MolecularInteraction.InteractionType) -> Color {
-        Color(red: Double(t.color.x), green: Double(t.color.y), blue: Double(t.color.z))
     }
 
     private func recompute() {

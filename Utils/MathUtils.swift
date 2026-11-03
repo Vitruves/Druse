@@ -97,15 +97,17 @@ struct Quat {
 // MARK: - Matrix Utilities
 
 enum Mat4 {
+    /// Right-handed perspective projection with Metal's [0, 1] clip-space depth range:
+    /// z_ndc = f(d − n) / (d(f − n)) for view depth d, i.e. 0 at the near plane and 1 at the far plane.
     static func perspective(fovY: Float, aspect: Float, near: Float, far: Float) -> float4x4 {
         let yScale = 1.0 / tanf(fovY * 0.5)
         let xScale = yScale / aspect
         let zRange = far - near
         return float4x4(columns: (
-            SIMD4<Float>(xScale, 0,      0,                          0),
-            SIMD4<Float>(0,      yScale, 0,                          0),
-            SIMD4<Float>(0,      0,      -(far + near) / zRange,    -1),
-            SIMD4<Float>(0,      0,      -2 * far * near / zRange,   0)
+            SIMD4<Float>(xScale, 0,      0,                     0),
+            SIMD4<Float>(0,      yScale, 0,                     0),
+            SIMD4<Float>(0,      0,      -far / zRange,        -1),
+            SIMD4<Float>(0,      0,      -far * near / zRange,  0)
         ))
     }
 

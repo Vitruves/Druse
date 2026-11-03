@@ -88,6 +88,11 @@ DruseFragmentResult* druse_decompose_fragments(
     std::memset(result, 0, sizeof(DruseFragmentResult));
     result->success = false;
 
+    if (!smiles || !smiles[0]) {
+        std::strncpy(result->errorMessage, "Empty SMILES", 511);
+        return result;
+    }
+
     try {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) {
@@ -319,6 +324,8 @@ DruseScaffoldMatch* druse_match_scaffold(const char *smiles, const char *scaffol
     result->hasMatch = false;
     result->tanimotoSimilarity = 0.0f;
 
+    if (!smiles || !smiles[0] || !scaffoldSmarts || !scaffoldSmarts[0]) return result;
+
     try {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) return result;
@@ -373,6 +380,7 @@ void druse_free_scaffold_match(DruseScaffoldMatch *result) {
 }
 
 float druse_tanimoto_similarity(const char *smiles1, const char *smiles2) {
+    if (!smiles1 || !smiles1[0] || !smiles2 || !smiles2[0]) return 0.0f;
     try {
         std::unique_ptr<RWMol> mol1(SmilesToMol(smiles1));
         std::unique_ptr<RWMol> mol2(SmilesToMol(smiles2));
@@ -507,6 +515,11 @@ DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features(const char 
     std::memset(result, 0, sizeof(DrusePharmacophoreFeatureResult));
     result->success = false;
 
+    if (!smiles || !smiles[0]) {
+        std::strncpy(result->errorMessage, "Empty SMILES", 511);
+        return result;
+    }
+
     try {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) {
@@ -523,10 +536,16 @@ DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features(const char 
         auto heavyMap = build_heavy_map(*mol);
         const auto &conf = mol->getConformer();
 
+        // Only discard the placeholder once the detection succeeded: if it
+        // throws, the catch below still owns and returns `result`.
+        auto *features = detect_features_impl(*mol, heavyMap, conf);
         delete result;
-        return detect_features_impl(*mol, heavyMap, conf);
+        return features;
     } catch (const std::exception &e) {
         std::strncpy(result->errorMessage, e.what(), 511);
+        return result;
+    } catch (...) {
+        std::strncpy(result->errorMessage, "Unknown error detecting pharmacophore features", 511);
         return result;
     }
 }
@@ -539,6 +558,11 @@ DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features_with_coords
     auto *result = new DrusePharmacophoreFeatureResult();
     std::memset(result, 0, sizeof(DrusePharmacophoreFeatureResult));
     result->success = false;
+
+    if (!smiles || !smiles[0] || !heavyCoords || numHeavy <= 0) {
+        std::strncpy(result->errorMessage, "Empty SMILES or coordinates", 511);
+        return result;
+    }
 
     try {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
@@ -568,10 +592,14 @@ DrusePharmacophoreFeatureResult* druse_detect_pharmacophore_features_with_coords
         mol->addConformer(conf, true);
 
         auto heavyMap = build_heavy_map(*mol);
+        auto *features = detect_features_impl(*mol, heavyMap, *conf);
         delete result;
-        return detect_features_impl(*mol, heavyMap, *conf);
+        return features;
     } catch (const std::exception &e) {
         std::strncpy(result->errorMessage, e.what(), 511);
+        return result;
+    } catch (...) {
+        std::strncpy(result->errorMessage, "Unknown error detecting pharmacophore features", 511);
         return result;
     }
 }
@@ -598,7 +626,7 @@ DruseMCSResult* druse_find_mcs(
     std::memset(result, 0, sizeof(DruseMCSResult));
     result->success = false;
 
-    if (numMols < 2) {
+    if (!smilesArray || numMols < 2) {
         std::strncpy(result->errorMessage, "Need at least 2 molecules for MCS", 511);
         return result;
     }
@@ -607,7 +635,8 @@ DruseMCSResult* druse_find_mcs(
         std::vector<ROMOL_SPTR> mols;
         mols.reserve(numMols);
         for (int i = 0; i < numMols; i++) {
-            std::unique_ptr<RWMol> mol(SmilesToMol(smilesArray[i]));
+            std::unique_ptr<RWMol> mol(
+                (smilesArray[i] && smilesArray[i][0]) ? SmilesToMol(smilesArray[i]) : nullptr);
             if (!mol) {
                 std::snprintf(result->errorMessage, 511,
                     "Failed to parse SMILES at index %d", i);
@@ -631,6 +660,9 @@ DruseMCSResult* druse_find_mcs(
         return result;
     } catch (const std::exception &e) {
         std::strncpy(result->errorMessage, e.what(), 511);
+        return result;
+    } catch (...) {
+        std::strncpy(result->errorMessage, "Unknown error in MCS search", 511);
         return result;
     }
 }

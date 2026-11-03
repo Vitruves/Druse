@@ -32,15 +32,16 @@ struct LigandMini3DView: View {
                 MetalView(renderer: renderer)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if atoms.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "cube")
-                        .font(.title)
-                        .foregroundStyle(.secondary)
-                    Text("Prepare ligand for 3D view")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                VStack(spacing: DS.Space.xs) {
+                    Image(systemName: "cube.transparent")
+                        .font(.title2)
+                        .symbolRenderingMode(.hierarchical)
+                    Text("Prepare the compound to see it in 3D")
+                        .font(DS.Font.caption)
                 }
+                .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(DS.Color.cardFill)
             } else {
                 Color.clear
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -50,34 +51,44 @@ struct LigandMini3DView: View {
             // Conformer navigation bar — chevrons + counter + energy
             if !conformers.isEmpty {
                 Divider()
-                HStack(spacing: 8) {
+                HStack(spacing: DS.Space.s) {
                     Button(action: { stepConformer(by: -1) }) {
                         Image(systemName: "chevron.left")
-                            .font(.footnote.weight(.semibold))
                     }
                     .buttonStyle(.borderless)
                     .help("Previous conformer")
+                    .accessibilityLabel("Previous conformer")
 
-                    Text("Conformer \(selectedConformerIndex + 1) / \(conformers.count)")
-                        .font(.footnote.monospaced().weight(.medium))
+                    Text("Conformer \(selectedConformerIndex + 1) of \(conformers.count)")
+                        .font(DS.Font.secondary.weight(.medium))
+                        .monospacedDigit()
 
                     Button(action: { stepConformer(by: 1) }) {
                         Image(systemName: "chevron.right")
-                            .font(.footnote.weight(.semibold))
                     }
                     .buttonStyle(.borderless)
                     .help("Next conformer")
+                    .accessibilityLabel("Next conformer")
 
-                    Spacer()
+                    Spacer(minLength: DS.Space.s)
 
-                    if selectedConformerIndex < conformers.count {
-                        Text(String(format: "%.1f kcal/mol", conformers[selectedConformerIndex].energy))
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
+                    if selectedConformerIndex < conformers.count,
+                       let minEnergy = conformers.map(\.energy).min() {
+                        // Absolute force-field energies have no physical
+                        // meaning on their own — report strain vs the lowest conformer.
+                        let energy = conformers[selectedConformerIndex].energy
+                        let delta = energy - minEnergy
+                        Text(delta < 0.05 ? "lowest energy" : String(format: "ΔE +%.1f kcal/mol", delta))
+                            .font(DS.Font.monoSmall)
+                            .foregroundStyle(delta < 0.05 ? DS.Color.success : .secondary)
+                            .help(String(format: "Force-field energy %.1f kcal/mol (relative to the lowest of %d conformers)",
+                                         energy, conformers.count))
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .font(DS.Font.secondary)
+                .padding(.horizontal, DS.Space.m)
+                .frame(height: DS.Size.rowHeight + DS.Space.xs)
+                .background(.bar)
             }
         }
         .onChange(of: atoms.count) { _, _ in

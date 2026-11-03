@@ -53,6 +53,9 @@ enum RibbonMeshGenerator {
 
     static let subdivisionsPerResidue: Int = 10
     static let radialSegments: Int = 8
+    /// Consecutive Cα atoms farther apart than this belong to different backbone
+    /// segments (trans peptide Cα–Cα ≈ 3.8 Å; same cutoff as Biopython's CaPPBuilder).
+    static let chainBreakCADistance: Float = 4.3
 
     struct CrossSection {
         var width: Float
@@ -84,7 +87,7 @@ enum RibbonMeshGenerator {
         selectedResidues: [Bool] = []
     ) -> (vertices: [RibbonVertex], indices: [UInt32]) {
         let n = caPositions.count
-        guard n >= 4 else { return ([], []) }
+        guard n >= 2 else { return ([], []) }
 
         // Step 1: Spline interpolation
         var splinePositions: [SIMD3<Float>] = []
@@ -256,14 +259,17 @@ enum RibbonMeshGenerator {
         for chain in molecule.chains {
             guard chain.type == .protein else { continue }
 
-            // Extract Cα atoms sorted by residue sequence
-            let caAtoms = molecule.atoms
-                .filter { $0.chainID == chain.id && $0.name.trimmingCharacters(in: .whitespaces) == "CA" }
-                .sorted { $0.residueSeq < $1.residueSeq }
+            // Extract backbone Cα atoms (element C, so calcium ions named "CA" are excluded),
+            // keeping only the first alternate location per residue, in residue order.
+            var seenResidues = Set<String>()
+            let caAtoms = molecule.atoms.enumerated()
+                .filter { $0.element.chainID == chain.id && $0.element.element == .C
+                    && $0.element.name.trimmingCharacters(in: .whitespaces) == "CA" }
+                .sorted { ($0.element.residueSeq, $0.offset) < ($1.element.residueSeq, $1.offset) }
+                .map(\.element)
+                .filter { seenResidues.insert("\($0.residueSeq)|\($0.insertionCode)").inserted }
 
-            guard caAtoms.count >= 4 else { continue }
-
-            let caPositions = caAtoms.map(\.position)
+            guard caAtoms.count >= 2 else { continue }
 
             // Build SS assignments per Cα
             let ssAssignments: [SecondaryStructure] = caAtoms.map { atom in
@@ -281,25 +287,36 @@ enum RibbonMeshGenerator {
                 selectedResidueKeys.contains("\(atom.chainID)|\(atom.residueSeq)")
             }
 
-            let (verts, idxs) = generate(
-                caPositions: caPositions,
-                ssAssignments: ssAssignments,
-                selectedResidues: selectedResidues
-            )
+            // Split at chain breaks so the tube is not drawn straight through missing residues.
+            var segmentStart = 0
+            for i in 1...caAtoms.count {
+                let isBreak = i == caAtoms.count
+                    || simd_distance(caAtoms[i - 1].position, caAtoms[i].position) > chainBreakCADistance
+                guard isBreak else { continue }
+                let range = segmentStart..<i
+                segmentStart = i
+                guard range.count >= 2 else { continue }
 
-            // Override vertex colors with per-chain color when chain coloring is active
-            var finalVerts = verts
-            if let chainColor = chainColorMap[chain.id] {
-                let color4 = SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
-                for i in finalVerts.indices {
-                    finalVerts[i].color = color4
+                let (verts, idxs) = generate(
+                    caPositions: caAtoms[range].map(\.position),
+                    ssAssignments: Array(ssAssignments[range]),
+                    selectedResidues: Array(selectedResidues[range])
+                )
+
+                // Override vertex colors with per-chain color when chain coloring is active
+                var finalVerts = verts
+                if let chainColor = chainColorMap[chain.id] {
+                    let color4 = SIMD4<Float>(chainColor.x, chainColor.y, chainColor.z, 1.0)
+                    for v in finalVerts.indices {
+                        finalVerts[v].color = color4
+                    }
                 }
-            }
 
-            // Offset indices for multi-chain merge
-            let vertexOffset = UInt32(allVertices.count)
-            allVertices.append(contentsOf: finalVerts)
-            allIndices.append(contentsOf: idxs.map { $0 + vertexOffset })
+                // Offset indices for multi-segment merge
+                let vertexOffset = UInt32(allVertices.count)
+                allVertices.append(contentsOf: finalVerts)
+                allIndices.append(contentsOf: idxs.map { $0 + vertexOffset })
+            }
         }
 
         return (allVertices, allIndices)

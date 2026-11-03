@@ -38,6 +38,7 @@ extension AppViewModel {
         docking.isBatchDocking = true
         docking.batchResults = []
         docking.dockingResults = []
+        docking.dockingPosesEvaluated = 0
         docking.batchProgress = (0, prepared.count)
         log.info("Starting batch docking: \(prepared.count) ligands, scoring=\(docking.scoringMethod.rawValue)", category: .dock)
         workspace.statusMessage = "Batch docking 0/\(prepared.count)..."
@@ -201,74 +202,6 @@ extension AppViewModel {
         }
     }
 
-    func dockAllFromDatabase() {
-        guard let pocket = docking.selectedPocket,
-              let prot = molecules.protein else {
-            log.error("Need protein and pocket for batch docking", category: .dock)
-            return
-        }
-
-        let prepared = ligandDB.entries.filter(\.isPrepared)
-        guard !prepared.isEmpty else {
-            log.warn("No prepared ligands in database", category: .dock)
-            return
-        }
-
-        docking.isBatchDocking = true
-        docking.batchResults = []
-        docking.batchProgress = (0, prepared.count)
-        log.info("Starting batch docking: \(prepared.count) ligands", category: .dock)
-        workspace.statusMessage = "Batch docking 0/\(prepared.count)..."
-
-        docking.batchDockingTask = Task {
-            if docking.dockingEngine == nil, let device = renderer?.device {
-                docking.dockingEngine = DockingEngine(device: device)
-            }
-            guard let engine = docking.dockingEngine else {
-                log.error("Failed to initialize docking engine", category: .dock)
-                docking.isBatchDocking = false
-                return
-            }
-
-            engine.computeGridMaps(protein: prot, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
-
-            for (i, entry) in prepared.enumerated() {
-                guard !Task.isCancelled, docking.isBatchDocking else {
-                    log.info("Batch docking cancelled at \(i)/\(prepared.count)", category: .dock)
-                    break
-                }
-
-                docking.batchProgress = (i, prepared.count)
-                workspace.statusMessage = "Batch docking \(i + 1)/\(prepared.count): \(entry.name)..."
-
-                let mol = Molecule(name: entry.name, atoms: entry.atoms, bonds: entry.bonds, title: entry.smiles, smiles: entry.smiles)
-
-                engine.onPoseUpdate = nil
-                engine.onGenerationComplete = nil
-
-                let results = await engine.runDocking(ligand: mol, pocket: pocket, config: docking.dockingConfig)
-                docking.batchResults.append((ligandName: entry.name, results: results))
-
-                if let best = results.first {
-                    let sm = docking.scoringMethod
-                    log.info(String(format: "  %@ best: %.1f %@", entry.name, best.displayScore(method: sm), sm.unitLabel), category: .dock)
-                }
-            }
-
-            docking.batchProgress = (prepared.count, prepared.count)
-            docking.isBatchDocking = false
-
-            docking.batchResults.sort { a, b in
-                let bestA = a.results.first?.energy ?? .infinity
-                let bestB = b.results.first?.energy ?? .infinity
-                return bestA < bestB
-            }
-
-            log.success("Batch docking complete: \(docking.batchResults.count) ligands docked", category: .dock)
-            workspace.statusMessage = "Batch docking complete"
-        }
-    }
-
     func cancelBatchDocking() {
         docking.batchDockingTask?.cancel()
         docking.dockingEngine?.stopDocking()
@@ -382,8 +315,8 @@ extension AppViewModel {
             let props: [String: String] = [
                 "Rank": "\(i + 1)",
                 "Energy": String(format: "%.3f", result.energy),
-                "VdW": String(format: "%.3f", result.vdwEnergy),
-                "Elec": String(format: "%.3f", result.elecEnergy),
+                "VdW": String(format: "%.3f", result.stericEnergy),
+                "Hydrophobic": String(format: "%.3f", result.hydrophobicEnergy),
                 "HBond": String(format: "%.3f", result.hbondEnergy),
                 "Cluster": "\(result.clusterID)"
             ]

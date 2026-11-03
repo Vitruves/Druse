@@ -2,100 +2,100 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import SwiftUI
-import MetalKit
 
+/// Main window: navigator pane | canvas over the debug bar | inspector pane, laid out as one
+/// integrated window under a unified toolbar. Both side panes are part of the window (window
+/// background, hairline dividers), resizable from their inner edge, and collapsible.
 struct ContentView: View {
     @Environment(AppViewModel.self) private var viewModel
-    @AppStorage("appTheme") private var appTheme: String = AppTheme.dark.rawValue
     @Environment(\.colorScheme) private var colorScheme
-    @State private var showInspector = false
-    @State private var showConsole = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage("ui.navigatorOpen") private var showNavigator = true
+    @AppStorage("ui.inspectorOpen") private var showInspector = false
+    @AppStorage("ui.consoleOpen") private var showConsole = false
+    @AppStorage("ui.navigatorWidth") private var navigatorWidth = Double(DS.Size.navigatorIdeal)
+    @AppStorage("ui.inspectorWidth") private var inspectorWidth = Double(DS.Size.inspectorIdeal)
     @State private var consoleHeight: CGFloat = 130
     @State private var isDragTargeted = false
     @State private var pipelineTab: SidebarTab = .search
-    @State private var pipelinePanelOpen: Bool = false
+    @State private var windowWidth: CGFloat = DS.Size.windowDefault.width
+    @State private var stepBarWidth: CGFloat = 0
+
+    /// The inspector opens by itself on first load only when there is room for it.
+    private static let inspectorAutoOpenMinWidth: CGFloat = 1400
+    /// Side panes give way (down to their minimum widths) before the canvas gets narrower than this.
+    private static let canvasMinWidth: CGFloat = 520
 
     var body: some View {
-        VStack(spacing: 0) {
-            mainContentArea
-            StatusStripView(showConsole: $showConsole, consoleHeight: $consoleHeight)
-        }
-        .toolbar {
-            // Pipeline steps — centered in the toolbar
-            ToolbarItem(placement: .principal) {
-                PipelineBar(selectedTab: $pipelineTab, panelOpen: $pipelinePanelOpen)
+        let widths = paneWidths
+        HStack(spacing: 0) {
+            if showNavigator {
+                NavigatorColumn(selection: pipelineTab)
+                    .frame(width: widths.navigator)
+                    .background(.background)
+                    .overlay(alignment: .trailing) {
+                        PaneResizeHandle(width: $navigatorWidth, range: DS.Size.navigatorMin...DS.Size.navigatorMax, edge: .trailing)
+                    }
+                    .transition(.move(edge: .leading))
+                Divider()
             }
 
-            // Inspector toggle only (console moved to status strip)
-            ToolbarItemGroup(placement: .primaryAction) {
-                Toggle(isOn: $showInspector) {
-                    Label("Inspector", systemImage: "sidebar.right")
-                }
-                .help("Toggle inspector panel")
+            VStack(spacing: 0) {
+                CanvasStage()
+                StatusStripView(showConsole: $showConsole, consoleHeight: $consoleHeight, currentStep: pipelineTab)
+            }
+            .frame(maxWidth: .infinity)
+            .layoutPriority(1)
+
+            if showInspector {
+                Divider()
+                InspectorPanel(showInspector: $showInspector)
+                    .frame(width: widths.inspector)
+                    .background(.background)
+                    .overlay(alignment: .leading) {
+                        PaneResizeHandle(width: $inspectorWidth, range: DS.Size.inspectorMin...DS.Size.inspectorMax, edge: .leading)
+                    }
+                    .transition(.move(edge: .trailing))
             }
         }
-        .onChange(of: ActivityLog.shared.entries.count) { _, _ in
-            // Auto-expand console on error
-            if let last = ActivityLog.shared.entries.last, last.level == .error, !showConsole {
-                withAnimation(.easeInOut(duration: 0.2)) { showConsole = true }
-            }
-        }
+        // Hairline under the toolbar so the panes read as sitting below it.
+        .overlay(alignment: .top) { Divider() }
+        .clipped()
+        .animation(DS.Motion.respecting(reduceMotion), value: showNavigator)
+        .animation(DS.Motion.respecting(reduceMotion), value: showInspector)
+        .onGeometryChange(for: CGFloat.self, of: \.size.width) { windowWidth = $0 }
+        .toolbar { toolbarContent }
+        .focusedSceneValue(\.selectedStep, $pipelineTab)
         .onChange(of: viewModel.workspace.requestedTabToken) { _, _ in
-            // View-model–driven tab switch (e.g. "Optimize" on a docking pose
-            // jumps to the Lead Opt tab with the reference already populated).
+            // View-model–driven step switch (welcome cards, "Continue to …", menu ⌘1…⌘8,
+            // "Optimize" on a pose). Always reveals the navigator.
             guard let target = viewModel.workspace.requestedTab else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
+            withAnimation(DS.Motion.respecting(reduceMotion)) {
                 pipelineTab = target
-                pipelinePanelOpen = true
+                showNavigator = true
             }
         }
         .onChange(of: viewModel.molecules.protein?.atomCount) { old, new in
-            // Auto-show inspector when first molecule is loaded
-            if old == nil && new != nil && !showInspector {
-                withAnimation(.easeInOut(duration: 0.2)) { showInspector = true }
-            }
+            guard old == nil, new != nil, !showInspector,
+                  (NSApp.keyWindow?.frame.width ?? 0) >= Self.inspectorAutoOpenMinWidth else { return }
+            withAnimation(DS.Motion.respecting(reduceMotion)) { showInspector = true }
         }
         .onChange(of: viewModel.demoStep) { _, step in
-            // Auto-advance pipeline tabs during guided demo
-            withAnimation(.easeInOut(duration: 0.2)) {
-                switch step {
-                case .fetching, .parsing:
-                    pipelineTab = .search
-                    pipelinePanelOpen = false
-                case .overview, .ribbon:
-                    pipelineTab = .search
-                    pipelinePanelOpen = false
-                case .pocketScan, .pocketFound, .gridSetup:
-                    pipelineTab = .dock
-                    pipelinePanelOpen = false
-                case .dockingStart, .dockingRun, .dockingConverge:
-                    pipelineTab = .dock
-                    pipelinePanelOpen = false
-                case .scoring, .bestPose, .interactions:
-                    pipelineTab = .results
-                    pipelinePanelOpen = false
-                case .complete, .idle:
-                    break
-                }
+            // Follow the guided demo through the pipeline steps.
+            let target: SidebarTab? = switch step {
+            case .fetching, .parsing, .overview, .ribbon: .search
+            case .pocketScan, .pocketFound, .gridSetup: .bindingSite
+            case .dockingStart, .dockingRun, .dockingConverge: .dock
+            case .scoring, .bestPose, .interactions: .results
+            case .complete, .idle: nil
             }
+            guard let target else { return }
+            withAnimation(DS.Motion.respecting(reduceMotion)) { pipelineTab = target }
         }
-        .onChange(of: colorScheme) { _, newScheme in
-            viewModel.renderer?.themeMode = (newScheme == .light) ? 1 : 0
-        }
-        .onAppear {
-            let theme = AppTheme(rawValue: appTheme) ?? .dark
-            let isLight: Bool
-            switch theme {
-            case .light: isLight = true
-            case .dark: isLight = false
-            case .auto: isLight = (colorScheme == .light)
-            }
-            viewModel.renderer?.themeMode = isLight ? 1 : 0
-            viewModel.renderer?.backgroundOpacity = viewModel.workspace.backgroundOpacity
-            viewModel.renderer?.surfaceOpacity = viewModel.workspace.surfaceOpacity
-
-            // No auto-open — welcome screen handles first interaction
-        }
+        // Renderer theme follows the effective appearance — the only place it is set.
+        .onAppear { syncRendererTheme() }
+        .onChange(of: colorScheme) { _, _ in syncRendererTheme() }
+        .onChange(of: viewModel.renderer == nil) { _, _ in syncRendererTheme() }
         .sheet(isPresented: Binding(
             get: { viewModel.workspace.showingConstraintSheet },
             set: { viewModel.workspace.showingConstraintSheet = $0 }
@@ -116,653 +116,166 @@ struct ContentView: View {
             return true
         }
         .overlay {
-            if isDragTargeted {
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8, 4]))
-                    .background(Color.accentColor.opacity(0.08))
-                    .overlay {
-                        VStack(spacing: 8) {
-                            Image(systemName: "arrow.down.doc")
-                                .font(.title)
-                                .foregroundStyle(.secondary)
-                            Text("Drop to import")
-                                .font(.body.weight(.medium))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .allowsHitTesting(false)
-            }
+            if isDragTargeted { dropTargetOverlay }
         }
     }
 
-    // MARK: - Main Content Area (extracted to help type checker)
+    // MARK: - Toolbar
 
-    private var mainContentArea: some View {
-        ZStack(alignment: .bottom) {
-            HStack(spacing: 0) {
-                // Pipeline panel — fixed width, takes priority over the viewport so
-                // it never gets compressed when the inspector opens.
-                if pipelinePanelOpen {
-                    PipelineContentPanel(
-                        selectedTab: $pipelineTab,
-                        panelOpen: $pipelinePanelOpen
-                    )
-                    .layoutPriority(1)
-                    .zIndex(2)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Toggle(isOn: $showNavigator) {
+                Label("Navigator", systemImage: "sidebar.leading")
+            }
+            .help(showNavigator ? "Hide Navigator ⌃⌘S" : "Show Navigator ⌃⌘S")
+            .accessibilityIdentifier(AccessibilityID.navigatorToggle)
+        }
 
-                    Divider()
-                        .zIndex(2)
-                }
+        ToolbarSpacer(.fixed, placement: .navigation)
 
-                // Metal viewport with overlays — fills the remaining space.
-                ZStack(alignment: .bottom) {
-                    metalViewport
-                        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+        ToolbarItemGroup(placement: .navigation) {
+            Button { viewModel.importFile() } label: {
+                Label("Open File…", systemImage: "doc")
+            }
+            .help("Open a structure or ligand file (⌘O)")
 
-                    if viewModel.molecules.protein == nil && !viewModel.isDemoRunning {
-                        WelcomeScreen(
-                            pipelineTab: $pipelineTab,
-                            pipelinePanelOpen: $pipelinePanelOpen
-                        )
-                        .transition(.opacity)
-                    } else {
-                        viewportTopOverlay
-                    }
+            Button { viewModel.openProject() } label: {
+                Label("Open Project…", systemImage: "folder")
+            }
+            .help("Open a saved Druse project (⇧⌘O)")
+            .accessibilityIdentifier(AccessibilityID.statusOpenProject)
 
-                    // Demo narration overlay (always on top when demo is active)
-                    DemoOverlay()
+            Button { DruseApp.saveProject(viewModel) } label: {
+                Label("Save Project", systemImage: "square.and.arrow.down")
+            }
+            .help("Save the current workspace as a Druse project (⌘S)")
+            .accessibilityIdentifier(AccessibilityID.statusSaveProject)
+        }
 
-                    // Render control shelf scoped to the viewport so it cannot
-                    // intercept clicks on the pipeline or inspector panels.
-                    if viewModel.molecules.protein != nil || viewModel.isDemoRunning {
-                        renderControlShelf
-                            .padding(12)
-                    }
-                }
-                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-                .zIndex(0)
-                .clipped()
-
-                if showInspector {
-                    Divider()
-                    InspectorPanel(showInspector: $showInspector)
-                        .layoutPriority(1)
-                        .zIndex(1)
+        // The one step switcher: centred and always visible, even with the navigator collapsed.
+        // It draws its own capsule so it can pick a density that fits the space it is given.
+        ToolbarItem(placement: .principal) {
+            PipelineStepBar(selection: pipelineTab, availableWidth: toolbarLayout.stepBar, usedWidth: $stepBarWidth) { tab in
+                withAnimation(DS.Motion.respecting(reduceMotion, DS.Motion.snappy)) {
+                    pipelineTab = tab
+                    showNavigator = true
                 }
             }
+        }
+        .sharedBackgroundVisibility(.hidden)
+
+        ToolbarItem(placement: .primaryAction) {
+            ActivityView(width: toolbarLayout.activity)
+        }
+
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+
+        ToolbarItemGroup(placement: .primaryAction) {
+            Toggle(isOn: Binding(
+                get: { showConsole },
+                set: { newValue in withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = newValue } }
+            )) {
+                Label("Console", systemImage: "terminal")
+            }
+            .help(showConsole ? "Hide Console ⇧⌘Y" : "Show Console ⇧⌘Y")
+
+            Toggle(isOn: $showInspector) {
+                Label("Inspector", systemImage: "sidebar.trailing")
+            }
+            .help(showInspector ? "Hide Inspector ⌥⌘0" : "Show Inspector ⌥⌘0")
+            .accessibilityIdentifier(AccessibilityID.inspectorToggle)
         }
     }
 
-    private var viewportTopOverlay: some View {
-        VStack {
-            HStack(alignment: .top) {
-                moleculeBadges
-                Spacer()
-                VStack(alignment: .trailing, spacing: 8) {
-                    if viewModel.workspace.showSurface, let legend = viewModel.workspace.surfaceLegend {
-                        SurfaceLegendView(mode: viewModel.workspace.surfaceColorMode, legend: legend)
-                    }
-                    if !viewModel.docking.currentInteractions.isEmpty {
-                        InteractionLegendView(interactions: viewModel.docking.currentInteractions)
-                    }
-                    if viewModel.docking.isDocking && !viewModel.isDemoRunning {
-                        dockingHUD
-                    }
-                }
-            }
-            .padding(12)
+    // MARK: - Layout
 
-            Spacer()
-        }
+    /// Toolbar budget. The step bar is centred in the window and has priority: it may use what is
+    /// left between the two sides with the activity capsule at its minimum. The capsule then
+    /// takes the trailing space the bar's chosen density leaves free.
+    private var toolbarLayout: (stepBar: CGFloat, activity: CGFloat) {
+        // Traffic lights + navigator toggle + file group; console/inspector pair plus the glass
+        // padding around the capsule; minimum gap NSToolbar keeps between neighbouring items.
+        let leading: CGFloat = 256, trailingChrome: CGFloat = 128, gap: CGFloat = 20
+        let activityRange: ClosedRange<CGFloat> = 132...320
+        let stepBar = max(windowWidth - 2 * (max(leading, trailingChrome + activityRange.lowerBound) + gap), 0)
+        let free = (windowWidth - min(stepBarWidth, stepBar)) / 2 - trailingChrome - gap
+        return (stepBar, min(max(free, activityRange.lowerBound), activityRange.upperBound))
     }
 
-    private var renderControlShelf: some View {
-        CenteredHorizontalScroll {
-            renderControls
+    /// Stored pane widths, clamped to their ranges and shrunk towards their minimums when the
+    /// window is too narrow to keep `canvasMinWidth` for the canvas.
+    private var paneWidths: (navigator: CGFloat, inspector: CGFloat) {
+        var nav = min(max(CGFloat(navigatorWidth), DS.Size.navigatorMin), DS.Size.navigatorMax)
+        var insp = min(max(CGFloat(inspectorWidth), DS.Size.inspectorMin), DS.Size.inspectorMax)
+        let excess = (showNavigator ? nav : 0) + (showInspector ? insp : 0) + Self.canvasMinWidth - windowWidth
+        if excess > 0 {
+            let navSlack = showNavigator ? nav - DS.Size.navigatorMin : 0
+            let inspSlack = showInspector ? insp - DS.Size.inspectorMin : 0
+            let slack = navSlack + inspSlack
+            if slack > 0 {
+                let take = min(excess, slack) / slack
+                nav -= navSlack * take
+                insp -= inspSlack * take
+            }
         }
-        .frame(maxWidth: .infinity)
+        return (nav, insp)
     }
 
-    // MARK: - Metal Viewport
+    // MARK: - Drop target
 
-    @ViewBuilder
-    private var metalViewport: some View {
-        if let renderer = viewModel.renderer {
-            MetalView(
-                renderer: renderer,
-                onAtomSelected: { atomIndex, isOptionClick in
-                    viewModel.selectAtom(atomIndex, toggle: isOptionClick)
-                },
-                onAtomDoubleClicked: { atomIndex in
-                    viewModel.selectChainOfAtom(atomIndex)
-                },
-                onRenderModeChanged: { mode in
-                    viewModel.setRenderMode(mode)
-                },
-                onToggleHydrogens: {
-                    viewModel.toggleHydrogens()
-                },
-                onToggleLighting: {
-                    viewModel.toggleLighting()
-                },
-                onBoxSelection: { atomIndices, addToExisting in
-                    viewModel.handleBoxSelection(atomIndices: atomIndices, addToExisting: addToExisting)
-                },
-                onRibbonResidueSelected: { proteinAtomID, isOptionClick in
-                    viewModel.selectAtom(proteinAtomID, toggle: isOptionClick)
-                },
-                onFitToView: {
-                    viewModel.fitToView()
-                },
-                onContextMenu: { event, view in
-                    viewModel.showContextMenu(event: event, view: view)
-                },
-                onDeselectAll: {
-                    viewModel.deselectAll()
-                }
-            )
-        } else {
-            ZStack {
-                Color(nsColor: .windowBackgroundColor)
-                VStack(spacing: 12) {
-                    Image(systemName: "cube.transparent")
-                        .font(.title)
-                        .foregroundStyle(.tertiary)
-                    Text("Initializing Metal...")
-                        .font(.headline)
-                        .foregroundStyle(.secondary)
-                    Text("Load a protein from the Search tab or drag a PDB file here to begin")
-                        .font(.subheadline)
-                        .foregroundStyle(.tertiary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 260)
-                }
+    private var dropTargetOverlay: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.floating, style: .continuous)
+        return shape
+            .strokeBorder(DS.Color.accent, style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+            .background(shape.fill(DS.Color.accentSoft.opacity(0.5)))
+            .padding(DS.Space.m)
+            .overlay {
+                Label("Drop to import", systemImage: "arrow.down.doc")
+                    .font(DS.Font.sectionTitle)
+                    .padding(.horizontal, DS.Space.xl)
+                    .padding(.vertical, DS.Space.l)
+                    .dsFloating()
             }
-        }
+            .allowsHitTesting(false)
     }
 
-    // MARK: - Molecule Badges (top overlay)
+    // MARK: - Renderer theme
 
-    @ViewBuilder
-    private var moleculeBadges: some View {
-        HStack(spacing: 8) {
-            if let prot = viewModel.molecules.protein {
-                badge(prot.name, icon: "cube", color: .cyan, count: prot.atomCount)
-            }
-            if let lig = viewModel.molecules.ligand {
-                badge(lig.name, icon: "hexagon", color: .green, count: lig.atomCount)
-            }
-            Spacer()
-        }
-    }
-
-    // MARK: - Render Controls (bottom overlay)
-
-    // MARK: - Docking HUD (live progress overlay on Metal viewport)
-
-    @ViewBuilder
-    private var dockingHUD: some View {
-        let gen = viewModel.docking.dockingGeneration
-        let totalGen = viewModel.docking.dockingTotalGenerations
-        let bestE = viewModel.docking.dockingBestEnergy
-        let bestPKi = viewModel.docking.dockingBestPKi
-        let isBatch = viewModel.docking.isBatchDocking
-        let bp = viewModel.docking.batchProgress
-
-        VStack(alignment: .trailing, spacing: 4) {
-            // Batch progress (if applicable)
-            if isBatch && bp.total > 1 {
-                Text("Ligand \(bp.current + 1)/\(bp.total)")
-                    .font(.footnote.weight(.semibold).monospaced())
-                    .foregroundStyle(.cyan)
-            }
-
-            // Generation progress bar
-            HStack(spacing: 8) {
-                Text("Gen \(gen + 1)/\(totalGen)")
-                    .font(.footnote.weight(.medium).monospaced())
-                    .foregroundStyle(.primary.opacity(0.9))
-
-                ProgressView(value: Double(gen + 1), total: Double(max(totalGen, 1)))
-                    .progressViewStyle(.linear)
-                    .frame(width: 80)
-                    .tint(.cyan)
-            }
-
-            // Best score (kcal/mol or pKi)
-            HStack(spacing: 4) {
-                let method = viewModel.docking.scoringMethod
-                if method.isAffinityScore, let pKi = bestPKi {
-                    Text("pKi")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Text(String(format: "%.1f", pKi))
-                        .font(.body.weight(.bold).monospaced())
-                        .foregroundStyle(pKi > 6 ? .green : pKi > 4 ? .yellow : .orange)
-                } else if bestE < .infinity {
-                    Text(String(format: "%.1f", bestE))
-                        .font(.body.weight(.bold).monospaced())
-                        .foregroundStyle(bestE < -6 ? .green : bestE < -3 ? .yellow : .orange)
-                    Text(method.unitLabel)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            // Poses tested count
-            let posesPerGen = viewModel.docking.dockingConfig.populationSize
-            let totalPoses = (gen + 1) * posesPerGen
-            Text("\(totalPoses) poses")
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(.ultraThinMaterial)
-                .shadow(color: Color(nsColor: .shadowColor).opacity(0.3), radius: 4, y: 2)
-        )
-    }
-
-    private var renderControls: some View {
-        HStack(spacing: 4) {
-            // Render mode buttons
-            ForEach(RenderMode.allCases, id: \.self) { mode in
-                let isActive = viewModel.workspace.renderMode == mode
-                Button(action: { viewModel.setRenderMode(mode) }) {
-                    Image(systemName: mode.icon)
-                        .font(.callout)
-                        .frame(width: 28, height: 28)
-                        .background(isActive ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(isActive ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: isActive ? 1 : 0.5)
-                        )
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(isActive ? .primary : .secondary)
-                .nativeTooltip(mode.rawValue)
-                .plainButtonAccessibility(AccessibilityID.renderMode(mode.rawValue))
-            }
-
-            // Side chain display in ribbon mode
-            if viewModel.workspace.renderMode == .ribbon {
-                let scActive = viewModel.workspace.sideChainDisplay != .none
-                Menu {
-                    ForEach(SideChainDisplay.allCases, id: \.self) { mode in
-                        Button(action: {
-                            viewModel.workspace.sideChainDisplay = mode
-                            viewModel.pushToRenderer()
-                        }) {
-                            HStack {
-                                Text(mode.rawValue)
-                                if viewModel.workspace.sideChainDisplay == mode {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: viewModel.workspace.sideChainDisplay.icon)
-                        .font(.callout)
-                        .frame(width: 28, height: 28)
-                        .background(scActive ? Color.purple.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(scActive ? Color.purple.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: scActive ? 1 : 0.5)
-                        )
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 34)
-                .foregroundStyle(scActive ? .purple : .secondary)
-                .nativeTooltip("Side chains: \(viewModel.workspace.sideChainDisplay.rawValue)")
-            }
-
-            Divider()
-                .frame(height: 24)
-                .padding(.horizontal, 2)
-
-            // Hydrogen toggle
-            let hActive = viewModel.workspace.showHydrogens
-            let hAvailable = viewModel.proteinHasHydrogens
-            Button(action: { viewModel.toggleHydrogens() }) {
-                Text("H")
-                    .font(.callout.weight(.bold).monospaced())
-                    .frame(width: 28, height: 28)
-                    .background(hActive && hAvailable ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(hActive && hAvailable ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: hActive && hAvailable ? 1 : 0.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(hAvailable ? (hActive ? .primary : .secondary) : .tertiary)
-            .disabled(!hAvailable)
-            .nativeTooltip(hAvailable ? (hActive ? "Hide hydrogens" : "Show hydrogens") : "No hydrogens — add them in Preparation")
-            .plainButtonAccessibility(AccessibilityID.renderHydrogens)
-
-            // Color scheme picker (ligand focus coloring)
-            let isLigandFocus = viewModel.workspace.colorScheme == .ligandFocus
-            Menu {
-                ForEach(WorkspaceState.MoleculeColorScheme.allCases, id: \.self) { scheme in
-                    Button(action: {
-                        viewModel.workspace.colorScheme = scheme
-                        viewModel.pushToRenderer()
-                    }) {
-                        HStack {
-                            Text(scheme.rawValue)
-                            if viewModel.workspace.colorScheme == scheme {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Image(systemName: "paintpalette")
-                    .font(.body)
-                    .frame(width: 28, height: 28)
-                    .background(isLigandFocus ? Color.yellow.opacity(0.3) : Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(isLigandFocus ? Color.yellow.opacity(0.5) : Color(nsColor: .separatorColor), lineWidth: isLigandFocus ? 1 : 0.5)
-                    )
-            }
-            .menuStyle(.borderlessButton)
-            .frame(width: 34)
-            .foregroundStyle(isLigandFocus ? .yellow : .secondary)
-            .nativeTooltip("Color scheme: \(viewModel.workspace.colorScheme.rawValue)")
-
-            // Molecular surface toggle
-            let surfActive = viewModel.workspace.showSurface
-            Button(action: { viewModel.toggleSurface() }) {
-                Image(systemName: "drop.halffull")
-                    .font(.body)
-                    .frame(width: 28, height: 28)
-                    .background(surfActive ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(surfActive ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: surfActive ? 1 : 0.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(surfActive ? .primary : .secondary)
-            .disabled(viewModel.molecules.protein == nil || viewModel.workspace.isGeneratingSurface)
-            .nativeTooltip(surfActive ? "Hide molecular surface" : "Show molecular surface")
-            .plainButtonAccessibility(AccessibilityID.renderSurface)
-
-            // Surface color mode picker and opacity (only when surface is visible)
-            if viewModel.workspace.showSurface {
-                let scmActive = viewModel.workspace.surfaceColorMode != .uniform
-                Menu {
-                    ForEach(SurfaceColorMode.allCases, id: \.self) { mode in
-                        Button(action: { viewModel.setSurfaceColorMode(mode) }) {
-                            HStack {
-                                Text(mode.rawValue)
-                                if viewModel.workspace.surfaceColorMode == mode {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: surfaceColorIcon)
-                        .font(.callout)
-                        .frame(width: 28, height: 28)
-                        .background(scmActive ? Color.yellow.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(scmActive ? Color.yellow.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: scmActive ? 1 : 0.5)
-                        )
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 34)
-                .foregroundStyle(scmActive ? .yellow : .secondary)
-                .nativeTooltip("Surface coloring: \(viewModel.workspace.surfaceColorMode.rawValue)")
-
-                // Surface opacity slider
-                Slider(value: Binding(
-                    get: { viewModel.workspace.surfaceOpacity },
-                    set: { viewModel.workspace.surfaceOpacity = $0; viewModel.renderer?.surfaceOpacity = $0 }
-                ), in: 0.1...1.0)
-                .frame(width: 60)
-                .controlSize(.small)
-                .nativeTooltip("Surface opacity: \(Int(viewModel.workspace.surfaceOpacity * 100))%")
-
-                // Probe radius control (affects channel/pocket size visibility)
-                Menu {
-                    Button("Water (1.4 Å)") { viewModel.workspace.surfaceProbeRadius = 1.4; viewModel.regenerateSurface() }
-                    Button("Small molecule (1.8 Å)") { viewModel.workspace.surfaceProbeRadius = 1.8; viewModel.regenerateSurface() }
-                    Button("Ligand access (2.2 Å)") { viewModel.workspace.surfaceProbeRadius = 2.2; viewModel.regenerateSurface() }
-                    Button("Large pocket (3.0 Å)") { viewModel.workspace.surfaceProbeRadius = 3.0; viewModel.regenerateSurface() }
-                    Divider()
-                    Button("Fine grid (0.3 Å)") { viewModel.workspace.surfaceGridSpacing = 0.3; viewModel.regenerateSurface() }
-                    Button("Normal grid (0.5 Å)") { viewModel.workspace.surfaceGridSpacing = 0.5; viewModel.regenerateSurface() }
-                    Button("Coarse grid (0.7 Å)") { viewModel.workspace.surfaceGridSpacing = 0.7; viewModel.regenerateSurface() }
-                } label: {
-                    Image(systemName: "scope")
-                        .font(.subheadline)
-                        .foregroundStyle(viewModel.workspace.surfaceProbeRadius != 1.4 ? .cyan : .secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 22)
-                .nativeTooltip("Probe: \(String(format: "%.1f", viewModel.workspace.surfaceProbeRadius)) Å, Grid: \(String(format: "%.1f", viewModel.workspace.surfaceGridSpacing)) Å")
-            }
-
-            // Lighting toggle
-            let lightActive = viewModel.workspace.useDirectionalLighting
-            Button(action: { viewModel.toggleLighting() }) {
-                Image(systemName: lightActive ? "sun.max.fill" : "sun.min")
-                    .font(.body)
-                    .frame(width: 28, height: 28)
-                    .background(lightActive ? Color.accentColor.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(lightActive ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: lightActive ? 1 : 0.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(lightActive ? .primary : .secondary)
-            .nativeTooltip(lightActive ? "Uniform lighting" : "Directional lighting")
-            .plainButtonAccessibility(AccessibilityID.renderLighting)
-
-            Divider()
-                .frame(height: 24)
-                .padding(.horizontal, 2)
-
-            // Z-slab clipping toggle
-            let clipActive = viewModel.workspace.enableClipping
-            Button(action: {
-                viewModel.workspace.enableClipping.toggle()
-                syncClipping()
-            }) {
-                Image(systemName: "scissors")
-                    .font(.body)
-                    .frame(width: 28, height: 28)
-                    .background(clipActive ? Color.orange.opacity(0.5) : Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(clipActive ? Color.orange.opacity(0.6) : Color(nsColor: .separatorColor), lineWidth: clipActive ? 1 : 0.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(clipActive ? .orange : .secondary)
-            .nativeTooltip("Z-slab clipping")
-            .plainButtonAccessibility(AccessibilityID.renderClipping)
-
-            if viewModel.workspace.enableClipping {
-                // Thickness / Offset sliders (object-space slab)
-                VStack(spacing: 2) {
-                    Slider(value: Binding(
-                        get: { viewModel.workspace.slabThickness },
-                        set: { viewModel.workspace.slabThickness = $0; syncClipping() }
-                    ), in: 2...40)
-                    .frame(width: 90)
-                    .controlSize(.small)
-
-                    Slider(value: Binding(
-                        get: { viewModel.workspace.slabOffset },
-                        set: { viewModel.workspace.slabOffset = $0; syncClipping() }
-                    ), in: -20...20)
-                    .frame(width: 90)
-                    .controlSize(.small)
-                }
-
-                Text(String(format: "%.0f \u{00C5}", viewModel.workspace.slabThickness))
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-
-            // Camera controls (moved from toolbar)
-            Divider()
-                .frame(height: 24)
-                .padding(.horizontal, 2)
-
-            cameraButtons
-
-            Divider()
-                .frame(height: 24)
-                .padding(.horizontal, 2)
-
-            // Current mode label
-            Text(viewModel.workspace.renderMode.rawValue)
-                .font(.subheadline.weight(.medium).monospaced())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color(nsColor: .separatorColor).opacity(0.3))
-                .clipShape(Capsule())
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
-    }
-
-    private var cameraButtons: some View {
-        HStack(spacing: 4) {
-            Button(action: { viewModel.fitToView() }) {
-                Image(systemName: "viewfinder")
-                    .font(.callout)
-                    .frame(width: 28, height: 28)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .nativeTooltip("Fit to view (Space)")
-            .plainButtonAccessibility(AccessibilityID.renderFitToView)
-
-            Button(action: { viewModel.fitToLigand() }) {
-                Image(systemName: "scope")
-                    .font(.callout)
-                    .frame(width: 28, height: 28)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .disabled(viewModel.molecules.ligand == nil)
-            .nativeTooltip("Center on ligand")
-            .plainButtonAccessibility(AccessibilityID.renderFitToLigand)
-
-            Button(action: { viewModel.fitToProtein() }) {
-                Image(systemName: "atom")
-                    .font(.callout)
-                    .frame(width: 28, height: 28)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .disabled(viewModel.molecules.protein == nil)
-            .nativeTooltip("Center on protein")
-            .plainButtonAccessibility(AccessibilityID.renderFitToProtein)
-
-            Button(action: { viewModel.renderer?.camera.reset(); viewModel.pushToRenderer() }) {
-                Image(systemName: "arrow.counterclockwise")
-                    .font(.callout)
-                    .frame(width: 28, height: 28)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .nativeTooltip("Reset camera")
-            .plainButtonAccessibility(AccessibilityID.renderResetCamera)
-        }
-    }
-
-    private func syncClipping() {
-        viewModel.renderer?.enableClipping = viewModel.workspace.enableClipping
-        viewModel.renderer?.clipNearZ = viewModel.workspace.clipNearZ
-        viewModel.renderer?.clipFarZ = viewModel.workspace.clipFarZ
-        viewModel.renderer?.slabHalfThickness = viewModel.workspace.slabThickness / 2.0
-        viewModel.renderer?.slabOffset = viewModel.workspace.slabOffset
-        // When the user toggles clipping from the central banner without a
-        // pocket focused, release any stale slab anchor so the slab follows
-        // the camera's look-at point (Renderer falls back to camera.target).
-        if !viewModel.workspace.enableClipping {
-            viewModel.renderer?.slabCenter = nil
-        }
-        viewModel.renderer?.setNeedsRedraw()
-    }
-
-    private func badge(_ name: String, icon: String, color: Color, count: Int) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.subheadline)
-            Text(name)
-                .font(.callout.weight(.medium))
-            Text("\(count) atoms")
-                .font(.footnote.monospaced())
-                .foregroundStyle(color.opacity(0.7))
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(color.opacity(0.15))
-        .foregroundStyle(color)
-        .clipShape(Capsule())
-    }
-
-    private var surfaceColorIcon: String {
-        switch viewModel.workspace.surfaceColorMode {
-        case .uniform: "paintpalette"
-        case .esp: "bolt.fill"
-        case .hydrophobicity: "drop.fill"
-        case .pharmacophore: "circle.hexagongrid"
-        }
+    private func syncRendererTheme() {
+        viewModel.renderer?.themeMode = colorScheme == .light ? 1 : 0
     }
 }
 
-private struct CenteredHorizontalScroll<Content: View>: View {
-    let content: Content
+// MARK: - Pane resize handle
 
-    init(@ViewBuilder content: () -> Content) {
-        self.content = content()
-    }
+/// Invisible drag strip on a side pane's inner edge that resizes the pane within `range` and
+/// persists the width. It straddles the hairline divider but stays mostly inside the pane: the
+/// canvas's Metal view would swallow the events on the other side. Also used by the
+/// Results Database window.
+struct PaneResizeHandle: View {
+    @Binding var width: Double
+    let range: ClosedRange<CGFloat>
+    /// The pane edge the handle sits on: `.trailing` for the navigator, `.leading` for the inspector.
+    let edge: HorizontalEdge
+    @State private var dragStartWidth: Double?
 
     var body: some View {
-        GeometryReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                content
-                    .frame(minWidth: proxy.size.width, alignment: .center)
-            }
-        }
-        .frame(height: 56)
+        Color.clear
+            .frame(width: 6)
+            .contentShape(Rectangle())
+            .offset(x: edge == .trailing ? 2 : -2)
+            .pointerStyle(.frameResize(position: edge == .trailing ? .trailing : .leading))
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { value in
+                        let start = dragStartWidth ?? width
+                        dragStartWidth = start
+                        let delta = edge == .trailing ? value.translation.width : -value.translation.width
+                        width = Double(min(max(CGFloat(start) + delta, range.lowerBound), range.upperBound))
+                    }
+                    .onEnded { _ in dragStartWidth = nil }
+            )
+            .accessibilityHidden(true)
     }
 }

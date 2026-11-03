@@ -37,7 +37,9 @@ struct FlexibleResidueConfig: Sendable {
         // Group protein atoms by residue sequence number
         var residueNames: [Int: String] = [:]
         var residueCBPositions: [Int: SIMD3<Float>] = [:]
-        for atom in protein {
+        // HETATM groups (waters, ligands, ions) can share a residue number with a polymer
+        // residue; they must not decide the residue name or reference position.
+        for atom in protein where !atom.isHetAtom {
             let seq = atom.residueSeq
             if residueNames[seq] == nil {
                 residueNames[seq] = atom.residueName

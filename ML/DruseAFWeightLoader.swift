@@ -26,12 +26,79 @@ struct DruseAFWeightLoader {
     static func loadFromBundle(device: MTLDevice) -> LoadedWeights? {
         // Prefer v4 weights, fall back to v3
         for filename in ["DruseAFv4", "DruseAF"] {
-            if let url = Bundle.main.url(forResource: filename, withExtension: "weights") {
-                return load(from: url, device: device)
+            if let url = Bundle.main.url(forResource: filename, withExtension: "weights"),
+               let weights = load(from: url, device: device) {
+                return weights
             }
         }
-        print("[DruseAF] No weight file found in bundle (tried DruseAFv4.weights, DruseAF.weights)")
+        print("[DruseAF] No usable weight file found in bundle (tried DruseAFv4.weights, DruseAF.weights)")
         return nil
+    }
+
+    /// Per-tensor float counts read by DruseAFCompute.metal (DRAF v1, 56 tensors).
+    static let v3ExpectedCounts: [Int] = {
+        let encoder: [Int] = [256 * 20, 256, 256 * 256, 256]
+        let crossAttnLayer: [Int] = [256 * 256, 256, 256 * 256, 256, 256 * 256, 256,  // Q, K, V
+                                     4 * 50, 4,                                        // RBF bias
+                                     256 * 256, 256, 256, 256]                         // out proj, norm
+        var counts: [Int] = []
+        counts += encoder                                // protein encoder
+        counts += encoder                                // ligand encoder
+        for _ in 0..<3 { counts += crossAttnLayer }
+        counts += [128 * 256, 128, 128, 1]               // gate
+        counts += [256 * 256, 256, 256, 1]               // affinity head
+        counts += [128 * 256, 128, 128, 1]               // confidence head
+        return counts
+    }()
+
+    /// Per-tensor float counts read by DruseAFv4Compute.metal (DRAF v2, 56 tensors;
+    /// order = EXPORT_WEIGHT_ORDER in trainDruseAFv4.py).
+    static let v4ExpectedCounts: [Int] = {
+        let encoder: [Int] = [128 * 20, 128, 128 * 128, 128]
+        let msgLayer: [Int] = [128 * 128, 128, 32 * 16, 32, 32, 1, 128, 128]
+        let head: [Int] = [64 * 128, 64, 64, 1]
+        var counts: [Int] = []
+        counts += encoder                                // protein encoder
+        for _ in 0..<3 { counts += msgLayer }
+        counts += encoder                                // ligand encoder
+        counts += [64 * 128, 64, 64 * 128, 64]           // pair projections
+        counts += [64 * 24, 64]                          // RBF projection
+        counts += [64, 1]                                // pair energy
+        counts += [64, 1]                                // context gate
+        counts += [128 * 64, 128]                        // context projection
+        counts += [128, 128]                             // context LayerNorm
+        counts += head                                   // affinity head
+        counts += head                                   // confidence head
+        counts += [1, 1]                                 // pair_scale, pair_bias
+        return counts
+    }()
+
+    /// Validate an offset table against the data section and the tensor sizes a
+    /// Metal kernel reads. Kernels index tensors by fixed position with no bounds
+    /// checks, so a short table, a tensor overrunning the data, or an
+    /// architecture mismatch must be rejected here rather than read out of
+    /// bounds (or silently mis-scored) on the GPU.
+    static func validateEntries(
+        _ entries: [DruseAFWeightEntry],
+        totalFloats: Int,
+        expectedCounts: [Int],
+        tag: String
+    ) -> Bool {
+        guard entries.count >= expectedCounts.count else {
+            print("[\(tag)] Weight file has \(entries.count) tensors, expected at least \(expectedCounts.count)")
+            return false
+        }
+        for (i, entry) in entries.enumerated() {
+            if Int(entry.offset) + Int(entry.count) > totalFloats {
+                print("[\(tag)] Tensor \(i) (offset \(entry.offset), count \(entry.count)) overruns \(totalFloats) floats")
+                return false
+            }
+            if i < expectedCounts.count && Int(entry.count) != expectedCounts[i] {
+                print("[\(tag)] Tensor \(i) has \(entry.count) floats, expected \(expectedCounts[i]) — architecture mismatch")
+                return false
+            }
+        }
+        return true
     }
 
     /// Load DruseAF weights from a file URL.
@@ -82,6 +149,12 @@ struct DruseAFWeightLoader {
             let count = data.withUnsafeBytes { $0.load(fromByteOffset: entryOffset + 4, as: UInt32.self) }
             entries.append(DruseAFWeightEntry(offset: offset, count: count))
         }
+
+        guard validateEntries(
+            entries, totalFloats: totalFloats,
+            expectedCounts: isV4 ? v4ExpectedCounts : v3ExpectedCounts,
+            tag: "DruseAF"
+        ) else { return nil }
 
         // Create Metal buffers
         let weightBytes = totalFloats * MemoryLayout<Float>.stride

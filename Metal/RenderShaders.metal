@@ -378,6 +378,11 @@ fragment BondFragmentOut bondFragment(
 
     float radius = max(in.radiusA, in.radiusB);
 
+    // Degenerate bond (coincident endpoints): no axis to intersect against.
+    if (baba < 1e-8) {
+        discard_fragment();
+    }
+
     float bard = dot(ba, rd);
     float baoc = dot(ba, oc);
 
@@ -386,15 +391,18 @@ fragment BondFragmentOut bondFragment(
     float k0 = baba * dot(oc, oc) - baoc * baoc - radius * radius * baba;
 
     float disc = k1 * k1 - k2 * k0;
-    if (disc < 0.0) {
+    // Axis parallel to the view ray: k2 -> 0 makes t = x/0 (NaN/Inf under fast
+    // math, so the range test below is unreliable). Only the caps are visible.
+    bool axisAlongRay = k2 <= 1e-6 * baba;
+    if (!axisAlongRay && disc < 0.0) {
         discard_fragment();
     }
 
-    float t = (-k1 - sqrt(disc)) / k2;
+    float t = axisAlongRay ? 0.0 : (-k1 - sqrt(disc)) / k2;
     float y = baoc + t * bard;
 
     // Check if hit is within cylinder length
-    if (y < 0.0 || y > baba) {
+    if (axisAlongRay || y < 0.0 || y > baba) {
         // Try hemisphere caps
         // Cap at A
         float3 capNorm = normalize(-ba);
@@ -543,8 +551,10 @@ fragment float4 ribbonFragment(
         float backNdotV = max(dot(-normal, viewDir), 0.0) * 0.4;
         color = in.color.rgb * (0.55 + 0.45 * (NdotV + backNdotV));
     } else {
-        // Directional Blinn-Phong with two-sided lighting
-        float3 lightDir = normalize(uniforms.lightDirection);
+        // Directional Blinn-Phong with two-sided lighting. Normals are in view
+        // space (normalMatrix), so bring the world-space light into view space
+        // exactly as the atom/bond impostors do.
+        float3 lightDir = normalize((uniforms.viewMatrix * float4(uniforms.lightDirection, 0.0)).xyz);
         float3 halfVec = normalize(lightDir + viewDir);
 
         float ambient = uniforms.ambientIntensity;
@@ -746,8 +756,10 @@ fragment float4 surfaceFragment(
         float backNdotV = max(dot(-normal, viewDir), 0.0) * 0.3;
         color = in.color.rgb * (0.50 + 0.50 * (NdotV + backNdotV));
     } else {
-        // Directional Blinn-Phong with two-sided lighting
-        float3 lightDir = normalize(uniforms.lightDirection);
+        // Directional Blinn-Phong with two-sided lighting. Normals are in view
+        // space (normalMatrix), so bring the world-space light into view space
+        // exactly as the atom/bond impostors do.
+        float3 lightDir = normalize((uniforms.viewMatrix * float4(uniforms.lightDirection, 0.0)).xyz);
         float3 halfVec = normalize(lightDir + viewDir);
 
         float ambient = uniforms.ambientIntensity;

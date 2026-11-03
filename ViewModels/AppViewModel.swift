@@ -25,6 +25,9 @@ final class AppViewModel {
     /// Tracks which LigandEntry is currently active in the 3D view / docking.
     var activeLigandEntryID: UUID?
 
+    /// In-flight RCSB text search (cancelled when a new search starts).
+    @ObservationIgnored var pdbSearchTask: Task<Void, Never>?
+
     /// Activity log
     let log = ActivityLog.shared
 
@@ -101,6 +104,7 @@ final class AppViewModel {
         activeLigandEntryID = entryID
         docking.originalDockingLigand = nil
         docking.dockingResults = []
+        docking.dockingPosesEvaluated = 0
         docking.currentInteractions = []
         renderer?.updateInteractionLines([])
         pushToRenderer()
@@ -309,6 +313,7 @@ final class AppViewModel {
         activeLigandEntryID = nil
         docking.originalDockingLigand = nil
         docking.dockingResults = []
+        docking.dockingPosesEvaluated = 0
         docking.currentInteractions = []
         docking.selectedPoseIndices = []
         renderer?.updateInteractionLines([])
@@ -446,12 +451,17 @@ final class AppViewModel {
             )
             renderer.updateRibbonMesh(vertices: ribbonVerts, indices: ribbonIdxs)
 
+            // Same Cα selection as RibbonMeshGenerator: element C (excludes calcium ions
+            // named "CA") and only the first alternate location per residue.
             var caControlPoints: [(position: SIMD3<Float>, atomID: Int)] = []
+            var seenCAResidues = Set<String>()
             for atom in prot.atoms {
                 if workspace.hiddenChainIDs.contains(atom.chainID) { continue }
-                if atom.name.trimmingCharacters(in: .whitespaces) == "CA" {
-                    caControlPoints.append((position: atom.position, atomID: atom.id))
-                }
+                guard atom.element == .C,
+                      atom.name.trimmingCharacters(in: .whitespaces) == "CA",
+                      seenCAResidues.insert("\(atom.chainID)|\(atom.residueSeq)|\(atom.insertionCode)").inserted
+                else { continue }
+                caControlPoints.append((position: atom.position, atomID: atom.id))
             }
             renderer.updateRibbonCAControlPoints(caControlPoints)
 

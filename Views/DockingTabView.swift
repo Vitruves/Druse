@@ -3,11 +3,20 @@
 
 import SwiftUI
 
+// MARK: - Docking step (step 5)
+
+/// Inputs → Search → Constraints → Flexibility → Refinement, with the run summary,
+/// Run / Stop controls pinned in the step footer. Live progress lives in the
+/// toolbar activity view and the canvas HUD; results live in the Results step.
 struct DockingTabView: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.openWindow) private var openWindow
 
+    @AppStorage("ui.confirmBeforeDocking") private var confirmBeforeDocking = true
+    @AppStorage("ui.docking.advancedExpanded") private var advancedExpanded = false
     @State private var showPreDockSheet = false
+
+    private var site: DockingSite { DockingSite(viewModel: viewModel) }
 
     /// Available scoring methods: Vina, Drusina, DruseAF (Metal), and PIGNet2 if weights present.
     private var scoringMethodsAvailable: [ScoringMethod] {
@@ -18,457 +27,247 @@ struct DockingTabView: View {
         return methods
     }
 
+    private var isRunning: Bool { viewModel.docking.isDocking || viewModel.docking.isBatchDocking }
+    private var isBatchQueued: Bool { viewModel.docking.batchQueue.count > 1 }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
-            ligandCard
-            pocketCard
-            gridBoxCard
-            searchCard
-            constraintsCard
-            if viewModel.docking.selectedPocket != nil {
-                flexibilityCard
+        @Bindable var vm = viewModel
+        DSStepScaffold {
+            if viewModel.molecules.protein == nil {
+                DSEmptyState(
+                    "No Protein Loaded",
+                    systemImage: SidebarTab.dock.icon,
+                    description: "Load and prepare a protein, then choose ligands and a binding site to configure a docking run."
+                ) {
+                    Button {
+                        site.goTo(.search)
+                    } label: {
+                        Label("Go to Search", systemImage: SidebarTab.search.icon)
+                    }
+                    .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
+                }
+                .padding(.top, DS.Space.xxl)
+            } else {
+                if !isRunning && !viewModel.docking.dockingResults.isEmpty {
+                    completionBanner
+                }
+                inputsCard
+                searchCard
+                constraintsCard
+                if viewModel.docking.selectedPocket != nil {
+                    flexibilityCard
+                }
+                refinementCard
             }
-            refinementCard
-            runCard
-            if viewModel.docking.isDocking {
-                progressCard
+        } footer: {
+            if isRunning {
+                runningFooter
+            } else {
+                runFooter
             }
-            if !viewModel.docking.dockingResults.isEmpty && !viewModel.docking.isDocking {
-                resultsCard
-            }
-            Spacer(minLength: 0)
         }
-        .padding(12)
         .sheet(isPresented: $showPreDockSheet) {
             PreDockSheet().environment(viewModel)
         }
-        .onChange(of: viewModel.docking.selectedPocket?.id) { _, newID in
-            if let newID, let pocket = viewModel.docking.detectedPockets.first(where: { $0.id == newID }) {
-                syncGridFromPocket(pocket)
-                viewModel.showGridBoxForPocket(pocket)
-            } else if newID == nil {
-                viewModel.renderer?.clearGridBox()
-            }
+        .sheet(isPresented: $vm.docking.showPharmacophoreEditor) {
+            PharmacophoreEditorView().environment(viewModel)
         }
-        .onAppear {
-            if !viewModel.docking.gridInitialized, let prot = viewModel.molecules.protein {
-                initializeGridAtProteinCenter(prot)
-            }
-        }
-        .onChange(of: viewModel.molecules.protein?.name) { _, _ in
-            if let prot = viewModel.molecules.protein,
-               viewModel.docking.selectedPocket == nil,
-               viewModel.docking.dockingResults.isEmpty {
-                initializeGridAtProteinCenter(prot)
-            }
-        }
+        .dockingSiteSync()
     }
 
-    // MARK: - Ligand card
+    // MARK: - Completion banner
 
-    private var ligandCard: some View {
-        let isBatch = viewModel.docking.batchQueue.count > 1
-        return PanelCard(
-            isBatch ? "Ligands" : "Ligand",
-            icon: isBatch ? "tray.full" : "hexagon",
-            accessory: {
-                Button(action: { openWindow(id: "ligand-database") }) {
-                    Image(systemName: "tablecells")
-                        .font(.system(size: 11, weight: .medium))
-                        .frame(width: 22, height: 22)
-                        .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(Color.accentColor.opacity(0.14))
-                        )
-                        .foregroundStyle(Color.accentColor)
+    @ViewBuilder
+    private var completionBanner: some View {
+        let results = viewModel.docking.dockingResults
+        let method = viewModel.docking.scoringMethod
+        let clusters = Set(results.map(\.clusterID)).count
+        PanelHighlightRow(color: DS.Color.success) {
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                HStack(spacing: DS.Space.s) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(DS.Color.success)
+                    Text("Done — \(results.count) poses")
+                        .font(DS.Font.label.weight(.medium))
+                        .monospacedDigit()
+                    Spacer(minLength: DS.Space.xs)
+                    if let best = results.first {
+                        DSScoreBadge(best.displayScore(method: method), method: method)
+                    }
                 }
-                .buttonStyle(.plain)
-                .help("Open Ligand Database (Cmd+L)")
-                .plainButtonAccessibility(AccessibilityID.dockOpenLigandDB)
-            }
-        ) {
-            ligandCardContent
-        }
-    }
-
-    @ViewBuilder
-    private var ligandCardContent: some View {
-        if viewModel.docking.batchQueue.count > 1 {
-            batchLigandSummary
-        } else if let lig = viewModel.molecules.ligand {
-            singleLigandSummary(lig)
-        } else {
-            PanelSecondaryButton(title: "Open Database to select ligand",
-                                 icon: "plus.circle") {
-                openWindow(id: "ligand-database")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var batchLigandSummary: some View {
-        PanelHighlightRow(color: .cyan) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Image(systemName: "tray.full.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.cyan)
-                    Text("\(viewModel.docking.batchQueue.count) ligands queued")
-                        .font(PanelStyle.bodyFont.weight(.medium))
+                FlowLayout(spacing: DS.Space.xs) {
+                    DSTag("\(clusters) clusters", monospaced: true)
+                    if viewModel.docking.dockingDuration > 0 {
+                        DSTag(formatDuration(viewModel.docking.dockingDuration), systemImage: "clock", monospaced: true)
+                    }
+                    poseBustersTag(results)
+                }
+                HStack {
                     Spacer()
-                    Button(action: {
-                        viewModel.docking.batchQueue = []
-                        viewModel.clearLigand()
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear batch queue")
-                    .plainButtonAccessibility(AccessibilityID.dockClearBatch)
+                    DSNextStepButton(.results)
                 }
-                let mws = viewModel.docking.batchQueue.compactMap { $0.descriptors?.molecularWeight }
-                if let minMW = mws.min(), let maxMW = mws.max() {
-                    Text(String(format: "MW range: %.0f – %.0f Da", minMW, maxMW))
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
-                }
-                let prepCount = viewModel.docking.batchQueue.filter(\.isPrepared).count
-                Text("\(prepCount)/\(viewModel.docking.batchQueue.count) prepared")
-                    .font(PanelStyle.monoSmall)
-                    .foregroundStyle(prepCount == viewModel.docking.batchQueue.count ? .green : .orange)
             }
         }
     }
 
     @ViewBuilder
-    private func singleLigandSummary(_ lig: Molecule) -> some View {
-        PanelHighlightRow(color: .green) {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.green)
-                Text(lig.name)
-                    .font(PanelStyle.bodyFont.weight(.medium))
-                    .lineLimit(1)
-                Spacer()
-                Text("\(lig.atomCount) atoms")
-                    .font(PanelStyle.monoSmall)
-                    .foregroundStyle(.secondary)
-                Button(action: { viewModel.removeLigandFromView() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Remove active ligand")
-                .plainButtonAccessibility(AccessibilityID.dockRemoveLigand)
+    private func poseBustersTag(_ results: [DockingResult]) -> some View {
+        if results.contains(where: { $0.validity != nil }) {
+            let validCount = results.filter { $0.validity?.passed == true }.count
+            let allPassed = validCount == results.count
+            let failures = results.first(where: { $0.validity?.passed == false })?.validity?.failures ?? []
+            DSTag("PoseBusters \(validCount)/\(results.count)",
+                  tone: allPassed ? .success : .warning,
+                  systemImage: allPassed ? "checkmark.shield" : "exclamationmark.shield",
+                  monospaced: true)
+                .help(failures.isEmpty ? "All poses pass PoseBusters-style validity checks"
+                                       : "First failure: " + failures.prefix(2).joined(separator: ", "))
+        }
+    }
+
+    // MARK: - Inputs card
+
+    private var inputsCard: some View {
+        PanelCard("Inputs", icon: "tray.2") {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                proteinInputRow
+                Divider()
+                ligandInputRow
+                Divider()
+                siteInputRow
             }
         }
     }
 
-    // MARK: - Pocket card (detection + selected pocket + pocket view)
-
-    private var pocketCard: some View {
-        PanelCard("Binding Site", icon: "scope") {
-            VStack(alignment: .leading, spacing: 10) {
-                pocketDetectionContent
-                if !viewModel.docking.detectedPockets.isEmpty {
-                    Divider().opacity(0.4)
-                    VStack(spacing: 4) {
-                        ForEach(viewModel.docking.detectedPockets) { pocket in
-                            pocketRow(pocket)
-                        }
-                    }
-                }
-                if let pocket = viewModel.docking.selectedPocket {
-                    Divider().opacity(0.4)
-                    selectedPocketStats(pocket)
-                }
-                Divider().opacity(0.4)
-                pocketViewControls
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var pocketDetectionContent: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSubheader(title: "Detect")
-            PanelChoiceGrid(columns: 2) {
-                PanelChoiceButton(
-                    title: "Auto", icon: "sparkles", isSelected: false,
-                    isDisabled: viewModel.molecules.protein == nil,
-                    help: "Hybrid pocket detection: ML candidates plus geometric fallback"
-                ) { detectPocketsAuto() }
-                .accessibilityIdentifier(AccessibilityID.dockDetectAuto)
-
-                PanelChoiceButton(
-                    title: "ML", icon: "brain", isSelected: false,
-                    isDisabled: viewModel.molecules.protein == nil || !viewModel.pocketDetectorML.isAvailable,
-                    help: "ML-based pocket detection (GNN)"
-                ) { viewModel.detectPocketsML() }
-                .accessibilityIdentifier(AccessibilityID.dockDetectML)
-
-                PanelChoiceButton(
-                    title: "From Ligand", icon: "hexagon", isSelected: false,
-                    isDisabled: viewModel.molecules.protein == nil || viewModel.molecules.ligand == nil,
-                    help: "Define pocket around current ligand"
-                ) { detectFromLigand() }
-                .accessibilityIdentifier(AccessibilityID.dockDetectLigand)
-
-                PanelChoiceButton(
-                    title: "From Selection", icon: "hand.tap", isSelected: false,
-                    isDisabled: viewModel.molecules.protein == nil || viewModel.workspace.selectedResidueIndices.isEmpty,
-                    help: "Define pocket from selected residues"
-                ) { pocketFromSelection() }
-                .accessibilityIdentifier(AccessibilityID.dockDetectSelection)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func pocketRow(_ pocket: BindingPocket) -> some View {
-        let isSelected = viewModel.docking.selectedPocket?.id == pocket.id
-        HStack(spacing: 8) {
-            Circle()
-                .fill(isSelected ? Color.green : Color.secondary.opacity(0.5))
-                .frame(width: 6, height: 6)
-            Text("Pocket #\(pocket.id)")
-                .font(PanelStyle.smallFont.weight(.medium))
-            Spacer()
-            Text(String(format: "%.0f Å³", pocket.volume))
-                .font(PanelStyle.monoSmall)
-                .foregroundStyle(.secondary)
-            Text("\(pocket.residueIndices.count) res")
-                .font(PanelStyle.monoSmall)
-                .foregroundStyle(.secondary)
-            Button(action: { removePocket(pocket) }) {
-                Image(systemName: "trash")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Remove this pocket and its grid box")
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isSelected ? Color.green.opacity(0.10) : Color.clear)
+    private var proteinInputRow: some View {
+        let prot = viewModel.molecules.protein
+        return DockInputRow(
+            kind: "Protein",
+            tint: DS.Color.protein,
+            title: prot?.name,
+            detail: prot.map { prot in
+                // Amino acids only, matching the Sequence overview and Inspector (no waters or caps).
+                let aminoAcids = prot.residues.filter(\.isStandard)
+                let chains = Set(aminoAcids.map(\.chainID)).count
+                return "\(aminoAcids.count) residues · \(chains) chain\(chains == 1 ? "" : "s")"
+            },
+            missingText: "Load a protein",
+            step: .search
         )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            viewModel.docking.selectedPocket = pocket
-            ActivityLog.shared.info(
-                "Pocket #\(pocket.id) selected (vol \(String(format: "%.0f", pocket.volume)) Å³, druggability \(String(format: "%.2f", pocket.druggability)))",
-                category: .dock
-            )
-        }
     }
 
-    @ViewBuilder
-    private func selectedPocketStats(_ pocket: BindingPocket) -> some View {
-        HStack(spacing: 8) {
-            PanelStat(label: "Volume", value: String(format: "%.0f", pocket.volume), unit: "Å³")
-            PanelStat(label: "Buried", value: String(format: "%.0f%%", pocket.buriedness * 100))
-            PanelStat(label: "Residues", value: "\(pocket.residueIndices.count)")
-            PanelSecondaryButton(title: "Focus", icon: "scope", help: "Zoom to pocket with Z-clipping slab") {
-                viewModel.focusOnPocket(pocket)
+    private var ligandInputRow: some View {
+        let queue = viewModel.docking.batchQueue
+        let lig = viewModel.molecules.ligand
+        let title: String?
+        let detail: String?
+        if isBatchQueued {
+            let prepared = queue.filter(\.isPrepared).count
+            let mws = queue.compactMap { $0.descriptors?.molecularWeight }
+            var parts = ["\(prepared)/\(queue.count) prepared"]
+            if let lo = mws.min(), let hi = mws.max() {
+                parts.append(String(format: "MW %.0f–%.0f Da", lo, hi))
             }
-            .accessibilityIdentifier(AccessibilityID.dockFocusPocket)
-            .frame(width: 80)
+            title = "\(queue.count) ligands queued"
+            detail = parts.joined(separator: " · ")
+        } else if let lig {
+            title = lig.name
+            detail = String(format: "%d heavy atoms · MW %.1f Da", lig.heavyAtomCount, RDKitBridge.parentMolecularWeight(of: lig))
+        } else {
+            title = nil
+            detail = nil
         }
-    }
-
-    @ViewBuilder
-    private var pocketViewControls: some View {
-        @Bindable var vm = viewModel
-        VStack(alignment: .leading, spacing: 8) {
-            PanelToggleRow(
-                title: "Pocket View",
-                subtitle: vm.workspace.enableClipping ? nil : "Clip view around the binding site",
-                icon: "rectangle.split.3x1",
-                isOn: Binding(
-                    get: { vm.workspace.enableClipping },
-                    set: { newValue in setPocketClipping(newValue) }
-                )
-            )
-            .accessibilityIdentifier(AccessibilityID.dockPocketViewToggle)
-
-            if vm.workspace.enableClipping {
-                PanelSliderRow(
-                    label: "Thickness",
-                    value: Binding(
-                        get: { vm.workspace.slabThickness },
-                        set: { newVal in
-                            vm.workspace.slabThickness = newVal
-                            vm.renderer?.slabHalfThickness = newVal / 2.0
-                            vm.renderer?.setNeedsRedraw()
-                        }
-                    ),
-                    range: 2...40,
-                    step: 0.5,
-                    format: { String(format: "%.1f Å", $0) },
-                    valueColor: vm.workspace.slabThickness < 10 ? .orange : .secondary
-                )
-                PanelSliderRow(
-                    label: "Offset",
-                    value: Binding(
-                        get: { vm.workspace.slabOffset },
-                        set: { newVal in
-                            vm.workspace.slabOffset = newVal
-                            vm.renderer?.slabOffset = newVal
-                            vm.renderer?.setNeedsRedraw()
-                        }
-                    ),
-                    range: -20...20,
-                    step: 0.5,
-                    format: { String(format: "%+.1f Å", $0) }
-                )
-                PanelChoiceGrid(columns: 3) {
-                    ForEach(["Tight", "Medium", "Wide"], id: \.self) { preset in
-                        PanelChoiceButton(
-                            title: preset, isSelected: false,
-                            help: "Z-slab \(preset.lowercased()) clipping around the pocket"
-                        ) { applySlabPreset(preset) }
-                        .accessibilityIdentifier(
-                            preset == "Tight" ? AccessibilityID.dockSlabTight :
-                            preset == "Medium" ? AccessibilityID.dockSlabMedium :
-                            AccessibilityID.dockSlabWide
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    private func setPocketClipping(_ newValue: Bool) {
-        let vm = viewModel
-        vm.workspace.enableClipping = newValue
-        vm.renderer?.enableClipping = newValue
-        if newValue, let pocket = vm.docking.selectedPocket {
-            vm.focusOnPocket(pocket)
-            if !vm.workspace.showSurface {
-                vm.toggleSurface()
-            }
-            if vm.workspace.surfaceOpacity > 0.7 {
-                vm.workspace.surfaceOpacity = 0.55
-                vm.renderer?.surfaceOpacity = 0.55
-            }
-        } else if !newValue {
-            if vm.workspace.showSurface {
-                vm.toggleSurface()
-            }
-            vm.renderer?.slabCenter = nil
-            vm.fitToView()
-        }
-        vm.renderer?.setNeedsRedraw()
-    }
-
-    // MARK: - Grid box card
-
-    private var gridBoxCard: some View {
-        PanelCard(
-            "Grid Box",
-            icon: "cube.transparent",
-            accessory: {
-                Button(action: { applyGridBoxFromSliders() }) {
-                    Image(systemName: "arrow.right.circle.fill")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.accentColor)
-                }
-                .buttonStyle(.plain)
-                .help("Apply grid box to viewport")
-                .plainButtonAccessibility(AccessibilityID.dockApplyGrid)
-            }
+        return DockInputRow(
+            kind: isBatchQueued ? "Ligands" : "Ligand",
+            tint: DS.Color.ligand,
+            title: title,
+            detail: detail,
+            missingText: "Choose a ligand",
+            step: .ligands
         ) {
-            VStack(alignment: .leading, spacing: 10) {
-                VStack(alignment: .leading, spacing: 4) {
-                    PanelSubheader(title: "Center")
-                    PanelAxisSlider(axis: "X", value: gridCenterBinding(\.x), range: -200...200, onChange: { _ in applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Y", value: gridCenterBinding(\.y), range: -200...200, onChange: { _ in applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Z", value: gridCenterBinding(\.z), range: -200...200, onChange: { _ in applyGridBoxFromSliders() })
+            Button("Manage…") { openWindow(id: "ligand-database") }
+                .buttonStyle(.borderless)
+                .font(DS.Font.secondary.weight(.medium))
+                .help("Open Ligand Database (⌘L)")
+                .accessibilityIdentifier(AccessibilityID.dockOpenLigandDB)
+            if isBatchQueued {
+                clearButton(help: "Clear batch queue") {
+                    viewModel.docking.batchQueue = []
+                    viewModel.clearLigand()
                 }
-                VStack(alignment: .leading, spacing: 4) {
-                    PanelSubheader(title: "Half-size")
-                    PanelAxisSlider(axis: "X", value: gridHalfBinding(\.x), range: 2...50, onChange: { _ in applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Y", value: gridHalfBinding(\.y), range: 2...50, onChange: { _ in applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Z", value: gridHalfBinding(\.z), range: 2...50, onChange: { _ in applyGridBoxFromSliders() })
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    PanelSubheader(title: "Center on")
-                    PanelChoiceGrid(columns: 2) {
-                        PanelChoiceButton(
-                            title: "Protein", icon: "building.2",
-                            isSelected: false,
-                            isDisabled: viewModel.molecules.protein == nil,
-                            help: "Center grid on protein centroid"
-                        ) { placeGridAtProteinCenter() }
-                        .accessibilityIdentifier(AccessibilityID.dockGridProtein)
-
-                        PanelChoiceButton(
-                            title: "Ligand", icon: "hexagon",
-                            isSelected: false,
-                            isDisabled: viewModel.molecules.ligand == nil,
-                            help: "Center grid on ligand position"
-                        ) { placeGridAtLigand() }
-                        .accessibilityIdentifier(AccessibilityID.dockGridLigand)
-
-                        PanelChoiceButton(
-                            title: "Selection", icon: "hand.tap",
-                            isSelected: false,
-                            isDisabled: viewModel.workspace.selectedResidueIndices.isEmpty,
-                            help: "Center grid on selected residues"
-                        ) { placeGridAtSelection() }
-                        .accessibilityIdentifier(AccessibilityID.dockGridSelection)
-
-                        PanelChoiceButton(
-                            title: "Pocket", icon: "arrow.counterclockwise",
-                            isSelected: false,
-                            isDisabled: viewModel.docking.selectedPocket == nil,
-                            help: "Reset grid to detected pocket"
-                        ) { resetGridToPocket() }
-                        .accessibilityIdentifier(AccessibilityID.dockGridPocket)
-                    }
-                }
+                .accessibilityIdentifier(AccessibilityID.dockClearBatch)
+            } else if lig != nil {
+                clearButton(help: "Remove active ligand") { viewModel.removeLigandFromView() }
+                    .accessibilityIdentifier(AccessibilityID.dockRemoveLigand)
             }
         }
     }
 
-    // MARK: - Search card (preset + method + scoring + budget + advanced)
+    private var siteInputRow: some View {
+        let half = viewModel.docking.gridHalfSize
+        let detail: String? = {
+            guard site.hasGrid else { return nil }
+            if let pocket = viewModel.docking.selectedPocket, !pocket.residueIndices.isEmpty {
+                return String(format: "%.0f Å³ · %d residues", pocket.volume, pocket.residueIndices.count)
+            }
+            return DockingSite.boxDimensions(half)
+        }()
+        return DockInputRow(
+            kind: "Binding Site",
+            tint: DS.Color.pocket,
+            title: site.siteTitle,
+            detail: detail,
+            missingText: "Define a binding site",
+            step: .bindingSite
+        ) {
+            if site.hasGrid {
+                Button("Edit") { site.goTo(.bindingSite) }
+                    .buttonStyle(.borderless)
+                    .font(DS.Font.secondary.weight(.medium))
+                    .help("Adjust the pocket and grid box in the Binding Site step")
+            }
+        }
+    }
+
+    private func clearButton(help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "xmark.circle.fill")
+                .font(DS.Font.label)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    // MARK: - Search card
 
     private var searchCard: some View {
-        return PanelCard("Search", icon: "magnifyingglass") {
-            VStack(alignment: .leading, spacing: 18) {
+        PanelCard("Search", icon: "magnifyingglass") {
+            VStack(alignment: .leading, spacing: DS.Space.xl) {
                 presetSection
-                searchBudgetSection
                 searchMethodSection
                 scoringFunctionSection
-                VStack(alignment: .leading, spacing: 18) {
-                    PanelLabeledDivider(title: "Advanced", icon: "slider.horizontal.3")
-                    searchBehaviorSection
-                    if viewModel.docking.dockingConfig.enableFlexibility {
-                        torsionSearchSection
-                    }
-                    searchMethodOptionsSection
-                    VStack(alignment: .leading, spacing: 8) {
-                        PanelSubheader(title: "Exploration Phase", icon: "sparkles")
+                searchBudgetSection
+                Divider()
+                PanelDisclosure("Advanced", icon: "slider.horizontal.3", isExpanded: $advancedExpanded) {
+                    VStack(alignment: .leading, spacing: DS.Space.xl) {
+                        searchBehaviorSection
+                        if viewModel.docking.dockingConfig.enableFlexibility {
+                            torsionSearchSection
+                        }
+                        searchMethodOptionsSection
                         explorationPhaseSection
                     }
                 }
-                .padding(.top, 2)
             }
         }
     }
 
-    @ViewBuilder
     private var presetSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelSubheader(title: "Preset")
-            PanelChoiceGrid(columns: 4) {
+            PanelChoiceGrid(columns: 2) {
                 ForEach(["Auto", "Fast", "Standard", "Thorough"], id: \.self) { preset in
                     PanelChoiceButton(
                         title: preset,
@@ -480,65 +279,62 @@ struct DockingTabView: View {
             if viewModel.docking.dockingConfig.autoMode {
                 PanelHint(text: "Parameters adapt to protein size, pocket shape, and ligand flexibility",
                           icon: "wand.and.stars",
-                          color: .purple)
+                          color: DS.Color.accent)
             }
         }
     }
 
-    @ViewBuilder
     private var searchMethodSection: some View {
-        @Bindable var vm = viewModel
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelSubheader(title: "Method")
+            // Stable methods fill a 2×2 grid; experimental ones get a full-width row so the BETA tag never truncates the label.
             PanelChoiceGrid(columns: 2) {
-                ForEach(SearchMethod.allCases, id: \.self) { method in
-                    PanelChoiceButton(
-                        title: method.shortLabel,
-                        icon: method.icon,
-                        badge: method.isExperimental ? "BETA" : nil,
-                        isSelected: vm.docking.dockingConfig.searchMethod == method,
-                        help: method.description
-                    ) {
-                        vm.docking.dockingConfig.searchMethod = method
-                        if method == .diffusionGuided && vm.docking.scoringMethod != .druseAffinity {
-                            vm.docking.scoringMethod = .druseAffinity
-                        }
-                    }
+                ForEach(SearchMethod.allCases.filter { !$0.isExperimental }, id: \.self) { method in
+                    searchMethodButton(method)
                 }
             }
-            Text(viewModel.docking.dockingConfig.searchMethod.description)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            ForEach(SearchMethod.allCases.filter(\.isExperimental), id: \.self) { method in
+                searchMethodButton(method)
+            }
+            descriptionText(viewModel.docking.dockingConfig.searchMethod.description)
         }
     }
 
-    @ViewBuilder
+    private func searchMethodButton(_ method: SearchMethod) -> some View {
+        PanelChoiceButton(
+            title: method.shortLabel,
+            icon: method.icon,
+            badge: method.isExperimental ? "BETA" : nil,
+            isSelected: viewModel.docking.dockingConfig.searchMethod == method,
+            help: method.description
+        ) {
+            viewModel.docking.dockingConfig.searchMethod = method
+            if method == .diffusionGuided && viewModel.docking.scoringMethod != .druseAffinity {
+                viewModel.docking.scoringMethod = .druseAffinity
+            }
+        }
+    }
+
     private var scoringFunctionSection: some View {
-        @Bindable var vm = viewModel
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelSubheader(title: "Scoring")
             PanelChoiceGrid(columns: 2) {
                 ForEach(scoringMethodsAvailable, id: \.self) { method in
                     PanelChoiceButton(
                         title: method.shortLabel,
                         icon: method.icon,
-                        isSelected: vm.docking.scoringMethod == method,
+                        isSelected: viewModel.docking.scoringMethod == method,
                         help: method.description
-                    ) { vm.docking.scoringMethod = method }
+                    ) { viewModel.docking.scoringMethod = method }
                 }
             }
-            Text(viewModel.docking.scoringMethod.description)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            descriptionText(viewModel.docking.scoringMethod.description)
             ScoringInteractionsBadgeRow(method: viewModel.docking.scoringMethod)
         }
     }
 
-    @ViewBuilder
     private var searchBudgetSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelSubheader(title: "Budget", icon: "speedometer")
             PanelLabeledRow("Population", help: "Candidate poses per generation") {
                 PanelNumberField(
@@ -567,21 +363,21 @@ struct DockingTabView: View {
                     minimum: 1
                 )
             }
-            HStack {
+            HStack(alignment: .firstTextBaseline) {
                 Text("Total evaluations")
-                    .font(PanelStyle.smallFont)
+                    .font(DS.Font.secondary)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Text(totalEvaluationsString)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .font(DS.Font.mono.weight(.semibold))
+                    .monospacedDigit()
             }
-            .padding(.top, 2)
+            .padding(.top, DS.Space.xxs)
         }
     }
 
-    @ViewBuilder
     private var searchBehaviorSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
             PanelSubheader(title: "Behavior")
             PanelSliderRow(
                 label: "Mutation Rate",
@@ -603,7 +399,7 @@ struct DockingTabView: View {
             )
             PanelLabeledRow("Grid Spacing",
                             help: "Energy grid resolution (smaller = more accurate but slower)") {
-                Picker("", selection: Binding(
+                Picker("Grid Spacing", selection: Binding(
                     get: { viewModel.docking.dockingConfig.gridSpacing },
                     set: { viewModel.docking.dockingConfig.gridSpacing = $0 }
                 )) {
@@ -614,14 +410,13 @@ struct DockingTabView: View {
                 .pickerStyle(.menu)
                 .controlSize(.small)
                 .labelsHidden()
-                .frame(width: 96)
+                .fixedSize()
             }
         }
     }
 
-    @ViewBuilder
     private var torsionSearchSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
             PanelSubheader(title: "Torsion Search", icon: "arrow.triangle.2.circlepath")
             PanelChoiceGrid(columns: 2) {
                 ForEach(TorsionSearchPreset.allCases, id: \.self) { preset in
@@ -634,72 +429,50 @@ struct DockingTabView: View {
                     }
                 }
             }
-            PanelSliderRow(
-                label: "Exact",
-                value: Binding(
-                    get: { viewModel.docking.dockingConfig.torsionExactFraction },
-                    set: {
-                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
-                        viewModel.docking.dockingConfig.torsionExactFraction = min(max($0, 0), 1)
-                    }
-                ),
-                range: 0...1, step: 0.05,
-                format: { String(format: "%.0f%%", $0 * 100) }
-            )
-            PanelSliderRow(
-                label: "Local",
-                value: Binding(
-                    get: { viewModel.docking.dockingConfig.torsionLocalFraction },
-                    set: {
-                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
-                        viewModel.docking.dockingConfig.torsionLocalFraction = min(max($0, 0), 1)
-                    }
-                ),
-                range: 0...1, step: 0.05,
-                format: { String(format: "%.0f%%", $0 * 100) }
-            )
-            PanelSliderRow(
-                label: "Local Width",
-                value: Binding(
-                    get: { viewModel.docking.dockingConfig.torsionLocalAmplitude },
-                    set: {
-                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
-                        viewModel.docking.dockingConfig.torsionLocalAmplitude = max(0, $0)
-                    }
-                ),
-                range: 0...1.5, step: 0.05,
-                format: { String(format: "%.2f rad", $0) }
-            )
-            PanelSliderRow(
-                label: "Reset",
-                value: Binding(
-                    get: { viewModel.docking.dockingConfig.torsionRandomResetProbability },
-                    set: {
-                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
-                        viewModel.docking.dockingConfig.torsionRandomResetProbability = min(max($0, 0), 1)
-                    }
-                ),
-                range: 0...0.5, step: 0.01,
-                format: { String(format: "%.0f%%", $0 * 100) }
-            )
-            PanelSliderRow(
-                label: "Step Scale",
-                value: Binding(
-                    get: { viewModel.docking.dockingConfig.torsionPerturbationScale },
-                    set: {
-                        viewModel.docking.dockingConfig.torsionSearchPreset = .manual
-                        viewModel.docking.dockingConfig.torsionPerturbationScale = max(0, $0)
-                    }
-                ),
-                range: 0...1.5, step: 0.05,
-                format: { String(format: "%.2fx", $0) }
-            )
+            torsionSlider("Exact", \.torsionExactFraction, range: 0...1, step: 0.05, clamp: 0...1) {
+                String(format: "%.0f%%", $0 * 100)
+            }
+            torsionSlider("Local", \.torsionLocalFraction, range: 0...1, step: 0.05, clamp: 0...1) {
+                String(format: "%.0f%%", $0 * 100)
+            }
+            torsionSlider("Local Width", \.torsionLocalAmplitude, range: 0...1.5, step: 0.05, clamp: 0...Float.greatestFiniteMagnitude) {
+                String(format: "%.2f rad", $0)
+            }
+            torsionSlider("Reset", \.torsionRandomResetProbability, range: 0...0.5, step: 0.01, clamp: 0...1) {
+                String(format: "%.0f%%", $0 * 100)
+            }
+            torsionSlider("Step Scale", \.torsionPerturbationScale, range: 0...1.5, step: 0.05, clamp: 0...Float.greatestFiniteMagnitude) {
+                String(format: "%.2fx", $0)
+            }
         }
     }
 
-    @ViewBuilder
+    /// Torsion slider: editing any value switches the torsion preset to Manual.
+    private func torsionSlider(
+        _ label: String,
+        _ keyPath: WritableKeyPath<DockingConfig, Float>,
+        range: ClosedRange<Float>,
+        step: Float,
+        clamp: ClosedRange<Float>,
+        format: @escaping (Float) -> String
+    ) -> some View {
+        PanelSliderRow(
+            label: label,
+            value: Binding(
+                get: { viewModel.docking.dockingConfig[keyPath: keyPath] },
+                set: {
+                    viewModel.docking.dockingConfig.torsionSearchPreset = .manual
+                    viewModel.docking.dockingConfig[keyPath: keyPath] = min(max($0, clamp.lowerBound), clamp.upperBound)
+                }
+            ),
+            range: range, step: step,
+            format: format
+        )
+    }
+
     private var explorationPhaseSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            PanelSubheader(title: "Exploration Phase", icon: "sparkles")
             PanelSliderRow(
                 label: "Phase Ratio",
                 value: Binding(
@@ -744,19 +517,16 @@ struct DockingTabView: View {
 
     @ViewBuilder
     private var searchMethodOptionsSection: some View {
-        let method = viewModel.docking.dockingConfig.searchMethod
-        if method == .fragmentBased {
-            fragmentMethodOptions
-        } else if method == .parallelTempering {
-            parallelTemperingOptions
-        } else if method == .diffusionGuided {
-            diffusionMethodOptions
+        switch viewModel.docking.dockingConfig.searchMethod {
+        case .fragmentBased:     fragmentMethodOptions
+        case .parallelTempering: parallelTemperingOptions
+        case .diffusionGuided:   diffusionMethodOptions
+        default:                 EmptyView()
         }
     }
 
-    @ViewBuilder
     private var fragmentMethodOptions: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
             PanelSubheader(title: "Fragment", icon: "puzzlepiece")
             PanelSliderRow(
                 label: "Beam Width",
@@ -767,59 +537,56 @@ struct DockingTabView: View {
                 range: 4...256, step: 4,
                 format: { String(Int($0)) }
             )
-            HStack(spacing: 6) {
-                PanelSecondaryButton(
-                    title: viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil ? "Edit Scaffold" : "Enforce Scaffold",
-                    icon: "pencil.and.outline",
-                    tint: viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil ? .orange : nil
-                ) { viewModel.docking.showScaffoldInput = true }
-                if viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil {
-                    PanelSecondaryButton(title: "", icon: "xmark", tint: .red) {
-                        viewModel.docking.dockingConfig.fragment.scaffoldSMARTS = nil
-                        viewModel.docking.dockingConfig.fragment.scaffoldMode = .auto
+            PanelLabeledRow("Scaffold", help: "SMARTS pattern that fragment growth must preserve (leave empty for automatic)") {
+                TextField("Auto", text: Binding(
+                    get: { viewModel.docking.dockingConfig.fragment.scaffoldSMARTS ?? "" },
+                    set: { newValue in
+                        let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        viewModel.docking.dockingConfig.fragment.scaffoldSMARTS = trimmed.isEmpty ? nil : trimmed
+                        viewModel.docking.dockingConfig.fragment.scaffoldMode = trimmed.isEmpty ? .auto : .manual
                     }
-                    .frame(width: 28)
-                }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(DS.Font.monoSmall)
+                .controlSize(.small)
             }
-            if let scaffold = viewModel.docking.dockingConfig.fragment.scaffoldSMARTS {
-                Text("Scaffold: \(scaffold)")
-                    .font(PanelStyle.monoSmall)
-                    .foregroundStyle(.orange)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            if viewModel.docking.dockingConfig.fragment.scaffoldSMARTS != nil {
+                PanelHint(text: "Scaffold enforced: poses must contain this substructure.",
+                          icon: "pencil.and.outline", color: DS.Color.warning)
             }
         }
     }
 
-    @ViewBuilder
     private var parallelTemperingOptions: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let rex = viewModel.docking.dockingConfig.replicaExchange
+        return VStack(alignment: .leading, spacing: DS.Space.m) {
             PanelSubheader(title: "Replica Exchange", icon: "thermometer")
             PanelLabeledRow("Replicas") {
-                Picker("", selection: Binding(
+                Picker("Replicas", selection: Binding(
                     get: { viewModel.docking.dockingConfig.replicaExchange.numReplicas },
                     set: { viewModel.docking.dockingConfig.replicaExchange.numReplicas = $0 }
                 )) {
                     ForEach([4, 8, 12, 16], id: \.self) { Text("\($0)").tag($0) }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 140)
+                .labelsHidden()
+                .controlSize(.small)
             }
-            HStack {
+            HStack(alignment: .firstTextBaseline) {
                 Text("Temperature range")
-                    .font(PanelStyle.smallFont)
+                    .font(DS.Font.secondary)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("\(String(format: "%.1f", viewModel.docking.dockingConfig.replicaExchange.minTemperature))–\(String(format: "%.1f", viewModel.docking.dockingConfig.replicaExchange.maxTemperature)) kcal/mol")
-                    .font(PanelStyle.monoSmall)
+                Text(String(format: "%.1f–%.1f kcal/mol", rex.minTemperature, rex.maxTemperature))
+                    .font(DS.Font.monoSmall)
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
         }
     }
 
-    @ViewBuilder
     private var diffusionMethodOptions: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
             PanelSubheader(title: "Diffusion", icon: "waveform.path.ecg")
             PanelSliderRow(
                 label: "Denoising",
@@ -831,7 +598,7 @@ struct DockingTabView: View {
                 format: { "\(Int($0)) steps" }
             )
             PanelLabeledRow("Schedule") {
-                Picker("", selection: Binding(
+                Picker("Schedule", selection: Binding(
                     get: { viewModel.docking.dockingConfig.diffusion.noiseSchedule },
                     set: { viewModel.docking.dockingConfig.diffusion.noiseSchedule = $0 }
                 )) {
@@ -840,112 +607,110 @@ struct DockingTabView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 200)
+                .labelsHidden()
+                .controlSize(.small)
             }
             PanelHint(
                 text: "Experimental. DruseAF was trained for affinity prediction, not denoising; the gradient is heuristic. Use GA or Fragment for production work.",
                 icon: "exclamationmark.triangle.fill",
-                color: .orange
+                color: DS.Color.warning
             )
         }
     }
 
     // MARK: - Constraints card
 
-    @ViewBuilder
     private var constraintsCard: some View {
-        @Bindable var vm = viewModel
-        let count = viewModel.docking.pharmacophoreConstraints.count
-        PanelCard(
-            "Constraints" + (count > 0 ? " (\(count))" : ""),
+        let constraints = viewModel.docking.pharmacophoreConstraints
+        return PanelCard(
+            "Constraints",
             icon: "circle.hexagongrid.circle",
             accessory: {
-                if count > 0 {
-                    Button("Clear") {
-                        viewModel.docking.pharmacophoreConstraints.removeAll()
+                if !constraints.isEmpty {
+                    HStack(spacing: DS.Space.s) {
+                        DSTag("\(constraints.count)", tone: .accent, monospaced: true)
+                        Button("Clear") { viewModel.docking.pharmacophoreConstraints.removeAll() }
+                            .buttonStyle(.borderless)
+                            .font(DS.Font.secondary.weight(.medium))
+                            .foregroundStyle(DS.Color.danger)
+                            .help("Remove all pharmacophore constraints")
                     }
-                    .font(PanelStyle.smallFont)
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.red)
-                    .help("Remove all pharmacophore constraints")
                 }
             }
         ) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                if constraints.isEmpty {
+                    PanelHint(text: "Optional. Right-click an atom or residue in the viewport to add one, or build a pharmacophore query.",
+                              icon: "info.circle")
+                } else {
+                    VStack(spacing: DS.Space.xs) {
+                        ForEach(Array(constraints.enumerated()), id: \.element.id) { idx, constraint in
+                            constraintRow(idx: idx, constraint: constraint)
+                        }
+                    }
+                }
                 PanelSecondaryButton(title: "Pharmacophore Editor…",
                                      icon: "circle.hexagongrid.circle",
                                      help: "Create constraints from a reference ligand's pharmacophoric features") {
                     viewModel.docking.showPharmacophoreEditor = true
                 }
-                ForEach(Array(viewModel.docking.pharmacophoreConstraints.enumerated()), id: \.element.id) { idx, constraint in
-                    constraintRow(idx: idx, constraint: constraint)
-                }
             }
-        }
-        .sheet(isPresented: $vm.docking.showPharmacophoreEditor) {
-            PharmacophoreEditorView().environment(viewModel)
         }
     }
 
-    @ViewBuilder
     private func constraintRow(idx: Int, constraint: PharmacophoreConstraintDef) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: DS.Space.s) {
             Image(systemName: constraint.interactionType.icon)
-                .font(.system(size: 11))
-                .frame(width: 14)
-                .foregroundColor(Color(
-                    red: Double(constraint.interactionType.color.x),
-                    green: Double(constraint.interactionType.color.y),
-                    blue: Double(constraint.interactionType.color.z)
-                ))
-            Text(constraint.targetLabel)
-                .font(PanelStyle.monoSmall)
-                .lineLimit(1)
-            Spacer()
-            Text(constraint.interactionType.rawValue)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-            Text(constraint.strength.isHard ? "Hard" : "Soft")
-                .font(.system(size: 10, weight: .medium))
-                .padding(.horizontal, 4)
-                .padding(.vertical, 1)
-                .background(
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill((constraint.strength.isHard ? Color.red : Color.orange).opacity(0.18))
-                )
-            Button(action: {
+                .font(DS.Font.label)
+                .foregroundStyle(constraint.interactionType.dsColor)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(constraint.targetLabel)
+                    .font(DS.Font.monoSmall)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(constraint.interactionType.rawValue)
+                    .font(DS.Font.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: DS.Space.xs)
+            DSTag(constraint.strength.isHard ? "Hard" : "Soft",
+                  tone: constraint.strength.isHard ? .danger : .warning)
+            Button {
                 viewModel.docking.pharmacophoreConstraints.remove(at: idx)
-            }) {
+            } label: {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 11))
+                    .font(DS.Font.label)
                     .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderless)
+            .help("Remove constraint")
         }
+        .padding(.vertical, DS.Space.xxs)
     }
 
     // MARK: - Flexibility card
 
-    @ViewBuilder
     private var flexibilityCard: some View {
         @Bindable var vm = viewModel
-        PanelCard(
+        let config = viewModel.docking.flexibleResidueConfig
+        return PanelCard(
             "Receptor Flexibility",
             icon: "figure.flexibility",
             accessory: {
-                if !viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.isEmpty
-                    && !viewModel.docking.flexibleResidueConfig.autoFlex {
+                if !config.flexibleResidueIndices.isEmpty && !config.autoFlex {
                     Button("Clear") {
                         viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.removeAll()
                     }
-                    .font(PanelStyle.smallFont)
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.red)
+                    .buttonStyle(.borderless)
+                    .font(DS.Font.secondary.weight(.medium))
+                    .foregroundStyle(DS.Color.danger)
                     .help("Remove all flexible residues (use rigid receptor)")
                 }
             }
         ) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
                 PanelToggleRow(
                     title: "Soft Flexibility",
                     subtitle: "Pocket-lining sidechains adjust gently during docking",
@@ -957,7 +722,7 @@ struct DockingTabView: View {
                     }
                 }
 
-                if viewModel.docking.flexibleResidueConfig.autoFlex {
+                if config.autoFlex {
                     autoFlexPreview
                 } else {
                     manualFlexResidues
@@ -975,24 +740,9 @@ struct DockingTabView: View {
                 pocket: (center: pocket.center, residueIndices: pocket.residueIndices)
             )
             if autoIndices.isEmpty {
-                PanelHint(text: "No rotatable residues lining this pocket", color: .orange)
+                PanelHint(text: "No rotatable residues lining this pocket", color: DS.Color.warning)
             } else {
-                let names = autoIndices.compactMap { seq -> String? in
-                    prot.atoms.first(where: { $0.residueSeq == seq }).map { "\($0.residueName)\(seq)" }
-                }
-                FlowLayout(spacing: 4) {
-                    ForEach(names, id: \.self) { name in
-                        PanelChip(text: name, color: .purple)
-                    }
-                }
-                let totalChi = autoIndices.compactMap { seq -> Int? in
-                    prot.atoms.first(where: { $0.residueSeq == seq }).flatMap {
-                        RotamerLibrary.rotamers(for: $0.residueName)?.chiAngles.count
-                    }
-                }.reduce(0, +)
-                Text("\(autoIndices.count) residue(s), \(totalChi) chi angle(s) — soft weight")
-                    .font(PanelStyle.smallFont)
-                    .foregroundStyle(.secondary)
+                flexResidueSummary(autoIndices, protein: prot, suffix: " — soft weight")
             }
         }
     }
@@ -1002,55 +752,54 @@ struct DockingTabView: View {
         let flexIndices = viewModel.docking.flexibleResidueConfig.flexibleResidueIndices
         if flexIndices.isEmpty {
             PanelHint(text: "Select residues in the sequence panel or 3D viewport for full induced-fit docking.")
-        } else {
-            let residueNames = flexIndices.compactMap { seq -> String? in
-                guard let prot = viewModel.molecules.protein else { return nil }
-                if let atom = prot.atoms.first(where: { $0.residueSeq == seq }) {
-                    return "\(atom.residueName)\(seq)"
-                }
-                return "?\(seq)"
-            }
-            FlowLayout(spacing: 4) {
-                ForEach(residueNames, id: \.self) { name in
-                    PanelChip(text: name, color: .purple)
-                }
-            }
-            let totalChi = flexIndices.compactMap { seq -> Int? in
-                guard let prot = viewModel.molecules.protein,
-                      let atom = prot.atoms.first(where: { $0.residueSeq == seq }) else { return nil }
-                return RotamerLibrary.rotamers(for: atom.residueName)?.chiAngles.count
-            }.reduce(0, +)
-            Text("\(flexIndices.count) residue(s), \(totalChi) chi angle(s)")
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
+        } else if let prot = viewModel.molecules.protein {
+            flexResidueSummary(flexIndices, protein: prot, suffix: "")
             if flexIndices.count >= FlexibleResidueConfig.maxFlexibleResidues {
-                PanelHint(text: "Maximum \(FlexibleResidueConfig.maxFlexibleResidues) flexible residues reached", color: .orange)
+                PanelHint(text: "Maximum \(FlexibleResidueConfig.maxFlexibleResidues) flexible residues reached",
+                          color: DS.Color.warning)
             }
         }
     }
 
+    @ViewBuilder
+    private func flexResidueSummary(_ indices: [Int], protein prot: Molecule, suffix: String) -> some View {
+        let residueNames: [Int: String] = Dictionary(
+            indices.compactMap { seq in
+                prot.atoms.first(where: { $0.residueSeq == seq }).map { (seq, $0.residueName) }
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let totalChi = indices.compactMap { seq in
+            residueNames[seq].flatMap { RotamerLibrary.rotamers(for: $0)?.chiAngles.count }
+        }.reduce(0, +)
+        FlowLayout(spacing: DS.Space.xs) {
+            ForEach(indices, id: \.self) { seq in
+                DSTag("\(residueNames[seq] ?? "?")\(seq)", tone: .pocket, monospaced: true)
+            }
+        }
+        Text("\(indices.count) residue(s), \(totalChi) chi angle(s)\(suffix)")
+            .font(DS.Font.secondary)
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
+    }
+
     // MARK: - Refinement card
 
-    @ViewBuilder
     private var refinementCard: some View {
         let afOn = viewModel.docking.dockingConfig.useAFv4Rescore
         let xtbOn = viewModel.docking.dockingConfig.gfn2Refinement.enabled
         let summary: String = {
-            if afOn && xtbOn { return "DruseAF + GFN2-xTB" }
+            if afOn && xtbOn { return "DruseAF + xTB" }
             if afOn { return "DruseAF" }
             if xtbOn { return "GFN2-xTB" }
             return "Off"
         }()
-        PanelCard(
+        return PanelCard(
             "Post-docking Refinement",
             icon: "wand.and.rays",
-            accessory: {
-                Text(summary)
-                    .font(PanelStyle.smallFont)
-                    .foregroundStyle(afOn || xtbOn ? Color.accentColor : .secondary)
-            }
+            accessory: { DSTag(summary, tone: afOn || xtbOn ? .accent : .neutral) }
         ) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
                 PanelToggleRow(
                     title: "DruseAF rescoring",
                     subtitle: "Re-rank top poses with DruseAF v4 (~0.1 ms/pose)",
@@ -1069,19 +818,18 @@ struct DockingTabView: View {
                         set: { viewModel.docking.dockingConfig.gfn2Refinement.enabled = $0 }
                     )
                 )
-                if viewModel.docking.dockingConfig.gfn2Refinement.enabled {
+                if xtbOn {
                     gfn2Options
                 }
             }
         }
     }
 
-    @ViewBuilder
     private var gfn2Options: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
             PanelLabeledRow("Solvation",
                             help: "Implicit solvation: ALPB (recommended) or GBSA for aqueous environment") {
-                Picker("", selection: Binding(
+                Picker("Solvation", selection: Binding(
                     get: { viewModel.docking.dockingConfig.gfn2Refinement.solvation },
                     set: { viewModel.docking.dockingConfig.gfn2Refinement.solvation = $0 }
                 )) {
@@ -1090,11 +838,11 @@ struct DockingTabView: View {
                 .pickerStyle(.menu)
                 .controlSize(.small)
                 .labelsHidden()
-                .frame(width: 110)
+                .fixedSize()
             }
             PanelLabeledRow("Opt Level",
                             help: "Crude (~5 ms/pose), Normal (~15 ms), Tight (~30 ms)") {
-                Picker("", selection: Binding(
+                Picker("Opt Level", selection: Binding(
                     get: { viewModel.docking.dockingConfig.gfn2Refinement.optLevel },
                     set: { viewModel.docking.dockingConfig.gfn2Refinement.optLevel = $0 }
                 )) {
@@ -1103,7 +851,7 @@ struct DockingTabView: View {
                 .pickerStyle(.menu)
                 .controlSize(.small)
                 .labelsHidden()
-                .frame(width: 96)
+                .fixedSize()
             }
             PanelLabeledRow("Top poses",
                             help: "Number of top-ranked poses to optimize with GFN2-xTB") {
@@ -1111,8 +859,7 @@ struct DockingTabView: View {
                     value: Binding(
                         get: { viewModel.docking.dockingConfig.gfn2Refinement.topPosesToRefine },
                         set: { viewModel.docking.dockingConfig.gfn2Refinement.topPosesToRefine = max(1, $0) }
-                    ),
-                    width: 56
+                    )
                 )
             }
             PanelSliderRow(
@@ -1125,65 +872,111 @@ struct DockingTabView: View {
                 format: { String(format: "%.0f%%", $0 * 100) }
             )
         }
-        .padding(.leading, 18)
+        .padding(.leading, DS.Space.xl)
     }
 
-    // MARK: - Run card
+    // MARK: - Footer: run summary + Run
 
-    @ViewBuilder
-    private var runCard: some View {
-        let hasGrid = viewModel.docking.selectedPocket != nil ||
-            (viewModel.docking.gridHalfSize.x > 2 && viewModel.docking.gridHalfSize.y > 2 && viewModel.docking.gridHalfSize.z > 2)
-        let canDock = hasGrid
+    private var canDock: Bool {
+        site.hasGrid
             && viewModel.molecules.ligand != nil
             && viewModel.molecules.protein != nil
             && !viewModel.docking.isDocking
+    }
 
-        VStack(alignment: .leading, spacing: 8) {
-            PanelRunButton(
-                title: viewModel.docking.batchQueue.count > 1
-                    ? "Dock \(viewModel.docking.batchQueue.count) Ligands"
-                    : "Run Docking",
-                icon: "play.fill",
-                isDisabled: !canDock
-            ) {
-                ensurePocketFromGrid()
-                if viewModel.docking.batchQueue.count > 1 {
-                    viewModel.dockEntries(viewModel.docking.batchQueue)
-                    viewModel.docking.batchQueue = []
-                } else {
-                    showPreDockSheet = true
-                }
-            }
-            .accessibilityIdentifier(AccessibilityID.dockStartButton)
+    @ViewBuilder
+    private var runFooter: some View {
+        if viewModel.molecules.protein != nil {
+            runSummary
+        }
+        if let warning = vramWarning() {
+            PanelHint(text: warning, icon: "exclamationmark.triangle.fill", color: DS.Color.warning)
+        }
+        PanelRunButton(
+            title: isBatchQueued
+                ? "Dock \(viewModel.docking.batchQueue.count) Ligands"
+                : (confirmBeforeDocking ? "Run Docking…" : "Run Docking"),
+            icon: "play.fill",
+            isDisabled: !canDock
+        ) { startDocking() }
+        .help(confirmBeforeDocking && !isBatchQueued
+              ? "Review the run, then start docking"
+              : "Start docking now")
+        .accessibilityIdentifier(AccessibilityID.dockStartButton)
+    }
 
-            if let warning = vramWarning() {
-                PanelHint(text: warning, icon: "exclamationmark.triangle.fill", color: .orange)
+    private var runSummary: some View {
+        let config = viewModel.docking.dockingConfig
+        let ligands: String? = isBatchQueued
+            ? "\(viewModel.docking.batchQueue.count) queued"
+            : viewModel.molecules.ligand?.name
+        let search = [config.searchMethod.shortLabel, viewModel.docking.scoringMethod.shortLabel, budgetSummary]
+            .joined(separator: " · ")
+        // Full-width rows: the Inputs card already names protein and site, the footer only recaps what will run.
+        return Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.xxs) {
+            GridRow {
+                summaryLabel(isBatchQueued ? "Ligands" : "Ligand")
+                summaryValue(ligands)
             }
-            if !canDock && !viewModel.docking.isDocking {
-                VStack(alignment: .leading, spacing: 3) {
-                    if viewModel.molecules.protein == nil {
-                        PanelRequirement(text: "Load a protein")
-                    }
-                    if viewModel.molecules.ligand == nil {
-                        PanelRequirement(text: "Set an active ligand")
-                    }
-                    if !hasGrid {
-                        PanelRequirement(text: "Configure grid box or detect pocket")
-                    }
-                }
+            GridRow {
+                summaryLabel("Site")
+                summaryValue(site.siteTitle)
             }
+            GridRow {
+                summaryLabel("Search")
+                summaryValue(search)
+                    .help("Total evaluations: \(totalEvaluationsString)")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func summaryLabel(_ text: String) -> some View {
+        Text(text)
+            .font(DS.Font.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private func summaryValue(_ text: String?) -> some View {
+        Text(text ?? "—")
+            .font(DS.Font.label)
+            .monospacedDigit()
+            .foregroundStyle(text == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var budgetSummary: String {
+        let c = viewModel.docking.dockingConfig
+        switch c.searchMethod {
+        case .fragmentBased:   return "beam \(c.fragment.beamWidth)"
+        case .diffusionGuided: return "\(c.diffusion.numDenoisingSteps) steps"
+        default:               return "\(c.populationSize)×\(c.generationsPerRun)×\(c.numRuns)"
+        }
+    }
+
+    private func startDocking() {
+        site.ensurePocketFromGrid()
+        if isBatchQueued {
+            viewModel.dockEntries(viewModel.docking.batchQueue)
+            viewModel.docking.batchQueue = []
+        } else if confirmBeforeDocking {
+            showPreDockSheet = true
+        } else {
+            viewModel.runDocking()
         }
     }
 
     private func vramWarning() -> String? {
         guard let engine = viewModel.docking.dockingEngine,
               let pocket = viewModel.docking.selectedPocket else { return nil }
+        let spacing = viewModel.docking.dockingConfig.gridSpacing
         let estimate = engine.estimateVRAMUsage(
             gridDims: SIMD3(
-                UInt32(ceil((pocket.size.x + 7) * 2 / viewModel.docking.dockingConfig.gridSpacing)) + 1,
-                UInt32(ceil((pocket.size.y + 7) * 2 / viewModel.docking.dockingConfig.gridSpacing)) + 1,
-                UInt32(ceil((pocket.size.z + 7) * 2 / viewModel.docking.dockingConfig.gridSpacing)) + 1
+                UInt32(ceil((pocket.size.x + 7) * 2 / spacing)) + 1,
+                UInt32(ceil((pocket.size.y + 7) * 2 / spacing)) + 1,
+                UInt32(ceil((pocket.size.z + 7) * 2 / spacing)) + 1
             ),
             numAffinityTypes: 10,
             populationSize: viewModel.docking.dockingConfig.populationSize,
@@ -1196,213 +989,59 @@ struct DockingTabView: View {
                       estimate.totalMB, estimate.deviceBudgetMB)
     }
 
-    // MARK: - Progress card
+    // MARK: - Footer: running
 
+    /// Single-ligand progress is shown once, in the canvas HUD (and the toolbar capsule);
+    /// the footer only swaps Run for Stop. Batch runs keep their ligand-level bar here because
+    /// the HUD tracks the ligand currently being docked.
     @ViewBuilder
-    private var progressCard: some View {
-        PanelCard(
-            "Docking In Progress",
-            icon: "bolt.fill",
-            accessory: {
-                let gen = viewModel.docking.dockingGeneration + 1
-                let total = viewModel.docking.dockingTotalGenerations
-                Text("Gen \(gen)/\(total)")
-                    .font(PanelStyle.monoSmall)
+    private var runningFooter: some View {
+        let isBatch = viewModel.docking.isBatchDocking
+        if isBatch {
+            let p = viewModel.docking.batchProgress
+            let label = "Ligand \(min(p.current + 1, max(p.total, 1))) of \(p.total)"
+            HStack(spacing: DS.Space.s) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("Batch docking…")
+                    .font(DS.Font.label.weight(.medium))
+                Spacer(minLength: DS.Space.xs)
+                Text(label)
+                    .font(DS.Font.monoSmall)
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
-        ) {
-            VStack(alignment: .leading, spacing: 8) {
-                ProgressView(
-                    value: min(Double(viewModel.docking.dockingGeneration + 1),
-                               Double(max(viewModel.docking.dockingTotalGenerations, 1))),
-                    total: Double(max(viewModel.docking.dockingTotalGenerations, 1))
-                )
+            ProgressView(value: Double(min(p.current, p.total)), total: Double(max(p.total, 1)))
                 .progressViewStyle(.linear)
-                .tint(.cyan)
-
-                PanelHint(text: "Live scores visible in viewport (top-right)")
-
-                PanelSecondaryButton(
-                    title: viewModel.docking.isBatchDocking ? "Stop All" : "Stop",
-                    icon: "stop.fill",
-                    tint: .red,
-                    help: "Cancel the active docking run and keep the best pose found so far"
-                ) {
-                    if viewModel.docking.isBatchDocking {
-                        viewModel.cancelBatchDocking()
-                    } else {
-                        viewModel.stopDocking()
-                    }
-                }
-                .accessibilityIdentifier(AccessibilityID.dockCancelButton)
-            }
+                .accessibilityLabel(label)
         }
-    }
-
-    // MARK: - Results card
-
-    @ViewBuilder
-    private var resultsCard: some View {
-        PanelCard(
-            "Docking Statistics",
-            icon: "chart.bar.xaxis",
-            accessory: {
-                if viewModel.docking.dockingDuration > 0 {
-                    Text(formatDuration(viewModel.docking.dockingDuration))
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
-                }
-            }
+        PanelRunButton(
+            title: isBatch ? "Stop All" : "Stop Docking",
+            icon: "stop.fill",
+            color: DS.Color.danger
         ) {
-            VStack(alignment: .leading, spacing: 10) {
-                resultsStatGrid
-                posebustersBadge
-                if let best = viewModel.docking.dockingResults.first {
-                    bestPoseBreakdown(best)
-                }
-                searchSummary
-                PanelSecondaryButton(title: "Open Results Database",
-                                     icon: "tablecells",
-                                     help: "Browse all docking poses with scores and exports") {
-                    openWindow(id: "results-database")
-                }
+            if isBatch {
+                viewModel.cancelBatchDocking()
+            } else {
+                viewModel.stopDocking()
             }
         }
+        .help("Cancel the active docking run and keep the best pose found so far")
+        .accessibilityIdentifier(AccessibilityID.dockCancelButton)
     }
 
-    @ViewBuilder
-    private var resultsStatGrid: some View {
-        let results = viewModel.docking.dockingResults
-        let energies = results.map(\.energy)
-        let clusterIDs = Set(results.map(\.clusterID))
-        HStack(spacing: 8) {
-            PanelStat(label: "Best", value: String(format: "%.1f", energies.min() ?? 0),
-                      color: (energies.min() ?? 0) < -6 ? .green : .yellow)
-            PanelStat(label: "Mean",
-                      value: String(format: "%.1f", energies.isEmpty ? 0 : energies.reduce(0, +) / Float(energies.count)))
-            PanelStat(label: "Poses", value: "\(results.count)", color: .blue)
-            PanelStat(label: "Clusters", value: "\(clusterIDs.count)", color: .cyan)
-        }
-        .padding(8)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.green.opacity(0.08))
-        )
-    }
+    // MARK: - Helpers
 
-    @ViewBuilder
-    private var posebustersBadge: some View {
-        let results = viewModel.docking.dockingResults
-        if results.contains(where: { $0.validity != nil }) {
-            let validCount = results.filter { $0.validity?.passed == true }.count
-            let total = results.count
-            let allPassed = validCount == total
-            HStack(spacing: 6) {
-                Image(systemName: allPassed ? "checkmark.seal.fill" : "exclamationmark.shield")
-                    .foregroundStyle(allPassed ? .green : .orange)
-                    .font(.system(size: 11))
-                Text("PoseBusters: \(validCount)/\(total) passed")
-                    .font(PanelStyle.smallFont.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if !allPassed,
-                   let firstBad = results.first(where: { $0.validity?.passed == false }),
-                   let v = firstBad.validity, !v.failures.isEmpty {
-                    Text(v.failures.prefix(2).joined(separator: ", "))
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.orange)
-                        .lineLimit(1)
-                }
-            }
-            .padding(6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill((allPassed ? Color.green : Color.orange).opacity(0.10))
-            )
-        }
-    }
-
-    @ViewBuilder
-    private func bestPoseBreakdown(_ best: DockingResult) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            PanelSubheader(title: "Best Pose Breakdown")
-            HStack(spacing: 8) {
-                scoreItem("vdW", best.vdwEnergy)
-                scoreItem("Elec", best.elecEnergy)
-                scoreItem("H-bond", best.hbondEnergy)
-                scoreItem("Torsion", best.torsionPenalty)
-            }
-            PanelSecondaryButton(title: "View Best Pose",
-                                 icon: "eye",
-                                 help: "Display the top-ranked docking pose in the 3D viewport") {
-                viewModel.showDockingPose(at: 0)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var searchSummary: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            PanelSubheader(title: "Search Summary")
-            HStack(spacing: 12) {
-                statMini("Generations", "\(viewModel.docking.dockingTotalGenerations)")
-                statMini("Population", "\(viewModel.docking.dockingConfig.populationSize)")
-                if let maxGen = viewModel.docking.dockingResults.map(\.generation).max() {
-                    statMini("Last Improv.", "Gen \(maxGen)")
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func scoreItem(_ label: String, _ value: Float) -> some View {
-        VStack(spacing: 1) {
-            Text(String(format: "%.1f", value))
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(value < 0 ? .green : .red)
-            Text(label)
-                .font(PanelStyle.captionFont)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    @ViewBuilder
-    private func statMini(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 3) {
-            Text("\(label):")
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(PanelStyle.monoSmall.weight(.medium))
-        }
+    private func descriptionText(_ text: String) -> some View {
+        Text(text)
+            .font(DS.Font.secondary)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func formatDuration(_ seconds: TimeInterval) -> String {
         if seconds < 60 { return String(format: "%.1fs", seconds) }
-        let m = Int(seconds) / 60
-        let s = Int(seconds) % 60
-        return "\(m)m \(s)s"
-    }
-
-    // MARK: - Helpers (presets, ordinals)
-
-    private func applySlabPreset(_ preset: String) {
-        guard let pocket = viewModel.docking.selectedPocket else { return }
-        let pocketRadius = max(pocket.size.x, max(pocket.size.y, pocket.size.z))
-        let thickness: Float
-        switch preset {
-        case "Tight":  thickness = pocketRadius * 1.5
-        case "Medium": thickness = pocketRadius * 2.5
-        default:       thickness = pocketRadius * 4.0
-        }
-        viewModel.workspace.slabThickness = thickness
-        viewModel.workspace.slabOffset = 0
-        viewModel.renderer?.slabCenter = pocket.center
-        viewModel.renderer?.slabHalfThickness = thickness / 2.0
-        viewModel.renderer?.slabOffset = 0
-        viewModel.focusOnPocket(pocket)
+        return "\(Int(seconds) / 60)m \(Int(seconds) % 60)s"
     }
 
     private func applyPreset(_ preset: String) {
@@ -1467,8 +1106,6 @@ struct DockingTabView: View {
 
     private var totalEvaluationsString: String {
         let cfg = viewModel.docking.dockingConfig
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
         let total: Int
         switch cfg.searchMethod {
         case .diffusionGuided:
@@ -1478,161 +1115,81 @@ struct DockingTabView: View {
         default:
             total = cfg.populationSize * cfg.generationsPerRun * cfg.numRuns
         }
-        return f.string(from: NSNumber(value: total)) ?? "\(total)"
+        return total.formatted(.number)
     }
+}
 
-    // MARK: - Pocket actions
+// MARK: - Inputs row
 
-    private func detectPocketsAuto() {
-        guard viewModel.molecules.protein != nil else { return }
-        let excluded = viewModel.workspace.hiddenChainIDs
-        let chainMsg = excluded.isEmpty ? "" : " (excluding chains: \(excluded.sorted().joined(separator: ", ")))"
-        viewModel.log.info("Detecting binding pockets\(chainMsg)...", category: .dock)
-        viewModel.detectPockets(excludedChainIDs: excluded)
-    }
+/// One Inputs row: eyebrow + entity dot + name + detail, or a requirement with a link to its step.
+private struct DockInputRow<Accessory: View>: View {
+    @Environment(AppViewModel.self) private var viewModel
 
-    private func detectFromLigand() {
-        guard viewModel.molecules.protein != nil, viewModel.molecules.ligand != nil else { return }
-        viewModel.log.info("Detecting pocket from ligand position...", category: .dock)
-        viewModel.detectLigandGuidedPocket()
-        if let pocket = viewModel.docking.selectedPocket {
-            syncGridFromPocket(pocket)
-            applyGridBoxFromSliders()
-        }
-    }
+    let kind: String
+    let tint: Color
+    let title: String?
+    let detail: String?
+    let missingText: String
+    let step: SidebarTab
+    @ViewBuilder let accessory: () -> Accessory
 
-    private func pocketFromSelection() {
-        guard viewModel.molecules.protein != nil,
-              !viewModel.workspace.selectedResidueIndices.isEmpty else { return }
-        viewModel.pocketFromSelection()
-        if let pocket = viewModel.docking.selectedPocket {
-            syncGridFromPocket(pocket)
-            applyGridBoxFromSliders()
-        }
-    }
-
-    private func removePocket(_ pocket: BindingPocket) {
-        viewModel.docking.detectedPockets.removeAll { $0.id == pocket.id }
-        if viewModel.docking.selectedPocket?.id == pocket.id {
-            viewModel.docking.selectedPocket = nil
-            viewModel.renderer?.clearGridBox()
-            viewModel.renderer?.setNeedsRedraw()
-        }
-        ActivityLog.shared.info("Removed pocket #\(pocket.id)", category: .dock)
-    }
-
-    // MARK: - Grid box actions
-
-    private func initializeGridAtProteinCenter(_ prot: Molecule) {
-        let positions: [SIMD3<Float>]
-        if viewModel.workspace.hiddenChainIDs.isEmpty {
-            positions = prot.atoms.map(\.position)
-        } else {
-            positions = prot.atoms.filter { !viewModel.workspace.hiddenChainIDs.contains($0.chainID) }.map(\.position)
-        }
-        guard !positions.isEmpty else { return }
-        let center = positions.reduce(SIMD3<Float>.zero, +) / Float(positions.count)
-        viewModel.docking.gridCenter = center
-        viewModel.docking.gridHalfSize = SIMD3<Float>(repeating: 10)
-        viewModel.docking.gridInitialized = true
-    }
-
-    private func syncGridFromPocket(_ pocket: BindingPocket) {
-        viewModel.docking.gridCenter = pocket.center
-        viewModel.docking.gridHalfSize = pocket.size
-    }
-
-    private func applyGridBoxFromSliders() {
-        viewModel.updateGridBoxVisualization(center: viewModel.docking.gridCenter,
-                                             halfSize: viewModel.docking.gridHalfSize)
-        if var pocket = viewModel.docking.selectedPocket {
-            pocket.center = viewModel.docking.gridCenter
-            pocket.size = viewModel.docking.gridHalfSize
-            viewModel.docking.selectedPocket = pocket
-        }
-    }
-
-    private func gridCenterBinding(_ keyPath: WritableKeyPath<SIMD3<Float>, Float>) -> Binding<Float> {
-        Binding(
-            get: { viewModel.docking.gridCenter[keyPath: keyPath] },
-            set: { viewModel.docking.gridCenter[keyPath: keyPath] = $0 }
-        )
-    }
-
-    private func gridHalfBinding(_ keyPath: WritableKeyPath<SIMD3<Float>, Float>) -> Binding<Float> {
-        Binding(
-            get: { viewModel.docking.gridHalfSize[keyPath: keyPath] },
-            set: { viewModel.docking.gridHalfSize[keyPath: keyPath] = $0 }
-        )
-    }
-
-    private func placeGridAtProteinCenter() {
-        guard let prot = viewModel.molecules.protein else { return }
-        initializeGridAtProteinCenter(prot)
-        applyGridBoxFromSliders()
-    }
-
-    private func placeGridAtLigand() {
-        guard let lig = viewModel.molecules.ligand else { return }
-        let positions = lig.atoms.map(\.position)
-        guard !positions.isEmpty else { return }
-        let center = positions.reduce(SIMD3<Float>.zero, +) / Float(positions.count)
-        var maxDist: Float = 0
-        for pos in positions {
-            let d = abs(pos - center)
-            maxDist = max(maxDist, max(d.x, max(d.y, d.z)))
-        }
-        let margin: Float = 4.0
-        viewModel.docking.gridCenter = center
-        viewModel.docking.gridHalfSize = SIMD3<Float>(repeating: maxDist + margin)
-        applyGridBoxFromSliders()
-    }
-
-    private func placeGridAtSelection() {
-        guard let prot = viewModel.molecules.protein else { return }
-        let resIndices = viewModel.workspace.selectedResidueIndices
-        guard !resIndices.isEmpty else { return }
-        var positions: [SIMD3<Float>] = []
-        for resIdx in resIndices {
-            if resIdx < prot.residues.count {
-                for atomIdx in prot.residues[resIdx].atomIndices {
-                    if atomIdx < prot.atoms.count {
-                        positions.append(prot.atoms[atomIdx].position)
-                    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            Text(kind.uppercased())
+                .font(DS.Font.eyebrow)
+                .tracking(0.6)
+                .foregroundStyle(.tertiary)
+            if let title {
+                HStack(spacing: DS.Space.s) {
+                    Circle()
+                        .fill(tint)
+                        .frame(width: 8, height: 8)
+                    Text(title)
+                        .font(DS.Font.label.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: DS.Space.xs)
+                    accessory()
+                }
+                if let detail {
+                    Text(detail)
+                        .font(DS.Font.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.leading, DS.Space.l + DS.Space.xxs)
+                }
+            } else {
+                HStack(spacing: DS.Space.m) {
+                    PanelRequirement(text: missingText)
+                    Spacer(minLength: DS.Space.xs)
+                    goToStepButton
+                    accessory()
                 }
             }
         }
-        guard !positions.isEmpty else { return }
-        let center = positions.reduce(SIMD3<Float>.zero, +) / Float(positions.count)
-        var maxDist: Float = 0
-        for pos in positions {
-            let d = abs(pos - center)
-            maxDist = max(maxDist, max(d.x, max(d.y, d.z)))
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var goToStepButton: some View {
+        Button {
+            step.request(in: viewModel)
+        } label: {
+            HStack(spacing: DS.Space.xxs) {
+                Text(step.rawValue)
+                Image(systemName: "arrow.right")
+            }
+            .font(DS.Font.secondary.weight(.medium))
         }
-        viewModel.docking.gridCenter = center
-        viewModel.docking.gridHalfSize = SIMD3<Float>(repeating: maxDist + 4.0)
-        applyGridBoxFromSliders()
+        .buttonStyle(.borderless)
+        .help("Go to step: \(step.rawValue)")
     }
+}
 
-    private func resetGridToPocket() {
-        guard let pocket = viewModel.docking.selectedPocket else { return }
-        syncGridFromPocket(pocket)
-        applyGridBoxFromSliders()
-    }
-
-    /// Create a pocket from current grid sliders so the docking engine has what it needs.
-    private func ensurePocketFromGrid() {
-        if viewModel.docking.selectedPocket != nil { return }
-        let center = viewModel.docking.gridCenter
-        let size = viewModel.docking.gridHalfSize
-        let pocket = BindingPocket(
-            id: 0, center: center, size: size,
-            volume: size.x * size.y * size.z * 8,
-            buriedness: 0.5, polarity: 0.5, druggability: 0.5,
-            residueIndices: [], probePositions: []
-        )
-        viewModel.docking.detectedPockets = [pocket]
-        viewModel.docking.selectedPocket = pocket
+extension DockInputRow where Accessory == EmptyView {
+    init(kind: String, tint: Color, title: String?, detail: String?, missingText: String, step: SidebarTab) {
+        self.init(kind: kind, tint: tint, title: title, detail: detail,
+                  missingText: missingText, step: step, accessory: { EmptyView() })
     }
 }
 
@@ -1647,31 +1204,41 @@ private struct ScoringInteractionsBadgeRow: View {
     }
 
     var body: some View {
-        if types.isEmpty {
-            EmptyView()
-        } else {
-            VStack(alignment: .leading, spacing: 4) {
+        if !types.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text("Accounted interactions")
-                    .font(.system(size: 10))
+                    .font(DS.Font.caption)
                     .foregroundStyle(.secondary)
-                FlowLayout(spacing: 4) {
+                FlowLayout(spacing: DS.Space.xs) {
                     ForEach(types, id: \.self) { t in
-                        HStack(spacing: 3) {
+                        HStack(spacing: DS.Space.xs) {
                             Circle()
-                                .fill(Color(red: Double(t.color.x),
-                                            green: Double(t.color.y),
-                                            blue: Double(t.color.z))
-                                        .opacity(Double(t.color.w)))
+                                .fill(color(for: t))
                                 .frame(width: 6, height: 6)
                             Text(t.label)
-                                .font(.system(size: 10))
                         }
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                        .font(DS.Font.caption)
+                        .padding(.horizontal, DS.Space.s)
+                        .padding(.vertical, DS.Space.xxs)
+                        .background(Capsule().fill(DS.Color.controlFill))
                     }
                 }
             }
+        }
+    }
+
+    /// Interaction palette tokens; types without a token keep their renderer colour.
+    private func color(for type: MolecularInteraction.InteractionType) -> Color {
+        switch type {
+        case .hbond:       DS.Color.interactionHBond
+        case .hydrophobic: DS.Color.interactionHydrophobic
+        case .saltBridge:  DS.Color.interactionSaltBridge
+        case .piStack:     DS.Color.interactionPiStack
+        case .piCation:    DS.Color.interactionPiCation
+        case .halogen:     DS.Color.interactionHalogen
+        case .metalCoord:  DS.Color.interactionMetal
+        default:
+            Color(red: Double(type.color.x), green: Double(type.color.y), blue: Double(type.color.z))
         }
     }
 }

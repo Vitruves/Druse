@@ -55,7 +55,7 @@ inline float trilinearInterpolate(
     float3 gc = (pos - origin) / spacing;
 
     if (gc.x < 0 || gc.y < 0 || gc.z < 0 ||
-        gc.x >= float(dims.x - 1) || gc.y >= float(dims.y - 1) || gc.z >= float(dims.z - 1)) {
+        gc.x > float(dims.x - 1) || gc.y > float(dims.y - 1) || gc.z > float(dims.z - 1)) {
         // Smooth quadratic out-of-grid penalty (gives GA gradient back)
         float dx = max(max(-gc.x, gc.x - float(dims.x - 1)), 0.0f);
         float dy = max(max(-gc.y, gc.y - float(dims.y - 1)), 0.0f);
@@ -63,22 +63,28 @@ inline float trilinearInterpolate(
         return 100.0f * (dx * dx + dy * dy + dz * dz);
     }
 
-    uint ix = uint(gc.x);  uint iy = uint(gc.y);  uint iz = uint(gc.z);
+    // Clamp the base cell so a point exactly on the upper face interpolates with frac = 1.
+    // A single-node axis (dim 1) has no cell: base and neighbour collapse onto node 0.
+    uint ix = min(uint(gc.x), max(dims.x, 2u) - 2u);
+    uint iy = min(uint(gc.y), max(dims.y, 2u) - 2u);
+    uint iz = min(uint(gc.z), max(dims.z, 2u) - 2u);
+    uint ix1 = min(ix + 1u, dims.x - 1u);
+    uint iy1 = min(iy + 1u, dims.y - 1u);
+    uint iz1 = min(iz + 1u, dims.z - 1u);
     float fx = gc.x - float(ix);
     float fy = gc.y - float(iy);
     float fz = gc.z - float(iz);
-
     uint nx = dims.x;  uint ny = dims.y;
 
     // Read half-precision grid values and promote to float for interpolation math
-    float c000 = float(gridMap[iz * nx * ny + iy * nx + ix]);
-    float c100 = float(gridMap[iz * nx * ny + iy * nx + ix + 1]);
-    float c010 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix]);
-    float c110 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix + 1]);
-    float c001 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix]);
-    float c101 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix + 1]);
-    float c011 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix]);
-    float c111 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix + 1]);
+    float c000 = float(gridMap[iz  * nx * ny + iy  * nx + ix ]);
+    float c100 = float(gridMap[iz  * nx * ny + iy  * nx + ix1]);
+    float c010 = float(gridMap[iz  * nx * ny + iy1 * nx + ix ]);
+    float c110 = float(gridMap[iz  * nx * ny + iy1 * nx + ix1]);
+    float c001 = float(gridMap[iz1 * nx * ny + iy  * nx + ix ]);
+    float c101 = float(gridMap[iz1 * nx * ny + iy  * nx + ix1]);
+    float c011 = float(gridMap[iz1 * nx * ny + iy1 * nx + ix ]);
+    float c111 = float(gridMap[iz1 * nx * ny + iy1 * nx + ix1]);
 
     return mix(mix(mix(c000, c100, fx), mix(c010, c110, fx), fy),
                mix(mix(c001, c101, fx), mix(c011, c111, fx), fy), fz);
@@ -107,6 +113,19 @@ inline float outOfGridPenalty(float3 pos, float3 gridMin, float3 gridMax) {
     return penalty;
 }
 
+/// Upper corner of the interpolatable grid region. The last grid node sits at
+/// origin + (dims - 1) * spacing; anything beyond cannot be trilinearly sampled.
+inline float3 gridUpperBound(constant GridParams &gp) {
+    return gp.origin + float3(gp.dims - 1u) * gp.spacing;
+}
+
+/// outOfGridPenalty with its gradient d(penalty)/d(pos).
+inline float outOfGridPenaltyWithGrad(float3 pos, float3 gridMin, float3 gridMax, thread float3 &grad) {
+    float3 excess = max(pos - gridMax, float3(0.0f)) - max(gridMin - pos, float3(0.0f));
+    grad = 2.0f * excess;
+    return dot(excess, excess);
+}
+
 inline float slopeStep(float xBad, float xGood, float x) {
     if (xBad < xGood) {
         if (x <= xBad) return 0.0f;
@@ -118,12 +137,10 @@ inline float slopeStep(float xBad, float xGood, float x) {
     return (x - xBad) / (xGood - xBad);
 }
 
-/// Smooth sigmoid approximation of slopeStep for continuous gradients.
-/// k=10 gives <1% deviation from piecewise linear at midpoint and endpoints.
-inline float smoothSlopeStep(float xBad, float xGood, float x) {
-    float k = 10.0f;
-    float t = k * (x - xBad) / (xGood - xBad) - k * 0.5f;
-    return 1.0f / (1.0f + exp(-t));
+/// Derivative of slopeStep w.r.t. x (piecewise constant, as in AutoDock Vina).
+inline float slopeStepDeriv(float xBad, float xGood, float x) {
+    bool inside = (xBad < xGood) ? (x > xBad && x < xGood) : (x < xBad && x > xGood);
+    return inside ? 1.0f / (xGood - xBad) : 0.0f;
 }
 
 /// Soft Vina quality gate: attenuates Drusina only for badly clashing poses (vinaE > 0).
@@ -136,14 +153,6 @@ inline float drusinaVinaQuality(float vinaE, constant DrusinaParams &params) {
     // quality ≈ 0.5 at vinaE = +2 (moderate clash)
     // quality → 0.0 for vinaE >> +2 (severe clash)
     return 1.0f / (1.0f + exp(0.5f * (vinaE - 2.0f)));
-}
-
-/// Derivative of smoothSlopeStep w.r.t. x.
-inline float smoothSlopeStepDeriv(float xBad, float xGood, float x) {
-    float k = 10.0f;
-    float t = k * (x - xBad) / (xGood - xBad) - k * 0.5f;
-    float s = 1.0f / (1.0f + exp(-t));
-    return k / (xGood - xBad) * s * (1.0f - s);
 }
 
 inline bool xsTypeSupported(int xsType) {
@@ -257,7 +266,7 @@ inline float trilinearInterpolateWithGrad(
     float3 gc = (pos - origin) / spacing;
 
     if (gc.x < 0 || gc.y < 0 || gc.z < 0 ||
-        gc.x >= float(dims.x - 1) || gc.y >= float(dims.y - 1) || gc.z >= float(dims.z - 1)) {
+        gc.x > float(dims.x - 1) || gc.y > float(dims.y - 1) || gc.z > float(dims.z - 1)) {
         // Out-of-grid: quadratic penalty with gradient
         float dx = gc.x < 0 ? -gc.x : max(gc.x - float(dims.x - 1), 0.0f);
         float dy = gc.y < 0 ? -gc.y : max(gc.y - float(dims.y - 1), 0.0f);
@@ -269,21 +278,28 @@ inline float trilinearInterpolateWithGrad(
         return 100.0f * (dx * dx + dy * dy + dz * dz);
     }
 
-    uint ix = uint(gc.x); uint iy = uint(gc.y); uint iz = uint(gc.z);
+    // Clamp the base cell so a point exactly on the upper face interpolates with frac = 1.
+    // A single-node axis (dim 1) has no cell: base and neighbour collapse onto node 0.
+    uint ix = min(uint(gc.x), max(dims.x, 2u) - 2u);
+    uint iy = min(uint(gc.y), max(dims.y, 2u) - 2u);
+    uint iz = min(uint(gc.z), max(dims.z, 2u) - 2u);
+    uint ix1 = min(ix + 1u, dims.x - 1u);
+    uint iy1 = min(iy + 1u, dims.y - 1u);
+    uint iz1 = min(iz + 1u, dims.z - 1u);
     float fx = gc.x - float(ix);
     float fy = gc.y - float(iy);
     float fz = gc.z - float(iz);
-    uint nx = dims.x; uint ny = dims.y;
+    uint nx = dims.x;  uint ny = dims.y;
 
     // Read half-precision grid values and promote to float for interpolation math
-    float c000 = float(gridMap[iz * nx * ny + iy * nx + ix]);
-    float c100 = float(gridMap[iz * nx * ny + iy * nx + ix + 1]);
-    float c010 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix]);
-    float c110 = float(gridMap[iz * nx * ny + (iy+1) * nx + ix + 1]);
-    float c001 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix]);
-    float c101 = float(gridMap[(iz+1) * nx * ny + iy * nx + ix + 1]);
-    float c011 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix]);
-    float c111 = float(gridMap[(iz+1) * nx * ny + (iy+1) * nx + ix + 1]);
+    float c000 = float(gridMap[iz  * nx * ny + iy  * nx + ix ]);
+    float c100 = float(gridMap[iz  * nx * ny + iy  * nx + ix1]);
+    float c010 = float(gridMap[iz  * nx * ny + iy1 * nx + ix ]);
+    float c110 = float(gridMap[iz  * nx * ny + iy1 * nx + ix1]);
+    float c001 = float(gridMap[iz1 * nx * ny + iy  * nx + ix ]);
+    float c101 = float(gridMap[iz1 * nx * ny + iy  * nx + ix1]);
+    float c011 = float(gridMap[iz1 * nx * ny + iy1 * nx + ix ]);
+    float c111 = float(gridMap[iz1 * nx * ny + iy1 * nx + ix1]);
 
     // Value
     float val = mix(mix(mix(c000, c100, fx), mix(c010, c110, fx), fy),
@@ -316,51 +332,56 @@ inline float sampleTypedAffinityMapWithGrad(
 }
 
 /// Vina pair energy with analytical derivative dE/dr.
+/// The energy is evaluated with the same expressions as vinaPairEnergyDecomposed so that
+/// the gradient pass and the accept/reject verification see identical energies.
 inline float vinaPairEnergyWithDeriv(int t1, int t2, float r, thread float &dEdr) {
     dEdr = 0.0f;
     if (!xsTypeSupported(t1) || !xsTypeSupported(t2) || r >= 8.0f) return 0.0f;
 
     float d = r - optimalDistanceXS(t1, t2);
-    float E = 0.0f;
+    float steric = 0.0f;
 
-    // Gauss1: w1 * exp(-4d²)
-    float g1 = exp(-4.0f * d * d);
-    E += wGauss1 * g1;
+    // Gauss1: w1 * exp(-(d/0.5)²)
+    float dOverHalf = d * 2.0f;
+    float g1 = exp(-(dOverHalf * dOverHalf));
+    steric += wGauss1 * g1;
     dEdr += wGauss1 * g1 * (-8.0f * d);
 
     // Gauss2: w2 * exp(-((d-3)/2)²)
     float dm3h = (d - 3.0f) * 0.5f;
-    float g2 = exp(-dm3h * dm3h);
-    E += wGauss2 * g2;
+    float g2 = exp(-(dm3h * dm3h));
+    steric += wGauss2 * g2;
     dEdr += wGauss2 * g2 * (-dm3h);  // chain rule: d/dd of -(dm3h²) = -dm3h
 
     // Repulsion: w_rep * d² if d<0
     if (d < 0.0f) {
-        E += wRepulsion * d * d;
+        steric += wRepulsion * d * d;
         dEdr += 2.0f * wRepulsion * d;
     }
 
-    // Hydrophobic (smooth for continuous gradient)
+    float hydrophobic = 0.0f;
     if (xsIsHydrophobic(t1) && xsIsHydrophobic(t2)) {
-        E += wHydrophobic * smoothSlopeStep(1.5f, 0.5f, d);
-        dEdr += wHydrophobic * smoothSlopeStepDeriv(1.5f, 0.5f, d);
+        hydrophobic = wHydrophobic * slopeStep(1.5f, 0.5f, d);
+        dEdr += wHydrophobic * slopeStepDeriv(1.5f, 0.5f, d);
     }
 
-    // H-bond (smooth for continuous gradient)
+    float hbond = 0.0f;
     if (xsHBondPossible(t1, t2)) {
-        E += wHBond * smoothSlopeStep(0.0f, -0.7f, d);
-        dEdr += wHBond * smoothSlopeStepDeriv(0.0f, -0.7f, d);
+        hbond = wHBond * slopeStep(0.0f, -0.7f, d);
+        dEdr += wHBond * slopeStepDeriv(0.0f, -0.7f, d);
     }
 
-    return E;
+    return steric + hydrophobic + hbond;
 }
 
 /// Compute intramolecular energy with gradient w.r.t. atom positions.
-/// Accumulates dE/dpos for each atom into the gradients array.
+/// Accumulates gradScale * dE/dpos for each atom into the gradients array
+/// (pass a negative scale to accumulate forces directly).
 /// Uses flat pair list (packed uint32_t: low 16 = atom A, high 16 = atom B).
 inline float intramolecularWithGrad(
     thread float3         *positions,
     thread float3         *gradients,
+    float                   gradScale,
     constant DockLigandAtom *ligandAtoms,
     uint                    nAtoms,
     constant uint32_t      *intraPairs,
@@ -380,7 +401,7 @@ inline float intramolecularWithGrad(
         float dEdr;
         total += vinaPairEnergyWithDeriv(ligandAtoms[i].vinaType, ligandAtoms[j].vinaType, r, dEdr);
 
-        float3 gradContrib = dEdr * diff / r;
+        float3 gradContrib = (gradScale * dEdr / r) * diff;
         gradients[i] += gradContrib;
         gradients[j] -= gradContrib;
     }
@@ -464,6 +485,12 @@ inline void transformAtoms(
 // MARK: - Pharmacophore Constraint Evaluation
 // ============================================================================
 
+/// True when the ligand XS type is set in a constraint's compatibility bitmask.
+/// Types outside [0, 32) (e.g. unassigned = -1) never match; shifting by them is undefined.
+inline bool constraintTypeCompatible(int vinaType, uint32_t mask) {
+    return uint(vinaType) < 32u && ((1u << uint(vinaType)) & mask) != 0u;
+}
+
 /// Compute pharmacophore constraint penalty for a pose.
 /// For each constraint group (shared groupID), finds the minimum distance from
 /// any compatible ligand atom to any constraint target in that group, then applies
@@ -503,8 +530,7 @@ inline float evaluateConstraintPenalty(
         } else {
             // Receptor-side: find closest compatible ligand atom
             for (uint a = 0; a < nAtoms; a++) {
-                uint32_t typeBit = 1u << uint32_t(ligandAtoms[a].vinaType);
-                if ((typeBit & con.compatibleVinaTypes) == 0) continue;
+                if (!constraintTypeCompatible(ligandAtoms[a].vinaType, con.compatibleVinaTypes)) continue;
                 float d = distance(positions[a], con.position);
                 bestDist = min(bestDist, d);
             }
@@ -576,8 +602,7 @@ inline float evaluateConstraintPenaltyWithGrad(
             }
         } else {
             for (uint a = 0; a < nAtoms; a++) {
-                uint32_t typeBit = 1u << uint32_t(ligandAtoms[a].vinaType);
-                if ((typeBit & con.compatibleVinaTypes) == 0) continue;
+                if (!constraintTypeCompatible(ligandAtoms[a].vinaType, con.compatibleVinaTypes)) continue;
                 float d = distance(positions[a], con.position);
                 float violation = max(d - con.distanceThreshold, 0.0f);
                 if (violation < groupViolation[gid]) {
@@ -631,7 +656,7 @@ inline float vinaScorePositions(
     uint                        numIntraPairs = 0)
 {
     float3 gridMin = gp.origin;
-    float3 gridMax = gp.origin + float3(gp.dims) * gp.spacing;
+    float3 gridMax = gridUpperBound(gp);
 
     float totalIntermolecular = 0.0f;
     float penalty = 0.0f;
@@ -685,7 +710,7 @@ inline float evaluatePose(
     applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTorsions);
 
     float3 gridMin = gp.origin;
-    float3 gridMax = gp.origin + float3(gp.dims) * gp.spacing;
+    float3 gridMax = gridUpperBound(gp);
 
     float totalIntermolecular = 0.0f;
     float boundaryPenalty = 0.0f;
@@ -740,7 +765,7 @@ inline float evaluatePoseConstrained(
     applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTorsions);
 
     float3 gridMin = gp.origin;
-    float3 gridMax = gp.origin + float3(gp.dims) * gp.spacing;
+    float3 gridMax = gridUpperBound(gp);
 
     float totalIntermolecular = 0.0f;
     float boundaryPenalty = 0.0f;
@@ -772,11 +797,12 @@ inline float evaluatePoseConstrained(
 }
 
 /// Evaluate pose energy and compute analytical gradients for all DOF in a single pass.
-/// Uses force/torque accumulation (same algorithm as AutoDock Vina tree.h).
+/// The energy is identical to evaluatePoseConstrained (same transform, grid-bound penalty,
+/// intramolecular terms and constraint penalty), so accept/reject comparisons are consistent.
 ///
-/// For each torsion, the derivative is: dE/dθ = torque · axis
-/// where torque = Σ cross(atom_pos - pivot, force_on_atom) for all downstream atoms.
-/// Forces propagate upward leaf→root: parent accumulates child forces and torques.
+/// Gradients use force/torque accumulation (AutoDock Vina tree.h): for each torsion,
+/// dE/dθ = -axis · Σ cross(pos_a - pivot, F_a) over all atoms downstream of the bond
+/// (movingIndices lists every downstream atom, including those moved by child torsions).
 ///
 /// Returns total energy. Fills gradT[3], gradR[3], gradTor[32].
 inline float evaluatePoseWithGradient(
@@ -792,6 +818,8 @@ inline float evaluatePoseWithGradient(
     float                    referenceIntraEnergy,
     constant uint32_t       *intraPairs,
     uint                     numIntraPairs,
+    constant PharmacophoreConstraint *constraints,
+    constant PharmacophoreParams &pharmaParams,
     thread float            *gradT,
     thread float            *gradR,
     thread float            *gradTor)
@@ -804,125 +832,67 @@ inline float evaluatePoseWithGradient(
     for (uint a = 0; a < nA; a++) {
         positions[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
     }
+    applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTor);
+
+    // --- Energy and per-atom forces (forces[a] = -dE/dpos[a]) ---
+    float normFactor = vinaRotNormalization(float(nTor));
+    float3 gridMin = gp.origin;
+    float3 gridMax = gridUpperBound(gp);
+
+    float3 forces[128];
+    float totalIntermolecular = 0.0f;
+    float boundaryPenalty = 0.0f;
+    for (uint a = 0; a < nA; a++) {
+        float3 grad;
+        float oopP = outOfGridPenaltyWithGrad(positions[a], gridMin, gridMax, grad);
+        if (oopP > 0.0f) {
+            boundaryPenalty += oopP;
+            forces[a] = -wPenalty * grad;
+            continue;
+        }
+        totalIntermolecular += sampleTypedAffinityMapWithGrad(
+            affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, positions[a], gp, grad
+        );
+        forces[a] = -grad * normFactor;
+    }
+
+    float intraE = 0.0f;
+    if (intraPairs && numIntraPairs > 0) {
+        intraE = intramolecularWithGrad(positions, forces, -normFactor, ligandAtoms, nA, intraPairs, numIntraPairs);
+    }
+
+    float constraintPen = evaluateConstraintPenaltyWithGrad(
+        positions, forces, ligandAtoms, nA, constraints, pharmaParams);
+
+    float totalEnergy = (totalIntermolecular + intraE - referenceIntraEnergy) * normFactor
+                      + wPenalty * boundaryPenalty + constraintPen;
+
+    // --- Torsion derivatives ---
     for (uint t = 0; t < nTor; t++) {
-        float angle = pose.torsions[t];
-        if (abs(angle) < 1e-6f) continue;
         TorsionEdge edge = torsionEdges[t];
         float3 pivot = positions[edge.atom1];
         float3 axisVec = positions[edge.atom2] - pivot;
         float axisLen = length(axisVec);
-        if (axisLen < 1e-6f) continue;
-        float3 axis = axisVec / axisLen;
-        float cosA = cos(angle);
-        float sinA = sin(angle);
-        for (int i = 0; i < edge.movingCount; i++) {
-            int ai = movingIndices[edge.movingStart + i];
-            if (ai < 0 || uint(ai) >= nA) continue;
-            float3 v = positions[ai] - pivot;
-            positions[ai] = pivot + v * cosA + cross(axis, v) * sinA + axis * dot(axis, v) * (1.0f - cosA);
-        }
-    }
-
-    // --- Compute energy and per-atom forces (negative gradient) ---
-    float3 forces[128];  // forces[a] = -dE/dpos[a]
-    for (uint a = 0; a < nA; a++) forces[a] = float3(0);
-
-    float nRotF = float(nTor);
-    float normFactor = vinaRotNormalization(nRotF);
-
-    // Intermolecular: grid-based energy + gradient
-    float totalIntermolecular = 0.0f;
-    for (uint a = 0; a < nA; a++) {
-        float3 grad;
-        float e = sampleTypedAffinityMapWithGrad(
-            affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, positions[a], gp, grad
-        );
-        totalIntermolecular += e;
-        forces[a] -= grad * normFactor;  // force = -gradient
-    }
-
-    // Intramolecular energy + gradient (intramolecularWithGrad accumulates +dE/dpos)
-    float intraE = 0.0f;
-    if (intraPairs && numIntraPairs > 0) {
-        float3 intraGrad[128];
-        for (uint a = 0; a < nA; a++) intraGrad[a] = float3(0);
-        intraE = intramolecularWithGrad(positions, intraGrad, ligandAtoms, nA, intraPairs, numIntraPairs);
-        for (uint a = 0; a < nA; a++) forces[a] -= intraGrad[a] * normFactor;  // force = -gradient
-    }
-    float intraDelta = intraE - referenceIntraEnergy;
-    float totalEnergy = (totalIntermolecular + intraDelta) * normFactor;
-
-    // --- Torsion derivatives via force/torque accumulation (Vina algorithm) ---
-    // Process torsions leaf→root. For each torsion:
-    //   1. Sum force and torque over the torsion's moving atoms
-    //   2. dE/dθ = -(torque · axis)  (torque from forces, sign: force = -dE/dpos)
-    //   3. Propagate: parent torsion receives child's force and torque contribution
-
-    // We process in reverse order (leaf→root) since torsions are stored root→leaf.
-    // Each torsion's derivative includes contributions from all downstream torsions.
-    float3 torsionForce[32];   // accumulated force for each torsion subtree
-    float3 torsionTorque[32];  // accumulated torque for each torsion subtree
-    for (uint t = 0; t < nTor; t++) {
-        torsionForce[t] = float3(0);
-        torsionTorque[t] = float3(0);
-    }
-
-    // Step 1: Each torsion accumulates force/torque from its own moving atoms
-    for (uint t = 0; t < nTor; t++) {
-        TorsionEdge edge = torsionEdges[t];
-        float3 pivot = positions[edge.atom1];
-        for (int i = 0; i < edge.movingCount; i++) {
-            int ai = movingIndices[edge.movingStart + i];
-            if (ai < 0 || uint(ai) >= nA) continue;
-            torsionForce[t] += forces[ai];
-            torsionTorque[t] += cross(positions[ai] - pivot, forces[ai]);
-        }
-    }
-
-    // Step 2: Propagate child torsion force/torque to parent (leaf→root)
-    // A child torsion's force gets added to the parent's force,
-    // and cross(child_origin - parent_origin, child_force) + child_torque gets added to parent's torque.
-    // Since our torsion tree is flat (not explicitly hierarchical), we check containment:
-    // torsion j is a child of torsion i if torsion i's moving atoms include torsion j's pivot atom.
-    // For the flat representation, torsions are ordered root→leaf, so we process in reverse.
-    // But a simpler approach: each atom's force only needs to appear in the innermost torsion
-    // that moves it, and the flat torsion loop already handles this correctly because
-    // inner torsions' atoms are a subset of outer torsions' atoms.
-    // The above per-torsion accumulation already double-counts atoms that appear in multiple
-    // torsion moving sets. We need to subtract child contributions and add them as torque.
-
-    // Actually, the correct approach for a flat torsion list where moving sets may overlap:
-    // Skip the hierarchical propagation and compute each torsion's gradient directly as
-    // the torque about the axis from ALL atoms downstream of that torsion bond.
-    // This is what the per-torsion accumulation above already does correctly, because
-    // edge.movingCount includes all atoms downstream of the torsion (including those
-    // moved by child torsions).
-
-    for (uint t = 0; t < nTor; t++) {
-        TorsionEdge edge = torsionEdges[t];
-        float3 axisVec = positions[edge.atom2] - positions[edge.atom1];
-        float axisLen = length(axisVec);
         if (axisLen < 1e-6f) { gradTor[t] = 0.0f; continue; }
-        float3 axis = axisVec / axisLen;
-        // dE/dθ = -(torque · axis)  because force = -dE/dpos
-        gradTor[t] = -dot(torsionTorque[t], axis);
+        float3 torque = float3(0);
+        for (int i = 0; i < edge.movingCount; i++) {
+            int ai = movingIndices[edge.movingStart + i];
+            if (ai < 0 || uint(ai) >= nA) continue;
+            torque += cross(positions[ai] - pivot, forces[ai]);
+        }
+        gradTor[t] = -dot(torque, axisVec / axisLen);
     }
 
-    // --- Translation gradient = -total_force = sum of dE/dpos ---
+    // --- Rigid-body gradients: dE/dT = -ΣF, dE/dω = -Σ cross(pos - T, F) ---
     float3 totalForce = float3(0);
-    for (uint a = 0; a < nA; a++) totalForce += forces[a];
-    gradT[0] = -totalForce.x;  // gradient = -force
-    gradT[1] = -totalForce.y;
-    gradT[2] = -totalForce.z;
-
-    // --- Rotation gradient via torque about ligand center ---
-    // Total torque about the rigid body origin (pose.translation):
-    // τ = Σ cross(pos_a - origin, force_a)
-    // dE/dω_k = -τ_k  (axis-angle parameterization)
     float3 totalTorque = float3(0);
     for (uint a = 0; a < nA; a++) {
+        totalForce += forces[a];
         totalTorque += cross(positions[a] - pose.translation, forces[a]);
     }
+    gradT[0] = -totalForce.x;
+    gradT[1] = -totalForce.y;
+    gradT[2] = -totalForce.z;
     gradR[0] = -totalTorque.x;
     gradR[1] = -totalTorque.y;
     gradR[2] = -totalTorque.z;
@@ -935,11 +905,13 @@ inline float evaluatePoseWithGradient(
 // ============================================================================
 
 /// PCG-style hash for high-quality pseudorandom numbers on GPU.
+/// Returns a uniform float in [0, 1): the top 24 bits are exactly representable, whereas
+/// float(word) / float(0xFFFFFFFF) rounds the largest words up to exactly 1.0.
 inline float gpuRandom(uint seed, uint seq) {
     uint state = seed * 747796405u + seq * 2891336453u + 1u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     word = (word >> 22u) ^ word;
-    return float(word) / float(0xFFFFFFFFu);
+    return float(word >> 8u) * (1.0f / 16777216.0f);
 }
 
 inline float3 randomInsideUnitSphere(uint seed, uint seqBase) {

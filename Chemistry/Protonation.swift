@@ -25,6 +25,7 @@ enum Protonation {
     struct ResiduePrediction: Sendable {
         let chainID: String
         let residueSeq: Int
+        let insertionCode: String
         let residueName: String
         let chemicalKind: ChemicalKind
         let state: StateKind
@@ -38,14 +39,71 @@ enum Protonation {
         let protonatedAtoms: Set<String>
 
         var summary: String {
-            "\(residueName) \(residueSeq) \(state.rawValue) pKa \(String(format: "%.2f", shiftedPKa))"
+            "\(residueName) \(residueSeq)\(insertionCode) \(state.rawValue) pKa \(String(format: "%.2f", shiftedPKa))"
+        }
+
+        /// The same prediction with a neutral histidine's single ring proton on the
+        /// other nitrogen (HID ↔ HIE), as chosen by the H-bond network optimizer.
+        /// Neutral tautomers carry no formal charge, so `atomFormalCharges` is unchanged.
+        func withNeutralHistidineTautomer(_ newState: StateKind) -> ResiduePrediction {
+            let protonated: Set<String>
+            switch newState {
+            case .histidineDelta: protonated = ["ND1"]
+            case .histidineEpsilon: protonated = ["NE2"]
+            default: return self
+            }
+            return ResiduePrediction(
+                chainID: chainID, residueSeq: residueSeq, insertionCode: insertionCode,
+                residueName: residueName, chemicalKind: chemicalKind, state: newState,
+                modelPKa: modelPKa, shiftedPKa: shiftedPKa,
+                burialContribution: burialContribution,
+                hydrogenBondContribution: hydrogenBondContribution,
+                chargeContribution: chargeContribution,
+                managedAtomNames: managedAtomNames,
+                atomFormalCharges: atomFormalCharges,
+                protonatedAtoms: protonated
+            )
         }
     }
 
     private struct ResidueKey: Hashable {
         let chainID: String
         let residueSeq: Int
+        let insertionCode: String
         let residueName: String
+
+        init(chainID: String, residueSeq: Int, insertionCode: String, residueName: String) {
+            self.chainID = chainID
+            self.residueSeq = residueSeq
+            self.insertionCode = insertionCode.trimmingCharacters(in: .whitespaces)
+            self.residueName = residueName
+        }
+
+        init(atom: Atom, residueName: String) {
+            self.init(chainID: atom.chainID, residueSeq: atom.residueSeq,
+                      insertionCode: atom.insertionCode, residueName: residueName)
+        }
+
+        init(prediction: ResiduePrediction) {
+            self.init(chainID: prediction.chainID, residueSeq: prediction.residueSeq,
+                      insertionCode: prediction.insertionCode, residueName: prediction.residueName)
+        }
+
+        var position: ResiduePosition {
+            ResiduePosition(residueSeq: residueSeq, insertionCode: insertionCode)
+        }
+    }
+
+    /// Sequence position of a residue; insertion codes order after the plain number
+    /// (52 < 52A < 52B < 53).
+    private struct ResiduePosition: Comparable {
+        let residueSeq: Int
+        let insertionCode: String
+
+        static func < (lhs: ResiduePosition, rhs: ResiduePosition) -> Bool {
+            if lhs.residueSeq != rhs.residueSeq { return lhs.residueSeq < rhs.residueSeq }
+            return lhs.insertionCode < rhs.insertionCode
+        }
     }
 
     private struct SiteDefinition {
@@ -274,11 +332,19 @@ enum Protonation {
         let residues = groupedResidues(from: atoms)
         let chainBounds = chainTerminalBounds(from: residues)
 
+        // Precompute spatial grid and bond adjacency for O(1) lookups.
+        let grid = SpatialGrid(atoms: atoms, cellSize: PropkaConfig.desolvationCutoff)
+        let adjacency = BondAdjacency(bonds: bonds, atomCount: atoms.count)
+
+        // Cystines (SG–SG disulfide) carry no titratable proton.
+        let disulfideCysteines = disulfideBondedCysteines(residues: residues, atoms: atoms, grid: grid)
+
         var snapshots: [SiteSnapshot] = []
         snapshots.reserveCapacity(residues.count + chainBounds.count * 2)
 
         for (key, indices) in residues {
             guard let definition = siteDefinitions[key.residueName],
+                  !disulfideCysteines.contains(key),
                   let center = siteCenter(atomNames: definition.siteAtoms, residueIndices: indices, atoms: atoms) else {
                 continue
             }
@@ -290,10 +356,25 @@ enum Protonation {
         }
 
         for (chainID, bounds) in chainBounds {
-            if let nCenter = terminusCenter(chainID: chainID, residueSeq: bounds.minResidueSeq, atomNames: ["N"], residues: residues, atoms: atoms) {
-                let key = ResidueKey(chainID: chainID, residueSeq: bounds.minResidueSeq, residueName: "*N-term*")
+            // A terminus capped by ACE/NME (or otherwise peptide-linked) is an amide, not NH3+/COO-.
+            let nTermKey = ResidueKey(chainID: chainID, residueSeq: bounds.first.residueSeq,
+                                      insertionCode: bounds.first.insertionCode, residueName: "*N-term*")
+            let cTermKey = ResidueKey(chainID: chainID, residueSeq: bounds.last.residueSeq,
+                                      insertionCode: bounds.last.insertionCode, residueName: "*C-term*")
+            let nTermCapped = isPeptideLinked(
+                atomName: "N", partnerElement: .C,
+                residueIndices: residueIndices(for: nTermKey, residues: residues),
+                atoms: atoms, grid: grid
+            )
+            let cTermCapped = isPeptideLinked(
+                atomName: "C", partnerElement: .N,
+                residueIndices: residueIndices(for: cTermKey, residues: residues),
+                atoms: atoms, grid: grid
+            )
+
+            if !nTermCapped, let nCenter = terminusCenter(key: nTermKey, atomNames: ["N"], residues: residues, atoms: atoms) {
                 snapshots.append(SiteSnapshot(
-                    key: key,
+                    key: nTermKey,
                     definition: SiteDefinition(
                         residueName: "*N-term*",
                         kind: .nTerminus,
@@ -307,21 +388,18 @@ enum Protonation {
                 ))
             }
 
-            if let cAtomName = preferredCTerminalAtomName(
-                chainID: chainID,
-                residueSeq: bounds.maxResidueSeq,
+            if !cTermCapped, let cAtomName = preferredCTerminalAtomName(
+                key: cTermKey,
                 residues: residues,
                 atoms: atoms
             ), let cCenter = terminusCenter(
-                chainID: chainID,
-                residueSeq: bounds.maxResidueSeq,
+                key: cTermKey,
                 atomNames: [cAtomName],
                 residues: residues,
                 atoms: atoms
             ) {
-                let key = ResidueKey(chainID: chainID, residueSeq: bounds.maxResidueSeq, residueName: "*C-term*")
                 snapshots.append(SiteSnapshot(
-                    key: key,
+                    key: cTermKey,
                     definition: SiteDefinition(
                         residueName: "*C-term*",
                         kind: .cTerminus,
@@ -335,10 +413,6 @@ enum Protonation {
                 ))
             }
         }
-
-        // Precompute spatial grid and bond adjacency for O(1) lookups.
-        let grid = SpatialGrid(atoms: atoms, cellSize: PropkaConfig.desolvationCutoff)
-        let adjacency = BondAdjacency(bonds: bonds, atomCount: atoms.count)
 
         // Precompute per-snapshot residue indices and numVolume (avoids redundant O(N) scans).
         var snapshotResidueIndicesCache: [Int: [Int]] = [:]
@@ -356,6 +430,11 @@ enum Protonation {
             for j in snapshots.indices where j < i {
                 let lhs = snapshots[i]
                 let rhs = snapshots[j]
+
+                // PROPKA only considers group pairs whose centers lie within the Coulomb
+                // cutoff (determinants.set_determinants); this also bounds the buried
+                // COO–HIS / CYS–HIS / CYS–CYS exception shifts to nearby pairs.
+                guard simd_distance(lhs.center, rhs.center) < PropkaConfig.coulombCutoff2 else { continue }
 
                 let lhsResidueIndices = snapshotResidueIndicesCache[i]!
                 let rhsResidueIndices = snapshotResidueIndicesCache[j]!
@@ -390,12 +469,13 @@ enum Protonation {
         }
 
         if !bonds.isEmpty {
+            let environment = HydrogenBondEnvironment(residues: residues, atoms: atoms)
             for (i, snapshot) in snapshots.enumerated() {
                 let snapshotResidueIndices = snapshotResidueIndicesCache[i]!
                 let contribution = environmentalHydrogenBondContribution(
                     for: snapshot,
                     residueIndices: snapshotResidueIndices,
-                    residues: residues,
+                    environment: environment,
                     atoms: atoms,
                     bonds: bonds,
                     adjacency: adjacency
@@ -427,7 +507,8 @@ enum Protonation {
                 shiftedPKa: shiftedPKa,
                 pH: pH,
                 residueIndices: residueIndices,
-                atoms: atoms
+                atoms: atoms,
+                grid: grid
             )
             let atomFormalCharges = formalCharges(
                 for: snapshot,
@@ -445,6 +526,7 @@ enum Protonation {
             predictions.append(ResiduePrediction(
                 chainID: snapshot.key.chainID,
                 residueSeq: snapshot.key.residueSeq,
+                insertionCode: snapshot.key.insertionCode,
                 residueName: snapshot.key.residueName,
                 chemicalKind: snapshot.definition.kind,
                 state: state,
@@ -469,7 +551,7 @@ enum Protonation {
     ) -> [(atomIndex: Int, charge: Int)] {
         let predictions = predictResidueStates(atoms: atoms, bonds: bonds, pH: pH)
         let keyedPredictions = Dictionary(uniqueKeysWithValues: predictions.map {
-            (ResidueKey(chainID: $0.chainID, residueSeq: $0.residueSeq, residueName: $0.residueName), $0)
+            (ResidueKey(prediction: $0), $0)
         })
 
         var results: [(atomIndex: Int, charge: Int)] = []
@@ -477,9 +559,9 @@ enum Protonation {
 
         for (index, atom) in atoms.enumerated() {
             let atomName = normalize(atom.name)
-            let directKey = ResidueKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: normalize(atom.residueName))
-            let nTermKey = ResidueKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: "*N-term*")
-            let cTermKey = ResidueKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: "*C-term*")
+            let directKey = ResidueKey(atom: atom, residueName: normalize(atom.residueName))
+            let nTermKey = ResidueKey(atom: atom, residueName: "*N-term*")
+            let cTermKey = ResidueKey(atom: atom, residueName: "*C-term*")
 
             for key in [directKey, nTermKey, cTermKey] {
                 guard let prediction = keyedPredictions[key], prediction.managedAtomNames.contains(atomName) else { continue }
@@ -501,14 +583,14 @@ enum Protonation {
 
     static func applyProtonation(atoms: [Atom], predictions: [ResiduePrediction]) -> [Atom] {
         let keyedPredictions = Dictionary(uniqueKeysWithValues: predictions.map {
-            (ResidueKey(chainID: $0.chainID, residueSeq: $0.residueSeq, residueName: $0.residueName), $0)
+            (ResidueKey(prediction: $0), $0)
         })
 
         return atoms.map { atom in
             let atomName = normalize(atom.name)
-            let directKey = ResidueKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: normalize(atom.residueName))
-            let nTermKey = ResidueKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: "*N-term*")
-            let cTermKey = ResidueKey(chainID: atom.chainID, residueSeq: atom.residueSeq, residueName: "*C-term*")
+            let directKey = ResidueKey(atom: atom, residueName: normalize(atom.residueName))
+            let nTermKey = ResidueKey(atom: atom, residueName: "*N-term*")
+            let cTermKey = ResidueKey(atom: atom, residueName: "*C-term*")
 
             for key in [directKey, nTermKey, cTermKey] {
                 guard let prediction = keyedPredictions[key],
@@ -532,29 +614,35 @@ enum Protonation {
         for index in atoms.indices {
             let atom = atoms[index]
             guard !atom.isHetAtom || atom.residueName == "ACE" || atom.residueName == "NME" else { continue }
-            let key = ResidueKey(
-                chainID: atom.chainID,
-                residueSeq: atom.residueSeq,
-                residueName: normalize(atom.residueName)
-            )
+            let key = ResidueKey(atom: atom, residueName: normalize(atom.residueName))
             grouped[key, default: []].append(index)
         }
         return grouped
     }
 
-    private static func chainTerminalBounds(from residues: [ResidueKey: [Int]]) -> [String: (minResidueSeq: Int, maxResidueSeq: Int)] {
-        var bounds: [String: (minResidueSeq: Int, maxResidueSeq: Int)] = [:]
+    private static func chainTerminalBounds(from residues: [ResidueKey: [Int]]) -> [String: (first: ResiduePosition, last: ResiduePosition)] {
+        var bounds: [String: (first: ResiduePosition, last: ResiduePosition)] = [:]
         for key in residues.keys where !key.residueName.hasPrefix("*") && key.residueName != "ACE" && key.residueName != "NME" {
+            let position = key.position
             if let current = bounds[key.chainID] {
-                bounds[key.chainID] = (
-                    min(current.minResidueSeq, key.residueSeq),
-                    max(current.maxResidueSeq, key.residueSeq)
-                )
+                bounds[key.chainID] = (min(current.first, position), max(current.last, position))
             } else {
-                bounds[key.chainID] = (key.residueSeq, key.residueSeq)
+                bounds[key.chainID] = (position, position)
             }
         }
         return bounds
+    }
+
+    /// Atom indices of the (non-terminal-pseudo) residue at a terminus key's position.
+    private static func residueAt(
+        _ key: ResidueKey,
+        residues: [ResidueKey: [Int]]
+    ) -> [(key: ResidueKey, value: [Int])] {
+        residues.filter {
+            $0.key.chainID == key.chainID &&
+            $0.key.position == key.position &&
+            !$0.key.residueName.hasPrefix("*")
+        }.map { (key: $0.key, value: $0.value) }
     }
 
     private static func residueIndices(
@@ -565,11 +653,7 @@ enum Protonation {
             return indices
         }
         if key.residueName.hasPrefix("*") {
-            return residues.first {
-                $0.key.chainID == key.chainID &&
-                $0.key.residueSeq == key.residueSeq &&
-                !$0.key.residueName.hasPrefix("*")
-            }?.value ?? []
+            return residueAt(key, residues: residues).first?.value ?? []
         }
         return []
     }
@@ -589,13 +673,12 @@ enum Protonation {
     }
 
     private static func terminusCenter(
-        chainID: String,
-        residueSeq: Int,
+        key: ResidueKey,
         atomNames: [String],
         residues: [ResidueKey: [Int]],
         atoms: [Atom]
     ) -> SIMD3<Float>? {
-        for (key, indices) in residues where key.chainID == chainID && key.residueSeq == residueSeq {
+        for (_, indices) in residueAt(key, residues: residues) {
             if let center = siteCenter(atomNames: atomNames, residueIndices: indices, atoms: atoms) {
                 return center
             }
@@ -604,16 +687,59 @@ enum Protonation {
     }
 
     private static func preferredCTerminalAtomName(
-        chainID: String,
-        residueSeq: Int,
+        key: ResidueKey,
         residues: [ResidueKey: [Int]],
         atoms: [Atom]
     ) -> String? {
-        let residueIndices = residues.first { $0.key.chainID == chainID && $0.key.residueSeq == residueSeq }?.value ?? []
+        let residueIndices = residueAt(key, residues: residues).first?.value ?? []
         let atomNames = Set(residueIndices.map { normalize(atoms[$0].name) })
         if atomNames.contains("OXT") { return "OXT" }
         if atomNames.contains("O") { return "O" }
         return nil
+    }
+
+    /// Maximum S–S distance for a disulfide bond (ideal 2.05 Å).
+    private static let disulfideCutoff: Float = 2.5
+
+    /// Cysteines whose SG is within disulfide distance of another cysteine's SG.
+    private static func disulfideBondedCysteines(
+        residues: [ResidueKey: [Int]],
+        atoms: [Atom],
+        grid: SpatialGrid
+    ) -> Set<ResidueKey> {
+        var sulfurOwners: [Int: ResidueKey] = [:]
+        for (key, indices) in residues where key.residueName == "CYS" {
+            for index in indices where normalize(atoms[index].name) == "SG" {
+                sulfurOwners[index] = key
+            }
+        }
+
+        var bonded = Set<ResidueKey>()
+        for (sulfurIndex, key) in sulfurOwners {
+            let partners = grid.query(center: atoms[sulfurIndex].position, radius: disulfideCutoff, atoms: atoms)
+            if partners.contains(where: { partner in sulfurOwners[partner].map { $0 != key } ?? false }) {
+                bonded.insert(key)
+            }
+        }
+        return bonded
+    }
+
+    /// True when the residue's `atomName` (backbone N or C) is within peptide-bond
+    /// distance of a `partnerElement` atom from another residue, e.g. an ACE/NME cap.
+    private static func isPeptideLinked(
+        atomName: String,
+        partnerElement: Element,
+        residueIndices: [Int],
+        atoms: [Atom],
+        grid: SpatialGrid
+    ) -> Bool {
+        guard let atomIndex = residueIndices.first(where: { normalize(atoms[$0].name) == atomName }) else {
+            return false
+        }
+        let residueSet = Set(residueIndices)
+        return grid.query(center: atoms[atomIndex].position, radius: 1.8, atoms: atoms).contains { other in
+            !residueSet.contains(other) && atoms[other].element == partnerElement
+        }
     }
 
     private static func desolvationContribution(
@@ -783,10 +909,61 @@ enum Protonation {
         let angleFactor: Float
     }
 
+    /// Neutral H-bonding side chains and backbone N/O positions, collected once per
+    /// prediction so the per-site environment scans do not re-derive them for every site.
+    private struct HydrogenBondEnvironment {
+        struct SideChain {
+            let key: ResidueKey
+            let group: NeutralHydrogenBondGroup
+            let residueIndices: [Int]
+            let center: SIMD3<Float>
+        }
+
+        struct Backbone {
+            let key: ResidueKey
+            let residueIndices: [Int]
+            let nitrogen: SIMD3<Float>?
+            let oxygen: SIMD3<Float>?
+        }
+
+        let sideChains: [SideChain]
+        let backbones: [Backbone]
+
+        init(residues: [ResidueKey: [Int]], atoms: [Atom]) {
+            var sideChains: [SideChain] = []
+            var backbones: [Backbone] = []
+            for (key, indices) in residues {
+                // A group whose named heavy atoms are all missing has no interaction atoms.
+                if let group = Protonation.neutralHydrogenBondGroup(for: key.residueName),
+                   let center = Protonation.siteCenter(
+                    atomNames: group.acidHeavyAtoms + group.baseHeavyAtoms,
+                    residueIndices: indices,
+                    atoms: atoms
+                   ) {
+                    sideChains.append(SideChain(key: key, group: group, residueIndices: indices, center: center))
+                }
+                if Protonation.isBackboneResidue(key.residueName) {
+                    var nitrogen: SIMD3<Float>?
+                    var oxygen: SIMD3<Float>?
+                    for index in indices {
+                        switch Protonation.normalize(atoms[index].name) {
+                        case "N": nitrogen = nitrogen ?? atoms[index].position
+                        case "O": oxygen = oxygen ?? atoms[index].position
+                        default: break
+                        }
+                    }
+                    backbones.append(Backbone(key: key, residueIndices: indices, nitrogen: nitrogen, oxygen: oxygen))
+                }
+            }
+            self.sideChains = sideChains
+            self.backbones = backbones
+        }
+    }
+
     private static func environmentalHydrogenBondContribution(
         for snapshot: SiteSnapshot,
         residueIndices: [Int],
-        residues: [ResidueKey: [Int]],
+        environment: HydrogenBondEnvironment,
         atoms: [Atom],
         bonds: [Bond],
         adjacency: BondAdjacency
@@ -796,9 +973,10 @@ enum Protonation {
         // Precompute snapshot interaction atoms per unique group type to avoid recomputation.
         var snapshotAtomsCache: [String: [InteractionAtom]] = [:]
 
-        for (key, environmentResidueIndices) in residues {
-            guard key != snapshot.key,
-                  let environmentGroup = neutralHydrogenBondGroup(for: key.residueName),
+        for sideChain in environment.sideChains {
+            let environmentGroup = sideChain.group
+            let environmentResidueIndices = sideChain.residueIndices
+            guard sideChain.key != snapshot.key,
                   let cutoffs = hydrogenBondCutoff(
                     lhsType: snapshot.definition.groupType,
                     rhsType: environmentGroup.groupType
@@ -808,9 +986,7 @@ enum Protonation {
 
             // Early distance pruning: skip residues whose centers are too far apart.
             // Max cutoff across all pair types is ~5 Å; residue atoms are typically within ~5 Å of center.
-            let envCenter = siteCenter(atomNames: environmentGroup.acidHeavyAtoms + environmentGroup.baseHeavyAtoms,
-                                       residueIndices: environmentResidueIndices, atoms: atoms)
-            if let ec = envCenter, simd_distance(snapshot.center, ec) > cutoffs.y + 10.0 {
+            if simd_distance(snapshot.center, sideChain.center) > cutoffs.y + 10.0 {
                 continue
             }
 
@@ -853,7 +1029,7 @@ enum Protonation {
         contribution += backboneHydrogenBondContribution(
             for: snapshot,
             residueIndices: residueIndices,
-            residues: residues,
+            environment: environment,
             atoms: atoms,
             bonds: bonds,
             adjacency: adjacency
@@ -907,7 +1083,7 @@ enum Protonation {
     private static func backboneHydrogenBondContribution(
         for snapshot: SiteSnapshot,
         residueIndices: [Int],
-        residues: [ResidueKey: [Int]],
+        environment: HydrogenBondEnvironment,
         atoms: [Atom],
         bonds: [Bond],
         adjacency: BondAdjacency
@@ -935,16 +1111,13 @@ enum Protonation {
             // Distance threshold for early pruning: cutoff + margin for atom offset from center.
             let bbNHPruneDistance = parameters.cutoffs.y + 8.0
 
-            for (key, backboneResidueIndices) in residues {
-                guard key != snapshot.key,
-                      isBackboneResidue(key.residueName),
-                      key.residueName != "PRO" else {
-                    continue
-                }
-
-                // Early distance pruning using backbone N position.
-                if let nIdx = backboneResidueIndices.first(where: { normalize(atoms[$0].name) == "N" }),
-                   simd_distance(snapshot.center, atoms[nIdx].position) > bbNHPruneDistance {
+            for backbone in environment.backbones {
+                let backboneResidueIndices = backbone.residueIndices
+                // Early distance pruning using backbone N position (no N, no interaction atoms).
+                guard backbone.key != snapshot.key,
+                      backbone.key.residueName != "PRO",
+                      let nitrogen = backbone.nitrogen,
+                      simd_distance(snapshot.center, nitrogen) <= bbNHPruneDistance else {
                     continue
                 }
 
@@ -996,15 +1169,12 @@ enum Protonation {
 
             let bbCOPruneDistance = parameters.cutoffs.y + 8.0
 
-            for (key, backboneResidueIndices) in residues {
-                guard key != snapshot.key,
-                      isBackboneResidue(key.residueName) else {
-                    continue
-                }
-
-                // Early distance pruning using backbone O position.
-                if let oIdx = backboneResidueIndices.first(where: { normalize(atoms[$0].name) == "O" }),
-                   simd_distance(snapshot.center, atoms[oIdx].position) > bbCOPruneDistance {
+            for backbone in environment.backbones {
+                let backboneResidueIndices = backbone.residueIndices
+                // Early distance pruning using backbone O position (no O, no interaction atoms).
+                guard backbone.key != snapshot.key,
+                      let oxygen = backbone.oxygen,
+                      simd_distance(snapshot.center, oxygen) <= bbCOPruneDistance else {
                     continue
                 }
 
@@ -1581,7 +1751,8 @@ enum Protonation {
         shiftedPKa: Float,
         pH: Float,
         residueIndices: [Int],
-        atoms: [Atom]
+        atoms: [Atom],
+        grid: SpatialGrid
     ) -> StateKind {
         switch snapshot.definition.kind {
         case .acid, .cTerminus:
@@ -1595,14 +1766,18 @@ enum Protonation {
             let nd1Score = histidineTautomerScore(
                 atomName: "ND1",
                 residueIndices: residueIndices,
-                atoms: atoms
+                atoms: atoms,
+                grid: grid
             )
             let ne2Score = histidineTautomerScore(
                 atomName: "NE2",
                 residueIndices: residueIndices,
-                atoms: atoms
+                atoms: atoms,
+                grid: grid
             )
-            return nd1Score >= ne2Score ? .histidineDelta : .histidineEpsilon
+            // Without a discriminating environment, prefer the Nε2-H tautomer, which
+            // dominates for neutral histidine in solution (~4:1; Reynolds et al., JACS 1973).
+            return nd1Score > ne2Score ? .histidineDelta : .histidineEpsilon
         }
     }
 
@@ -1615,7 +1790,8 @@ enum Protonation {
     private static func histidineTautomerScore(
         atomName: String,
         residueIndices: [Int],
-        atoms: [Atom]
+        atoms: [Atom],
+        grid: SpatialGrid
     ) -> Float {
         guard let siteIndex = residueIndices.first(where: { normalize(atoms[$0].name) == atomName }) else {
             return 0
@@ -1644,8 +1820,9 @@ enum Protonation {
             hDirection = nil
         }
 
-        return atoms.enumerated().reduce(Float.zero) { partial, entry in
-            let (otherIndex, other) = entry
+        // The grid indexes heavy atoms only, matching the hydrogen exclusion below.
+        return grid.query(center: site.position, radius: 3.5, atoms: atoms).reduce(Float.zero) { partial, otherIndex in
+            let other = atoms[otherIndex]
             guard !residueSet.contains(otherIndex), other.element != .H else { return partial }
             let distance = simd_distance(site.position, other.position)
             guard distance > 0.1 && distance < 3.5 else { return partial }
@@ -1759,8 +1936,8 @@ enum Protonation {
         if lhs.key.chainID != rhs.key.chainID {
             return lhs.key.chainID < rhs.key.chainID
         }
-        if lhs.key.residueSeq != rhs.key.residueSeq {
-            return lhs.key.residueSeq < rhs.key.residueSeq
+        if lhs.key.position != rhs.key.position {
+            return lhs.key.position < rhs.key.position
         }
         return lhs.key.residueName < rhs.key.residueName
     }

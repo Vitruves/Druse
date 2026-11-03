@@ -20,8 +20,9 @@ enum BondPerception {
         let cellSize: Float = 5.0 // covers max bonded distance
         var grid: [SIMD3<Int32>: [Int]] = [:]
 
-        // Build spatial hash
-        for (i, atom) in atoms.enumerated() {
+        // Build spatial hash. Non-finite coordinates (e.g. "nan" in a malformed
+        // file) would trap in the Int32 conversion and cannot bond anyway.
+        for (i, atom) in atoms.enumerated() where isFinite(atom.position) {
             let cell = cellCoord(atom.position, cellSize: cellSize)
             grid[cell, default: []].append(i)
         }
@@ -30,7 +31,7 @@ enum BondPerception {
         var bondID = 0
 
         // Check each atom against neighbors in adjacent cells
-        for (i, atomA) in atoms.enumerated() {
+        for (i, atomA) in atoms.enumerated() where isFinite(atomA.position) {
             let cellA = cellCoord(atomA.position, cellSize: cellSize)
 
             for dx: Int32 in -1...1 {
@@ -62,6 +63,10 @@ enum BondPerception {
 
         Task { @MainActor in ActivityLog.shared.debug("[Prep] Bond perception: \(bonds.count) bonds from \(atoms.count) atoms", category: .prep) }
         return bonds
+    }
+
+    private static func isFinite(_ p: SIMD3<Float>) -> Bool {
+        p.x.isFinite && p.y.isFinite && p.z.isFinite
     }
 
     private static func cellCoord(_ position: SIMD3<Float>, cellSize: Float) -> SIMD3<Int32> {

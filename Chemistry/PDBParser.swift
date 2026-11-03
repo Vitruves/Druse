@@ -82,7 +82,14 @@ enum PDBParser {
         var allHetSerials: [Int] = []
         var ssRanges: [SecondaryStructureRange] = []
 
-        let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+        // Split on any newline (Character-level "\n" does not match the "\r\n"
+        // grapheme cluster, so CRLF files would otherwise collapse into one line).
+        let lines = content.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+
+        // Multi-model files (NMR ensembles): keep only the first model's atoms,
+        // matching the Gemmi path which reads `structure.models.front()`. CONECT
+        // records follow the last ENDMDL, so later records are still processed.
+        var pastFirstModel = false
 
         for line in lines {
             let s = String(line)
@@ -90,6 +97,9 @@ enum PDBParser {
             let record = substr(s, 0, 6).trimmingCharacters(in: .whitespaces)
 
             switch record {
+            case "ENDMDL":
+                pastFirstModel = true
+
             case "HEADER":
                 header.classification = substr(s, 10, 40).trimmingCharacters(in: .whitespaces)
                 header.date = substr(s, 50, 9).trimmingCharacters(in: .whitespaces)
@@ -103,7 +113,8 @@ enum PDBParser {
                 parseRemark(s, header: &header)
 
             case "ATOM", "HETATM":
-                guard let parsed = parseAtomLine(s, warnings: &warnings) else { continue }
+                guard !pastFirstModel,
+                      let parsed = parseAtomLine(s, warnings: &warnings) else { continue }
                 let (atom, serial) = parsed
 
                 if record == "HETATM" {
@@ -268,7 +279,7 @@ enum PDBParser {
         var header = PDBHeader()
         var ssRanges: [SecondaryStructureRange] = []
 
-        for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
+        for rawLine in content.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
             let line = String(rawLine)
             guard line.count >= 6 else { continue }
             let record = substr(line, 0, 6).trimmingCharacters(in: .whitespaces)
@@ -357,7 +368,8 @@ enum PDBParser {
             return nil
         }
 
-        let atomName = substr(line, 12, 4).trimmingCharacters(in: .whitespaces)
+        let atomNameField = substr(line, 12, 4)
+        let atomName = atomNameField.trimmingCharacters(in: .whitespaces)
         let altLoc = substr(line, 16, 1).trimmingCharacters(in: .whitespaces)
         let resName = substr(line, 17, 3).trimmingCharacters(in: .whitespaces)
         let chainID = substr(line, 21, 1)
@@ -377,7 +389,7 @@ enum PDBParser {
         let tempFactor = Float(substr(line, 60, 6).trimmingCharacters(in: .whitespaces)) ?? 0.0
 
         // Element detection: prefer columns 77-78, fallback to atom name
-        let element = detectElement(line: line, atomName: atomName, resName: resName, isHet: isHet)
+        let element = detectElement(line: line, atomNameField: atomNameField, resName: resName, isHet: isHet)
 
         let resSeq = Int(resSeqStr) ?? 0
         let charge = parseCharge(substr(line, 78, 2))
@@ -404,46 +416,46 @@ enum PDBParser {
 
     // MARK: - Element Detection
 
-    private static func detectElement(line: String, atomName: String, resName: String, isHet: Bool) -> Element {
+    private static func detectElement(line: String, atomNameField: String, resName: String, isHet: Bool) -> Element {
         // Try columns 77-78 first
         let elemCol = substr(line, 76, 2).trimmingCharacters(in: .whitespaces)
         if !elemCol.isEmpty, let elem = Element.from(symbol: elemCol) {
             return elem
         }
 
-        // Fallback: infer from atom name
-        return elementFromAtomName(atomName, resName: resName, isHet: isHet)
+        // Fallback: infer from the fixed-column atom name field
+        return elementFromAtomName(atomNameField, resName: resName, isHet: isHet)
     }
 
-    private static func elementFromAtomName(_ name: String, resName: String, isHet: Bool) -> Element {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
+    /// Infer the element from the 4-character atom-name field (columns 13-16).
+    ///
+    /// PDB convention: the element symbol is right-justified in columns 13-14, so
+    /// " CA " is an alpha carbon while "CA  " is calcium. Polymer (ATOM) records only
+    /// contain H/C/N/O/S/P/Se, so their element is the first letter of the name;
+    /// this avoids reading CA/CD/NE/HE/HG/CE as Ca/Cd/Ne/He/Hg/Ce.
+    private static func elementFromAtomName(_ field: String, resName: String, isHet: Bool) -> Element {
+        let trimmed = field.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return .C }
 
-        // Known metal ions
-        let metalIons: Set<String> = ["CA", "ZN", "FE", "MG", "MN", "CU", "CO", "NI", "NA", "K"]
-        if isHet && metalIons.contains(trimmed.uppercased()) {
-            // Check if it's a single-residue HETATM (ion)
-            let ionResidues: Set<String> = ["CA", "ZN", "FE", "MG", "MN", "CU", "CO", "NI", "NA", "K"]
-            if ionResidues.contains(resName.uppercased()) {
-                if let elem = Element.from(symbol: trimmed) { return elem }
+        // Single-atom ions: atom name equals residue name (ZN/ZN, CA/CA, MG/MG, ...)
+        if isHet, trimmed.uppercased() == resName.uppercased(),
+           let elem = Element.from(symbol: trimmed) {
+            return elem
+        }
+
+        let letters = trimmed.filter(\.isLetter)
+        guard let first = letters.first else { return .C }
+
+        if isHet {
+            let chars = Array(field)
+            // Two-letter symbol only when it starts in column 13 (not hydrogen names like HE21)
+            if chars.count >= 2, chars[0].isLetter, chars[1].isLetter, chars[0].uppercased() != "H",
+               let elem = Element.from(symbol: String(chars[0...1])) {
+                return elem
             }
         }
 
-        // Strip leading digits and spaces
-        var stripped = ""
-        for ch in trimmed {
-            if ch.isLetter { stripped.append(ch) }
-        }
-        guard !stripped.isEmpty else { return .C }
-
-        // Try two-character symbol first, then one-character
-        if stripped.count >= 2 {
-            let twoChar = String(stripped.prefix(2))
-            if let elem = Element.from(symbol: twoChar) { return elem }
-        }
-        if let elem = Element.from(symbol: String(stripped.prefix(1))) { return elem }
-
-        return .C // fallback
+        return Element.from(symbol: String(first)) ?? .C
     }
 
     private static func parseCharge(_ s: String) -> Int {
@@ -516,7 +528,7 @@ enum PDBParser {
                 continue
             }
 
-            let key = "\(atom.chainID):\(atom.residueSeq):\(atom.name)"
+            let key = "\(atom.chainID):\(atom.residueSeq):\(atom.insertionCode):\(atom.name)"
             if let existing = bestMap[key] {
                 if atom.occupancy > existing.occ {
                     bestMap[key] = (atom.occupancy, i)
@@ -683,7 +695,8 @@ enum PDBParser {
             isHetAtom: atom.isHetAtom,
             occupancy: atom.occupancy,
             tempFactor: atom.tempFactor,
-            altLoc: atom.altLoc
+            altLoc: atom.altLoc,
+            insertionCode: atom.insertionCode
         )
     }
 
@@ -779,9 +792,11 @@ enum PDBParser {
     /// Safe substring extraction by character offset and length.
     /// Pads with spaces if the line is too short.
     private static func substr(_ s: String, _ start: Int, _ length: Int) -> String {
-        let chars = Array(s)
-        let end = min(start + length, chars.count)
-        guard start < chars.count else { return String(repeating: " ", count: length) }
-        return String(chars[start..<end])
+        guard let lower = s.index(s.startIndex, offsetBy: start, limitedBy: s.endIndex),
+              lower < s.endIndex else {
+            return String(repeating: " ", count: length)
+        }
+        let upper = s.index(lower, offsetBy: length, limitedBy: s.endIndex) ?? s.endIndex
+        return String(s[lower..<upper])
     }
 }

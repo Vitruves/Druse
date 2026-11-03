@@ -287,17 +287,11 @@ enum ScaffoldAnalogGenerator {
         let attachmentRanges = findAttachmentPointRanges(in: scaffoldSmiles)
         guard !attachmentRanges.isEmpty else { throw GenerationError.noAttachmentPoints }
 
-        // Sentinel scaffold: replace each attachment token (right-to-left so
-        // earlier indices stay valid) with `{R0}`, `{R1}`, …
-        var sentinelScaffold = scaffoldSmiles
-        for (i, r) in attachmentRanges.enumerated().reversed() {
-            sentinelScaffold.replaceSubrange(r, with: "{R\(i)}")
-        }
+        let template = makeDecorationTemplate(scaffoldSmiles: scaffoldSmiles, attachmentRanges: attachmentRanges)
         let numSites = attachmentRanges.count
 
         // Reference for similarity = scaffold with all R → H.
-        var bareScaffold = sentinelScaffold
-        for i in 0..<numSites { bareScaffold = bareScaffold.replacingOccurrences(of: "{R\(i)}", with: "[H]") }
+        let bareScaffold = template.assemble(Array(repeating: "[H]", count: numSites))
         guard RDKitBridge.computeDescriptors(smiles: bareScaffold) != nil else {
             throw GenerationError.invalidScaffold
         }
@@ -340,13 +334,9 @@ enum ScaffoldAnalogGenerator {
                 }
             }
 
-            var candidate = sentinelScaffold
-            var labelParts: [String] = []
-            for i in 0..<numSites {
-                let grp = allowed[counter[i]]
-                candidate = candidate.replacingOccurrences(of: "{R\(i)}", with: grp.attachmentSMILES)
-                labelParts.append(grp.id)
-            }
+            let groups = counter.map { allowed[$0] }
+            let candidate = template.assemble(groups.map(\.attachmentSMILES))
+            let labelParts = groups.map(\.id)
 
             if !seen.contains(candidate),
                let desc = RDKitBridge.computeDescriptors(smiles: candidate) {
@@ -370,6 +360,114 @@ enum ScaffoldAnalogGenerator {
         }
         analogs.sort { $0.similarity > $1.similarity }
         return analogs
+    }
+
+    // MARK: - Decoration template
+
+    /// Scaffold text with one placeholder per attachment point.
+    ///
+    /// Splicing a substituent's SMILES in place of `*` bonds the scaffold to the
+    /// substituent's *first* atom only when `*` follows its neighbour (`c(*)`, `C*`).
+    /// When `*` starts the SMILES or a dot-component (`*c1ccccc1`, RDKit's usual
+    /// canonical form), the scaffold atom that follows bonds to the substituent's
+    /// *last main-chain* atom instead — `OC` + `c1ccccc1` gives benzyl alcohol, not
+    /// anisole. Those sites are rewritten as a ring-closure bond from the neighbour
+    /// atom to the substituent's first atom, with the substituent appended as a
+    /// separate dot-component.
+    private struct DecorationTemplate {
+        let sentinel: String
+        /// Site index → ring-closure label (e.g. "%90") for leading attachment points.
+        let ringClosureLabels: [Int: String]
+        let siteCount: Int
+
+        func assemble(_ substituents: [String]) -> String {
+            var core = sentinel
+            var components: [String] = []
+            for i in 0..<siteCount {
+                if let label = ringClosureLabels[i] {
+                    components.append(ScaffoldAnalogGenerator.insertingAfterFirstAtom(label, in: substituents[i]))
+                } else {
+                    core = core.replacingOccurrences(of: "{R\(i)}", with: substituents[i])
+                }
+            }
+            return ([core] + components).joined(separator: ".")
+        }
+    }
+
+    private static func makeDecorationTemplate(
+        scaffoldSmiles: String,
+        attachmentRanges: [Range<String.Index>]
+    ) -> DecorationTemplate {
+        // Ring-closure labels %90… must not clash with labels already in the scaffold.
+        let canUseRingClosures = !scaffoldSmiles.contains("%9")
+        var sentinel = ""
+        var labels: [Int: String] = [:]
+        var cursor = scaffoldSmiles.startIndex
+
+        for (i, range) in attachmentRanges.enumerated() {
+            sentinel += scaffoldSmiles[cursor..<range.lowerBound]
+            cursor = range.upperBound
+
+            let startsComponent = range.lowerBound == scaffoldSmiles.startIndex
+                || scaffoldSmiles[scaffoldSmiles.index(before: range.lowerBound)] == "."
+            if canUseRingClosures, startsComponent, labels.count < 10,
+               let neighbor = leadingNeighbor(after: range.upperBound, in: scaffoldSmiles),
+               // A neighbouring dummy atom is itself an attachment site; consuming it
+               // here would skip that site's placeholder.
+               !scaffoldSmiles[neighbor.atom].contains("*") {
+                let label = "%\(90 + labels.count)"
+                labels[i] = label
+                sentinel += String(scaffoldSmiles[neighbor.atom]) + neighbor.bond + label
+                cursor = neighbor.atom.upperBound
+            } else {
+                sentinel += "{R\(i)}"
+            }
+        }
+        sentinel += scaffoldSmiles[cursor...]
+
+        return DecorationTemplate(sentinel: sentinel, ringClosureLabels: labels, siteCount: attachmentRanges.count)
+    }
+
+    /// The atom bonded to a leading attachment point: optional bond symbol, then one
+    /// SMILES atom token. The bond symbol defaults to an explicit single bond so an
+    /// aromatic–aromatic ring closure (biaryl) is not read as an aromatic bond.
+    private static func leadingNeighbor(
+        after index: String.Index,
+        in smiles: String
+    ) -> (bond: String, atom: Range<String.Index>)? {
+        guard index < smiles.endIndex else { return nil }
+        var i = index
+        var bond = "-"
+        if "-=#:/\\".contains(smiles[i]) {
+            bond = String(smiles[i])
+            i = smiles.index(after: i)
+        }
+        guard let atomEnd = endOfAtomToken(at: i, in: smiles) else { return nil }
+        return (bond, i..<atomEnd)
+    }
+
+    /// End index of the SMILES atom token starting at `i` (bracket atom, Cl/Br, or a
+    /// one-letter organic-subset atom), or nil if no atom starts there.
+    private static func endOfAtomToken(at i: String.Index, in smiles: String) -> String.Index? {
+        guard i < smiles.endIndex else { return nil }
+        let c = smiles[i]
+        if c == "[" {
+            guard let close = smiles[i...].firstIndex(of: "]") else { return nil }
+            return smiles.index(after: close)
+        }
+        let next = smiles.index(after: i)
+        if (c == "C" || c == "B"), next < smiles.endIndex, smiles[next] == (c == "C" ? "l" : "r") {
+            return smiles.index(after: next)
+        }
+        return "BCNOPSFIbcnops".contains(c) ? next : nil
+    }
+
+    /// Insert `text` (a ring-closure label) directly after the first atom token.
+    private static func insertingAfterFirstAtom(_ text: String, in smiles: String) -> String {
+        guard let end = endOfAtomToken(at: smiles.startIndex, in: smiles) else { return smiles + text }
+        var result = smiles
+        result.insert(contentsOf: text, at: end)
+        return result
     }
 
     // MARK: - Whole-molecule transform mode

@@ -403,7 +403,7 @@ double druse_mmff_strain_energy(const char *smiles, const float *heavyPositions,
         MMFF::MMFFMolProperties mmffProps(*mol);
         if (!mmffProps.isValid()) return NAN;
 
-        auto *ff = MMFF::constructForceField(*mol, &mmffProps);
+        std::unique_ptr<ForceFields::ForceField> ff(MMFF::constructForceField(*mol, &mmffProps));
         if (!ff) return NAN;
 
         for (unsigned i = 0; i < mol->getNumAtoms(); i++) {
@@ -413,9 +413,7 @@ double druse_mmff_strain_energy(const char *smiles, const float *heavyPositions,
         }
         ff->minimize(200);
 
-        double energy = ff->calcEnergy();
-        delete ff;
-        return energy;
+        return ff->calcEnergy();
     } catch (...) {
         return NAN;
     }
@@ -429,17 +427,15 @@ double druse_mmff_reference_energy(const char *smiles) {
 
         MolOps::addHs(*mol);
         if (embed_molecule(*mol) < 0) return NAN;
-        mmff_minimize_single(*mol);
+        if (!mmff_minimize_single(*mol)) return NAN;
 
         MMFF::MMFFMolProperties mmffProps(*mol);
         if (!mmffProps.isValid()) return NAN;
 
-        auto *ff = MMFF::constructForceField(*mol, &mmffProps);
+        std::unique_ptr<ForceFields::ForceField> ff(MMFF::constructForceField(*mol, &mmffProps));
         if (!ff) return NAN;
 
-        double energy = ff->calcEnergy();
-        delete ff;
-        return energy;
+        return ff->calcEnergy();
     } catch (...) {
         return NAN;
     }

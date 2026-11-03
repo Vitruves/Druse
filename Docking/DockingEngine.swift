@@ -61,7 +61,6 @@ final class DockingEngine {
     var ligandAtomBuffer: MTLBuffer?
     var gaParamsBuffer: MTLBuffer?
     var gaParamsRing: [MTLBuffer] = []
-    var pairwiseRMSDPipeline: MTLComputePipelineState?
     var torsionEdgeBuffer: MTLBuffer?
     var movingIndicesBuffer: MTLBuffer?
     var intraPairsBuffer: MTLBuffer?
@@ -148,11 +147,6 @@ final class DockingEngine {
     private(set) var lastGridTotalPoints: Int = 0
     private(set) var lastGridNumAffinityTypes: Int = 0
 
-    /// Cached Vina types + spacing from last grid computation — skip recompute if unchanged.
-    private var lastGridVinaTypes: [Int32] = []
-    private var lastGridSpacing: Float = 0
-    private var lastGridPocketCenter: SIMD3<Float> = .zero
-
     /// Optional flex docking engine for receptor flexibility (induced fit).
     var flexEngine: FlexDockingEngine?
 
@@ -174,6 +168,8 @@ final class DockingEngine {
 
     /// Diagnostics from the last completed docking run.
     var lastDiagnostics: DockingDiagnostics?
+    /// Final-population poses of the last run before output selection (energy window + dedupe).
+    var lastEvaluatedPoseCount: Int = 0
 
     var onPoseUpdate: ((DockingResult, [MolecularInteraction]) -> Void)?
     var onGenerationComplete: ((Int, Float) -> Void)?
@@ -228,9 +224,6 @@ final class DockingEngine {
             }
             if let decompFunc = library.makeFunction(name: "scorePosesDecomposition") {
                 drusinaDecompositionPipeline = try device.makeComputePipelineState(function: decompFunc)
-            }
-            if let rmsdFunction = library.makeFunction(name: "computePairwiseRMSD") {
-                pairwiseRMSDPipeline = try device.makeComputePipelineState(function: rmsdFunction)
             }
             // Parallel Tempering / Replica Exchange
             if let perturbFunc = library.makeFunction(name: "mcPerturbReplica"),
@@ -384,6 +377,7 @@ final class DockingEngine {
         case .F:  return vinaTypeID(VINA_F_H)
         case .Cl: return vinaTypeID(VINA_Cl_H)
         case .Br: return vinaTypeID(VINA_Br_H)
+        case .I:  return vinaTypeID(VINA_I_H)
 
         case .Na, .Mg, .Ca, .Sc, .Ti, .V, .Cr, .Mn, .Fe, .Co, .Ni, .Cu, .Zn:
             return vinaTypeID(VINA_MET_D)
@@ -419,6 +413,7 @@ final class DockingEngine {
         case .F:  return vinaTypeID(VINA_F_H)
         case .Cl: return vinaTypeID(VINA_Cl_H)
         case .Br: return vinaTypeID(VINA_Br_H)
+        case .I:  return vinaTypeID(VINA_I_H)
 
         case .Na, .Mg, .Ca, .Sc, .Ti, .V, .Cr, .Mn, .Fe, .Co, .Ni, .Cu, .Zn:
             return vinaTypeID(VINA_MET_D)
@@ -807,8 +802,10 @@ final class DockingEngine {
         )
     }
 
-    func prepareLigandGA(_ ligand: Molecule) -> LigandGAData? {
-        let prepared = prepareLigandGeometry(ligand)
+    /// - Parameter prepared: geometry already produced by `prepareLigandGeometry(ligand)`,
+    ///   passed to avoid recomputing charges/typing when the caller has it.
+    func prepareLigandGA(_ ligand: Molecule, prepared: PreparedDockingLigand? = nil) -> LigandGAData? {
+        let prepared = prepared ?? prepareLigandGeometry(ligand)
         let gpuAtoms = prepared.gpuAtoms
         guard gpuAtoms.count <= 128, gpuAtoms.count > 0 else { return nil }
 
@@ -821,36 +818,9 @@ final class DockingEngine {
             ))
             movingIndices.append(contentsOf: edge.movingAtoms.map { Int32($0) })
         }
-        if torsionEdges.isEmpty { torsionEdges.append(TorsionEdge(atom1: 0, atom2: 0, movingStart: 0, movingCount: 0)) }
-        if movingIndices.isEmpty { movingIndices.append(0) }
-
-        var excluded = Set<UInt32>()
-        var adj: [[Int]] = Array(repeating: [], count: gpuAtoms.count)
-        for bond in prepared.heavyBonds {
-            let a = bond.atomIndex1, b = bond.atomIndex2
-            guard a < gpuAtoms.count, b < gpuAtoms.count else { continue }
-            adj[a].append(b); adj[b].append(a)
-        }
-        for i in 0..<gpuAtoms.count {
-            for j in adj[i] where j > i {
-                excluded.insert(UInt32(i) | (UInt32(j) << 16))
-                for k in adj[j] where k > i && k != i {
-                    let lo = min(i, k), hi = max(i, k)
-                    excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
-                }
-                for k in adj[i] where k != j {
-                    let lo = min(j, k), hi = max(j, k)
-                    excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
-                }
-            }
-        }
-        var pairList = [UInt32]()
-        for i in 0..<gpuAtoms.count {
-            for j in (i+1)..<gpuAtoms.count {
-                let packed = UInt32(i) | (UInt32(j) << 16)
-                if !excluded.contains(packed) { pairList.append(packed) }
-            }
-        }
+        // No dummy padding here: BatchedGAAccelerator pads the flattened arrays itself and
+        // uses torsionEdges.count as the ligand's rotatable-bond count (Vina Nrot normalization).
+        let pairList = Self.intramolecularPairList(atomCount: gpuAtoms.count, bonds: prepared.heavyBonds)
 
         let refIntraE = intramolecularReferenceEnergy(ligandAtoms: gpuAtoms, pairList: pairList)
         let ligRad = max(sqrt(gpuAtoms.map { simd_length_squared($0.position) }.reduce(0, +) / Float(max(gpuAtoms.count, 1))), 1.0)
@@ -858,8 +828,41 @@ final class DockingEngine {
         return LigandGAData(
             gpuAtoms: gpuAtoms, torsionEdges: torsionEdges, movingIndices: movingIndices,
             pairList: pairList, referenceIntraEnergy: refIntraE, ligandRadius: ligRad,
-            centroid: prepared.centroid, heavyAtoms: prepared.heavyAtoms
+            centroid: prepared.centroid, heavyAtoms: prepared.heavyAtoms,
+            heavyBonds: prepared.heavyBonds
         )
+    }
+
+    /// Packed (lo | hi << 16) list of ligand atom pairs scored by the intramolecular term:
+    /// every pair except 1-2 and 1-3 neighbours. Shared by the single-ligand, batched and
+    /// debug scoring paths so all of them score the same pair set.
+    nonisolated static func intramolecularPairList(atomCount: Int, bonds: [Bond]) -> [UInt32] {
+        guard atomCount > 1 else { return [] }
+        var adj: [[Int]] = Array(repeating: [], count: atomCount)
+        for bond in bonds {
+            let a = bond.atomIndex1, b = bond.atomIndex2
+            guard a >= 0, b >= 0, a < atomCount, b < atomCount, a != b else { continue }
+            adj[a].append(b)
+            adj[b].append(a)
+        }
+        var excluded = Set<UInt32>()
+        for center in 0..<atomCount {
+            for a in adj[center] {
+                excluded.insert(UInt32(min(center, a)) | (UInt32(max(center, a)) << 16))
+                for b in adj[center] where b != a {
+                    excluded.insert(UInt32(min(a, b)) | (UInt32(max(a, b)) << 16))
+                }
+            }
+        }
+        var pairList = [UInt32]()
+        pairList.reserveCapacity(atomCount * (atomCount - 1) / 2)
+        for i in 0..<atomCount {
+            for j in (i + 1)..<atomCount {
+                let packed = UInt32(i) | (UInt32(j) << 16)
+                if !excluded.contains(packed) { pairList.append(packed) }
+            }
+        }
+        return pairList
     }
 
     // MARK: - Drusina Buffer Preparation
@@ -1446,23 +1449,50 @@ final class DockingEngine {
         return max(0.15, min(1.0, count / 25.0))
     }
 
+    // MARK: - ML Scorer Pocket Selection
+
+    /// Heavy-atom pocket for the DruseAF and PIGNet2 scorers, selected the way both
+    /// models were trained: hydrogens removed (trainDruseAFv4.py `parse_pdb_atoms`
+    /// skips H; PIGNet2 featurises `Chem.RemoveAllHs` molecules), atoms strictly
+    /// within `radius` of the pocket centre, and — when more than `maxAtoms`
+    /// remain — the `maxAtoms` closest (trainDruseAFv4.py `preprocess_complex`).
+    private func mlPocketAtoms(center: SIMD3<Float>, radius: Float = 10.0, maxAtoms: Int) -> [Atom] {
+        let inPocket = proteinAtoms.filter { atom in
+            atom.element != .H && simd_distance(atom.position, center) < radius
+        }
+        guard inPocket.count > maxAtoms else { return inPocket }
+        return Array(inPocket
+            .sorted { simd_distance_squared($0.position, center) < simd_distance_squared($1.position, center) }
+            .prefix(maxAtoms))
+    }
+
     // MARK: - DruseAF ML Scoring Buffers
 
+    /// Builds the DruseAF (v3 or v4) feature/position buffers and runs the protein
+    /// setup pass. Returns `false` when setup could not be completed (missing
+    /// weights/pipelines, empty heavy-atom pocket, or a GPU command-buffer error);
+    /// in that case the setup outputs are cleared so the run must not score with
+    /// DruseAF and should fall back to the base Vina score.
     func prepareDruseAFBuffers(
         ligandAtoms: [Atom],
         ligandBonds: [Bond],
         gpuLigAtoms: [DockLigandAtom],
         pocket: BindingPocket,
         popSize: Int
-    ) {
-        guard let afWeights = druseAFWeights else { return }
-        guard useAFv4 || druseAFSetupPipeline != nil else { return }
+    ) -> Bool {
+        guard let afWeights = druseAFWeights else { return false }
+        guard useAFv4 || druseAFSetupPipeline != nil else { return false }
 
-        let pocketAtoms = proteinAtoms.filter { atom in
-            simd_distance(atom.position, pocket.center) <= 10.0
-        }
-        let P = min(pocketAtoms.count, 256)
+        let pocketAtoms = mlPocketAtoms(center: pocket.center, maxAtoms: 256)
+        let P = pocketAtoms.count
         let L = min(ligandAtoms.count, 64)
+        guard P > 0, L > 0 else {
+            ActivityLog.shared.error(
+                "[DruseAF] Setup skipped: \(P) heavy protein atoms within 10 Å of the pocket centre, \(L) ligand atoms — DruseAF scoring unavailable for this run",
+                category: .dock)
+            clearDruseAFSetupOutputs()
+            return false
+        }
 
         let protHybrid = DruseScoreFeatureExtractor.buildHybridizationMap(
             atoms: pocketAtoms, bonds: proteinStructure?.bonds ?? [])
@@ -1559,10 +1589,10 @@ final class DockingEngine {
                   let v4Enc = afv4EncodePipeline,
                   let v4MsgT = afv4MsgTransformPipeline,
                   let v4MsgA = afv4MsgAggregatePipeline,
-                  let v4Prep = afv4PairPrepPipeline else { return }
+                  let v4Prep = afv4PairPrepPipeline else { clearDruseAFSetupOutputs(); return false }
 
             guard let cb = commandQueue.makeCommandBuffer(),
-                  let enc = cb.makeComputeCommandEncoder() else { return }
+                  let enc = cb.makeComputeCommandEncoder() else { clearDruseAFSetupOutputs(); return false }
 
             let totalAtoms = P + L
             let tgSize1 = MTLSize(width: min(totalAtoms, 256), height: 1, depth: 1)
@@ -1620,13 +1650,20 @@ final class DockingEngine {
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
+            if cb.status == .error {
+                ActivityLog.shared.error(
+                    "[DruseAF v4] Setup command buffer failed: \(cb.error?.localizedDescription ?? "unknown error") — DruseAF scoring unavailable for this run",
+                    category: .dock)
+                clearDruseAFSetupOutputs()
+                return false
+            }
 
             ActivityLog.shared.info(
                 "[DruseAF v4] Setup complete: \(P) prot, \(L) lig atoms, 3 msg-pass layers",
                 category: .dock)
         } else {
             // === DruseAF v3 cross-attention setup (legacy) ===
-            guard let setupPipeV3 = druseAFSetupPipeline else { return }
+            guard let setupPipeV3 = druseAFSetupPipeline else { clearDruseAFSetupOutputs(); return false }
 
             var params = DruseAFParams(
                 numProteinAtoms: UInt32(P), numLigandAtoms: UInt32(L),
@@ -1644,14 +1681,14 @@ final class DockingEngine {
             guard let afParamsBuf = druseAFParamsBuffer,
                   let afProtFeat = druseAFProtFeatBuffer,
                   let afLigFeat = druseAFLigFeatBuffer,
-                  let afSetupBuf = druseAFSetupBuffer else { return }
+                  let afSetupBuf = druseAFSetupBuffer else { clearDruseAFSetupOutputs(); return false }
 
             let totalAtoms = P + L
             let setupTgSize = MTLSize(width: min(totalAtoms, 256), height: 1, depth: 1)
             let setupTgCount = MTLSize(width: (totalAtoms + 255) / 256, height: 1, depth: 1)
 
             guard let cb = commandQueue.makeCommandBuffer(),
-                  let enc = cb.makeComputeCommandEncoder() else { return }
+                  let enc = cb.makeComputeCommandEncoder() else { clearDruseAFSetupOutputs(); return false }
             enc.setComputePipelineState(setupPipeV3)
             enc.setBuffer(afProtFeat, offset: 0, index: 0)
             enc.setBuffer(afLigFeat, offset: 0, index: 1)
@@ -1663,11 +1700,29 @@ final class DockingEngine {
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
+            if cb.status == .error {
+                ActivityLog.shared.error(
+                    "[DruseAF v3] Setup command buffer failed: \(cb.error?.localizedDescription ?? "unknown error") — DruseAF scoring unavailable for this run",
+                    category: .dock)
+                clearDruseAFSetupOutputs()
+                return false
+            }
 
             ActivityLog.shared.info(
                 "[DruseAF v3] Setup complete: \(P) protein atoms, \(L) ligand atoms",
                 category: .dock)
         }
+        return true
+    }
+
+    /// Drops the DruseAF setup outputs so no scorer can run on a failed or stale setup.
+    private func clearDruseAFSetupOutputs() {
+        druseAFSetupBuffer = nil
+        afv4ProtHiddenBuffer = nil
+        afv4LigHiddenBuffer = nil
+        afv4MsgTempBuffer = nil
+        afv4ProtPairProjBuffer = nil
+        afv4LigPairProjBuffer = nil
     }
 
     // MARK: - PIGNet2 Physics-Informed GNN Buffers
@@ -1702,7 +1757,7 @@ final class DockingEngine {
         return s
     }()
 
-    private static let hydrophobicElements: Set<Element> = [.C, .S, .F, .Cl, .Br]
+    private static let hydrophobicElements: Set<Element> = [.C, .S, .F, .Cl, .Br, .I]
 
     // Period/Group lookup from atomic number (matches PIGNet2 chem.py PERIODIC_TABLE)
     // Period is 0-indexed row (0-5), Group is 0-indexed column (0-17)
@@ -1798,32 +1853,45 @@ final class DockingEngine {
         )
     }
 
+    /// Builds the PIGNet2 feature/edge buffers and runs the protein GatedGAT setup
+    /// pass. Returns `false` when setup could not be completed (missing weights or
+    /// pipeline, empty heavy-atom pocket, or a GPU command-buffer error); in that case
+    /// `pignet2SetupBuffer` is cleared so `scorePIGNet2` cannot rerank on garbage and
+    /// the poses keep their base Vina scores.
     func preparePIGNet2Buffers(
         ligandAtoms: [Atom],
         ligandBonds: [Bond],
         gpuLigAtoms: [DockLigandAtom],
         pocket: BindingPocket,
         popSize: Int
-    ) {
+    ) -> Bool {
+        pignet2SetupBuffer = nil
         guard let pig2Weights = pignet2Weights,
-              let setupPipe = pignet2SetupPipeline else { return }
+              let setupPipe = pignet2SetupPipeline else { return false }
 
-        // Extract pocket protein atoms
-        let pocketAtoms = proteinAtoms.filter { atom in
-            simd_distance(atom.position, pocket.center) <= 10.0
-        }
-        let P = min(pocketAtoms.count, Int(PIG_MAX_PROT))
+        // Heavy-atom pocket, selected as in training (see `mlPocketAtoms`).
+        let pocketAtoms = mlPocketAtoms(center: pocket.center, maxAtoms: Int(PIG_MAX_PROT))
+        let P = pocketAtoms.count
         let L = min(ligandAtoms.count, Int(PIG_MAX_LIG))
+        guard P > 0, L > 0 else {
+            ActivityLog.shared.error(
+                "[PIGNet2] Setup skipped: \(P) heavy protein atoms within 10 Å of the pocket centre, \(L) ligand atoms — keeping Vina scores for this run",
+                category: .dock)
+            return false
+        }
 
-        // Build neighbor maps for degree/hydrophobic computation
+        // Heavy-atom neighbor maps for degree/hydrophobic computation. PIGNet2
+        // featurises hydrogen-free molecules (Chem.RemoveAllHs), so explicit H
+        // neighbours must not count toward degree or break the hydrophobic test.
         let allProtBonds = proteinStructure?.bonds ?? []
         var protNeighborMap = [Int: [Atom]]()
         for bond in allProtBonds {
             let a1 = bond.atomIndex1, a2 = bond.atomIndex2
-            if a1 < proteinAtoms.count && a2 < proteinAtoms.count {
-                protNeighborMap[proteinAtoms[a1].id, default: []].append(proteinAtoms[a2])
-                protNeighborMap[proteinAtoms[a2].id, default: []].append(proteinAtoms[a1])
-            }
+            guard a1 < proteinAtoms.count, a2 < proteinAtoms.count else { continue }
+            let atom1 = proteinAtoms[a1], atom2 = proteinAtoms[a2]
+            guard atom1.element != .H, atom2.element != .H else { continue }
+            protNeighborMap[atom1.id, default: []].append(atom2)
+            protNeighborMap[atom2.id, default: []].append(atom1)
         }
         var ligNeighborMap = [Int: [Atom]]()
         for bond in ligandBonds {
@@ -1837,8 +1905,7 @@ final class DockingEngine {
         // Build protein features (47-dim per atom)
         var protFeats = [Float](repeating: 0, count: Int(PIG_MAX_PROT) * 47)
         var protAuxArray = [PIGNet2AtomAux](repeating: PIGNet2AtomAux(vdwRadius: 0, flags: 0, formalCharge: 0, _pad: 0), count: Int(PIG_MAX_PROT))
-        _ = Set(pocketAtoms.prefix(P).map { $0.id })
-        let pocketIndexMap = Dictionary(uniqueKeysWithValues: pocketAtoms.prefix(P).enumerated().map { ($1.id, $0) })
+        let pocketIndexMap = Dictionary(uniqueKeysWithValues: pocketAtoms.enumerated().map { ($1.id, $0) })
 
         // Aromatic residue atoms set (matches PIGNet2 chem.py)
         let aromaticResAtoms: [String: Set<String>] = [
@@ -1850,8 +1917,8 @@ final class DockingEngine {
 
         // Pocket atom donor/acceptor flags via residue+atom-name lookup —
         // matches the chemistry-aware behaviour of the original PIGNet2 SMARTS.
-        let pocketDonorFlags  = pocketAtoms.prefix(P).map { HBondClassifier.proteinHBondDonorFlag($0) }
-        let pocketAcceptorFlags = pocketAtoms.prefix(P).map { HBondClassifier.proteinHBondAcceptorFlag($0) }
+        let pocketDonorFlags  = pocketAtoms.map { HBondClassifier.proteinHBondDonorFlag($0) }
+        let pocketAcceptorFlags = pocketAtoms.map { HBondClassifier.proteinHBondAcceptorFlag($0) }
 
         for i in 0..<P {
             let atom = pocketAtoms[i]
@@ -1979,13 +2046,15 @@ final class DockingEngine {
               let pigProtFeat = pignet2ProtFeatBuffer,
               let pigSetupBuf = pignet2SetupBuffer,
               let pigScratch = pignet2ScratchBuffer,
-              let pigProtEdgeBuf = pignet2ProtEdgeBuffer else { return }
+              let pigProtEdgeBuf = pignet2ProtEdgeBuffer else { pignet2SetupBuffer = nil; return false }
 
-        let tgSize = MTLSize(width: min(P, 256), height: 1, depth: 1)
-        let tgCount = MTLSize(width: (P + tgSize.width - 1) / tgSize.width, height: 1, depth: 1)
+        // pignet2Setup synchronises its GatedGAT phases with threadgroup barriers and
+        // strides over atoms, so it must run as exactly ONE threadgroup.
+        let tgSize = MTLSize(width: min(P, setupPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+        let tgCount = MTLSize(width: 1, height: 1, depth: 1)
 
         guard let cb = commandQueue.makeCommandBuffer(),
-              let enc = cb.makeComputeCommandEncoder() else { return }
+              let enc = cb.makeComputeCommandEncoder() else { pignet2SetupBuffer = nil; return false }
         enc.setComputePipelineState(setupPipe)
         enc.setBuffer(pigProtFeat, offset: 0, index: 0)
         enc.setBuffer(pig2Weights.weightBuffer, offset: 0, index: 1)
@@ -1998,6 +2067,13 @@ final class DockingEngine {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
+        if cb.status == .error {
+            ActivityLog.shared.error(
+                "[PIGNet2] Setup command buffer failed: \(cb.error?.localizedDescription ?? "unknown error") — keeping Vina scores for this run",
+                category: .dock)
+            pignet2SetupBuffer = nil
+            return false
+        }
 
         ActivityLog.shared.info(
             "[PIGNet2] Setup complete: \(P) protein atoms, \(L) ligand atoms, " +
@@ -2005,6 +2081,7 @@ final class DockingEngine {
             "\(numRotBonds) rotatable bonds",
             category: .dock
         )
+        return true
     }
 
     // MARK: - Pharmacophore Constraint Buffers

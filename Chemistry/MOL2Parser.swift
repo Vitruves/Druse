@@ -83,23 +83,27 @@ enum MOL2Parser {
         // Line 1: num_atoms [num_bonds [num_subst [num_feat [num_sets]]]]
         // Line 2: molecule type (SMALL, BIOPOLYMER, PROTEIN, etc.)
         // Line 3: charge type (GASTEIGER, NO_CHARGES, etc.)
-        // Line 4+: optional comments (used as title)
+        // Line 4: status bits (often blank)
+        // Line 5+: optional comment (used as title)
+        // The MOLECULE record is line-positional: a blank name or status-bits line is
+        // legal, so blank lines must not be dropped before indexing.
         let molLines = moleculeSection
-            .components(separatedBy: .newlines)
+            .components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
 
-        let moleculeName = molLines.first ?? "Molecule \(index + 1)"
+        let moleculeName = molLines.first ?? ""
 
         var moleculeType = ""
         if molLines.count > 2 {
             moleculeType = molLines[2]
         }
 
-        // Comments after the charge type become the title
+        // The comment follows the status-bits line and becomes the title
         var title = ""
-        if molLines.count > 4 {
-            title = molLines[4...].joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        if molLines.count > 5 {
+            title = molLines[5...]
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
         }
         if title.isEmpty {
             title = moleculeType.isEmpty ? "MOL2" : moleculeType
@@ -112,11 +116,12 @@ enum MOL2Parser {
             .filter { !$0.isEmpty }
 
         var atoms: [Atom] = []
+        var isCarboxylateOxygen: [Bool] = []
         // Map from MOL2 atom_id (1-based) to our 0-based index
         var mol2IdToIndex: [Int: Int] = [:]
 
         for line in atomLines {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
             // Minimum fields: atom_id atom_name x y z atom_type
             guard parts.count >= 6 else { continue }
 
@@ -160,6 +165,7 @@ enum MOL2Parser {
                 formalCharge: formalChargeFromSybylType(sybylType),
                 isHetAtom: true
             ))
+            isCarboxylateOxygen.append(sybylType.lowercased() == "o.co2")
         }
 
         guard !atoms.isEmpty else { return nil }
@@ -173,7 +179,7 @@ enum MOL2Parser {
                 .filter { !$0.isEmpty }
 
             for line in bondLines {
-                let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+                let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
                 // Minimum: bond_id origin_atom_id target_atom_id bond_type
                 guard parts.count >= 4 else { continue }
 
@@ -182,6 +188,8 @@ enum MOL2Parser {
                 else { continue }
 
                 let bondTypeStr = parts[3].lowercased()
+                // "nc" = explicitly not connected: no chemical bond.
+                guard bondTypeStr != "nc" else { continue }
                 let order = bondOrderFromMOL2Type(bondTypeStr)
 
                 // Resolve 1-based MOL2 atom IDs to 0-based indices via our map.
@@ -191,7 +199,8 @@ enum MOL2Parser {
                 else { continue }
 
                 guard idx1 >= 0, idx1 < atoms.count,
-                      idx2 >= 0, idx2 < atoms.count
+                      idx2 >= 0, idx2 < atoms.count,
+                      idx1 != idx2
                 else { continue }
 
                 bonds.append(Bond(
@@ -202,6 +211,8 @@ enum MOL2Parser {
                 ))
             }
         }
+
+        resolveCarboxylateOxygens(atoms: &atoms, bonds: &bonds, isCarboxylateOxygen: isCarboxylateOxygen)
 
         let finalName = moleculeName.isEmpty ? "Molecule \(index + 1)" : moleculeName
 
@@ -218,8 +229,10 @@ enum MOL2Parser {
 
         let prefix = "@<TRIPOS>"
 
-        for line in block.components(separatedBy: .newlines) {
-            let trimmedLine = line.trimmingCharacters(in: .init(charactersIn: "\r"))
+        // Character-level newline split treats "\r\n" as one separator (a CharacterSet
+        // split would insert an empty line per CRLF and shift positional records).
+        for line in block.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            let trimmedLine = String(line)
             if trimmedLine.hasPrefix(prefix) {
                 // Flush previous section
                 if let key = currentKey {
@@ -262,7 +275,6 @@ enum MOL2Parser {
         case "am", "amide":   return .single   // amide has partial double character, map to single
         case "du", "dummy":   return .single
         case "un", "unknown": return .single
-        case "nc":            return .single    // not connected, but keep as single if present
         default:              return .single
         }
     }
@@ -345,6 +357,7 @@ enum MOL2Parser {
         case "SE":  return .Se
         case "BR":  return .Br
         case "KR":  return .Kr
+        case "I":   return .I
         case "LP":  return .H  // lone pair placeholder
         case "DU":  return .C  // dummy atom
         default:    return .C  // fallback
@@ -356,7 +369,7 @@ enum MOL2Parser {
     /// Infer formal charge from special Sybyl atom types.
     ///   N.4   → +1 (quaternary/protonated nitrogen)
     ///   C.cat → +1 (carbocation)
-    ///   O.co2 → -1 (carboxylate, approximation for one oxygen)
+    ///   O.co2 → -1 (refined per group by resolveCarboxylateOxygens once bonds are known)
     private static func formalChargeFromSybylType(_ sybylType: String) -> Int {
         let lower = sybylType.lowercased()
         switch lower {
@@ -364,6 +377,83 @@ enum MOL2Parser {
         case "c.cat": return 1   // carbocation
         case "o.co2": return -1  // carboxylate oxygen (approximate: formal -1 per O)
         default:      return 0
+        }
+    }
+
+    // MARK: - Carboxylate / Phosphate Oxygens
+
+    /// Sybyl types every terminal oxygen of a carboxylate or phosphate as `O.co2`
+    /// (usually with `ar` bonds to the central atom), which describes the delocalised
+    /// group rather than a valence structure. Charging every O.co2 with -1 gives
+    /// -2 for a carboxylate and -3 for a phosphate monoester, and the non-ring `ar`
+    /// bonds break RDKit sanitization. Resolve each group to one Kekulé structure:
+    /// the central atom keeps its normal number of X=O double bonds (C/P: 1, S: 2),
+    /// any further terminal O.co2 carries -1 on a single bond, and O.co2 atoms with a
+    /// second neighbour (acid H / ester) are neutral single-bonded oxygens.
+    private static func resolveCarboxylateOxygens(
+        atoms: inout [Atom],
+        bonds: inout [Bond],
+        isCarboxylateOxygen: [Bool]
+    ) {
+        guard isCarboxylateOxygen.contains(true) else { return }
+
+        var degree = [Int](repeating: 0, count: atoms.count)
+        for bond in bonds {
+            degree[bond.atomIndex1] += 1
+            degree[bond.atomIndex2] += 1
+        }
+
+        var oxygensByCenter: [Int: [(oxygen: Int, bond: Int)]] = [:]
+        for (bondIndex, bond) in bonds.enumerated() {
+            let a = bond.atomIndex1, b = bond.atomIndex2
+            if isCarboxylateOxygen[a] && !isCarboxylateOxygen[b] {
+                oxygensByCenter[b, default: []].append((a, bondIndex))
+            } else if isCarboxylateOxygen[b] && !isCarboxylateOxygen[a] {
+                oxygensByCenter[a, default: []].append((b, bondIndex))
+            }
+        }
+
+        for (center, entries) in oxygensByCenter {
+            let valenceDoubleBonds: Int
+            switch atoms[center].element {
+            case .C, .P: valenceDoubleBonds = 1
+            case .S:     valenceDoubleBonds = 2
+            default:     continue
+            }
+            // Double bonds the center already makes to non-O.co2 partners (e.g. P=O typed O.2).
+            let existingDoubleBonds = bonds.filter { bond in
+                guard bond.order == .double else { return false }
+                if bond.atomIndex1 == center { return !isCarboxylateOxygen[bond.atomIndex2] }
+                if bond.atomIndex2 == center { return !isCarboxylateOxygen[bond.atomIndex1] }
+                return false
+            }.count
+            let doubleBondCount = max(valenceDoubleBonds - existingDoubleBonds, 0)
+
+            var terminal: [(oxygen: Int, bond: Int)] = []
+            for entry in entries {
+                if degree[entry.oxygen] > 1 {
+                    atoms[entry.oxygen].formalCharge = 0
+                    if bonds[entry.bond].order == .aromatic { bonds[entry.bond].order = .single }
+                } else {
+                    terminal.append(entry)
+                }
+            }
+
+            // Prefer oxygens the file already marks as double-bonded, then file order.
+            terminal.sort { lhs, rhs in
+                let lhsDouble = bonds[lhs.bond].order == .double
+                let rhsDouble = bonds[rhs.bond].order == .double
+                if lhsDouble != rhsDouble { return lhsDouble }
+                return lhs.oxygen < rhs.oxygen
+            }
+
+            for (rank, entry) in terminal.enumerated() {
+                let isDouble = rank < doubleBondCount
+                // Set the order explicitly: a neutral O on a single (or `1`) bond would be
+                // under-valent, and a -1 O on a double bond over-valent.
+                atoms[entry.oxygen].formalCharge = isDouble ? 0 : -1
+                bonds[entry.bond].order = isDouble ? .double : .single
+            }
         }
     }
 

@@ -17,8 +17,10 @@ kernel void computeStericGrid(
     uint                        tid          [[thread_position_in_grid]],
     uint                        lid          [[thread_index_in_threadgroup]])
 {
-    if (tid >= params.totalPoints) return;
-    float3 gridPos = gridPosition(tid, params);
+    // Threads past the end must not return early: they still load their tile slot
+    // and reach every threadgroup barrier (the last threadgroup is partially filled).
+    bool active = tid < params.totalPoints;
+    float3 gridPos = gridPosition(active ? tid : 0u, params);
     float totalE = 0.0f;
     // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
     threadgroup float3 tilePositions[kAtomTileSize];
@@ -56,7 +58,7 @@ kernel void computeStericGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
+    if (active) gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute hydrophobic grid map (legacy approximate Vina hydrophobic contact term).
@@ -71,8 +73,10 @@ kernel void computeHydrophobicGrid(
     uint                        tid          [[thread_position_in_grid]],
     uint                        lid          [[thread_index_in_threadgroup]])
 {
-    if (tid >= params.totalPoints) return;
-    float3 gridPos = gridPosition(tid, params);
+    // Threads past the end must not return early: they still load their tile slot
+    // and reach every threadgroup barrier (the last threadgroup is partially filled).
+    bool active = tid < params.totalPoints;
+    float3 gridPos = gridPosition(active ? tid : 0u, params);
     float totalE = 0.0f;
     // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
     threadgroup float3 tilePositions[kAtomTileSize];
@@ -114,7 +118,7 @@ kernel void computeHydrophobicGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
+    if (active) gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute hydrogen bond grid map (legacy approximate Vina H-bond term).
@@ -129,8 +133,10 @@ kernel void computeHBondGrid(
     uint                        tid          [[thread_position_in_grid]],
     uint                        lid          [[thread_index_in_threadgroup]])
 {
-    if (tid >= params.totalPoints) return;
-    float3 gridPos = gridPosition(tid, params);
+    // Threads past the end must not return early: they still load their tile slot
+    // and reach every threadgroup barrier (the last threadgroup is partially filled).
+    bool active = tid < params.totalPoints;
+    float3 gridPos = gridPosition(active ? tid : 0u, params);
     float totalE = 0.0f;
     // SoA threadgroup layout eliminates bank conflicts vs AoS GridProteinAtom
     threadgroup float3 tilePositions[kAtomTileSize];
@@ -173,7 +179,7 @@ kernel void computeHBondGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
+    if (active) gridMap[tid] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute exact AutoDock Vina affinity maps for the requested ligand XS types.
@@ -186,11 +192,15 @@ kernel void computeVinaAffinityMaps(
     uint                        tid           [[thread_position_in_grid]],
     uint                        lid           [[thread_index_in_threadgroup]])
 {
+    if (params.numAffinityTypes == 0 || params.totalPoints == 0) return;  // uniform across the dispatch
     uint totalEntries = params.totalPoints * params.numAffinityTypes;
-    if (tid >= totalEntries || params.numAffinityTypes == 0) return;
+    // Threads past the end must not return early: they still load their tile slot
+    // and reach every threadgroup barrier (the last threadgroup is partially filled).
+    bool active = tid < totalEntries;
+    uint entry = active ? tid : 0u;
 
-    uint pointIdx = tid % params.totalPoints;
-    uint typeIdx = tid / params.totalPoints;
+    uint pointIdx = entry % params.totalPoints;
+    uint typeIdx = entry / params.totalPoints;
     int probeType = affinityTypes[typeIdx];
     float3 gridPos = gridPosition(pointIdx, params);
     float totalE = 0.0f;
@@ -220,7 +230,7 @@ kernel void computeVinaAffinityMaps(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    affinityMaps[typeIdx * params.totalPoints + pointIdx] = half(clamp(totalE, -100.0f, 100.0f));
+    if (active) affinityMaps[typeIdx * params.totalPoints + pointIdx] = half(clamp(totalE, -100.0f, 100.0f));
 }
 
 /// Compute electrostatic potential grid using screened Coulomb with distance-dependent dielectric ε=4r.
@@ -233,8 +243,10 @@ kernel void computeElectrostaticGrid(
     uint                        tid          [[thread_position_in_grid]],
     uint                        lid          [[thread_index_in_threadgroup]])
 {
-    if (tid >= params.totalPoints) return;
-    float3 gridPos = gridPosition(tid, params);
+    // Threads past the end must not return early: they still load their tile slot
+    // and reach every threadgroup barrier (the last threadgroup is partially filled).
+    bool active = tid < params.totalPoints;
+    float3 gridPos = gridPosition(active ? tid : 0u, params);
     float phi = 0.0f;
 
     threadgroup float3 tilePositions[kAtomTileSize];
@@ -259,5 +271,5 @@ kernel void computeElectrostaticGrid(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    gridMap[tid] = half(clamp(phi, -50.0f, 50.0f));
+    if (active) gridMap[tid] = half(clamp(phi, -50.0f, 50.0f));
 }

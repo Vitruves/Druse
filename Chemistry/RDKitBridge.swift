@@ -95,6 +95,26 @@ enum RDKitBridge {
         )
     }
 
+    /// Neutral-parent MW per SMILES, so views can call `parentMolecularWeight(of:)` per render.
+    @MainActor private static var parentMolecularWeightCache: [String: (heavyAtoms: Int, mw: Float)] = [:]
+
+    /// The single molecular-weight definition shown for ligands: average MW of the neutral
+    /// parent (heavy atoms + implicit H, charges neutralised; see druse_compute_descriptors),
+    /// so every protonation state and every H-depleted pose of a compound reports the same
+    /// value. Falls back to the atom-mass sum only when the molecule has no SMILES or its
+    /// SMILES describes a different heavy-atom graph.
+    @MainActor static func parentMolecularWeight(of molecule: Molecule) -> Float {
+        if let smiles = molecule.smiles, !smiles.isEmpty {
+            let entry = parentMolecularWeightCache[smiles] ?? computeDescriptors(smiles: smiles).map {
+                let value = (heavyAtoms: $0.heavyAtomCount, mw: $0.molecularWeight)
+                parentMolecularWeightCache[smiles] = value
+                return value
+            }
+            if let entry, entry.heavyAtoms == molecule.heavyAtomCount { return entry.mw }
+        }
+        return molecule.atoms.reduce(0) { $0 + $1.element.mass }
+    }
+
     /// Batch process SMILES strings. Uses the TBB-backed C++ path when possible.
     /// Pass a `cancelFlag` pointer to allow early termination of the TBB parallel loop.
     static func batchProcess(
@@ -923,7 +943,9 @@ enum RDKitBridge {
                 position: SIMD3<Float>(da.x, da.y, da.z),
                 name: atomName.isEmpty ? symbol : atomName,
                 residueName: residueNameRaw.isEmpty ? "LIG" : residueNameRaw,
-                residueSeq: da.residueSeq == 0 ? 1 : Int(da.residueSeq),
+                // Residue 0 is a valid PDB number (e.g. expression tags); only default
+                // to 1 when the atom carries no residue metadata at all.
+                residueSeq: hasResidueMetadata ? Int(da.residueSeq) : 1,
                 chainID: chainIDRaw.isEmpty ? (hasResidueMetadata ? "A" : "L") : chainIDRaw,
                 charge: da.charge,
                 formalCharge: Int(da.formalCharge),

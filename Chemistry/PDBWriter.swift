@@ -29,31 +29,8 @@ enum PDBWriter {
         }
 
         var serial = 1
-        var lastChain: String? = nil
-
         if let protein {
-            for atom in protein.atoms {
-                if let prev = lastChain, prev != atom.chainID {
-                    lines.append(terRecord(serial: serial,
-                                           residueName: atom.residueName,
-                                           chainID: prev,
-                                           residueSeq: atom.residueSeq))
-                    serial += 1
-                }
-                lines.append(atomRecord(record: atom.isHetAtom ? "HETATM" : "ATOM",
-                                        serial: serial,
-                                        atom: atom,
-                                        position: atom.position))
-                serial += 1
-                lastChain = atom.chainID
-            }
-            if let last = lastChain, let lastAtom = protein.atoms.last {
-                lines.append(terRecord(serial: serial,
-                                       residueName: lastAtom.residueName,
-                                       chainID: last,
-                                       residueSeq: lastAtom.residueSeq))
-                serial += 1
-            }
+            appendProteinRecords(protein.atoms, to: &lines, serial: &serial)
         }
 
         // Ligand HETATM records — use the heavy-atom template combined with the
@@ -117,30 +94,8 @@ enum PDBWriter {
 
         // Protein block (written once)
         var serial = 1
-        var lastChain: String? = nil
         if let protein {
-            for atom in protein.atoms {
-                if let prev = lastChain, prev != atom.chainID {
-                    lines.append(terRecord(serial: serial,
-                                           residueName: atom.residueName,
-                                           chainID: prev,
-                                           residueSeq: atom.residueSeq))
-                    serial += 1
-                }
-                lines.append(atomRecord(record: atom.isHetAtom ? "HETATM" : "ATOM",
-                                        serial: serial,
-                                        atom: atom,
-                                        position: atom.position))
-                serial += 1
-                lastChain = atom.chainID
-            }
-            if let last = lastChain, let lastAtom = protein.atoms.last {
-                lines.append(terRecord(serial: serial,
-                                       residueName: lastAtom.residueName,
-                                       chainID: last,
-                                       residueSeq: lastAtom.residueSeq))
-                serial += 1
-            }
+            appendProteinRecords(protein.atoms, to: &lines, serial: &serial)
         }
 
         // Each ligand pose as a separate residue (residueSeq = rank)
@@ -181,15 +136,37 @@ enum PDBWriter {
 
     // MARK: - Record formatting
 
+    /// Append ATOM/HETATM records for the receptor, closing each chain with a TER
+    /// record that names the chain's last residue (not the first residue of the next chain).
+    private static func appendProteinRecords(_ atoms: [Atom], to lines: inout [String], serial: inout Int) {
+        var previous: Atom?
+        for atom in atoms {
+            if let prev = previous, prev.chainID != atom.chainID {
+                lines.append(terRecord(serial: serial, atom: prev))
+                serial += 1
+            }
+            lines.append(atomRecord(record: atom.isHetAtom ? "HETATM" : "ATOM",
+                                    serial: serial,
+                                    atom: atom,
+                                    position: atom.position))
+            serial += 1
+            previous = atom
+        }
+        if let last = previous {
+            lines.append(terRecord(serial: serial, atom: last))
+            serial += 1
+        }
+    }
+
     private static func atomRecord(record: String, serial: Int, atom: Atom, position: SIMD3<Float>) -> String {
         // PDB fixed-column ATOM/HETATM record (80 cols).
         let recordField = record.padding(toLength: 6, withPad: " ", startingAt: 0)
         let serialStr = String(format: "%5d", min(serial, 99999))
         let nameField = formatAtomName(atom.name, element: atom.element.symbol)
         let altLoc = atom.altLoc.isEmpty ? " " : String(atom.altLoc.prefix(1))
-        let resName = atom.residueName.padding(toLength: 3, withPad: " ", startingAt: 0)
+        let resName = residueNameField(atom.residueName)
         let chain = atom.chainID.isEmpty ? " " : String(atom.chainID.prefix(1))
-        let resSeq = String(format: "%4d", atom.residueSeq)
+        let resSeq = residueSeqField(atom.residueSeq)
         let iCode = atom.insertionCode.isEmpty ? " " : String(atom.insertionCode.prefix(1))
         let x = String(format: "%8.3f", clampCoord(position.x))
         let y = String(format: "%8.3f", clampCoord(position.y))
@@ -221,12 +198,24 @@ enum PDBWriter {
             + chargeField
     }
 
-    private static func terRecord(serial: Int, residueName: String, chainID: String, residueSeq: Int) -> String {
+    private static func terRecord(serial: Int, atom: Atom) -> String {
         let serialStr = String(format: "%5d", min(serial, 99999))
-        let resName = residueName.padding(toLength: 3, withPad: " ", startingAt: 0)
-        let chain = chainID.isEmpty ? " " : String(chainID.prefix(1))
-        let resSeq = String(format: "%4d", residueSeq)
-        return "TER   " + serialStr + "      " + resName + " " + chain + resSeq
+        let chain = atom.chainID.isEmpty ? " " : String(atom.chainID.prefix(1))
+        let iCode = atom.insertionCode.isEmpty ? " " : String(atom.insertionCode.prefix(1))
+        return "TER   " + serialStr + "      " + residueNameField(atom.residueName) + " " + chain
+            + residueSeqField(atom.residueSeq) + iCode
+    }
+
+    /// Residue name, columns 18-20, right-justified (e.g. " ZN", " DA").
+    private static func residueNameField(_ name: String) -> String {
+        padLeft(String(name.trimmingCharacters(in: .whitespaces).prefix(3)), width: 3)
+    }
+
+    /// Residue number, columns 23-26. Values outside -999...9999 would widen the field
+    /// and shift every following column, so they wrap modulo 10000 (as VMD/OpenBabel do).
+    private static func residueSeqField(_ seq: Int) -> String {
+        let wrapped = (-999...9999).contains(seq) ? seq : ((seq % 10000) + 10000) % 10000
+        return String(format: "%4d", wrapped)
     }
 
     /// Format the atom-name field (columns 13-16) per PDB convention:
@@ -271,11 +260,12 @@ enum PDBWriter {
 
     private static func clampCoord(_ value: Float) -> Float {
         if value.isNaN || value.isInfinite { return 0 }
-        return max(-9999.999, min(9999.999, value))
+        // "%8.3f" holds -999.999...9999.999; anything wider shifts the following columns.
+        return max(-999.999, min(9999.999, value))
     }
 
     private static func titleChunks(_ title: String) -> [String] {
-        let cleaned = title.replacingOccurrences(of: "\n", with: " ")
+        let cleaned = title.split(whereSeparator: \.isNewline).joined(separator: " ")
         let maxLen = 70
         var chunks: [String] = []
         var remaining = cleaned[...]
@@ -284,7 +274,8 @@ enum PDBWriter {
             let take = remaining.prefix(maxLen)
             remaining = remaining.dropFirst(take.count)
             let cont = index == 1 ? "  " : String(format: "%2d", index)
-            chunks.append("TITLE " + cont + " " + take)
+            // Columns 1-6 "TITLE ", 9-10 continuation, 11-80 text.
+            chunks.append("TITLE   " + cont + take)
             index += 1
         }
         return chunks

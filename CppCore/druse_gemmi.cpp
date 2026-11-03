@@ -408,7 +408,11 @@ int32_t druse_find_structure_neighbors(
             }
         }
 
-        gemmi::NeighborSearch neighborSearch(model, structure.cell, radius);
+        // Search the deposited model only. Passing structure.cell would enable
+        // periodic wrapping and crystallographic symmetry images, so atoms whose
+        // symmetry mate (not the atom itself) lies near the query would be
+        // returned with the image's distance.
+        gemmi::NeighborSearch neighborSearch(model, gemmi::UnitCell(), radius);
         neighborSearch.populate(includeHydrogens);
 
         const gemmi::Position query{

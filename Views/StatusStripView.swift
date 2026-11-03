@@ -3,355 +3,262 @@
 
 import SwiftUI
 
-/// Persistent bottom status strip showing current operation, contextual hints, and system metrics.
+extension LogLevel {
+    /// Design-system tone for log icons (readable in Light and Dark).
+    var dsColor: Color {
+        switch self {
+        case .info:    .secondary
+        case .success: DS.Color.success
+        case .warning: DS.Color.warning
+        case .error:   DS.Color.danger
+        case .debug:   DS.Color.pocket
+        }
+    }
+}
+
+/// Bottom debug area of the main window: a 24 pt bar (console toggle, next-step hint,
+/// warning/error counters, console tools) above a resizable log console.
+/// Live status, progress and stop live in the toolbar's `ActivityView`.
 struct StatusStripView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var showConsole: Bool
     @Binding var consoleHeight: CGFloat
-    let log = ActivityLog.shared
+    /// Step shown in the navigator; the hint never points at the step the user is already on.
+    let currentStep: SidebarTab
+    private let log = ActivityLog.shared
 
     @State private var filterLevel: LogLevel? = nil
-    @State private var scrollToBottom = true
-
     @GestureState private var dragStartHeight: CGFloat = 0
 
     // Console selection state
     @State private var selectedEntryIDs: Set<UUID> = []
     @State private var lastClickedID: UUID? = nil
 
-    var filteredEntries: [LogEntry] {
-        if let level = filterLevel {
-            return log.entries.filter { $0.level == level }
-        }
-        return log.entries
+    // Error handling: the console opens by itself for one error only; after that
+    // (until the user opens the console again) new errors just pulse the badge.
+    @State private var autoOpenArmed = true
+    @State private var isAutoOpening = false
+    @State private var errorPulse = 0
+
+    private static let consoleHeightRange: ClosedRange<CGFloat> = 80...500
+
+    private var filteredEntries: [LogEntry] {
+        guard let level = filterLevel else { return log.entries }
+        return log.entries.filter { $0.level == level }
     }
 
-    // MARK: - Computed Status
-
-    private var progressFraction: Float {
-        if viewModel.docking.isBatchDocking {
-            let bp = viewModel.docking.batchProgress
-            return bp.total > 0 ? Float(bp.current) / Float(bp.total) : 0
-        }
-        if viewModel.docking.screeningProgress > 0 && viewModel.docking.screeningProgress < 1 {
-            return viewModel.docking.screeningProgress
-        }
-        return 0
-    }
-
-    private var isScreeningActive: Bool {
-        if case .idle = viewModel.docking.screeningState { return false }
-        return true
-    }
-
-    private var isActive: Bool {
-        viewModel.docking.isDocking || viewModel.docking.isBatchDocking || viewModel.molecules.isMinimizing
-            || viewModel.workspace.isGeneratingSurface || viewModel.workspace.isLoading || viewModel.workspace.isSearching
-            || isScreeningActive || viewModel.leadOpt.isGenerating || viewModel.leadOpt.isDocking
-            || viewModel.workspace.statusMessage.hasSuffix("...")
-    }
-
-    private var statusInfo: (icon: String, message: String, color: Color) {
-        if viewModel.docking.isBatchDocking {
-            let bp = viewModel.docking.batchProgress
-            return ("bolt.fill", "Docking \(bp.current)/\(bp.total)", .cyan)
-        }
-        if viewModel.docking.isDocking {
-            return ("bolt.fill", "Docking...", .cyan)
-        }
-        if viewModel.molecules.isMinimizing {
-            return ("waveform.path.ecg", "Structure cleanup...", .orange)
-        }
-        if viewModel.workspace.isGeneratingSurface {
-            return ("drop.halffull", "Generating surface...", .blue)
-        }
-        if viewModel.workspace.isLoading {
-            return ("arrow.down.circle", viewModel.workspace.loadingMessage, .blue)
-        }
-        if viewModel.workspace.isSearching {
-            return ("magnifyingglass", "Searching RCSB...", .blue)
-        }
-        // Use statusMessage (updated immediately) instead of log.entries.last (throttled)
-        let msg = viewModel.workspace.statusMessage
-        if msg != "Ready", let last = log.entries.last {
-            return (last.level.icon, msg, last.level.color)
-        }
-        if let last = log.entries.last {
-            return (last.level.icon, last.message, last.level.color)
-        }
-        return ("checkmark.circle", "Ready", .green)
-    }
-
-    /// Contextual hint based on current app state — guides the user to the next logical step.
-    private var contextualHint: String? {
-        if isActive { return nil }
-        if viewModel.molecules.protein == nil {
-            return "Load a protein from Search or drag a PDB file"
-        }
-        if !viewModel.molecules.proteinPrepared && viewModel.molecules.protein != nil {
-            return "Tip: Run Preparation to clean the structure"
-        }
-        if viewModel.molecules.ligand == nil && viewModel.molecules.protein != nil {
-            return "Add a ligand from the Ligands tab to dock"
-        }
-        if viewModel.molecules.ligand != nil && viewModel.docking.selectedPocket == nil && viewModel.docking.dockingResults.isEmpty {
-            return "Detect a binding site in the Docking tab"
-        }
-        if viewModel.docking.selectedPocket != nil && viewModel.docking.dockingResults.isEmpty {
-            return "Ready to dock — configure and run"
-        }
-        if !viewModel.docking.dockingResults.isEmpty {
-            let method = viewModel.docking.scoringMethod
-            let score = viewModel.docking.dockingResults.first?.displayScore(method: method) ?? 0
-            return String(format: "Best pose: %.2f %@ — check Results", score, method.unitLabel)
-        }
-        return nil
-    }
+    private var nextStep: SidebarTab? { currentStep.suggestedNextStep(in: viewModel) }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Drag handle for resizing console
-            if showConsole {
-                Rectangle()
-                    .fill(Color.clear)
-                    .frame(height: 6)
-                    .contentShape(Rectangle())
-                    .onHover { hovering in
-                        if hovering { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
-                    }
-                    .gesture(
-                        DragGesture(minimumDistance: 1)
-                            .updating($dragStartHeight) { _, state, _ in
-                                if state == 0 { state = consoleHeight }
-                            }
-                            .onChanged { value in
-                                let initial = dragStartHeight != 0 ? dragStartHeight : consoleHeight
-                                consoleHeight = max(60, min(500, initial - value.translation.height))
-                            }
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 1.5)
-                            .fill(Color.secondary.opacity(0.4))
-                            .frame(width: 36, height: 3)
-                    )
-                    .background(Color(nsColor: .windowBackgroundColor))
-            }
-
             Divider()
-
-            // Status strip — always visible
-            HStack(alignment: .center, spacing: 6) {
-                // Expand/collapse console
-                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showConsole.toggle() } }) {
-                    Image(systemName: showConsole ? "chevron.down" : "chevron.up")
-                        .font(.caption2.weight(.bold))
-                        .frame(width: 20, height: 20)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help(showConsole ? "Collapse console" : "Expand console")
-                .plainButtonAccessibility(AccessibilityID.statusToggleConsole)
-
-                // Status indicator
-                let status = statusInfo
-                HStack(spacing: 4) {
-                    if isActive {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .scaleEffect(0.7)
-                            .frame(width: 14, height: 14)
-                    } else {
-                        Image(systemName: status.icon)
-                            .font(.caption2)
-                            .foregroundStyle(status.color)
-                            .frame(width: 14, height: 14)
-                    }
-
-                    Text(status.message)
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                }
-
-                // Progress bar + stop button for active operations
-                if isActive {
-                    let progress = progressFraction
-                    if progress > 0 {
-                        GeometryReader { geo in
-                            ZStack(alignment: .leading) {
-                                RoundedRectangle(cornerRadius: 2)
-                                    .fill(Color.primary.opacity(0.08))
-                                RoundedRectangle(cornerRadius: 2)
-                                    .fill(Color.cyan)
-                                    .frame(width: geo.size.width * CGFloat(progress))
-                            }
-                        }
-                        .frame(width: 80, height: 4)
-
-                    }
-
-                    Button(action: stopCurrentOperation) {
-                        Image(systemName: "stop.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.red)
-                            .frame(width: 20, height: 20)
-                            .background(Color.red.opacity(0.12))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                    .buttonStyle(.plain)
-                    .help(stopButtonHint)
-                    .plainButtonAccessibility(AccessibilityID.statusStop)
-                }
-
-                // Contextual hint (when not actively working)
-                if !isActive, let hint = contextualHint {
-                    Divider().frame(height: 12)
-                    HStack(spacing: 4) {
-                        Image(systemName: "lightbulb.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.yellow.opacity(0.7))
-                            .frame(width: 14, height: 14)
-                        Text(hint)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer(minLength: 4)
-
-                if showConsole {
-                    Picker("", selection: $filterLevel) {
-                        Text("All").tag(nil as LogLevel?)
-                        ForEach(LogLevel.allCases, id: \.self) { level in
-                            Label(level.rawValue, systemImage: level.icon).tag(level as LogLevel?)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 60)
-                    .help("Filter console by log level")
-
-                    if !selectedEntryIDs.isEmpty {
-                        Button(action: copySelected) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "doc.on.doc")
-                                    .font(.caption2)
-                                Text("\(selectedEntryIDs.count)")
-                                    .font(.footnote.monospaced())
-                            }
-                            .frame(height: 20)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Copy selected lines")
-                        .plainButtonAccessibility(AccessibilityID.statusCopySelected)
-                    }
-
-                    statusBarButton(icon: "doc.on.clipboard", help: "Copy all console output",
-                                    accessibilityID: AccessibilityID.statusCopyAll) { copyAll() }
-
-                    statusBarButton(icon: "trash", help: "Clear all log entries",
-                                    accessibilityID: AccessibilityID.statusClearLog) {
-                        log.clear()
-                        selectedEntryIDs.removeAll()
-                        lastClickedID = nil
-                    }
-
-                    if log.currentLogFileURL != nil {
-                        statusBarButton(icon: "doc.text.magnifyingglass", help: "Reveal log file in Finder",
-                                        accessibilityID: AccessibilityID.statusRevealLog) { log.revealLogInFinder() }
-                    }
-                }
-
-                if !showConsole {
-                    let errorCount = log.entries.filter { $0.level == .error }.count
-                    if errorCount > 0 {
-                        HStack(spacing: 3) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.caption2)
-                            Text("\(errorCount)")
-                                .font(.caption2.weight(.medium).monospaced())
-                        }
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                        .background(Color.red.opacity(0.15))
-                        .foregroundStyle(.red)
-                        .clipShape(Capsule())
-                    }
-                }
-
-                Divider().frame(height: 12)
-
-                // Console toggle
-                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showConsole.toggle() } }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "terminal")
-                            .font(.caption2)
-                        if !showConsole {
-                            Text("Console")
-                                .font(.footnote)
-                        }
-                    }
-                    .foregroundStyle(showConsole ? .primary : .secondary)
-                    .padding(.horizontal, 6)
-                    .frame(height: 20)
-                    .background(showConsole ? Color.accentColor.opacity(0.12) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(showConsole ? "Hide console" : "Show console")
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 26)
-            .background(Color(nsColor: .windowBackgroundColor))
-
-            // Expanded console
+            bar
             if showConsole {
                 Divider()
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 1) {
-                            ForEach(filteredEntries) { entry in
-                                logEntryRow(entry)
-                                    .id(entry.id)
-                            }
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                    }
-                    .onChange(of: log.entries.count) { _, _ in
-                        if scrollToBottom, let last = filteredEntries.last {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
-                    }
-                    .onChange(of: filterLevel) { _, _ in
-                        scrollToLatest(proxy)
-                    }
-                    .onChange(of: showConsole) { _, visible in
-                        if visible {
-                            scrollToLatest(proxy)
-                        }
-                    }
-                    .onAppear {
-                        scrollToLatest(proxy)
-                    }
-                    .onKeyPress(.escape) {
-                        selectedEntryIDs.removeAll()
-                        lastClickedID = nil
-                        return .handled
-                    }
-                }
-                .frame(height: consoleHeight)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .copyable(formatEntries(selectedEntryIDs.isEmpty ? filteredEntries : selectedEntries))
+                console
+            }
+        }
+        .onChange(of: log.entries.count) { _, _ in
+            guard let last = log.entries.last, last.level == .error else { return }
+            if !showConsole && autoOpenArmed {
+                autoOpenArmed = false
+                isAutoOpening = true
+                withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = true }
+            } else if !showConsole {
+                errorPulse &+= 1
+            }
+        }
+        .onChange(of: showConsole) { _, isOpen in
+            // A user-driven open re-arms the one-shot auto-open.
+            if isAutoOpening {
+                isAutoOpening = false
+            } else if isOpen {
+                autoOpenArmed = true
             }
         }
     }
 
-    // MARK: - Status Bar Button
+    // MARK: - Bar
+
+    private var bar: some View {
+        HStack(spacing: DS.Space.m) {
+            Button(action: toggleConsole) {
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: showConsole ? "chevron.down" : "chevron.up")
+                        .font(DS.Font.caption.weight(.semibold))
+                    Text("Console")
+                        .font(DS.Font.secondary)
+                }
+                .foregroundStyle(showConsole ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help(showConsole ? "Hide Console ⇧⌘Y" : "Show Console ⇧⌘Y")
+            .accessibilityIdentifier(AccessibilityID.statusToggleConsole)
+
+            if let next = nextStep {
+                Divider().frame(height: 12)
+                Button { next.request(in: viewModel) } label: {
+                    Label {
+                        Text("Up next: \(next.rawValue) — \(next.subtitle)").lineLimit(1)
+                    } icon: {
+                        Image(systemName: "lightbulb")
+                    }
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Go to step \(next.shortcutNumber): \(next.rawValue) (⌘\(next.shortcutNumber))")
+            }
+
+            Spacer(minLength: DS.Space.m)
+
+            counters
+
+            if showConsole {
+                Divider().frame(height: 12)
+                consoleTools
+            }
+        }
+        .padding(.horizontal, DS.Space.l)
+        .frame(height: DS.Size.debugBar)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            if showConsole { resizeHandle }
+        }
+    }
+
+    @ViewBuilder
+    private var counters: some View {
+        let warnings = log.entries.lazy.filter { $0.level == .warning }.count
+        let errors = log.entries.lazy.filter { $0.level == .error }.count
+        if warnings > 0 {
+            counterButton(count: warnings, level: .warning, tone: .warning)
+        }
+        if errors > 0 {
+            counterButton(count: errors, level: .error, tone: .danger)
+                .symbolEffect(.bounce, value: errorPulse)
+        }
+    }
+
+    private func counterButton(count: Int, level: LogLevel, tone: DSTone) -> some View {
+        Button {
+            filterLevel = level
+            if !showConsole { toggleConsole() }
+        } label: {
+            DSTag("\(count)", tone: tone, systemImage: level.icon)
+        }
+        .buttonStyle(.plain)
+        .help("Show \(count) \(level.rawValue.lowercased()) message\(count == 1 ? "" : "s")")
+    }
+
+    @ViewBuilder
+    private var consoleTools: some View {
+        Picker("Filter", selection: $filterLevel) {
+            Text("All").tag(nil as LogLevel?)
+            ForEach(LogLevel.allCases, id: \.self) { level in
+                Image(systemName: level.icon)
+                    .accessibilityLabel(level.rawValue)
+                    .tag(level as LogLevel?)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .fixedSize()
+        .help("Filter console by log level")
+
+        if !selectedEntryIDs.isEmpty {
+            Button(action: copySelected) {
+                Label("\(selectedEntryIDs.count)", systemImage: "doc.on.doc")
+                    .monospacedDigit()
+            }
+            .buttonStyle(.borderless)
+            .help("Copy selected lines ⌘C")
+            .accessibilityIdentifier(AccessibilityID.statusCopySelected)
+        }
+
+        toolButton("Copy All", systemImage: "doc.on.clipboard", help: "Copy all console output",
+                   id: AccessibilityID.statusCopyAll, action: copyAll)
+
+        toolButton("Clear", systemImage: "trash", help: "Clear all log entries",
+                   id: AccessibilityID.statusClearLog) {
+            log.clear()
+            selectedEntryIDs.removeAll()
+            lastClickedID = nil
+        }
+
+        if log.currentLogFileURL != nil {
+            toolButton("Reveal Log", systemImage: "doc.text.magnifyingglass", help: "Reveal log file in Finder",
+                       id: AccessibilityID.statusRevealLog) { log.revealLogInFinder() }
+        }
+    }
+
+    private func toolButton(_ title: String, systemImage: String, help: String, id: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityIdentifier(id)
+    }
+
+    private var resizeHandle: some View {
+        Color.clear
+            .frame(height: 5)
+            .contentShape(Rectangle())
+            .pointerStyle(.rowResize)
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .updating($dragStartHeight) { _, state, _ in
+                        if state == 0 { state = consoleHeight }
+                    }
+                    .onChanged { value in
+                        let initial = dragStartHeight != 0 ? dragStartHeight : consoleHeight
+                        let range = Self.consoleHeightRange
+                        consoleHeight = min(range.upperBound, max(range.lowerBound, initial - value.translation.height))
+                    }
+            )
+            .offset(y: -2)
+            .accessibilityHidden(true)
+    }
+
+    // MARK: - Console
+
+    private var console: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(filteredEntries) { entry in
+                        logEntryRow(entry)
+                            .id(entry.id)
+                    }
+                }
+                .padding(.horizontal, DS.Space.m)
+                .padding(.vertical, DS.Space.xs)
+            }
+            .onChange(of: log.entries.count) { _, _ in
+                if let last = filteredEntries.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+            .onChange(of: filterLevel) { _, _ in scrollToLatest(proxy) }
+            .onAppear { scrollToLatest(proxy) }
+            .onKeyPress(.escape) {
+                selectedEntryIDs.removeAll()
+                lastClickedID = nil
+                return .handled
+            }
+        }
+        .frame(height: min(Self.consoleHeightRange.upperBound, max(Self.consoleHeightRange.lowerBound, consoleHeight)))
+        .background(Color(nsColor: .textBackgroundColor))
+        .copyable(formatEntries(selectedEntryIDs.isEmpty ? filteredEntries : selectedEntries))
+    }
 
     private func scrollToLatest(_ proxy: ScrollViewProxy) {
         guard let last = filteredEntries.last else { return }
@@ -360,64 +267,47 @@ struct StatusStripView: View {
         }
     }
 
-    private func statusBarButton(icon: String, help: String, accessibilityID: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.caption2)
-                .frame(width: 20, height: 20)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
-        .help(help)
-        .plainButtonAccessibility(accessibilityID)
-    }
-
-    // MARK: - Log Entry Row
-
     @ViewBuilder
     private func logEntryRow(_ entry: LogEntry) -> some View {
         let isSelected = selectedEntryIDs.contains(entry.id)
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.m) {
             Text(entry.formattedTime)
-                .font(.footnote.monospaced())
                 .foregroundStyle(.secondary)
-                .frame(width: 80, alignment: .leading)
+                .frame(width: 84, alignment: .leading)
             Image(systemName: entry.level.icon)
-                .font(.footnote)
-                .foregroundStyle(entry.level.color)
+                .foregroundStyle(entry.level.dsColor)
                 .frame(width: 14)
             Text(entry.category.rawValue)
-                .font(.footnote.weight(.medium).monospaced())
-                .padding(.horizontal, 4)
-                .padding(.vertical, 1)
-                .background(Color.accentColor.opacity(0.15))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.secondary)
+                .frame(width: 72, alignment: .leading)
+                .lineLimit(1)
             Text(entry.message)
-                .font(.subheadline.monospaced())
                 .foregroundStyle(.primary)
                 .lineLimit(2)
                 .textSelection(.enabled)
-            Spacer()
+            Spacer(minLength: 0)
         }
-        .padding(.vertical, 3)
-        .padding(.horizontal, 4)
-        .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .font(DS.Font.monoSmall)
+        .padding(.vertical, DS.Space.xxs + 1)
+        .padding(.horizontal, DS.Space.xs)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                .fill(isSelected ? DS.Color.accentSoft : .clear)
+        )
         .contentShape(Rectangle())
-        .overlay(alignment: .bottom) {
-            Divider().padding(.leading, 8)
-        }
         .onTapGesture {
             handleEntryClick(entry, shiftKey: NSEvent.modifierFlags.contains(.shift))
         }
     }
 
-    // MARK: - Selection & Copy
+    // MARK: - Actions
+
+    private func toggleConsole() {
+        withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole.toggle() }
+    }
 
     private var selectedEntries: [LogEntry] {
-        let entries = filteredEntries
-        return entries.filter { selectedEntryIDs.contains($0.id) }
+        filteredEntries.filter { selectedEntryIDs.contains($0.id) }
     }
 
     private func handleEntryClick(_ entry: LogEntry, shiftKey: Bool) {
@@ -425,18 +315,14 @@ struct StatusStripView: View {
         if shiftKey, let anchorID = lastClickedID,
            let anchorIdx = entries.firstIndex(where: { $0.id == anchorID }),
            let clickIdx = entries.firstIndex(where: { $0.id == entry.id }) {
-            // Shift-click: select range
             let range = min(anchorIdx, clickIdx)...max(anchorIdx, clickIdx)
             selectedEntryIDs = Set(entries[range].map(\.id))
+        } else if selectedEntryIDs.contains(entry.id) && selectedEntryIDs.count == 1 {
+            selectedEntryIDs.removeAll()
+            lastClickedID = nil
         } else {
-            // Single click: toggle or select
-            if selectedEntryIDs.contains(entry.id) && selectedEntryIDs.count == 1 {
-                selectedEntryIDs.removeAll()
-                lastClickedID = nil
-            } else {
-                selectedEntryIDs = [entry.id]
-                lastClickedID = entry.id
-            }
+            selectedEntryIDs = [entry.id]
+            lastClickedID = entry.id
         }
     }
 
@@ -448,85 +334,15 @@ struct StatusStripView: View {
     }
 
     private func copySelected() {
-        let text = formatEntries(selectedEntries).first ?? ""
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        copyToPasteboard(formatEntries(selectedEntries).first ?? "")
     }
 
     private func copyAll() {
-        let text = formatEntries(filteredEntries).first ?? ""
+        copyToPasteboard(formatEntries(filteredEntries).first ?? "")
+    }
+
+    private func copyToPasteboard(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-    }
-
-    private func saveProject() {
-        let panel = NSSavePanel()
-        panel.title = "Save Druse Project"
-        panel.allowedContentTypes = [.folder]
-        panel.nameFieldStringValue = "\(viewModel.molecules.protein?.name ?? "Untitled").druse"
-        panel.canCreateDirectories = true
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in
-                do {
-                    try DruseProjectIO.save(to: url, viewModel: viewModel)
-                } catch {
-                    viewModel.log.error("Save failed: \(error.localizedDescription)", category: .system)
-                }
-            }
-        }
-    }
-
-    // MARK: - Stop Operations
-
-    private var stopButtonHint: String {
-        if viewModel.docking.isBatchDocking { return "Stop batch docking" }
-        if viewModel.docking.isDocking { return "Stop docking" }
-        if isScreeningActive { return "Stop virtual screening" }
-        if viewModel.leadOpt.isGenerating || viewModel.leadOpt.isDocking { return "Stop lead optimization" }
-        if viewModel.molecules.isMinimizing { return "Stop structure cleanup" }
-        if viewModel.workspace.isGeneratingSurface { return "Stop surface generation" }
-        if viewModel.workspace.isLoading { return "Cancel loading" }
-        if viewModel.workspace.statusMessage.hasSuffix("...") { return "Cancel current operation" }
-        return "Stop"
-    }
-
-    private func stopCurrentOperation() {
-        if viewModel.docking.isBatchDocking {
-            viewModel.cancelBatchDocking()
-        } else if viewModel.docking.isDocking {
-            viewModel.stopDocking()
-        } else if isScreeningActive {
-            viewModel.cancelScreening()
-        } else if viewModel.leadOpt.isGenerating || viewModel.leadOpt.isDocking {
-            viewModel.cancelLeadOptimization()
-        } else if viewModel.molecules.isMinimizing {
-            viewModel.molecules.isMinimizing = false
-        } else if viewModel.workspace.isGeneratingSurface {
-            viewModel.workspace.isGeneratingSurface = false
-        } else if viewModel.workspace.isLoading {
-            viewModel.workspace.isLoading = false
-        }
-        // Reset status for operations tracked only by statusMessage
-        if viewModel.workspace.statusMessage.hasSuffix("...") {
-            viewModel.workspace.statusMessage = "Cancelled"
-        }
-    }
-
-    private func openProject() {
-        let panel = NSOpenPanel()
-        panel.title = "Open Druse Project"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in
-                do {
-                    try await DruseProjectIO.load(from: url, into: viewModel)
-                } catch {
-                    viewModel.log.error("Load failed: \(error.localizedDescription)", category: .system)
-                }
-            }
-        }
     }
 }

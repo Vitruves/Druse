@@ -5,26 +5,37 @@ import SwiftUI
 
 // MARK: - Layout constants
 
+/// Legacy panel constants; every value forwards to `DS` tokens.
 enum PanelStyle {
-    static let cardCornerRadius: CGFloat = 10
-    static let cardPadding: CGFloat = 12
-    static let cardSpacing: CGFloat = 10
-    static let sectionSpacing: CGFloat = 12
-    static let rowSpacing: CGFloat = 6
-    static let labelColumnWidth: CGFloat = 88
-    static let valueColumnWidth: CGFloat = 60
-    static let numberFieldWidth: CGFloat = 64
-    static let buttonHeight: CGFloat = 24
-    static let runButtonHeight: CGFloat = 32
+    static let cardCornerRadius: CGFloat = DS.Radius.m
+    static let cardPadding: CGFloat = DS.Space.l
+    static let cardSpacing: CGFloat = DS.Space.m
+    static let sectionSpacing: CGFloat = DS.Space.l
+    static let rowSpacing: CGFloat = DS.Space.s
+    static let labelColumnWidth: CGFloat = DS.Size.labelColumn
+    static let valueColumnWidth: CGFloat = DS.Size.valueColumn
+    static let numberFieldWidth: CGFloat = DS.Size.numberField
+    static let buttonHeight: CGFloat = DS.Size.buttonHeight
+    static let runButtonHeight: CGFloat = DS.Size.primaryButtonHeight
     static let cardFillOpacity: Double = 0.045
     static let chipFillOpacity: Double = 0.06
 
-    static let titleFont: Font = .system(size: 13, weight: .semibold)
-    static let bodyFont: Font = .system(size: 12)
-    static let smallFont: Font = .system(size: 11)
-    static let captionFont: Font = .system(size: 10)
-    static let monoSmall: Font = .system(size: 11, design: .monospaced)
-    static let monoBody: Font = .system(size: 12, design: .monospaced)
+    static let titleFont: Font = DS.Font.sectionTitle
+    static let bodyFont: Font = DS.Font.label
+    static let smallFont: Font = DS.Font.secondary
+    static let captionFont: Font = DS.Font.caption
+    static let monoSmall: Font = DS.Font.monoSmall
+    static let monoBody: Font = DS.Font.mono
+}
+
+/// Maps legacy low-contrast literals (.yellow / .cyan / .green) onto tone-safe tokens.
+private func dsToneSafe(_ color: Color) -> Color {
+    switch color {
+    case .yellow: DS.Color.warning
+    case .cyan:   DS.Color.accent
+    case .green:  DS.Color.success
+    default:      color
+    }
 }
 
 // MARK: - Card
@@ -53,25 +64,22 @@ struct PanelCard<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            HStack(spacing: DS.Space.s) {
                 Image(systemName: icon)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: DS.Size.toolIcon, weight: .medium))
+                    .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(.secondary)
                     .frame(width: 16, height: 16)
                 Text(title)
-                    .font(PanelStyle.titleFont)
-                Spacer(minLength: 4)
+                    .font(DS.Font.sectionTitle)
+                Spacer(minLength: DS.Space.xs)
                 if let accessory { accessory }
             }
             content()
         }
-        .padding(PanelStyle.cardPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: PanelStyle.cardCornerRadius, style: .continuous)
-                .fill(Color.primary.opacity(PanelStyle.cardFillOpacity))
-        )
+        .dsCard(padding: PanelStyle.cardPadding)
     }
 }
 
@@ -81,19 +89,34 @@ struct PanelSubheader: View {
     let title: String
     var icon: String? = nil
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: DS.Space.xs) {
             if let icon {
-                Image(systemName: icon).font(.caption2)
+                Image(systemName: icon)
             }
             Text(title)
-                .font(.caption.weight(.semibold))
                 .textCase(.uppercase)
+                .tracking(0.6)
         }
-        .foregroundStyle(.secondary)
+        .font(DS.Font.eyebrow)
+        .foregroundStyle(.tertiary)
     }
 }
 
 // MARK: - Slider row
+
+/// Quantises slider writes to `step` (anchored at the range's lower bound) without
+/// passing `step:` to `Slider`. On macOS `Slider(step:)` draws one tick mark per step,
+/// which on ranges like ±100 Å at 0.5 Å collapses into a solid bar under the track.
+func snappedSliderBinding(_ value: Binding<Float>, range: ClosedRange<Float>, step: Float) -> Binding<Float> {
+    Binding(
+        get: { value.wrappedValue },
+        set: { raw in
+            guard step > 0 else { value.wrappedValue = raw; return }
+            let snapped = range.lowerBound + ((raw - range.lowerBound) / step).rounded() * step
+            value.wrappedValue = min(max(snapped, range.lowerBound), range.upperBound)
+        }
+    )
+}
 
 struct PanelSliderRow: View {
     let label: String
@@ -107,17 +130,18 @@ struct PanelSliderRow: View {
     var onChange: ((Float) -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: DS.Space.m) {
             Text(label)
-                .font(PanelStyle.smallFont)
+                .font(DS.Font.label)
                 .foregroundStyle(.secondary)
                 .frame(width: labelWidth, alignment: .leading)
                 .lineLimit(1)
-            Slider(value: $value, in: range, step: step)
-                .controlSize(.mini)
+            Slider(value: snappedSliderBinding($value, range: range, step: step), in: range)
+                .controlSize(.small)
                 .onChange(of: value) { _, newValue in onChange?(newValue) }
             Text(format(value))
-                .font(PanelStyle.monoSmall)
+                .font(DS.Font.monoSmall)
+                .monospacedDigit()
                 .foregroundStyle(valueColor)
                 .frame(width: valueWidth, alignment: .trailing)
         }
@@ -135,16 +159,17 @@ struct PanelAxisSlider: View {
     var onChange: ((Float) -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: DS.Space.s) {
             Text(axis)
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .font(DS.Font.monoSmall.weight(.bold))
                 .foregroundStyle(.secondary)
                 .frame(width: 10, alignment: .trailing)
-            Slider(value: $value, in: range, step: step)
-                .controlSize(.mini)
+            Slider(value: snappedSliderBinding($value, range: range, step: step), in: range)
+                .controlSize(.small)
                 .onChange(of: value) { _, newValue in onChange?(newValue) }
             Text(format(value))
-                .font(PanelStyle.monoSmall)
+                .font(DS.Font.monoSmall)
+                .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .frame(width: 56, alignment: .trailing)
         }
@@ -165,7 +190,8 @@ struct PanelNumberField: View {
         ), format: .number)
             .textFieldStyle(.roundedBorder)
             .controlSize(.small)
-            .font(PanelStyle.monoSmall)
+            .font(DS.Font.monoSmall)
+            .monospacedDigit()
             .multilineTextAlignment(.trailing)
             .frame(width: width)
     }
@@ -186,10 +212,12 @@ struct PanelLabeledRow<Content: View>: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: DS.Space.m) {
             Text(label)
-                .font(PanelStyle.bodyFont)
-            Spacer(minLength: 4)
+                .font(DS.Font.label)
+                .foregroundStyle(.secondary)
+                .frame(minWidth: DS.Size.labelColumn, alignment: .leading)
+            Spacer(minLength: DS.Space.xs)
             content()
         }
         .help(help ?? "")
@@ -208,45 +236,36 @@ struct PanelChoiceButton: View {
     let action: () -> Void
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
         Button(action: action) {
-            HStack(spacing: 4) {
+            HStack(spacing: DS.Space.xs) {
                 if let icon {
                     Image(systemName: icon)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(DS.Font.secondary.weight(.medium))
                 }
                 Text(title)
-                    .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                    .font(DS.Font.label.weight(isSelected ? .semibold : .regular))
                     .lineLimit(1)
                 if let badge {
-                    Text(badge)
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 3)
-                        .padding(.vertical, 1)
-                        .background(Color.orange.opacity(0.15))
-                        .clipShape(RoundedRectangle(cornerRadius: 2))
+                    DSTag(badge, tone: .info)
                 }
             }
+            .padding(.horizontal, DS.Space.xs)
             .frame(maxWidth: .infinity)
             .frame(height: PanelStyle.buttonHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isSelected
-                          ? Color.accentColor.opacity(0.18)
-                          : Color.primary.opacity(PanelStyle.chipFillOpacity))
-            )
+            .background(shape.fill(isSelected ? DS.Color.accentSoft : DS.Color.controlFill))
             .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.55) : Color.clear,
-                                  lineWidth: 1)
+                shape.strokeBorder(isSelected ? DS.Color.accent : DS.Color.hairline,
+                                   lineWidth: isSelected ? 1 : 0.5)
             )
-            .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+            .foregroundStyle(isSelected ? DS.Color.accent : Color.primary)
             .opacity(isDisabled ? 0.4 : 1.0)
-            .contentShape(Rectangle())
+            .contentShape(shape)
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .help(help ?? "")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
@@ -254,7 +273,7 @@ struct PanelChoiceButton: View {
 
 struct PanelChoiceGrid<Content: View>: View {
     var columns: Int = 2
-    var spacing: CGFloat = 6
+    var spacing: CGFloat = DS.Space.s
     @ViewBuilder let content: () -> Content
 
     var body: some View {
@@ -276,19 +295,19 @@ struct PanelToggleRow: View {
     @Binding var isOn: Bool
 
     var body: some View {
-        HStack(alignment: .center, spacing: 8) {
+        HStack(alignment: .center, spacing: DS.Space.m) {
             if let icon {
                 Image(systemName: icon)
-                    .font(.system(size: 11))
+                    .font(DS.Font.secondary)
                     .foregroundStyle(.secondary)
                     .frame(width: 14)
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(PanelStyle.bodyFont)
+                    .font(DS.Font.label)
                 if let subtitle {
                     Text(subtitle)
-                        .font(PanelStyle.smallFont)
+                        .font(DS.Font.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -309,16 +328,17 @@ struct PanelHint: View {
     var icon: String? = nil
     var color: Color = .secondary
     var body: some View {
-        HStack(alignment: .top, spacing: 4) {
+        let tint = dsToneSafe(color)
+        HStack(alignment: .top, spacing: DS.Space.xs) {
             if let icon {
                 Image(systemName: icon)
-                    .font(.system(size: 10))
-                    .foregroundStyle(color)
+                    .font(DS.Font.caption)
+                    .foregroundStyle(tint)
                     .padding(.top, 1)
             }
             Text(text)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(color)
+                .font(DS.Font.secondary)
+                .foregroundStyle(tint)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -334,22 +354,29 @@ struct PanelStat: View {
     var color: Color = .primary
 
     var body: some View {
-        VStack(spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: 2) {
+        let tint = dsToneSafe(color)
+        VStack(spacing: DS.Space.xxs) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.xxs) {
                 Text(value)
-                    .font(.system(size: 13, weight: .medium, design: .monospaced))
-                    .foregroundStyle(color)
+                    .font(DS.Font.metric)
+                    .foregroundStyle(tint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
                 if let unit {
                     Text(unit)
-                        .font(PanelStyle.captionFont)
+                        .font(DS.Font.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             Text(label)
-                .font(PanelStyle.captionFont)
+                .font(DS.Font.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
+        .padding(DS.Space.m)
         .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous).fill(DS.Color.cardFill))
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -364,21 +391,12 @@ struct PanelRunButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
+            HStack(spacing: DS.Space.s) {
                 Image(systemName: icon)
-                    .font(.system(size: 12, weight: .semibold))
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold))
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: PanelStyle.runButtonHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(color.opacity(isDisabled ? 0.35 : 1.0))
-            )
-            .foregroundStyle(.white)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(DSPrimaryButtonStyle(tint: color))
         .disabled(isDisabled)
     }
 }
@@ -395,26 +413,15 @@ struct PanelSecondaryButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
+            HStack(spacing: DS.Space.xs) {
                 if let icon {
                     Image(systemName: icon)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(DS.Font.secondary.weight(.medium))
                 }
                 Text(title)
-                    .font(PanelStyle.bodyFont)
-                    .lineLimit(1)
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: PanelStyle.buttonHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.primary.opacity(PanelStyle.chipFillOpacity))
-            )
-            .foregroundStyle(tint ?? .primary)
-            .opacity(isDisabled ? 0.4 : 1.0)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(DSSecondaryButtonStyle(tint: tint))
         .disabled(isDisabled)
         .help(help ?? "")
     }
@@ -430,19 +437,21 @@ struct PanelLabeledDivider: View {
     var icon: String? = nil
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: DS.Space.s) {
             if let icon {
-                Image(systemName: icon).font(.caption2)
+                Image(systemName: icon)
             }
             Text(title)
-                .font(.caption.weight(.semibold))
                 .textCase(.uppercase)
+                .tracking(0.6)
+                .fixedSize()
             Rectangle()
-                .fill(Color.secondary.opacity(0.25))
+                .fill(DS.Color.hairline)
                 .frame(height: 0.5)
         }
-        .foregroundStyle(.secondary)
-        .padding(.top, 2)
+        .font(DS.Font.eyebrow)
+        .foregroundStyle(.tertiary)
+        .padding(.top, DS.Space.xxs)
     }
 }
 
@@ -453,6 +462,7 @@ struct PanelDisclosure<Content: View>: View {
     var icon: String? = nil
     @Binding var isExpanded: Bool
     @ViewBuilder let content: () -> Content
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(_ title: String,
          icon: String? = nil,
@@ -465,26 +475,28 @@ struct PanelDisclosure<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
-            }) {
-                HStack(spacing: 4) {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            Button {
+                withAnimation(DS.Motion.respecting(reduceMotion, DS.Motion.snappy)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: DS.Space.xs) {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     if let icon {
-                        Image(systemName: icon).font(.caption2)
+                        Image(systemName: icon)
+                            .font(DS.Font.secondary)
+                            .foregroundStyle(.secondary)
                     }
                     Text(title)
-                        .font(.caption.weight(.semibold))
-                        .textCase(.uppercase)
+                        .font(DS.Font.label.weight(.medium))
                     Spacer()
                 }
-                .foregroundStyle(.secondary)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
             if isExpanded {
                 content()
             }
@@ -500,11 +512,11 @@ struct PanelHighlightRow<Content: View>: View {
 
     var body: some View {
         content()
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.horizontal, DS.Space.m)
+            .padding(.vertical, DS.Space.s)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
                     .fill(color.opacity(0.10))
             )
     }
@@ -516,15 +528,7 @@ struct PanelChip: View {
     let text: String
     var color: Color = .accentColor
     var body: some View {
-        Text(text)
-            .font(.system(size: 11, weight: .medium, design: .monospaced))
-            .foregroundStyle(color)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(color.opacity(0.14))
-            )
+        DSTag(text, tint: dsToneSafe(color), monospaced: true)
     }
 }
 
@@ -533,12 +537,12 @@ struct PanelChip: View {
 struct PanelRequirement: View {
     let text: String
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: DS.Space.xs) {
             Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 11))
-                .foregroundStyle(.red.opacity(0.75))
+                .font(DS.Font.secondary)
+                .foregroundStyle(DS.Color.danger)
             Text(text)
-                .font(PanelStyle.smallFont)
+                .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
         }
     }

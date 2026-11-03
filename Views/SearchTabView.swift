@@ -16,15 +16,21 @@ struct SearchTabView: View {
     private enum LoadSource { case loadStructure, recentDownloads, searchResults }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: PanelStyle.cardSpacing) {
-            loadStructureCard
-            searchRCSBCard
-            if isLoadingCache || !cachedEntries.isEmpty {
-                recentDownloadsCard
+        Group {
+            if viewModel.molecules.protein != nil {
+                DSStepScaffold {
+                    cards
+                } footer: {
+                    HStack {
+                        Spacer(minLength: 0)
+                        DSNextStepButton(SidebarTab.search.suggestedNextStep(in: viewModel) ?? .preparation)
+                            .fixedSize()
+                    }
+                }
+            } else {
+                DSStepScaffold { cards }
             }
-            Spacer(minLength: 0)
         }
-        .padding(12)
         .task { await refreshCachedEntries() }
         .onChange(of: viewModel.workspace.isLoading) { _, loading in
             if !loading {
@@ -34,179 +40,198 @@ struct SearchTabView: View {
         }
     }
 
+    @ViewBuilder
+    private var cards: some View {
+        if viewModel.molecules.protein != nil || viewModel.molecules.ligand != nil {
+            loadedCard
+        }
+        loadStructureCard
+        searchRCSBCard
+        if isLoadingCache || !cachedEntries.isEmpty {
+            recentDownloadsCard
+        }
+    }
+
     /// True when the global isLoading flag is set AND this card initiated
     /// (or is associated with) the load.
     private func isLoading(in source: LoadSource) -> Bool {
         viewModel.workspace.isLoading && loadSource == source
     }
 
-    @ViewBuilder
     private func inlineLoadingIndicator() -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: DS.Space.s) {
             ProgressView().controlSize(.small)
             Text(viewModel.workspace.loadingMessage)
-                .font(PanelStyle.smallFont)
+                .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    // MARK: - Loaded card
+
+    private var loadedCard: some View {
+        PanelCard("Loaded", icon: "checkmark.circle") {
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                if let prot = viewModel.molecules.protein {
+                    loadedRow(
+                        color: DS.Color.protein,
+                        name: prot.name,
+                        detail: "\(prot.chains.count) chain\(prot.chains.count == 1 ? "" : "s") · \(prot.atomCount.formatted()) atoms",
+                        clearHelp: "Unload protein",
+                        clearID: AccessibilityID.searchClearProtein
+                    ) {
+                        viewModel.molecules.protein = nil
+                        viewModel.pushToRenderer()
+                    }
+                }
+                if let lig = viewModel.molecules.ligand {
+                    loadedRow(
+                        color: DS.Color.ligand,
+                        name: lig.name,
+                        detail: "\(lig.heavyAtomCount) heavy atoms",
+                        clearHelp: "Remove ligand",
+                        clearID: AccessibilityID.searchClearLigand
+                    ) {
+                        viewModel.removeLigandFromView()
+                    }
+                }
+            }
+        }
+    }
+
+    private func loadedRow(
+        color: Color,
+        name: String,
+        detail: String,
+        clearHelp: String,
+        clearID: String,
+        onClear: @escaping () -> Void
+    ) -> some View {
+        PanelHighlightRow(color: color) {
+            HStack(spacing: DS.Space.m) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name)
+                        .font(DS.Font.label.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(detail)
+                        .font(DS.Font.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: DS.Space.xs)
+                Button(action: onClear) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(DS.Font.label)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(clearHelp)
+                .accessibilityLabel(clearHelp)
+                .accessibilityIdentifier(clearID)
+            }
         }
     }
 
     // MARK: - Load structure card
 
-    @ViewBuilder
     private var loadStructureCard: some View {
-        PanelCard("Load Structure", icon: "tray.and.arrow.down") {
-            VStack(alignment: .leading, spacing: 10) {
-                if viewModel.molecules.protein != nil || viewModel.molecules.ligand != nil {
-                    activeMoleculesSection
-                }
-
-                PanelSubheader(title: "From File")
+        PanelCard("Load Structure", icon: "square.and.arrow.down.on.square") {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                PanelLabeledDivider(title: "From a file")
                 PanelChoiceGrid(columns: 2) {
                     PanelSecondaryButton(
-                        title: "Protein", icon: "doc",
-                        help: "Open .pdb / .cif protein file"
+                        title: "Protein…", icon: "cube",
+                        help: "Open a .pdb / .cif protein file (⌘O)"
                     ) { viewModel.importFile() }
                     .accessibilityIdentifier(AccessibilityID.searchImportProtein)
 
                     PanelSecondaryButton(
-                        title: "Ligand", icon: "doc",
-                        help: "Open .sdf / .mol2 / .pdb ligand file"
+                        title: "Ligand…", icon: "hexagon",
+                        help: "Open a .sdf / .mol2 / .pdb ligand file"
                     ) { viewModel.importFile() }
                     .accessibilityIdentifier(AccessibilityID.searchImportLigand)
                 }
 
-                PanelLabeledDivider(title: "From PDB", icon: "arrow.down.doc")
+                PanelLabeledDivider(title: "From the PDB")
 
-                HStack(spacing: 6) {
-                    TextField("e.g. 1HSG", text: $pdbID)
+                HStack(spacing: DS.Space.s) {
+                    TextField("PDB ID, e.g. 1HSG", text: $pdbID)
                         .textFieldStyle(.roundedBorder)
-                        .controlSize(.small)
-                        .font(PanelStyle.monoBody)
+                        .font(DS.Font.mono)
                         .onSubmit { fetchPDB() }
                         .accessibilityIdentifier(AccessibilityID.searchPDBField)
 
-                    PanelSecondaryButton(
-                        title: "Fetch", icon: "arrow.down.circle",
-                        isDisabled: pdbID.trimmingCharacters(in: .whitespaces).count < 4
-                            || viewModel.workspace.isLoading,
-                        help: "Fetch this PDB entry from RCSB"
-                    ) { fetchPDB() }
+                    Button(action: fetchPDB) {
+                        Label("Fetch", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
+                    .disabled(pdbID.trimmingCharacters(in: .whitespaces).count < 4
+                              || viewModel.workspace.isLoading)
+                    .help("Fetch this entry from RCSB")
                     .accessibilityIdentifier(AccessibilityID.searchFetchPDB)
-                    .frame(width: 84)
                 }
 
                 if isLoading(in: .loadStructure) {
                     inlineLoadingIndicator()
                 }
-            }
-        }
-    }
 
-    @ViewBuilder
-    private var activeMoleculesSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let prot = viewModel.molecules.protein {
-                PanelHighlightRow(color: .cyan) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "cube.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.cyan)
-                        Text(prot.name)
-                            .font(PanelStyle.bodyFont.weight(.medium))
-                            .lineLimit(1)
-                        Spacer()
-                        Text("\(prot.atomCount) atoms")
-                            .font(PanelStyle.monoSmall)
-                            .foregroundStyle(.secondary)
-                        Button(action: {
-                            viewModel.molecules.protein = nil
-                            viewModel.pushToRenderer()
-                        }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Unload protein")
-                        .plainButtonAccessibility(AccessibilityID.searchClearProtein)
-                    }
-                }
-            }
-            if let lig = viewModel.molecules.ligand {
-                PanelHighlightRow(color: .green) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "hexagon.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.green)
-                        Text(lig.name)
-                            .font(PanelStyle.bodyFont.weight(.medium))
-                            .lineLimit(1)
-                        Spacer()
-                        Text("\(lig.atomCount) atoms")
-                            .font(PanelStyle.monoSmall)
-                            .foregroundStyle(.secondary)
-                        Button(action: { viewModel.removeLigandFromView() }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Remove ligand")
-                        .plainButtonAccessibility(AccessibilityID.searchClearLigand)
-                    }
-                }
+                PanelHint(
+                    text: "Or drop .pdb, .cif, .sdf or .mol2 files onto the viewport.",
+                    icon: "arrow.down.doc"
+                )
             }
         }
     }
 
     // MARK: - Search RCSB card
 
-    @ViewBuilder
     private var searchRCSBCard: some View {
         PanelCard(
             "Search RCSB",
             icon: "magnifyingglass",
             accessory: {
                 if !viewModel.workspace.searchResults.isEmpty {
-                    Text("\(viewModel.workspace.searchResults.count)")
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    DSTag("\(viewModel.workspace.searchResults.count)", monospaced: true)
                 }
             }
         ) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                HStack(spacing: DS.Space.s) {
                     TextField("e.g. HIV protease", text: $searchQuery)
                         .textFieldStyle(.roundedBorder)
-                        .controlSize(.small)
-                        .font(PanelStyle.bodyFont)
-                        .onSubmit { viewModel.searchPDB(query: searchQuery) }
+                        .font(DS.Font.label)
+                        .onSubmit { runSearch() }
                         .accessibilityIdentifier(AccessibilityID.searchQueryField)
 
-                    PanelSecondaryButton(
-                        title: "Search", icon: "magnifyingglass",
-                        isDisabled: searchQuery.isEmpty || viewModel.workspace.isSearching
-                    ) { viewModel.searchPDB(query: searchQuery) }
+                    Button(action: runSearch) {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
+                    .disabled(searchQuery.isEmpty || viewModel.workspace.isSearching)
+                    .help("Search the RCSB Protein Data Bank")
                     .accessibilityIdentifier(AccessibilityID.searchRunSearch)
-                    .frame(width: 84)
                 }
 
                 if viewModel.workspace.isSearching {
-                    HStack(spacing: 6) {
+                    HStack(spacing: DS.Space.s) {
                         ProgressView().controlSize(.small)
                         Text("Searching…")
-                            .font(PanelStyle.smallFont)
+                            .font(DS.Font.secondary)
                             .foregroundStyle(.secondary)
                     }
                 }
 
                 if !viewModel.workspace.searchResults.isEmpty {
-                    PanelLabeledDivider(title: "Results")
-                    ForEach(viewModel.workspace.searchResults) { result in
-                        resultRow(result)
+                    VStack(spacing: DS.Space.s) {
+                        ForEach(viewModel.workspace.searchResults) { result in
+                            resultRow(result)
+                        }
                     }
                     if isLoading(in: .searchResults) {
                         inlineLoadingIndicator()
@@ -216,65 +241,63 @@ struct SearchTabView: View {
         }
     }
 
-    @ViewBuilder
     private func resultRow(_ result: PDBSearchResult) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
                 Text(result.id)
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                Spacer()
+                    .font(DS.Font.mono.weight(.semibold))
+                    .textSelection(.enabled)
                 if let res = result.resolution {
-                    HStack(spacing: 2) {
-                        Text(String(format: "%.1f", res))
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                        Text("Å")
-                            .font(PanelStyle.smallFont)
-                    }
-                    .foregroundStyle(.secondary)
+                    DSTag(String(format: "%.2f Å", res), tone: resolutionTone(res), monospaced: true)
+                        .help("Resolution")
                 }
-            }
-            Text(result.title)
-                .font(PanelStyle.smallFont)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 6) {
-                if let method = result.experimentMethod {
-                    Text(method)
-                        .font(.system(size: 10, weight: .medium))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.14)))
-                        .foregroundStyle(Color.accentColor)
-                }
-                if let date = result.releaseDate {
-                    Text(date)
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                PanelSecondaryButton(
-                    title: "Load", icon: "arrow.down.circle",
-                    isDisabled: viewModel.workspace.isLoading
-                ) {
+                Spacer(minLength: DS.Space.xs)
+                Button {
                     loadSource = .searchResults
                     viewModel.loadFromPDB(id: result.id)
+                } label: {
+                    Label("Load", systemImage: "arrow.down.circle")
                 }
+                .buttonStyle(DSSecondaryButtonStyle(tint: DS.Color.accent, fullWidth: false))
+                .disabled(viewModel.workspace.isLoading)
+                .help("Load \(result.id)")
                 .accessibilityIdentifier(AccessibilityID.searchLoadStructure)
-                .frame(width: 80)
+            }
+            Text(result.title)
+                .font(DS.Font.secondary)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(result.title)
+            if result.experimentMethod != nil || result.releaseDate != nil {
+                HStack(spacing: DS.Space.s) {
+                    if let method = result.experimentMethod {
+                        DSTag(method.capitalized)
+                    }
+                    if let date = result.releaseDate {
+                        Text(date)
+                            .font(DS.Font.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                    }
+                }
             }
         }
-        .padding(8)
+        .padding(DS.Space.m)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.primary.opacity(0.04))
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(DS.Color.controlFill)
         )
+    }
+
+    /// Crystallographic quality at a glance: ≤ 2 Å good, ≤ 3 Å fair, above that weak.
+    private func resolutionTone(_ resolution: Float) -> DSTone {
+        resolution <= 2.0 ? .success : resolution <= 3.0 ? .neutral : .warning
     }
 
     // MARK: - Recent downloads card
 
-    @ViewBuilder
     private var recentDownloadsCard: some View {
         PanelCard(
             "Recent Downloads",
@@ -283,22 +306,31 @@ struct SearchTabView: View {
                 if isLoadingCache {
                     ProgressView().controlSize(.small)
                 } else if !cachedEntries.isEmpty {
-                    Text("\(cachedEntries.count)")
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
+                    DSTag("\(cachedEntries.count)", monospaced: true)
                 }
             }
         ) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 if isLoadingCache && cachedEntries.isEmpty {
                     Text("Scanning cache…")
-                        .font(PanelStyle.smallFont)
+                        .font(DS.Font.secondary)
                         .foregroundStyle(.secondary)
                 } else {
-                    VStack(spacing: 4) {
-                        ForEach(cachedEntries) { entry in
-                            cachedEntryRow(entry)
-                        }
+                    ForEach(cachedEntries) { entry in
+                        CachedEntryRow(
+                            entry: entry,
+                            isDisabled: viewModel.workspace.isLoading,
+                            onLoad: {
+                                loadSource = .recentDownloads
+                                viewModel.loadFromPDB(id: entry.id)
+                            },
+                            onRemove: {
+                                Task {
+                                    await PDBService.shared.removeCachedEntry(id: entry.id)
+                                    await refreshCachedEntries()
+                                }
+                            }
+                        )
                     }
                 }
                 if isLoading(in: .recentDownloads) {
@@ -306,54 +338,6 @@ struct SearchTabView: View {
                 }
             }
         }
-    }
-
-    @ViewBuilder
-    private func cachedEntryRow(_ entry: CachedPDBEntry) -> some View {
-        HStack(spacing: 6) {
-            Button(action: {
-                loadSource = .recentDownloads
-                viewModel.loadFromPDB(id: entry.id)
-            }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "doc")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Text(entry.id)
-                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    Text(entry.fetchedAt.formatted(.relative(presentation: .named)))
-                        .font(PanelStyle.smallFont)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer()
-                    Text("\(entry.sizeBytes / 1024) KB")
-                        .font(PanelStyle.monoSmall)
-                        .foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(viewModel.workspace.isLoading)
-
-            Button(action: {
-                Task {
-                    await PDBService.shared.removeCachedEntry(id: entry.id)
-                    await refreshCachedEntries()
-                }
-            }) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Remove from cache")
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(Color.primary.opacity(0.04))
-        )
     }
 
     // MARK: - Actions
@@ -370,5 +354,64 @@ struct SearchTabView: View {
         guard id.count >= 4 else { return }
         loadSource = .loadStructure
         viewModel.loadFromPDB(id: id)
+    }
+
+    private func runSearch() {
+        guard !searchQuery.isEmpty else { return }
+        viewModel.searchPDB(query: searchQuery)
+    }
+}
+
+// MARK: - Recent download row (hover-highlighted list row)
+
+private struct CachedEntryRow: View {
+    let entry: CachedPDBEntry
+    let isDisabled: Bool
+    let onLoad: () -> Void
+    let onRemove: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: DS.Space.s) {
+            Button(action: onLoad) {
+                HStack(spacing: DS.Space.m) {
+                    Image(systemName: "cube")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(DS.Color.protein)
+                    Text(entry.id)
+                        .font(DS.Font.mono.weight(.semibold))
+                    Text(entry.fetchedAt.formatted(.relative(presentation: .named)))
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: DS.Space.xs)
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(entry.sizeBytes), countStyle: .file))
+                        .font(DS.Font.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isDisabled)
+            .help("Load \(entry.id)")
+
+            // Always present (reachable by keyboard focus and VoiceOver); quiet until hovered.
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(DS.Font.label)
+                    .foregroundStyle(isHovering ? AnyShapeStyle(.secondary) : AnyShapeStyle(.quaternary))
+            }
+            .buttonStyle(.borderless)
+            .help("Remove \(entry.id) from the download cache")
+            .accessibilityLabel("Remove \(entry.id) from cache")
+        }
+        .padding(.horizontal, DS.Space.s)
+        .frame(height: DS.Size.rowHeight + DS.Space.xs)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(isHovering ? DS.Color.controlFill : Color.clear)
+        )
+        .onHover { isHovering = $0 }
     }
 }

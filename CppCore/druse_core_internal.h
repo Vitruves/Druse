@@ -23,8 +23,11 @@
 #include <GraphMol/MonomerInfo.h>
 #include <RDGeneral/versions.h>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <utility>
 #include <tuple>
 #include <vector>
 
@@ -45,8 +48,29 @@ std::vector<std::tuple<int, int, bool, double>> detectIonSitesInternal(const ROM
 unsigned neighborEnvironmentFingerprint(const ROMol &mol, int atomIdx);
 
 DruseMoleculeResult* make_error(const char *msg);
-void mmff_minimize_single(RWMol &mol, int confId = -1);
-void mmff_minimize_confs_pick_best(RWMol &mol);
+/// Heavy-atom pairs more than two bonds apart (beyond 1-3) closer than this are a
+/// collapsed geometry: MMFF can converge such a conformer to a deceptively low energy
+/// (atoms passed through each other / a ring was pierced), so it must never win on energy.
+constexpr double kCollapsedHeavyAtomDistance = 1.6;
+
+/// True when `conf` has non-finite coordinates or two heavy atoms separated by more than
+/// two bonds lie closer than kCollapsedHeavyAtomDistance.
+bool conformer_is_collapsed(const ROMol &mol, const Conformer &conf);
+
+/// Re-embeds `mol` (ETKDGv3 random-coordinate starts, fresh seeds), MMFF-minimizes the
+/// trial conformers and writes the lowest-energy non-collapsed one into conformer
+/// `confId`. `energy` receives its MMFF energy (NaN without MMFF parameters). Returns
+/// false, leaving `mol` untouched, when every attempt collapsed or failed to embed.
+bool reembed_valid_conformer(RWMol &mol, int confId, double *energy = nullptr);
+
+/// MMFF-minimizes conformer `confId`; if the minimum is collapsed, replaces it via
+/// reembed_valid_conformer. Returns false when no valid geometry could be produced.
+bool mmff_minimize_single(RWMol &mol, int confId = -1, double *energy = nullptr);
+
+/// MMFF-minimizes every conformer and copies the lowest-energy non-collapsed one into
+/// the first conformer (re-embedding when all collapsed). Returns false when no valid
+/// geometry could be produced.
+bool mmff_minimize_confs_pick_best(RWMol &mol);
 int embed_molecule(RWMol &mol);
 void populate_pdb_metadata(const RWMol &mol, const Atom &atom, DruseAtom &da);
 std::vector<int> embed_multiple(RWMol &mol, int numConfs);
@@ -67,5 +91,22 @@ int32_t vina_xs_type_for_atom(
     const std::vector<bool> &donorFlags,
     const std::vector<bool> &acceptorFlags
 );
+
+/// Energy of conformer `ci` from MMFFOptimizeMoleculeConfs results. Status 0
+/// (converged) and 1 (iteration cap reached) both carry a valid geometry and
+/// energy; status -1 (no MMFF parameters) and missing entries yield NaN.
+inline double conformer_mmff_energy(const std::vector<std::pair<int, double>> &mmffResults, int ci) {
+    if (ci >= 0 && ci < (int)mmffResults.size() && mmffResults[ci].first >= 0) {
+        return mmffResults[ci].second;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+/// Strict-weak-ordering energy comparator that sorts NaN energies last.
+inline bool energy_less_nan_last(const std::pair<int, double> &a, const std::pair<int, double> &b) {
+    if (std::isnan(a.second)) return false;
+    if (std::isnan(b.second)) return true;
+    return a.second < b.second;
+}
 
 #endif

@@ -232,23 +232,29 @@ struct ChemDrawerSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
+            HStack(spacing: DS.Space.m) {
                 Image(systemName: "pencil.and.outline")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.blue)
-                Text(title).font(.headline)
-                Spacer()
+                    .font(.title3)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(DS.Color.accent)
+                Text(title)
+                    .font(DS.Font.stepTitle)
+                    .lineLimit(1)
+                Spacer(minLength: DS.Space.l)
 
                 if !currentSmiles.isEmpty {
                     Text(currentSmiles)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(DS.Font.monoSmall)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .frame(maxWidth: 300, alignment: .trailing)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 360, alignment: .trailing)
+                        .help(currentSmiles)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(.horizontal, DS.Space.xl)
+            .padding(.vertical, DS.Space.m)
 
             Divider()
 
@@ -264,20 +270,26 @@ struct ChemDrawerSheet: View {
             Divider()
 
             // Footer
-            HStack {
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
+            HStack(spacing: DS.Space.m) {
                 if mode == .scaffold && !currentSmarts.isEmpty {
-                    HStack(spacing: 4) {
-                        Text("SMARTS:").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: DS.Space.xs) {
+                        Text("SMARTS")
+                            .font(DS.Font.eyebrow)
+                            .tracking(0.6)
+                            .foregroundStyle(.tertiary)
                         Text(currentSmarts)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.purple)
+                            .font(DS.Font.monoSmall)
+                            .foregroundStyle(DS.Color.pocket)
                             .lineLimit(1)
-                            .frame(maxWidth: 200, alignment: .leading)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: 320, alignment: .leading)
+                            .help(currentSmarts)
                     }
                 }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Button(mode == .scaffold ? "Use as Scaffold" : "Use Structure") {
                     onConfirm(currentSmiles, currentSmarts)
                     dismiss()
@@ -286,8 +298,7 @@ struct ChemDrawerSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(currentSmiles.isEmpty)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(DS.Space.l)
         }
         .frame(minWidth: 900, minHeight: 650)
         .onAppear {

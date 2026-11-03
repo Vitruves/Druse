@@ -559,17 +559,18 @@ struct FragmentAtom {
 struct FragmentDef {
     uint32_t    atomStart;          // offset into FragmentAtom array
     uint32_t    atomCount;          // number of atoms in this fragment
-    uint32_t    connectingTorsionIdx; // torsion edge index connecting to parent (-1 for anchor)
     int32_t     parentFragmentIdx;  // -1 for anchor fragment
+    uint32_t    _pad0;
     simd_float3 centroid;           // fragment centroid in ligand frame
-    float       _pad0;
+    simd_float3 bondParentAtom;     // ligand-frame position of the connecting-bond atom in the parent fragment
+    simd_float3 bondChildAtom;      // ligand-frame position of the connecting-bond atom in this fragment
 };
 
 // A candidate placement for a fragment (beam search node)
 struct FragmentPlacement {
     simd_float3 translation;        // world-space translation
     float       energy;             // cumulative partial energy
-    simd_float4 rotation;           // quaternion for anchor; identity for grown fragments
+    simd_float4 rotation;           // orientation of this fragment's frame (atoms at R·(x − c) + t)
     float       connectingTorsion;  // torsion angle at connecting bond
     int32_t     parentPlacementIdx; // index of parent in previous beam (-1 for anchor)
     int32_t     fragmentIdx;        // which fragment this placement is for
@@ -739,14 +740,6 @@ struct RBFParams {
     uint32_t _pad0;
 };
 
-// Pairwise RMSD compute types
-struct RMSDParams {
-    uint32_t numPoses;
-    uint32_t numAtoms;
-    uint32_t _pad0;
-    uint32_t _pad1;
-};
-
 
 // ============================================================================
 // H-Bond Network Scoring types (Phase 4)
@@ -871,27 +864,9 @@ struct GFN2RepAtom {
     simd_float3 position;       // Bohr
     float       zeff;           // effective nuclear charge
     float       arep;           // repulsion exponent
-    float       _pad0;
+    float       isLight;        // 1 when Z <= 2 (H/He): light-light pairs use kexp = 1.0
     float       _pad1;
     float       _pad2;
-};
-
-/// Parameters for GPU-accelerated GB solvation energy.
-struct GFN2GBParams {
-    uint32_t atomCount;
-    float    keps;              // (1 - 1/epsilon)
-    float    gamma_au;          // surface tension (Hartree/Bohr²)
-    uint32_t computeGrad;
-};
-
-/// Per-atom data for GB solvation GPU kernel (after Born radii computed).
-struct GFN2GBAtom {
-    simd_float3 position;       // Bohr
-    float       charge;         // negated Mulliken charge (real partial charge)
-    float       bornRadius;     // pre-computed Born radius
-    float       sasa;           // pre-computed SASA
-    float       _pad0;
-    float       _pad1;
 };
 
 /// Per-atom data for CN gradient propagation kernel.

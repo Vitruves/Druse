@@ -148,7 +148,9 @@ kernel void pkaGNNFull(
 ) {
     if (tid != 0) return;
 
-    const uint N = params->numAtoms;
+    // h/agg are fixed-size [PKA_MAXN] stack arrays: never index past them.
+    // Callers must reject larger molecules (PKaGNNPredictor does).
+    const uint N = min(params->numAtoms, PKA_MAXN);
     const uint E = params->numEdges;
     if (N == 0) return;
 
@@ -198,31 +200,18 @@ kernel void pkaGNNFull(
             count[a] = 0;
         }
 
-        // For each edge: compute message and accumulate
-        for (uint e = 0; e < E; e++) {
-            uint src = edgeSrc[e];
-            uint dst = edgeDst[e];
-            if (src >= N || dst >= N) continue;
-
-            // edge_mlp: Linear(10→128) + GELU + Linear(128→128)
-            float bf[PKA_BF];
-            for (uint i = 0; i < PKA_BF; i++)
-                bf[i] = bondFeatures[e * PKA_BF + i];
-
-            float ew_tmp[PKA_H], edge_weight[PKA_H];
-            for (uint o = 0; o < PKA_H; o++) {
-                float sum = edge_b0[o];
-                for (uint i = 0; i < PKA_BF; i++) sum += edge_w0[o * PKA_BF + i] * bf[i];
-                ew_tmp[o] = gelu(sum);
+        // msg_mlp(x[src]) depends only on the source atom, so it is computed
+        // once per atom and reused for every out-edge (reference:
+        // msg = msg_mlp(x[src]) * edge_mlp(edge_attr)).
+        for (uint src = 0; src < N; src++) {
+            bool has_out_edge = false;
+            for (uint e = 0; e < E; e++) {
+                if (uint(edgeSrc[e]) == src && uint(edgeDst[e]) < N) { has_out_edge = true; break; }
             }
-            for (uint o = 0; o < PKA_H; o++) {
-                float sum = edge_b1[o];
-                for (uint i = 0; i < PKA_H; i++) sum += edge_w1[o * PKA_H + i] * ew_tmp[i];
-                edge_weight[o] = sum;
-            }
+            if (!has_out_edge) continue;
 
-            // msg_mlp(x[src]): Linear(128→128) + GELU + Linear(128→128)
-            float mt[PKA_H], msg[PKA_H];
+            // msg_mlp: Linear(128→128) + GELU + Linear(128→128)
+            float mt[PKA_H], node_msg[PKA_H];
             for (uint o = 0; o < PKA_H; o++) {
                 float sum = msg_b0[o];
                 for (uint i = 0; i < PKA_H; i++) sum += msg_w0[o * PKA_H + i] * h[src][i];
@@ -231,12 +220,32 @@ kernel void pkaGNNFull(
             for (uint o = 0; o < PKA_H; o++) {
                 float sum = msg_b1[o];
                 for (uint i = 0; i < PKA_H; i++) sum += msg_w1[o * PKA_H + i] * mt[i];
-                msg[o] = sum * edge_weight[o];  // element-wise multiply
+                node_msg[o] = sum;
             }
 
-            // Accumulate at dst
-            for (uint i = 0; i < PKA_H; i++) agg[dst][i] += msg[i];
-            count[dst] += 1.0f;
+            for (uint e = 0; e < E; e++) {
+                if (uint(edgeSrc[e]) != src) continue;
+                uint dst = uint(edgeDst[e]);
+                if (dst >= N) continue;
+
+                // edge_mlp: Linear(10→128) + GELU + Linear(128→128)
+                float bf[PKA_BF];
+                for (uint i = 0; i < PKA_BF; i++)
+                    bf[i] = bondFeatures[e * PKA_BF + i];
+
+                float ew_tmp[PKA_H];
+                for (uint o = 0; o < PKA_H; o++) {
+                    float sum = edge_b0[o];
+                    for (uint i = 0; i < PKA_BF; i++) sum += edge_w0[o * PKA_BF + i] * bf[i];
+                    ew_tmp[o] = gelu(sum);
+                }
+                for (uint o = 0; o < PKA_H; o++) {
+                    float sum = edge_b1[o];
+                    for (uint i = 0; i < PKA_H; i++) sum += edge_w1[o * PKA_H + i] * ew_tmp[i];
+                    agg[dst][o] += node_msg[o] * sum;  // element-wise message, accumulated at dst
+                }
+                count[dst] += 1.0f;
+            }
         }
 
         // Mean aggregation + gated residual + LayerNorm

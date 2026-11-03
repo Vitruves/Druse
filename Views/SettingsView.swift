@@ -4,29 +4,38 @@
 import SwiftUI
 
 enum AppTheme: String, CaseIterable {
-    case auto = "Auto"
+    case auto = "Auto"     // rawValues are persisted in "appTheme"; keep them stable
     case light = "Light"
     case dark = "Dark"
 
+    var title: String {
+        switch self {
+        case .auto: "Automatic"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
     var colorScheme: ColorScheme? {
         switch self {
-        case .auto: return nil
-        case .light: return .light
-        case .dark: return .dark
+        case .auto: nil
+        case .light: .light
+        case .dark: .dark
         }
     }
 
     var icon: String {
         switch self {
-        case .auto: return "circle.lefthalf.filled"
-        case .light: return "sun.max.fill"
-        case .dark: return "moon.fill"
+        case .auto: "circle.lefthalf.filled"
+        case .light: "sun.max"
+        case .dark: "moon"
         }
     }
 }
 
 struct SettingsView: View {
-    @AppStorage("appTheme") private var appTheme: String = AppTheme.dark.rawValue
+    @AppStorage("appTheme") private var appTheme: String = AppTheme.auto.rawValue
+    @AppStorage("ui.confirmBeforeDocking") private var confirmBeforeDocking: Bool = true
     @Environment(AppViewModel.self) private var viewModel
 
     // Logging settings (local state synced with LogSettings)
@@ -35,45 +44,50 @@ struct SettingsView: View {
     @AppStorage("logFileRetentionDays") private var logFileRetentionDays: Int = 7
 
     private var selectedTheme: AppTheme {
-        AppTheme(rawValue: appTheme) ?? .dark
+        AppTheme(rawValue: appTheme) ?? .auto
     }
 
     var body: some View {
         TabView {
-            appearanceSettings
-                .tabItem {
-                    Label("Appearance", systemImage: "paintbrush")
-                }
-
-            loggingSettings
-                .tabItem {
-                    Label("Logging", systemImage: "doc.text")
-                }
+            generalPane
+                .tabItem { Label("General", systemImage: "gearshape") }
+            viewportPane
+                .tabItem { Label("Viewport", systemImage: "cube.transparent") }
+            dockingPane
+                .tabItem { Label("Docking", systemImage: "arrow.down.right.and.arrow.up.left") }
+            loggingPane
+                .tabItem { Label("Logging", systemImage: "doc.text.magnifyingglass") }
         }
-        .frame(width: 500, height: 520)
+        .frame(width: 560)
     }
 
-    // MARK: - Appearance Tab
+    // MARK: - General
 
-    private var appearanceSettings: some View {
+    private var generalPane: some View {
         Form {
-            Section("Theme") {
+            Section {
                 Picker("Appearance", selection: $appTheme) {
                     ForEach(AppTheme.allCases, id: \.rawValue) { theme in
-                        Label(theme.rawValue, systemImage: theme.icon)
+                        Label(theme.title, systemImage: theme.icon)
                             .tag(theme.rawValue)
                     }
                 }
                 .pickerStyle(.segmented)
-
+            } footer: {
                 Text(themeDescription)
-                    .font(.caption)
+                    .font(DS.Font.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+        .settingsPane()
+    }
 
-            Section("Viewport Background") {
-                HStack {
-                    Text("Gradient intensity")
+    // MARK: - Viewport
+
+    private var viewportPane: some View {
+        Form {
+            Section {
+                LabeledContent("Gradient intensity") {
                     Slider(value: Binding(
                         get: { viewModel.workspace.backgroundOpacity },
                         set: {
@@ -82,58 +96,81 @@ struct SettingsView: View {
                         }
                     ), in: 0...1)
                 }
-                Text("Slide to 0 for a plain white (light) or black (dark) background, useful for presentations.")
-                    .font(.caption)
+                LabeledContent("Surface opacity") {
+                    Slider(value: Binding(
+                        get: { viewModel.workspace.surfaceOpacity },
+                        set: {
+                            viewModel.workspace.surfaceOpacity = $0
+                            viewModel.renderer?.surfaceOpacity = $0
+                        }
+                    ), in: 0.1...1)
+                }
+            } header: {
+                Text("Background & Surface")
+            } footer: {
+                Text("Set the gradient to 0 for a plain white (light) or black (dark) backdrop, useful for figures.")
+                    .font(DS.Font.caption)
                     .foregroundStyle(.secondary)
             }
 
             Section("Grid Box") {
-                HStack {
-                    Text("Line thickness")
-                    Slider(value: Binding(
-                        get: { viewModel.workspace.gridLineWidth },
-                        set: {
-                            viewModel.workspace.gridLineWidth = $0
-                            viewModel.renderer?.gridLineWidth = $0
-                        }
-                    ), in: 1...8, step: 0.5)
-                    Text(String(format: "%.1f", viewModel.workspace.gridLineWidth))
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(width: 30)
+                LabeledContent("Line thickness") {
+                    HStack(spacing: DS.Space.m) {
+                        Slider(value: Binding(
+                            get: { viewModel.workspace.gridLineWidth },
+                            set: {
+                                viewModel.workspace.gridLineWidth = $0
+                                viewModel.renderer?.gridLineWidth = $0
+                            }
+                        ), in: 1...8, step: 0.5)
+                        Text(String(format: "%.1f", viewModel.workspace.gridLineWidth))
+                            .font(DS.Font.monoSmall)
+                            .monospacedDigit()
+                            .frame(width: 30, alignment: .trailing)
+                    }
                 }
 
-                HStack {
-                    Text("Color")
-                    Spacer()
-                    ColorPicker("", selection: Binding(
-                        get: {
-                            let c = viewModel.workspace.gridColor
-                            return Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z), opacity: Double(c.w))
-                        },
-                        set: { newColor in
-                            if let components = NSColor(newColor).usingColorSpace(.deviceRGB) {
-                                viewModel.workspace.gridColor = SIMD4<Float>(
-                                    Float(components.redComponent),
-                                    Float(components.greenComponent),
-                                    Float(components.blueComponent),
-                                    Float(components.alphaComponent)
-                                )
-                            }
+                ColorPicker("Color", selection: Binding(
+                    get: {
+                        let c = viewModel.workspace.gridColor
+                        return Color(.sRGB, red: Double(c.x), green: Double(c.y), blue: Double(c.z), opacity: Double(c.w))
+                    },
+                    set: { newColor in
+                        if let components = NSColor(newColor).usingColorSpace(.deviceRGB) {
+                            viewModel.workspace.gridColor = SIMD4<Float>(
+                                Float(components.redComponent),
+                                Float(components.greenComponent),
+                                Float(components.blueComponent),
+                                Float(components.alphaComponent)
+                            )
                         }
-                    ), supportsOpacity: true)
-                    .labelsHidden()
-                }
+                    }
+                ), supportsOpacity: true)
             }
         }
-        .formStyle(.grouped)
-        .padding()
+        .settingsPane()
     }
 
-    // MARK: - Logging Tab
+    // MARK: - Docking
 
-    private var loggingSettings: some View {
+    private var dockingPane: some View {
         Form {
-            Section("File Logging") {
+            Section {
+                Toggle("Confirm before docking", isOn: $confirmBeforeDocking)
+            } footer: {
+                Text("Shows a review sheet with the protein, ligands, site and method before each run. Turn off to start docking straight from Run.")
+                    .font(DS.Font.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .settingsPane()
+    }
+
+    // MARK: - Logging
+
+    private var loggingPane: some View {
+        Form {
+            Section {
                 Toggle("Write logs to file", isOn: $logFileEnabled)
                     .onChange(of: logFileEnabled) { _, enabled in
                         LogSettings.isFileLoggingEnabled = enabled
@@ -143,9 +180,11 @@ struct SettingsView: View {
                             ActivityLog.shared.stopFileLogging()
                         }
                     }
-
-                Text("When enabled, each session creates a timestamped log file with all console output.")
-                    .font(.caption)
+            } header: {
+                Text("File Logging")
+            } footer: {
+                Text("Each session creates a timestamped log file with all console output.")
+                    .font(DS.Font.caption)
                     .foregroundStyle(.secondary)
             }
 
@@ -153,81 +192,81 @@ struct SettingsView: View {
                 HStack {
                     TextField("Path", text: $logFileDirectory)
                         .textFieldStyle(.roundedBorder)
-                        .font(.subheadline.monospaced())
+                        .font(DS.Font.mono)
+                        .labelsHidden()
                         .onChange(of: logFileDirectory) { _, newPath in
                             LogSettings.logDirectory = newPath
                         }
-
-                    Button("Choose...") {
-                        chooseLogDirectory()
-                    }
-                    .controlSize(.small)
+                    Button("Choose…") { chooseLogDirectory() }
                 }
 
-                HStack(spacing: 12) {
+                HStack(spacing: DS.Space.l) {
                     Button("Reset to Default") {
                         logFileDirectory = LogSettings.defaultLogDirectory
                         LogSettings.logDirectory = LogSettings.defaultLogDirectory
                     }
-                    .controlSize(.small)
-
                     Button("Open in Finder") {
                         ActivityLog.shared.revealLogDirectoryInFinder()
                     }
-                    .controlSize(.small)
                 }
+                .controlSize(.small)
 
                 if let url = ActivityLog.shared.currentLogFileURL {
-                    HStack(spacing: 4) {
-                        Image(systemName: "doc.text.fill")
-                            .font(.footnote)
-                            .foregroundStyle(.green)
-                        Text("Current: \(url.lastPathComponent)")
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-                        Button("Reveal") {
-                            ActivityLog.shared.revealLogInFinder()
+                    LabeledContent {
+                        Button("Reveal") { ActivityLog.shared.revealLogInFinder() }
+                            .controlSize(.small)
+                    } label: {
+                        Label {
+                            Text("Current: \(url.lastPathComponent)")
+                                .font(DS.Font.monoSmall)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        } icon: {
+                            Image(systemName: "doc.text")
+                                .foregroundStyle(DS.Color.success)
                         }
-                        .controlSize(.mini)
                     }
                 }
             }
 
-            Section("Retention") {
+            Section {
                 Stepper("Keep logs for \(logFileRetentionDays) day\(logFileRetentionDays == 1 ? "" : "s")",
                         value: $logFileRetentionDays, in: 1...90)
+                    .monospacedDigit()
                     .onChange(of: logFileRetentionDays) { _, days in
                         LogSettings.retentionDays = days
                     }
 
-                Text("Log files older than this are automatically deleted on app launch.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Button("Prune Old Logs Now") {
-                    Task.detached(priority: .utility) {
-                        LogSettings.pruneOldLogs()
+                LabeledContent {
+                    Button("Prune Old Logs Now") {
+                        Task.detached(priority: .utility) {
+                            LogSettings.pruneOldLogs()
+                        }
+                        viewModel.log.info("Pruned log files older than \(logFileRetentionDays) day(s)", category: .system)
                     }
-                    viewModel.log.info("Pruned log files older than \(logFileRetentionDays) day(s)", category: .system)
+                    .controlSize(.small)
+                } label: {
+                    logDirectoryStats
                 }
-                .controlSize(.small)
-
-                logDirectoryStats
+            } header: {
+                Text("Retention")
+            } footer: {
+                Text("Log files older than this are deleted automatically on launch.")
+                    .font(DS.Font.caption)
+                    .foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
-        .padding()
+        .settingsPane()
     }
 
     // MARK: - Helpers
 
     private var themeDescription: String {
         switch selectedTheme {
-        case .auto: return "Follows your macOS system appearance."
-        case .light: return "Always use light appearance."
-        case .dark: return "Always use dark appearance."
+        case .auto: "Follows your macOS system appearance."
+        case .light: "Always use the light appearance."
+        case .dark: "Always use the dark appearance."
         }
     }
 
@@ -243,14 +282,14 @@ struct SettingsView: View {
             try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
         }.reduce(0, +)
 
-        HStack {
+        HStack(spacing: DS.Space.xs) {
             Text("\(files.count) log file\(files.count == 1 ? "" : "s")")
-                .font(.caption)
                 .foregroundStyle(.secondary)
             Text("(\(ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file)))")
-                .font(.caption)
                 .foregroundStyle(.tertiary)
         }
+        .font(DS.Font.secondary)
+        .monospacedDigit()
     }
 
     private func chooseLogDirectory() {
@@ -266,5 +305,15 @@ struct SettingsView: View {
             // Restart file logging with new path
             ActivityLog.shared.startFileLogging()
         }
+    }
+}
+
+private extension View {
+    /// Grouped form sized to its content, so each Settings tab resizes the window to fit
+    /// instead of leaving a mostly empty pane.
+    func settingsPane() -> some View {
+        formStyle(.grouped)
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }

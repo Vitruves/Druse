@@ -42,101 +42,117 @@ struct BugReportWindow: View {
     """
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Report a Bug")
-                .font(.title2).bold()
-            Text("Your message goes directly to the developer. No data is sent until you press Send.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            GroupBox("Summary") {
-                TextField("Short title (e.g. \"Crash when loading PDB 1ABC\")", text: $title)
-                    .textFieldStyle(.roundedBorder)
-                    .padding(.vertical, 2)
-            }
-
-            GroupBox("Description") {
-                ZStack(alignment: .topLeading) {
-                    if steps.isEmpty {
-                        Text(placeholder)
-                            .foregroundStyle(.secondary.opacity(0.7))
-                            .font(.system(.body, design: .monospaced))
-                            .padding(6)
-                            .allowsHitTesting(false)
-                    }
-                    TextEditor(text: $steps)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(minHeight: 160)
-                        .scrollContentBackground(.hidden)
+        DSSheetScaffold(
+            title: "Report a Bug",
+            subtitle: "Your message goes directly to the developer. Nothing is sent until you press Send.",
+            systemImage: "ladybug"
+        ) {
+            Form {
+                Section("Summary") {
+                    TextField("Title", text: $title,
+                              prompt: Text("e.g. Crash when loading PDB 1ABC"))
                 }
-            }
 
-            GroupBox("Reply-to (optional)") {
-                TextField("your@email.com — so the developer can reply", text: $reporterEmail)
-                    .textFieldStyle(.roundedBorder)
-                    .padding(.vertical, 2)
-            }
+                Section {
+                    ZStack(alignment: .topLeading) {
+                        if steps.isEmpty {
+                            Text(placeholder)
+                                .font(DS.Font.mono)
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, DS.Space.xxs)
+                                .padding(.leading, DS.Space.xs + DS.Space.xxs)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
+                        TextEditor(text: $steps)
+                            .font(DS.Font.mono)
+                            .scrollContentBackground(.hidden)
+                            .frame(minHeight: 120)
+                            .accessibilityLabel("Description")
+                    }
+                } header: {
+                    Text("Description")
+                } footer: {
+                    Text("What did you do, what did you expect, and what happened instead?")
+                }
 
-            GroupBox("Diagnostics") {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Toggle("Include recent activity log", isOn: $includeLog)
-                            .toggleStyle(.checkbox)
-                        Spacer()
+                Section {
+                    TextField("Reply-to", text: $reporterEmail, prompt: Text("your@email.com"))
+                        .textContentType(.emailAddress)
+                } header: {
+                    Text("Contact")
+                } footer: {
+                    Text("Optional — lets the developer reply to you.")
+                }
+
+                Section {
+                    Toggle("Include recent activity log", isOn: $includeLog)
+                    LabeledContent("Screenshot") {
                         Button {
                             Task { await captureMainWindow() }
                         } label: {
-                            Label("Save Screenshot to Desktop", systemImage: "camera.viewfinder")
+                            Label("Save to Desktop", systemImage: "camera.viewfinder")
                         }
+                        .help("Capture the main Druse window as a PNG on your Desktop")
                     }
-                    Text("Screenshots can't be auto-uploaded — save one to your Desktop and email it to \(Self.replyAddress) with this report's summary line as the subject.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if !savedScreenshots.isEmpty {
-                        ForEach(savedScreenshots, id: \.self) { url in
-                            HStack(spacing: 4) {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                                Text("Saved: \(url.lastPathComponent)")
+                    ForEach(savedScreenshots, id: \.self) { url in
+                        LabeledContent {
+                            Button("Reveal in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
+                            .buttonStyle(.link)
+                        } label: {
+                            Label {
+                                Text(url.lastPathComponent)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                Spacer()
-                                Button("Reveal") {
-                                    NSWorkspace.shared.activateFileViewerSelecting([url])
-                                }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(.blue)
+                            } icon: {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(DS.Color.success)
                             }
-                            .font(.caption)
+                            .font(DS.Font.label)
                         }
                     }
-                }
-                .padding(.vertical, 2)
-            }
-
-            Spacer(minLength: 0)
-
-            HStack {
-                statusView
-                Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button {
-                    Task { await send() }
-                } label: {
-                    if status == .sending {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text("Send")
+                    DisclosureGroup("System details sent with the report") {
+                        ForEach(Self.systemDetails, id: \.label) { detail in
+                            LabeledContent(detail.label) {
+                                Text(detail.value)
+                                    .font(DS.Font.monoSmall)
+                                    .monospacedDigit()
+                                    .textSelection(.enabled)
+                            }
+                        }
                     }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("Screenshots can't be uploaded automatically — email them to \(Self.replyAddress) with this report's title as the subject.")
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!canSend)
             }
+            .formStyle(.grouped)
+        } footer: {
+            statusView
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+            Button {
+                Task { await send() }
+            } label: {
+                if status == .sending {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("Send")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canSend)
         }
-        .padding(16)
-        .frame(minWidth: 560, minHeight: 560)
+        .frame(minWidth: 540, idealWidth: 600, maxWidth: 720, minHeight: 600, idealHeight: 700)
+        // The scaffold header already says "Report a Bug"; a second title in the
+        // window's title bar only repeats it.
+        .toolbar(removing: .title)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
         .onAppear {
             // Drop a marker so the inlined log tail makes it obvious when the
             // user reached for the bug report, separating "what they were
@@ -152,16 +168,16 @@ struct BugReportWindow: View {
             EmptyView()
         case .sending:
             Label("Sending…", systemImage: "paperplane")
-                .font(.caption)
+                .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
         case .sent:
             Label("Sent. Thank you!", systemImage: "checkmark.circle.fill")
-                .font(.caption)
-                .foregroundStyle(.green)
+                .font(DS.Font.secondary)
+                .foregroundStyle(DS.Color.success)
         case .error(let msg):
             Label(msg, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.red)
+                .font(DS.Font.secondary)
+                .foregroundStyle(DS.Color.danger)
                 .lineLimit(2)
         }
     }
@@ -294,18 +310,23 @@ struct BugReportWindow: View {
         return parts.joined(separator: "\n")
     }
 
+    /// System details shown in the form and sent with every report.
+    private static let systemDetails: [(label: String, value: String)] = {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return [
+            ("Druse", "\(version) (\(build))"),
+            ("macOS", ProcessInfo.processInfo.operatingSystemVersionString),
+            ("GPU", MTLCreateSystemDefaultDevice()?.name ?? "unknown"),
+            ("Locale", Locale.current.identifier),
+        ]
+    }()
+
     private func diagnostics() -> String {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-        let os = ProcessInfo.processInfo.operatingSystemVersionString
-        let gpu = MTLCreateSystemDefaultDevice()?.name ?? "unknown"
-        let locale = Locale.current.identifier
-        return """
-        Druse \(version) (\(build))
-        macOS: \(os)
-        GPU: \(gpu)
-        Locale: \(locale)
-        """
+        Self.systemDetails
+            .map { $0.label == "Druse" ? "Druse \($0.value)" : "\($0.label): \($0.value)" }
+            .joined(separator: "\n")
     }
 }
 
@@ -315,11 +336,5 @@ private enum BugReportError: LocalizedError {
         switch self {
         case .badResponse(let s): return "Send failed — \(s)"
         }
-    }
-}
-
-private extension Data {
-    mutating func append(_ string: String) {
-        if let data = string.data(using: .utf8) { append(data) }
     }
 }

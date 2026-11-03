@@ -22,23 +22,55 @@ private let nucleotideToOne: [String: String] = [
     "ADE": "A", "THY": "T", "GUA": "G", "CYT": "C", "URA": "U",
 ]
 
-/// Secondary structure color mapping.
-private func ssColor(_ ss: SecondaryStructure) -> Color {
-    switch ss {
-    case .helix: .red.opacity(0.3)
-    case .sheet: .yellow.opacity(0.3)
-    case .coil:  .gray.opacity(0.15)
-    case .turn:  .cyan.opacity(0.2)
-    }
-}
+// MARK: - Secondary-structure presentation (shared with InspectorPanel)
 
-/// SS legend label text.
-private func ssLabel(_ ss: SecondaryStructure) -> String {
-    switch ss {
-    case .helix: "Helix"
-    case .sheet: "Sheet"
-    case .coil:  "Coil"
-    case .turn:  "Turn"
+extension SecondaryStructure {
+    /// Adaptive data colours for chips, legends and sequence cells. Dedicated
+    /// hues (magenta helix, gold sheet, green turn — the familiar ribbon
+    /// convention) so structure never reads as an error, warning or water.
+    var ssTint: Color {
+        switch self {
+        case .helix: DS.dynamic(light: 0xB8327F, dark: 0xF07AC0)
+        case .sheet: DS.dynamic(light: 0xA77B00, dark: 0xE8C255)
+        case .turn:  DS.dynamic(light: 0x2B8A5E, dark: 0x5FD39B)
+        case .coil:  Color.secondary
+        }
+    }
+
+    var ssDisplayName: String {
+        switch self {
+        case .helix: "Alpha Helix"
+        case .sheet: "Beta Sheet"
+        case .turn:  "Turn"
+        case .coil:  "Coil"
+        }
+    }
+
+    var ssShortName: String {
+        switch self {
+        case .helix: "Helix"
+        case .sheet: "Sheet"
+        case .turn:  "Turn"
+        case .coil:  "Coil"
+        }
+    }
+
+    var ssSymbol: String {
+        switch self {
+        case .helix: "arrow.trianglehead.turn.up.right.diamond"
+        case .sheet: "arrow.right.to.line"
+        case .turn, .coil: "scribble"
+        }
+    }
+
+    /// Cell background in the sequence canvas.
+    fileprivate var ssFill: Color {
+        switch self {
+        case .helix: ssTint.opacity(0.22)
+        case .sheet: ssTint.opacity(0.26)
+        case .turn:  ssTint.opacity(0.22)
+        case .coil:  Color.primary.opacity(0.06)
+        }
     }
 }
 
@@ -70,15 +102,10 @@ private struct ResidueEntry {
 
 struct SequenceView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var lastClickedResIdx: Int?
     @State private var hoveredResIdx: Int?
     @State private var collapsedChains: Set<String> = []
-
-    /// Cached secondary structure lookup: (chainID, seqNum) → SecondaryStructure.
-    /// Rebuilt when protein changes (via .id on the outer view).
-    @State private var ssCache: [String: SecondaryStructure] = [:]
-    /// Protein identity token to detect when cache must be rebuilt.
-    @State private var cachedProteinID: UUID?
 
     // Rename chain sheet
     @State private var showRenameSheet = false
@@ -94,27 +121,21 @@ struct SequenceView: View {
     @State private var showDeleteConfirm = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if viewModel.molecules.protein == nil {
-                ContentUnavailableView {
-                    Label("No Protein", systemImage: "textformat.abc")
-                } description: {
-                    Text("Load a protein to view its sequence")
-                }
+        DSStepScaffold {
+            if let prot = viewModel.molecules.protein {
+                sequenceContent(prot)
             } else {
-                sequenceContent
+                DSEmptyState(
+                    "No Protein Loaded",
+                    systemImage: "textformat.abc",
+                    description: "Load a structure to view its sequence."
+                )
+                .padding(.top, DS.Space.xxl)
             }
         }
-        .padding(12)
-        .onAppear {
-            if let prot = viewModel.molecules.protein, cachedProteinID != prot.id {
-                rebuildSSCache(prot: prot)
-            }
-        }
-        .onChange(of: viewModel.molecules.protein?.id) { _, newID in
-            if let prot = viewModel.molecules.protein, let newID, cachedProteinID != newID {
-                rebuildSSCache(prot: prot)
-            }
+        .onAppear { viewModel.ensureSecondaryStructure() }
+        .onChange(of: viewModel.molecules.protein?.id) { _, _ in
+            viewModel.ensureSecondaryStructure()
         }
         .sheet(isPresented: $showRenameSheet) { renameSheet }
         .sheet(isPresented: $showMergeSheet) { mergeSheet }
@@ -130,204 +151,180 @@ struct SequenceView: View {
     // MARK: - Main Content
 
     @ViewBuilder
-    private var sequenceContent: some View {
-        if let prot = viewModel.molecules.protein {
-            // Header
-            HStack {
-                Label("Sequence", systemImage: "textformat.abc")
-                    .font(.callout.weight(.semibold))
-                Spacer()
-                HStack(spacing: 8) {
-                    ssLegendDot(.helix)
-                    ssLegendDot(.sheet)
-                    ssLegendDot(.coil)
+    private func sequenceContent(_ prot: Molecule) -> some View {
+        let proteinChains = prot.chains.filter { $0.type == .protein }
+        let naChains = prot.chains.filter { $0.type == .nucleicAcid }
+        let ssLookup = secondaryStructureLookup(prot)
+
+        overviewCard(prot)
+
+        if proteinChains.isEmpty && naChains.isEmpty {
+            PanelHint(text: "No protein or nucleic acid chains found.", icon: "info.circle")
+        } else {
+            ForEach(proteinChains, id: \.id) { chain in
+                chainSection(chain, prot: prot, ssLookup: ssLookup)
+            }
+            if !naChains.isEmpty {
+                PanelLabeledDivider(title: "Nucleic Acid", icon: "helix")
+                ForEach(naChains, id: \.id) { chain in
+                    naChainSection(chain, prot: prot)
                 }
             }
+        }
 
-            // Toolbar
-            toolbar(prot)
-
-            // Selection info
-            if !viewModel.workspace.selectedResidueIndices.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "scope")
-                        .font(.footnote)
-                        .foregroundStyle(.cyan)
-                    Text("\(viewModel.workspace.selectedResidueIndices.count) selected")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.cyan)
-                    Spacer()
-                    Button {
-                        viewModel.workspace.selectedResidueIndices.removeAll()
-                        viewModel.workspace.selectedAtomIndices.removeAll()
-                        viewModel.workspace.selectedAtomIndex = nil
-                        viewModel.pushToRenderer()
-                    } label: {
-                        Text("Clear")
-                            .font(.footnote)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier(AccessibilityID.seqClearSelection)
-                }
-            }
-
-            // Chain sections
-            let proteinChains = prot.chains.filter { $0.type == .protein }
-            let naChains = prot.chains.filter { $0.type == .nucleicAcid }
-            if proteinChains.isEmpty && naChains.isEmpty {
-                Text("No protein or nucleic acid chains found")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            } else {
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(proteinChains, id: \.id) { chain in
-                            chainSection(chain, prot: prot)
-                        }
-                        if !naChains.isEmpty {
-                            Divider().padding(.vertical, 2)
-                            Label("Nucleic Acid", systemImage: "helix")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.orange)
-                            ForEach(naChains, id: \.id) { chain in
-                                naChainSection(chain, prot: prot)
-                            }
-                        }
-                    }
-                }
-                .frame(maxHeight: .infinity)
-            }
-
-            Divider()
-            selectedResidueInfo(prot)
+        if !viewModel.workspace.selectedResidueIndices.isEmpty {
+            selectedResidueCard(prot)
         }
     }
 
-    // MARK: - Toolbar
+    // MARK: - Overview card (actions + structure legend)
 
-    @ViewBuilder
-    private func toolbar(_ prot: Molecule) -> some View {
-        HStack(spacing: 4) {
-            // Copy sequence
-            Button {
-                viewModel.copySequenceToClipboard()
-            } label: {
-                Image(systemName: "doc.on.doc")
-            }
-            .buttonStyle(.borderless)
-            .help("Copy sequence to clipboard")
-            .controlSize(.small)
-            .accessibilityIdentifier(AccessibilityID.seqCopySequence)
+    private func overviewCard(_ prot: Molecule) -> some View {
+        let aaCount = prot.residues.filter(\.isStandard).count
+        let naCount = prot.chains.filter { $0.type == .nucleicAcid }
+            .flatMap(\.residueIndices)
+            .filter { $0 < prot.residues.count && nucleotideToOne[prot.residues[$0].name] != nil }
+            .count
+        let countText = naCount > 0 ? "\(aaCount) aa + \(naCount) nt" : "\(aaCount) aa"
+        let selectedCount = viewModel.workspace.selectedResidueIndices.count
 
-            // Select by SS menu
-            Menu {
-                Button("All Helices") { viewModel.selectBySecondaryStructure(.helix) }
-                    .accessibilityIdentifier(AccessibilityID.seqSelectHelices)
-                Button("All Sheets") { viewModel.selectBySecondaryStructure(.sheet) }
-                    .accessibilityIdentifier(AccessibilityID.seqSelectSheets)
-                Button("All Coils") { viewModel.selectBySecondaryStructure(.coil) }
-                    .accessibilityIdentifier(AccessibilityID.seqSelectCoils)
-                Button("All Turns") { viewModel.selectBySecondaryStructure(.turn) }
-                    .accessibilityIdentifier(AccessibilityID.seqSelectTurns)
-            } label: {
-                Image(systemName: "line.3.horizontal.decrease.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .help("Select by secondary structure")
-            .controlSize(.small)
-            .frame(width: 20)
+        return PanelCard(
+            "Overview",
+            icon: "list.bullet.rectangle",
+            accessory: { DSTag(countText, monospaced: true) }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                PanelChoiceGrid(columns: 2) {
+                    PanelSecondaryButton(
+                        title: "Copy", icon: "doc.on.doc",
+                        help: "Copy the selected residues (or the whole sequence) as one-letter codes"
+                    ) { viewModel.copySequenceToClipboard() }
+                    .accessibilityIdentifier(AccessibilityID.seqCopySequence)
 
-            Spacer()
+                    PanelSecondaryButton(
+                        title: "Deselect All", icon: "xmark.circle",
+                        isDisabled: selectedCount == 0,
+                        help: "Deselect all residues"
+                    ) { clearSelection() }
+                    .accessibilityIdentifier(AccessibilityID.seqClearSelection)
+                }
 
-            let aaCount = prot.residues.filter(\.isStandard).count
-            let naCount = prot.chains.filter { $0.type == .nucleicAcid }
-                .flatMap(\.residueIndices)
-                .filter { $0 < prot.residues.count && nucleotideToOne[prot.residues[$0].name] != nil }
-                .count
-            if naCount > 0 {
-                Text("\(aaCount) aa + \(naCount) nt")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("\(aaCount) residues")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                PanelSubheader(title: "Select by structure")
+                PanelChoiceGrid(columns: 4) {
+                    ssButton(.helix, plural: "helices", id: AccessibilityID.seqSelectHelices)
+                    ssButton(.sheet, plural: "sheets", id: AccessibilityID.seqSelectSheets)
+                    ssButton(.coil, plural: "coils", id: AccessibilityID.seqSelectCoils)
+                    ssButton(.turn, plural: "turns", id: AccessibilityID.seqSelectTurns)
+                }
+
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: selectedCount > 0 ? "scope" : "cursorarrow.click")
+                        .font(DS.Font.caption)
+                        .foregroundStyle(selectedCount > 0 ? DS.Color.accent : Color.secondary)
+                    Text(selectedCount > 0
+                         ? "\(selectedCount) residue\(selectedCount == 1 ? "" : "s") selected"
+                         : "Click a residue · ⇧ range · ⌘ toggle")
+                        .font(DS.Font.secondary)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
+    }
+
+    /// Structure-selection button whose swatch doubles as the cell-color legend.
+    private func ssButton(_ ss: SecondaryStructure, plural: String, id: String) -> some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+        return Button {
+            viewModel.selectBySecondaryStructure(ss)
+        } label: {
+            HStack(spacing: DS.Space.xs) {
+                RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                    .fill(ss.ssFill)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                            .strokeBorder(ss.ssTint.opacity(0.6), lineWidth: 0.5)
+                    )
+                    .frame(width: 10, height: 10)
+                Text(ss.ssShortName)
+                    .font(DS.Font.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, DS.Space.xs)
+            .frame(maxWidth: .infinity)
+            .frame(height: DS.Size.buttonHeight)
+            .background(shape.fill(DS.Color.controlFill))
+            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .help("Select all \(plural)")
+        .accessibilityLabel("Select all \(plural)")
+        .accessibilityIdentifier(id)
+    }
+
+    private func clearSelection() {
+        viewModel.workspace.selectedResidueIndices.removeAll()
+        viewModel.workspace.selectedAtomIndices.removeAll()
+        viewModel.workspace.selectedAtomIndex = nil
+        viewModel.pushToRenderer()
     }
 
     // MARK: - Chain Section
 
-    @ViewBuilder
-    private func chainSection(_ chain: Chain, prot: Molecule) -> some View {
-        let isCollapsed = collapsedChains.contains(chain.id)
-        let residueEntries = chainResidues(chain, prot: prot)
-        let cells = buildCells(from: residueEntries, chainID: chain.id)
-
-        VStack(alignment: .leading, spacing: 3) {
-            // Chain header
-            HStack(spacing: 4) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        if isCollapsed {
-                            collapsedChains.remove(chain.id)
-                        } else {
-                            collapsedChains.insert(chain.id)
-                        }
-                    }
-                } label: {
-                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.footnote)
-                        .frame(width: 12)
-                }
-                .buttonStyle(.plain)
-                .help(isCollapsed ? "Expand chain \(chain.id)" : "Collapse chain \(chain.id)")
-
-                Text("Chain \(chain.id)")
-                    .font(.footnote.monospaced().weight(.semibold))
-                    .foregroundStyle(chain.displayColor)
-
-                Text("\(residueEntries.count) res")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                // Chain context menu
-                Menu {
-                    Button("Select Chain") {
-                        viewModel.selectChain(chain.id)
-                    }
-                    Button("Copy Sequence") {
-                        viewModel.copySequenceToClipboard(chainID: chain.id)
-                    }
-                    Divider()
-                    Button("Rename Chain...") {
-                        renameChainID = chain.id
-                        renameNewID = chain.id
-                        showRenameSheet = true
-                    }
-                    if prot.chains.filter({ $0.type == .protein }).count > 1 {
-                        Menu("Merge Into...") {
-                            ForEach(prot.chains.filter({ $0.type == .protein && $0.id != chain.id }), id: \.id) { target in
-                                Button("Chain \(target.id)") {
-                                    mergeSourceID = chain.id
-                                    mergeTargetID = target.id
-                                    showMergeSheet = true
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 16)
+    private func toggleCollapsed(_ chainID: String) {
+        withAnimation(DS.Motion.respecting(reduceMotion, DS.Motion.snappy)) {
+            if collapsedChains.contains(chainID) {
+                collapsedChains.remove(chainID)
+            } else {
+                collapsedChains.insert(chainID)
             }
-            .padding(.horizontal, 2)
+        }
+    }
+
+    private func chainHeaderLeading(_ chain: Chain, isCollapsed: Bool) -> some View {
+        HStack(spacing: DS.Space.s) {
+            Button { toggleCollapsed(chain.id) } label: {
+                Image(systemName: "chevron.right")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                    .frame(width: 14, height: 14)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isCollapsed ? "Expand chain \(chain.id)" : "Collapse chain \(chain.id)")
+            .accessibilityLabel(isCollapsed ? "Expand chain \(chain.id)" : "Collapse chain \(chain.id)")
+
+            Circle()
+                .fill(chain.displayColor)
+                .frame(width: 8, height: 8)
+            Text("Chain \(chain.id)")
+                .font(DS.Font.label.weight(.semibold).monospaced())
+        }
+    }
+
+    @ViewBuilder
+    private func chainSection(_ chain: Chain, prot: Molecule, ssLookup: [String: SecondaryStructure]) -> some View {
+        let isCollapsed = collapsedChains.contains(chain.id)
+        let residueEntries = chainResidues(chain, prot: prot, ssLookup: ssLookup)
+        let cells = buildCells(from: residueEntries, chainID: chain.id)
+        let gapCount = cells.filter { !$0.isResidue }.count
+
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            HStack(spacing: DS.Space.s) {
+                chainHeaderLeading(chain, isCollapsed: isCollapsed)
+                DSTag("\(residueEntries.count) res", monospaced: true)
+                if gapCount > 0 {
+                    DSTag("\(gapCount) gap\(gapCount == 1 ? "" : "s")", tone: .warning, monospaced: true)
+                        .help("Missing residues detected from numbering discontinuities")
+                }
+                Spacer(minLength: DS.Space.xs)
+                chainMenu(chain, prot: prot)
+            }
 
             if !isCollapsed {
                 // Canvas-based sequence rendering: draws all residues directly
@@ -336,18 +333,50 @@ struct SequenceView: View {
                     cells: cells,
                     selectedResidueIndices: viewModel.workspace.selectedResidueIndices,
                     hoveredResIdx: hoveredResIdx,
-                    ssCache: ssCache,
-                    onTapCell: { entry in handleResidueClick(entry) },
+                    onTapCell: { entry in handleResidueClick(entry, chainOrder: residueEntries) },
                     onHoverCell: { resIdx in hoveredResIdx = resIdx },
                     contextMenuBuilder: { entry in residueContextMenu(entry, chainID: chain.id, prot: prot) }
                 )
             }
         }
-        .padding(.vertical, 2)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(.quaternary.opacity(0.3))
-        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard(padding: DS.Space.m)
+    }
+
+    private func chainMenu(_ chain: Chain, prot: Molecule) -> some View {
+        Menu {
+            Button("Select Chain") {
+                viewModel.selectChain(chain.id)
+            }
+            Button("Copy Sequence") {
+                viewModel.copySequenceToClipboard(chainID: chain.id)
+            }
+            Divider()
+            Button("Rename Chain…") {
+                renameChainID = chain.id
+                renameNewID = chain.id
+                showRenameSheet = true
+            }
+            if prot.chains.filter({ $0.type == .protein }).count > 1 {
+                Menu("Merge Into…") {
+                    ForEach(prot.chains.filter({ $0.type == .protein && $0.id != chain.id }), id: \.id) { target in
+                        Button("Chain \(target.id)") {
+                            mergeSourceID = chain.id
+                            mergeTargetID = target.id
+                            showMergeSheet = true
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(DS.Font.label)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Chain \(chain.id) actions")
     }
 
     // MARK: - Gap Detection
@@ -377,13 +406,13 @@ struct SequenceView: View {
     }
 
     /// Build ResidueEntry list for a chain (standard residues only, sorted by sequence number).
-    private func chainResidues(_ chain: Chain, prot: Molecule) -> [ResidueEntry] {
+    private func chainResidues(_ chain: Chain, prot: Molecule, ssLookup: [String: SecondaryStructure]) -> [ResidueEntry] {
         chain.residueIndices.compactMap { idx -> ResidueEntry? in
             guard idx < prot.residues.count else { return nil }
             let res = prot.residues[idx]
             guard res.isStandard else { return nil }
             let code = threeToOne[res.name] ?? "?"
-            let ss = cachedSS(chainID: res.chainID, seqNum: res.sequenceNumber)
+            let ss = ssLookup["\(res.chainID)_\(res.sequenceNumber)"] ?? .coil
             return ResidueEntry(
                 resIdx: idx, name: res.name, oneLetterCode: code,
                 seqNum: res.sequenceNumber, chainID: res.chainID, ss: ss
@@ -397,8 +426,7 @@ struct SequenceView: View {
         chain.residueIndices.compactMap { idx -> ResidueEntry? in
             guard idx < prot.residues.count else { return nil }
             let res = prot.residues[idx]
-            let code = nucleotideToOne[res.name]
-            guard let code else { return nil }  // skip non-nucleotide residues
+            guard let code = nucleotideToOne[res.name] else { return nil }  // skip non-nucleotide residues
             return ResidueEntry(
                 resIdx: idx, name: res.name, oneLetterCode: code,
                 seqNum: res.sequenceNumber, chainID: res.chainID, ss: .coil
@@ -415,45 +443,16 @@ struct SequenceView: View {
         let residueEntries = naChainResidues(chain, prot: prot)
         let isDNA = residueEntries.contains { $0.name.hasPrefix("D") }
 
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        if isCollapsed {
-                            collapsedChains.remove(chain.id)
-                        } else {
-                            collapsedChains.insert(chain.id)
-                        }
-                    }
-                } label: {
-                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.footnote)
-                        .frame(width: 12)
-                }
-                .buttonStyle(.plain)
-                .help(isCollapsed ? "Expand chain \(chain.id)" : "Collapse chain \(chain.id)")
-
-                Text("Chain \(chain.id)")
-                    .font(.footnote.monospaced().weight(.semibold))
-                    .foregroundStyle(chain.displayColor)
-
-                Text(isDNA ? "DNA" : "RNA")
-                    .font(.footnote.weight(.medium))
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.orange.opacity(0.2)))
-                    .foregroundStyle(.orange)
-
-                Text("\(residueEntries.count) nt")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            HStack(spacing: DS.Space.s) {
+                chainHeaderLeading(chain, isCollapsed: isCollapsed)
+                DSTag(isDNA ? "DNA" : "RNA", tone: .accent)
+                DSTag("\(residueEntries.count) nt", monospaced: true)
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 2)
 
             if !isCollapsed && !residueEntries.isEmpty {
-                // Simple text-based sequence for nucleic acids (no SS coloring)
+                // Text-based sequence for nucleic acids, in blocks of 10 with a position ruler.
                 let seqString = residueEntries.map(\.oneLetterCode).joined()
                 let chunks = stride(from: 0, to: seqString.count, by: 10).map { start in
                     let s = seqString.index(seqString.startIndex, offsetBy: start)
@@ -461,59 +460,37 @@ struct SequenceView: View {
                     return String(seqString[s..<e])
                 }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(stride(from: 0, to: chunks.count, by: 6).enumerated()), id: \.offset) { _, rowStart in
-                        HStack(spacing: 8) {
-                            // Position label
-                            let pos = rowStart * 10 + 1
-                            Text("\(pos)")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .frame(width: 30, alignment: .trailing)
-
-                            ForEach(rowStart..<min(rowStart + 6, chunks.count), id: \.self) { ci in
-                                Text(chunks[ci])
-                                    .font(.subheadline.monospaced().weight(.medium))
-                                    .foregroundStyle(naBaseColor(chunks[ci]))
-                            }
-                            Spacer()
+                FlowLayout(spacing: DS.Space.m) {
+                    ForEach(Array(chunks.enumerated()), id: \.offset) { ci, chunk in
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("\(ci * 10 + 1)")
+                                .font(DS.Font.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(.tertiary)
+                            Text(chunk)
+                                .font(DS.Font.monoSmall.weight(.medium))
+                                .foregroundStyle(.primary)
                         }
                     }
                 }
-                .padding(8)
+                .textSelection(.enabled)
             }
         }
-        .padding(.vertical, 2)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color.orange.opacity(0.05))
-        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard(padding: DS.Space.m)
     }
 
-    /// Color nucleotide bases: A=green, T/U=red, G=yellow, C=blue
-    private func naBaseColor(_ chunk: String) -> Color {
-        // Return a neutral color for mixed chunks; individual coloring would need per-char rendering
-        .primary.opacity(0.85)
-    }
-
-    private func cachedSS(chainID: String, seqNum: Int) -> SecondaryStructure {
-        ssCache["\(chainID)_\(seqNum)"] ?? .coil
-    }
-
-    /// Rebuild the secondary structure cache from scratch.
-    private func rebuildSSCache(prot: Molecule) {
-        var cache: [String: SecondaryStructure] = [:]
-        for ssa in prot.secondaryStructureAssignments {
-            guard ssa.start <= ssa.end else { continue }
+    /// (chainID, seqNum) → secondary structure, read from the molecule so it follows
+    /// assignments made after the view appeared (e.g. backbone-derived ones).
+    private func secondaryStructureLookup(_ prot: Molecule) -> [String: SecondaryStructure] {
+        var lookup: [String: SecondaryStructure] = [:]
+        for ssa in prot.secondaryStructureAssignments where ssa.start <= ssa.end {
             for seq in ssa.start...ssa.end {
-                cache["\(ssa.chain)_\(seq)"] = ssa.type
+                lookup["\(ssa.chain)_\(seq)"] = ssa.type
             }
         }
-        ssCache = cache
-        cachedProteinID = prot.id
+        return lookup
     }
-
-    // Residue cells are now rendered by SequenceCanvas (Canvas-based).
 
     // MARK: - Context Menu
 
@@ -554,19 +531,19 @@ struct SequenceView: View {
                 viewModel.showConstraintSheetForResidue(entry.resIdx)
             }
 
-            let isFlexible = viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.contains(entry.resIdx)
+            // FlexibleResidueConfig stores residue sequence numbers (what FlexDockingEngine
+            // matches against atom.residueSeq), not indices into `residues`.
+            let flexConfig = viewModel.docking.flexibleResidueConfig
+            let isFlexible = flexConfig.flexibleResidueIndices.contains(entry.seqNum)
+            let hasRotamers = RotamerLibrary.rotamers(for: entry.name) != nil
             Button(isFlexible ? "Remove Flexible Residue" : "Make Flexible (Induced Fit)") {
                 if isFlexible {
-                    viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.removeAll { $0 == entry.resIdx }
-                } else if viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.count < FlexibleResidueConfig.maxFlexibleResidues {
-                    if let prot = viewModel.molecules.protein,
-                       let atom = prot.atoms.first(where: { $0.residueSeq == entry.resIdx }),
-                       RotamerLibrary.rotamers(for: atom.residueName) != nil {
-                        viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.append(entry.resIdx)
-                    }
+                    viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.removeAll { $0 == entry.seqNum }
+                } else {
+                    viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.append(entry.seqNum)
                 }
             }
-            .disabled(!isFlexible && viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.count >= FlexibleResidueConfig.maxFlexibleResidues)
+            .disabled(!isFlexible && (!hasRotamers || flexConfig.flexibleResidueIndices.count >= FlexibleResidueConfig.maxFlexibleResidues))
 
             Divider()
         }
@@ -585,18 +562,21 @@ struct SequenceView: View {
             Button("Coils in Chain \(chainID)") {
                 viewModel.selectBySecondaryStructure(.coil, chainID: chainID)
             }
+            Button("Turns in Chain \(chainID)") {
+                viewModel.selectBySecondaryStructure(.turn, chainID: chainID)
+            }
         }
 
         Divider()
 
-        Button("Rename Chain \(chainID)...") {
+        Button("Rename Chain \(chainID)…") {
             renameChainID = chainID
             renameNewID = chainID
             showRenameSheet = true
         }
 
         if prot.chains.filter({ $0.type == .protein }).count > 1 {
-            Menu("Merge Chain \(chainID) Into...") {
+            Menu("Merge Chain \(chainID) Into…") {
                 ForEach(prot.chains.filter({ $0.type == .protein && $0.id != chainID }), id: \.id) { target in
                     Button("Chain \(target.id)") {
                         mergeSourceID = chainID
@@ -610,24 +590,23 @@ struct SequenceView: View {
 
     // MARK: - Click Handling
 
-    private func handleResidueClick(_ entry: ResidueEntry) {
+    /// `chainOrder` is the chain's displayed residue order: a shift-range spans the cells
+    /// between the two clicks, never the waters, ligands or other chains whose indices
+    /// happen to fall between them in `residues`.
+    private func handleResidueClick(_ entry: ResidueEntry, chainOrder: [ResidueEntry]) {
         let modifiers = NSEvent.modifierFlags
         let isCmd = modifiers.contains(.command)
         let isShift = modifiers.contains(.shift)
 
-        if isShift, let last = lastClickedResIdx {
-            // Range select between last clicked and current
-            guard let prot = viewModel.molecules.protein else { return }
-            // Find all residues in the same chain between the two indices
-            let lo = min(last, entry.resIdx)
-            let hi = max(last, entry.resIdx)
+        if isShift, let last = lastClickedResIdx,
+           let anchor = chainOrder.firstIndex(where: { $0.resIdx == last }),
+           let current = chainOrder.firstIndex(where: { $0.resIdx == entry.resIdx }) {
             if !isCmd {
                 // Shift without Cmd: replace selection with range
                 viewModel.workspace.selectedResidueIndices.removeAll()
             }
-            for i in lo...hi {
-                guard i < prot.residues.count else { continue }
-                viewModel.workspace.selectedResidueIndices.insert(i)
+            for cell in chainOrder[min(anchor, current)...max(anchor, current)] {
+                viewModel.workspace.selectedResidueIndices.insert(cell.resIdx)
             }
         } else if isCmd {
             // Toggle individual residue
@@ -658,60 +637,39 @@ struct SequenceView: View {
         viewModel.workspace.selectedAtomIndex = atomIndices.first
     }
 
-    // MARK: - SS Legend Dot
+    // MARK: - Selected Residue Card
 
-    private func ssLegendDot(_ ss: SecondaryStructure) -> some View {
-        HStack(spacing: 3) {
-            Circle()
-                .fill(ssColor(ss))
-                .frame(width: 7, height: 7)
-            Text(ssLabel(ss))
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    // MARK: - Selected Residue Info
-
-    @ViewBuilder
-    private func selectedResidueInfo(_ prot: Molecule) -> some View {
+    private func selectedResidueCard(_ prot: Molecule) -> some View {
         let sortedSelected = viewModel.workspace.selectedResidueIndices.sorted()
-        if sortedSelected.isEmpty {
-            EmptyView()
-        } else if sortedSelected.count == 1, let first = sortedSelected.first, first < prot.residues.count {
-            let res = prot.residues[first]
-            VStack(alignment: .leading, spacing: 4) {
-                Label("Selected", systemImage: "scope")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Text("\(res.name) \(res.sequenceNumber)")
-                        .font(.callout.monospaced().weight(.medium))
-                    Text("Chain \(res.chainID)")
-                        .font(.footnote)
+        let totalAtoms = sortedSelected.reduce(0) { sum, idx in
+            idx < prot.residues.count ? sum + prot.residues[idx].atomIndices.count : sum
+        }
+
+        return PanelCard(
+            "Selected",
+            icon: "scope",
+            accessory: { DSTag("\(sortedSelected.count)", tone: .accent, monospaced: true) }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                if sortedSelected.count == 1, let first = sortedSelected.first, first < prot.residues.count {
+                    let res = prot.residues[first]
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
+                        Text("\(res.name) \(res.sequenceNumber)")
+                            .font(DS.Font.mono.weight(.medium))
+                        Text("Chain \(res.chainID)")
+                            .font(DS.Font.secondary)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(condenseRanges(sortedSelected, prot: prot))
+                        .font(DS.Font.monoSmall)
                         .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
                 }
-                Text("\(res.atomIndices.count) atoms")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-        } else {
-            VStack(alignment: .leading, spacing: 4) {
-                Label("Selected (\(sortedSelected.count) residues)", systemImage: "scope")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-
-                let ranges = condenseRanges(sortedSelected, prot: prot)
-                Text(ranges)
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-
-                let totalAtoms = sortedSelected.reduce(0) { sum, idx in
-                    idx < prot.residues.count ? sum + prot.residues[idx].atomIndices.count : sum
-                }
-                Text("\(totalAtoms) atoms total")
-                    .font(.footnote)
+                Text("\(totalAtoms) atoms")
+                    .font(DS.Font.secondary)
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
         }
@@ -738,60 +696,62 @@ struct SequenceView: View {
     private func rangeString(_ start: Int, _ end: Int, prot: Molecule) -> String {
         let startSeq = start < prot.residues.count ? prot.residues[start].sequenceNumber : start
         let endSeq = end < prot.residues.count ? prot.residues[end].sequenceNumber : end
-        return startSeq == endSeq ? "\(startSeq)" : "\(startSeq)-\(endSeq)"
+        return startSeq == endSeq ? "\(startSeq)" : "\(startSeq)–\(endSeq)"
     }
 
     // MARK: - Rename Sheet
 
     private var renameSheet: some View {
-        VStack(spacing: 12) {
-            Text("Rename Chain \(renameChainID)")
-                .font(.headline)
-
-            TextField("New chain ID", text: $renameNewID)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 120)
-
-            HStack {
-                Button("Cancel") { showRenameSheet = false }
-                    .keyboardShortcut(.cancelAction)
-                Button("Rename") {
-                    viewModel.renameChain(from: renameChainID, to: renameNewID)
-                    showRenameSheet = false
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(renameNewID.isEmpty || renameNewID == renameChainID)
+        DSSheetScaffold(
+            title: "Rename Chain \(renameChainID)",
+            subtitle: "Chain identifiers are usually a single letter or digit.",
+            systemImage: "character.cursor.ibeam"
+        ) {
+            Form {
+                TextField("New chain ID", text: $renameNewID)
+                    .font(DS.Font.mono)
             }
+            .formStyle(.grouped)
+        } footer: {
+            Button("Cancel") { showRenameSheet = false }
+                .keyboardShortcut(.cancelAction)
+            Button("Rename") {
+                viewModel.renameChain(from: renameChainID, to: renameNewID)
+                showRenameSheet = false
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(renameNewID.isEmpty || renameNewID == renameChainID)
         }
-        .padding(20)
-        .frame(width: 250)
+        .frame(minWidth: 360, idealWidth: 380, minHeight: 230, idealHeight: 240)
     }
 
     // MARK: - Merge Sheet
 
     private var mergeSheet: some View {
-        VStack(spacing: 12) {
-            Text("Merge Chain \(mergeSourceID) into Chain \(mergeTargetID)?")
-                .font(.headline)
-                .multilineTextAlignment(.center)
-
-            Text("All residues from chain \(mergeSourceID) will be reassigned to chain \(mergeTargetID). This cannot be undone.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-
-            HStack {
-                Button("Cancel") { showMergeSheet = false }
-                    .keyboardShortcut(.cancelAction)
-                Button("Merge") {
-                    viewModel.mergeChains(from: mergeSourceID, into: mergeTargetID)
-                    showMergeSheet = false
+        DSSheetScaffold(
+            title: "Merge Chains",
+            subtitle: "All residues from chain \(mergeSourceID) will be reassigned to chain \(mergeTargetID). This cannot be undone.",
+            systemImage: "arrow.triangle.merge"
+        ) {
+            Form {
+                LabeledContent("From") {
+                    Text("Chain \(mergeSourceID)").font(DS.Font.mono)
                 }
-                .keyboardShortcut(.defaultAction)
+                LabeledContent("Into") {
+                    Text("Chain \(mergeTargetID)").font(DS.Font.mono)
+                }
             }
+            .formStyle(.grouped)
+        } footer: {
+            Button("Cancel") { showMergeSheet = false }
+                .keyboardShortcut(.cancelAction)
+            Button("Merge") {
+                viewModel.mergeChains(from: mergeSourceID, into: mergeTargetID)
+                showMergeSheet = false
+            }
+            .keyboardShortcut(.defaultAction)
         }
-        .padding(20)
-        .frame(width: 300)
+        .frame(minWidth: 380, idealWidth: 400, minHeight: 260, idealHeight: 280)
     }
 }
 
@@ -804,7 +764,6 @@ private struct SequenceCanvas<MenuContent: View>: View {
     let cells: [SequenceCell]
     let selectedResidueIndices: Set<Int>
     let hoveredResIdx: Int?
-    let ssCache: [String: SecondaryStructure]
     let onTapCell: (ResidueEntry) -> Void
     let onHoverCell: (Int?) -> Void
     @ViewBuilder let contextMenuBuilder: (ResidueEntry) -> MenuContent
@@ -812,7 +771,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
     // Layout constants
     private let cellW: CGFloat = 14
     private let cellH: CGFloat = 16
-    private let numberH: CGFloat = 8
+    private let numberH: CGFloat = 11
     private let gapW: CGFloat = 40
     private let spacing: CGFloat = 1
 
@@ -948,10 +907,10 @@ private struct SequenceCanvas<MenuContent: View>: View {
             rects = computed
         }
 
-        let residueFont = Font.footnote.monospaced().weight(.medium)
-        let residueFontBold = Font.footnote.monospaced().weight(.bold)
-        let numberFont = Font.system(size: 6, design: .monospaced)
-        let gapFont = Font.footnote.monospaced().weight(.medium)
+        let residueFont = DS.Font.monoSmall.weight(.medium)
+        let residueFontBold = DS.Font.monoSmall.weight(.bold)
+        let numberFont = DS.Font.canvasLabel.monospacedDigit()
+        let gapFont = DS.Font.monoSmall.weight(.medium)
 
         for (i, cell) in cells.enumerated() {
             guard i < rects.count else { break }
@@ -963,21 +922,15 @@ private struct SequenceCanvas<MenuContent: View>: View {
                 let isHovered = hoveredResIdx == entry.resIdx
 
                 // Background
-                let bgColor: Color
-                if isSelected {
-                    bgColor = .cyan.opacity(0.6)
-                } else if isHovered {
-                    bgColor = ssColor(entry.ss).opacity(0.5)
-                } else {
-                    bgColor = ssColor(entry.ss)
-                }
-
                 let cellRect = CGRect(x: rect.minX, y: rect.minY + numberH, width: cellW, height: cellH)
-                context.fill(Path(cellRect), with: .color(bgColor))
+                context.fill(Path(cellRect), with: .color(isSelected ? DS.Color.accent.opacity(0.35) : entry.ss.ssFill))
+                if isHovered && !isSelected {
+                    context.fill(Path(cellRect), with: .color(.primary.opacity(0.10)))
+                }
 
                 // Selection/hover border
                 if isSelected {
-                    context.stroke(Path(cellRect), with: .color(.cyan), lineWidth: 1)
+                    context.stroke(Path(cellRect), with: .color(DS.Color.accent), lineWidth: 1)
                 } else if isHovered {
                     context.stroke(Path(cellRect), with: .color(.primary.opacity(0.3)), lineWidth: 1)
                 }
@@ -986,7 +939,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
                 if entry.seqNum % 10 == 0 {
                     let numText = Text("\(entry.seqNum)")
                         .font(numberFont)
-                        .foregroundColor(.gray.opacity(0.5))
+                        .foregroundColor(.secondary)
                     context.draw(context.resolve(numText),
                                  at: CGPoint(x: rect.minX + cellW / 2, y: rect.minY + numberH / 2),
                                  anchor: .center)
@@ -995,42 +948,33 @@ private struct SequenceCanvas<MenuContent: View>: View {
                 // One-letter code
                 let letterText = Text(entry.oneLetterCode)
                     .font(isSelected ? residueFontBold : residueFont)
-                    .foregroundColor(isSelected ? .primary : .secondary)
+                    .foregroundColor(isSelected ? .primary : .primary.opacity(0.8))
                 context.draw(context.resolve(letterText),
                              at: CGPoint(x: cellRect.midX, y: cellRect.midY),
                              anchor: .center)
 
             case .gap(_, let count, _, _):
                 let gapRect = CGRect(x: rect.minX, y: rect.minY + numberH, width: gapW, height: cellH)
-                let gapPath = RoundedRectangle(cornerRadius: 2).path(in: gapRect)
+                let gapPath = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous).path(in: gapRect)
                 // Gap background
                 context.fill(
                     gapPath,
-                    with: .color(.orange.opacity(0.1))
+                    with: .color(DS.Color.warning.opacity(0.12))
                 )
                 context.stroke(
                     gapPath,
-                    with: .color(.orange.opacity(0.3)),
+                    with: .color(DS.Color.warning.opacity(0.4)),
                     lineWidth: 0.5
                 )
                 // Gap label
                 let gapText = Text("···\(count)···")
                     .font(gapFont)
-                    .foregroundColor(.orange.opacity(0.8))
+                    .foregroundColor(DS.Color.warning)
                 context.draw(context.resolve(gapText),
                              at: CGPoint(x: gapRect.midX, y: gapRect.midY),
                              anchor: .center)
             }
         }
-    }
-}
-
-// Helper for rounded rect path in Canvas
-private struct RoundedRect: Shape {
-    let rect: CGRect
-    let cornerSize: CGSize
-    func path(in bounds: CGRect) -> Path {
-        Path(roundedRect: rect, cornerSize: cornerSize)
     }
 }
 

@@ -78,52 +78,63 @@ final class Renderer: NSObject {
 
     // State
     private var startTime = CFAbsoluteTimeGetCurrent()
-    var selectedAtomIndex: Int = -1
-    var selectedResidueAtomIndices: Set<Int> = []
-    var renderMode: RenderMode = .ballAndStick
-    var ligandRenderMode: RenderMode?
-    var lightingMode: Int32 = 0 // 0 = uniform, 1 = directional
-    var themeMode: Int32 = 0    // 0 = dark, 1 = light
-    var backgroundOpacity: Float = 1.0
-    var surfaceOpacity: Float = 0.85
-    var gridLineWidth: Float = 2.5
+    var selectedAtomIndex: Int = -1 { didSet { setNeedsRedraw() } }
+    var selectedResidueAtomIndices: Set<Int> = [] { didSet { setNeedsRedraw() } }
+    var renderMode: RenderMode = .ballAndStick { didSet { setNeedsRedraw() } }
+    var ligandRenderMode: RenderMode? { didSet { setNeedsRedraw() } }
+    var lightingMode: Int32 = 0 { didSet { setNeedsRedraw() } } // 0 = uniform, 1 = directional
+    var themeMode: Int32 = 0 { didSet { setNeedsRedraw() } }    // 0 = dark, 1 = light
+    var backgroundOpacity: Float = 1.0 { didSet { setNeedsRedraw() } }
+    var surfaceOpacity: Float = 0.85 { didSet { setNeedsRedraw() } }
+    var gridLineWidth: Float = 2.5 { didSet { setNeedsRedraw() } }
 
     // Z-slab clipping
-    var enableClipping: Bool = false
-    var clipNearZ: Float = 0    // view-space distance from camera to near clip (legacy/fallback)
-    var clipFarZ: Float = 100   // view-space distance from camera to far clip (legacy/fallback)
+    var enableClipping: Bool = false { didSet { setNeedsRedraw() } }
+    var clipNearZ: Float = 0 { didSet { setNeedsRedraw() } }    // view-space distance from camera to near clip (legacy/fallback)
+    var clipFarZ: Float = 100 { didSet { setNeedsRedraw() } }   // view-space distance from camera to far clip (legacy/fallback)
 
     // Object-space slab clipping (zoom-invariant)
-    var slabCenter: SIMD3<Float>? = nil
-    var slabHalfThickness: Float = 10.0
-    var slabOffset: Float = 0.0
+    var slabCenter: SIMD3<Float>? = nil { didSet { setNeedsRedraw() } }
+    var slabHalfThickness: Float = 10.0 { didSet { setNeedsRedraw() } }
+    var slabOffset: Float = 0.0 { didSet { setNeedsRedraw() } }
 
     // Ligand Focus color overrides (set from AppViewModel based on WorkspaceState.colorScheme)
     /// When set, protein atoms use this uniform color instead of element colors
-    var uniformProteinColor: SIMD3<Float>? = nil
+    var uniformProteinColor: SIMD3<Float>? = nil { didSet { setNeedsRedraw() } }
     /// When set, ligand carbon atoms use this color (e.g., gold/yellow for Ligand Focus)
-    var ligandCarbonColor: SIMD3<Float>? = nil
+    var ligandCarbonColor: SIMD3<Float>? = nil { didSet { setNeedsRedraw() } }
     /// Number of protein atoms in the current data (used to distinguish protein vs ligand)
-    var proteinAtomCount: Int = 0
+    var proteinAtomCount: Int = 0 { didSet { setNeedsRedraw() } }
     /// Per-chain color map for chain-colored mode (protein atoms only; ligand keeps CPK)
-    var chainColorMap: [String: SIMD3<Float>] = [:]
+    var chainColorMap: [String: SIMD3<Float>] = [:] { didSet { setNeedsRedraw() } }
     /// Per-chain coloring scope. If a chain id is in `chainColorMap` but its
     /// scope is `.carbonsOnly` (or simply present in this set), the override
     /// applies only to carbons; heteroatoms keep their element colors.
-    var chainColorCarbonsOnly: Set<String> = []
+    var chainColorCarbonsOnly: Set<String> = [] { didSet { setNeedsRedraw() } }
     /// When true, `ligandCarbonColor` is applied only to carbons (default).
     /// When false, it paints the whole ligand uniformly.
-    var ligandColorCarbonsOnly: Bool = true
+    var ligandColorCarbonsOnly: Bool = true { didSet { setNeedsRedraw() } }
 
     /// Whether a ligand is currently visible (controls interaction lines and grid visibility)
-    var ligandVisible: Bool = true
+    var ligandVisible: Bool = true { didSet { setNeedsRedraw() } }
 
     // On-demand rendering: weak ref to the MTKView so we can request redraws
     weak var mtkView: MTKView?
+    private var redrawScheduled = false
 
     /// Request a new frame. Call after any state change that affects the rendered image.
+    /// Draws directly on the next main-queue turn (coalescing bursts of changes) instead of
+    /// `needsDisplay = true`: with a paused MTKView that relies on the display cycle, which
+    /// is not reliably triggered for changes made outside a view update (same reason the
+    /// mouse handlers in MetalMTKView call `draw()` directly).
     func setNeedsRedraw() {
-        mtkView?.needsDisplay = true
+        guard mtkView != nil, !redrawScheduled else { return }
+        redrawScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.redrawScheduled = false
+            self.mtkView?.draw()
+        }
     }
 
     // Molecule data (set from AppViewModel)
@@ -946,7 +957,12 @@ final class Renderer: NSObject {
         // Update uniforms into the current ring buffer slot
         updateUniforms(into: uniformBuffer, viewportSize: SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height)))
 
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            // Commit the empty buffer so its completion handler returns the frame slot;
+            // otherwise three consecutive failures would deadlock the main thread on wait().
+            commandBuffer.commit()
+            return
+        }
 
         // 1. Background gradient
         encoder.setRenderPipelineState(backgroundPipeline)
@@ -1076,7 +1092,9 @@ final class Renderer: NSObject {
     }
 
     private func updateUniforms(into buffer: MTLBuffer, viewportSize: SIMD2<Float>) {
-        camera.aspectRatio = viewportSize.x / viewportSize.y
+        if viewportSize.x > 0, viewportSize.y > 0 {
+            camera.aspectRatio = viewportSize.x / viewportSize.y
+        }
 
         var uniforms = Uniforms()
         uniforms.modelMatrix = Mat4.identity
@@ -1127,6 +1145,10 @@ final class Renderer: NSObject {
         let height = Int(viewportSize.y)
         guard width > 0, height > 0 else { return nil }
 
+        let px = Int(screenPoint.x)
+        let py = Int(screenPoint.y)
+        guard px >= 0, px < width, py >= 0, py < height else { return nil }
+
         // Recreate pick textures if viewport size changed
         if width != pickTextureWidth || height != pickTextureHeight {
             rebuildPickTextures(width: width, height: height)
@@ -1150,6 +1172,9 @@ final class Renderer: NSObject {
 
         encoder.setRenderPipelineState(pickPipeline)
         encoder.setDepthStencilState(depthStateReadWrite)
+        // Only the clicked pixel is read back: restrict rasterization to it so the
+        // ray-sphere fragment work is O(atoms covering 1 px) instead of full-screen.
+        encoder.setScissorRect(MTLScissorRect(x: px, y: py, width: 1, height: 1))
         let pickUniformBuffer = uniformBuffers[currentUniformBufferIndex]
         encoder.setVertexBuffer(atomBuf, offset: 0, index: Int(BufferIndexInstances.rawValue))
         encoder.setVertexBuffer(pickUniformBuffer, offset: 0, index: Int(BufferIndexUniforms.rawValue))
@@ -1167,10 +1192,6 @@ final class Renderer: NSObject {
         cmdBuf.waitUntilCompleted()
 
         // Read back the single pixel at the click location
-        let px = Int(screenPoint.x)
-        let py = Int(screenPoint.y)
-        guard px >= 0, px < width, py >= 0, py < height else { return nil }
-
         var pixelValue: UInt32 = 0xFFFFFFFF
         pickTex.getBytes(&pixelValue,
                          bytesPerRow: width * MemoryLayout<UInt32>.stride,
@@ -1232,8 +1253,7 @@ final class Renderer: NSObject {
 
     /// Project a world-space position to screen-space pixel coordinates.
     /// Returns nil if the point is behind the camera.
-    func worldToScreen(_ worldPos: SIMD3<Float>, viewportSize: SIMD2<Float>) -> SIMD2<Float>? {
-        let viewProj = camera.projectionMatrix * camera.viewMatrix
+    private func worldToScreen(_ worldPos: SIMD3<Float>, viewProj: float4x4, viewportSize: SIMD2<Float>) -> SIMD2<Float>? {
         let clip = viewProj * SIMD4<Float>(worldPos.x, worldPos.y, worldPos.z, 1.0)
         guard clip.w > 0 else { return nil }  // behind camera
         let ndc = SIMD3<Float>(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w)
@@ -1249,8 +1269,10 @@ final class Renderer: NSObject {
     /// can be box-selected even though their atoms aren't in the live buffer.
     func atomsInRect(rectMin: SIMD2<Float>, rectMax: SIMD2<Float>, viewportSize: SIMD2<Float>) -> [Int] {
         var result: [Int] = []
+        // Camera matrices are rebuilt from the quaternion on every access; compute once.
+        let viewProj = camera.projectionMatrix * camera.viewMatrix
         for atom in currentAtoms {
-            guard let sp = worldToScreen(atom.position, viewportSize: viewportSize) else { continue }
+            guard let sp = worldToScreen(atom.position, viewProj: viewProj, viewportSize: viewportSize) else { continue }
             if sp.x >= rectMin.x && sp.x <= rectMax.x &&
                sp.y >= rectMin.y && sp.y <= rectMax.y {
                 result.append(atom.id)
@@ -1260,7 +1282,7 @@ final class Renderer: NSObject {
         // CA control points. Their atomID is the original protein atom index,
         // which is what `handleBoxSelection` / `selectAtom` expect.
         for cp in ribbonCAControlPoints {
-            guard let sp = worldToScreen(cp.position, viewportSize: viewportSize) else { continue }
+            guard let sp = worldToScreen(cp.position, viewProj: viewProj, viewportSize: viewportSize) else { continue }
             if sp.x >= rectMin.x && sp.x <= rectMax.x &&
                sp.y >= rectMin.y && sp.y <= rectMax.y {
                 result.append(cp.atomID)

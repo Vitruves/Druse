@@ -6,7 +6,9 @@
 //
 // Metal compute dispatch wrapper for FASPR sidechain packing energy kernels.
 // Evaluates VDW self-energy (rotamer vs backbone) and pair-energy (rotamer
-// vs rotamer) on GPU for rapid dead-end elimination scoring.
+// vs rotamer) on GPU for rapid dead-end elimination scoring. The kernels use
+// the plain combined radius, so callers only send atom pairs for which the
+// FASPR H-bond / S-S distance override cannot apply.
 //
 // Architecture:
 //   Swift caller → Metal compute dispatch (self / pair VDW)
@@ -29,17 +31,17 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
 
     init?(device: MTLDevice) {
         guard let queue = device.makeCommandQueue(),
-              let library = device.makeDefaultLibrary()
+              let library = device.makeDefaultLibrary(),
+              let selfFn = library.makeFunction(name: "faspr_self_energy"),
+              let pairFn = library.makeFunction(name: "faspr_pair_energy")
         else { return nil }
 
         self.device = device
         self.queue = queue
 
         do {
-            selfEnergyPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "faspr_self_energy")!)
-            pairEnergyPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "faspr_pair_energy")!)
+            selfEnergyPipeline = try device.makeComputePipelineState(function: selfFn)
+            pairEnergyPipeline = try device.makeComputePipelineState(function: pairFn)
         } catch {
             return nil
         }
@@ -49,9 +51,10 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
 
     private func makeBuffer<T>(_ data: [T]) -> MTLBuffer? {
         data.withUnsafeBufferPointer { ptr in
-            device.makeBuffer(bytes: ptr.baseAddress!,
-                              length: ptr.count * MemoryLayout<T>.stride,
-                              options: .storageModeShared)
+            guard let base = ptr.baseAddress, ptr.count > 0 else { return nil }
+            return device.makeBuffer(bytes: base,
+                                     length: ptr.count * MemoryLayout<T>.stride,
+                                     options: .storageModeShared)
         }
     }
 
@@ -68,13 +71,14 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
     // MARK: - Self-Energy
 
     /// Compute self-energy: VDW between each rotamer's sidechain and backbone atoms.
-    /// Returns energy per rotamer.
+    /// Returns energy per rotamer, or nil if the GPU work could not be set up
+    /// (caller falls back to CPU).
     func computeSelfVDW(
         rotamerAtoms: [FASPRGPUAtom],
         backboneAtoms: [FASPRGPUAtom],
         rotamerOffsets: [UInt32],
         rotamerCount: Int
-    ) -> [Float] {
+    ) -> [Float]? {
         // Compute max atoms per rotamer from offsets
         var maxAtomsPerRotamer: UInt32 = 0
         for i in 0..<rotamerCount {
@@ -86,7 +90,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
               let backboneBuf = makeBuffer(backboneAtoms),
               let offsetBuf = makeBuffer(rotamerOffsets),
               let energyBuf = makeBuffer(count: rotamerCount, type: Float.self)
-        else { return Array(repeating: Float.infinity, count: rotamerCount) }
+        else { return nil }
 
         var params = FASPRSelfParams(
             rotamerCount: UInt32(rotamerCount),
@@ -98,9 +102,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
         )
 
         guard let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else {
-            return Array(repeating: Float.infinity, count: rotamerCount)
-        }
+              let encoder = cmdBuf.makeComputeCommandEncoder() else { return nil }
 
         encoder.setComputePipelineState(selfEnergyPipeline)
         encoder.setBuffer(rotamerAtomBuf, offset: 0, index: 0)
@@ -114,6 +116,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
         encoder.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        guard cmdBuf.status == .completed else { return nil }
 
         // Read results
         let ptr = energyBuf.contents().bindMemory(to: Float.self, capacity: rotamerCount)
@@ -123,7 +126,8 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
     // MARK: - Pair-Energy
 
     /// Compute pair-energy: VDW between rotamer pairs from two sites.
-    /// Returns flat array [rot1 * rot2Count + rot2].
+    /// Returns flat array [rot1 * rot2Count + rot2], or nil if the GPU work
+    /// could not be set up (caller falls back to CPU).
     func computePairVDW(
         site1Atoms: [FASPRGPUAtom],
         site2Atoms: [FASPRGPUAtom],
@@ -131,7 +135,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
         offsets2: [UInt32],
         rot1Count: Int,
         rot2Count: Int
-    ) -> [Float] {
+    ) -> [Float]? {
         let totalPairs = rot1Count * rot2Count
 
         // Compute max atoms per rotamer for each site
@@ -151,7 +155,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
               let offset1Buf = makeBuffer(offsets1),
               let offset2Buf = makeBuffer(offsets2),
               let energyBuf = makeBuffer(count: totalPairs, type: Float.self)
-        else { return Array(repeating: Float.infinity, count: totalPairs) }
+        else { return nil }
 
         var params = FASPRPairParams(
             rot1Count: UInt32(rot1Count),
@@ -165,9 +169,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
         )
 
         guard let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else {
-            return Array(repeating: Float.infinity, count: totalPairs)
-        }
+              let encoder = cmdBuf.makeComputeCommandEncoder() else { return nil }
 
         encoder.setComputePipelineState(pairEnergyPipeline)
         encoder.setBuffer(site1Buf, offset: 0, index: 0)
@@ -182,6 +184,7 @@ final class FASPRMetalAccelerator: @unchecked Sendable {
         encoder.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        guard cmdBuf.status == .completed else { return nil }
 
         // Read results
         let ptr = energyBuf.contents().bindMemory(to: Float.self, capacity: totalPairs)

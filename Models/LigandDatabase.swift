@@ -115,6 +115,15 @@ struct LigandEntry: Identifiable, Sendable {
     }
 }
 
+extension LigandDescriptors {
+    /// Crippen logP to one decimal. Values that round to zero print as "0.0":
+    /// `String(format:)` keeps the sign of e.g. -0.04 and would show "-0.0".
+    var logPText: String {
+        let rounded = (logP * 10).rounded() / 10
+        return String(format: "%.1f", rounded == 0 ? 0 : rounded)
+    }
+}
+
 /// In-memory ligand database with search, filter, and persistent JSON storage.
 @Observable
 @MainActor
@@ -132,8 +141,15 @@ final class LigandDatabase {
     private var saveTask: Task<Void, Never>?
     private let saveDebounceInterval: Duration = .milliseconds(500)
 
+    /// Auto-save is only allowed while the in-memory entries are the authoritative copy of the
+    /// default database file: the file did not exist at launch, or it was loaded/saved explicitly.
+    /// Otherwise the first edit of a fresh session (or a project load) would overwrite the user's
+    /// saved database with a partial set of entries.
+    private var autoSaveEnabled: Bool
+
     init() {
         // Don't auto-load — user explicitly loads via File > Load Database
+        autoSaveEnabled = !FileManager.default.fileExists(atPath: Self.defaultURL.path)
     }
 
     // MARK: - Helpers
@@ -254,59 +270,50 @@ final class LigandDatabase {
 
     // MARK: - Batch Import from SMILES list
 
+    typealias ImportedAffinity = (ki: Float?, pKi: Float?, ic50: Float?)
+
+    /// - Parameter affinities: experimental affinity data keyed by index into `lines`.
     func importSMILES(_ lines: [(smiles: String, name: String)], prepare: Bool = true,
-                       addH: Bool = true, minimize: Bool = true, charges: Bool = true) {
+                       addH: Bool = true, minimize: Bool = true, charges: Bool = true,
+                       affinities: [Int: ImportedAffinity] = [:]) {
         isProcessing = true
         processingMessage = "Importing \(lines.count) molecules..."
         processingProgress = 0
 
         Task {
-            if prepare {
-                let results = await Task.detached {
-                    RDKitBridge.batchProcess(entries: lines, addHydrogens: addH,
-                                             minimize: minimize, computeCharges: charges)
-                }.value
-
-                // Build entries off the hot path, then batch-insert
-                let batchSize = 500
-                var batch: [LigandEntry] = []
-                batch.reserveCapacity(min(batchSize, results.count))
-
-                for (i, result) in results.enumerated() {
-                    let line = lines[i]
+            // Build all entries (RDKit preparation + descriptors) in one background pass,
+            // then insert them with a single mutation (one didSet / one debounced save).
+            let newEntries = await Task.detached(priority: .userInitiated) { () -> [LigandEntry] in
+                let results = prepare
+                    ? RDKitBridge.batchProcess(entries: lines, addHydrogens: addH,
+                                               minimize: minimize, computeCharges: charges)
+                    : []
+                return lines.enumerated().map { i, line in
                     var entry = LigandEntry(name: line.name, smiles: line.smiles)
-                    if let mol = result.molecule {
-                        entry.atoms = mol.atoms
-                        entry.bonds = mol.bonds
-                        entry.isPrepared = true
-                        entry.preparationDate = Date()
-                        entry.conformerCount = 1
+                    if prepare {
+                        if i < results.count, let mol = results[i].molecule {
+                            entry.atoms = mol.atoms
+                            entry.bonds = mol.bonds
+                            entry.isPrepared = true
+                            entry.preparationDate = Date()
+                            entry.conformerCount = 1
+                        }
+                        entry.descriptors = RDKitBridge.computeDescriptors(smiles: line.smiles)
                     }
-                    if let desc = await Task.detached(operation: { RDKitBridge.computeDescriptors(smiles: line.smiles) }).value {
-                        entry.descriptors = desc
+                    if let aff = affinities[i] {
+                        entry.ki = aff.ki
+                        entry.pKi = aff.pKi
+                        entry.ic50 = aff.ic50
                     }
-                    batch.append(entry)
+                    return entry
+                }
+            }.value
 
-                    // Flush batch periodically to show progress without triggering didSet per-row
-                    if batch.count >= batchSize {
-                        let chunk = batch
-                        batchMutate { entries in entries.append(contentsOf: chunk) }
-                        batch.removeAll(keepingCapacity: true)
-                    }
-                    processingProgress = Double(i + 1) / Double(results.count)
-                }
-                // Flush remaining
-                if !batch.isEmpty {
-                    let chunk = batch
-                    batchMutate { entries in entries.append(contentsOf: chunk) }
-                }
-            } else {
-                let newEntries = lines.map { LigandEntry(name: $0.name, smiles: $0.smiles) }
-                batchMutate { entries in
-                    entries.reserveCapacity(entries.count + newEntries.count)
-                    entries.append(contentsOf: newEntries)
-                }
+            batchMutate { entries in
+                entries.reserveCapacity(entries.count + newEntries.count)
+                entries.append(contentsOf: newEntries)
             }
+            processingProgress = 1
 
             isProcessing = false
             processingMessage = ""
@@ -397,49 +404,29 @@ final class LigandDatabase {
         let hasAffinity = kiCol != nil || pKiCol != nil || ic50Col != nil
 
         let baseIndex = entries.count
-        let lines = dataRows.enumerated().compactMap { offset, row -> (smiles: String, name: String)? in
-            let cols = row
-            guard detectedSmilesCol < cols.count else { return nil }
+        var lines: [(smiles: String, name: String)] = []
+        // Affinity data keyed by index into `lines`; applied when the entries are built
+        // (importSMILES inserts asynchronously, so it cannot be patched in afterwards).
+        var affinities: [Int: ImportedAffinity] = [:]
+        for (offset, cols) in dataRows.enumerated() {
+            guard detectedSmilesCol < cols.count else { continue }
             let smi = cols[detectedSmilesCol]
             let name = detectedNameCol < cols.count ? cols[detectedNameCol] : "Mol_\(baseIndex + offset + 1)"
-            return (smi, name)
-        }
-
-        // Parse affinity data per row before importing SMILES
-        var affinityMap: [String: (ki: Float?, pKi: Float?, ic50: Float?)] = [:]
-        if hasAffinity {
-            for (offset, row) in dataRows.enumerated() {
-                let cols = row
-                guard detectedSmilesCol < cols.count else { continue }
-                let name: String
-                if detectedNameCol < cols.count {
-                    name = cols[detectedNameCol]
-                } else {
-                    name = "Mol_\(baseIndex + offset + 1)"
-                }
+            if hasAffinity {
                 let ki = kiCol.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
                 let pKi = pKiCol.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
                 let ic50 = ic50Col.flatMap { $0 < cols.count ? Float(cols[$0]) : nil }
                 if ki != nil || pKi != nil || ic50 != nil {
-                    affinityMap[name] = (ki: ki, pKi: pKi, ic50: ic50)
+                    affinities[lines.count] = (ki: ki, pKi: pKi, ic50: ic50)
                 }
             }
+            lines.append((smi, name))
         }
 
-        importSMILES(lines, prepare: prepare)
+        importSMILES(lines, prepare: prepare, affinities: affinities)
 
-        // Apply affinity data to imported entries
-        if !affinityMap.isEmpty {
-            for i in (entries.count - lines.count)..<entries.count {
-                guard i >= 0, i < entries.count else { continue }
-                if let aff = affinityMap[entries[i].name] {
-                    entries[i].ki = aff.ki
-                    entries[i].pKi = aff.pKi
-                    entries[i].ic50 = aff.ic50
-                }
-            }
-            let affCount = affinityMap.count
-            ActivityLog.shared.info("Imported affinity data for \(affCount) ligands (Ki/pKi/IC50)", category: .molecule)
+        if !affinities.isEmpty {
+            ActivityLog.shared.info("Imported affinity data for \(affinities.count) ligands (Ki/pKi/IC50)", category: .molecule)
         }
     }
 
@@ -540,19 +527,21 @@ final class LigandDatabase {
     /// Save the database to ~/Library/Application Support/Druse/ligand_database.json
     func save() {
         do {
-            let data = try encodeToDisk()
+            let data = try Self.encode(entries)
             try data.write(to: Self.defaultURL, options: .atomic)
+            autoSaveEnabled = true
         } catch {
             ActivityLog.shared.error("Failed to save ligand database: \(error.localizedDescription)", category: .system)
         }
     }
 
-    /// Load the database from disk. Called automatically on init.
+    /// Load the database from disk (File > Load Ligand Database).
     func load() {
         guard FileManager.default.fileExists(atPath: Self.defaultURL.path) else { return }
         do {
             let data = try Data(contentsOf: Self.defaultURL)
-            try decodeFromDisk(data)
+            entries = try Self.decodeEntries(from: data)
+            autoSaveEnabled = true
             ActivityLog.shared.info("Loaded \(entries.count) ligands from database", category: .system)
         } catch {
             ActivityLog.shared.error("Failed to load ligand database: \(error.localizedDescription)", category: .system)
@@ -560,27 +549,44 @@ final class LigandDatabase {
     }
 
     /// Schedule a debounced save. Cancels any pending save and waits before writing.
+    /// JSON encoding and the file write run off the main actor; writes are serialized so an
+    /// older snapshot can never land on disk after a newer one.
     private func scheduleSave() {
+        guard autoSaveEnabled else { return }
         saveTask?.cancel()
+        let previousSave = saveTask
+        let debounce = saveDebounceInterval
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: self?.saveDebounceInterval ?? .milliseconds(500))
-            guard !Task.isCancelled else { return }
-            self?.save()
+            try? await Task.sleep(for: debounce)
+            guard !Task.isCancelled, let snapshot = self?.entries else { return }
+            await previousSave?.value
+            let url = Self.defaultURL
+            let failure: String? = await Task.detached(priority: .utility) {
+                do {
+                    try Self.encode(snapshot).write(to: url, options: .atomic)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let failure {
+                ActivityLog.shared.error("Failed to save ligand database: \(failure)", category: .system)
+            }
         }
     }
 
-    // Backward compatibility aliases
-    func saveToDefault() { save() }
-    func loadFromDefault() { load() }
-
     /// Encode the entire database to Data (for project save).
-    func encodeToData() -> Data {
-        (try? encodeToDisk()) ?? Data()
+    func encodeToData() throws -> Data {
+        try Self.encode(entries)
     }
 
-    /// Decode database from Data (for project load). Replaces current entries.
-    func decodeFromData(_ data: Data) {
-        try? decodeFromDisk(data)
+    /// Replace the current entries with ones decoded from a project's ligand file.
+    /// The project's ligands are not the default database, so auto-save is suspended
+    /// until the user explicitly saves or loads the default database.
+    func replaceWithProjectEntries(_ projectEntries: [LigandEntry]) {
+        autoSaveEnabled = false
+        saveTask?.cancel()
+        entries = projectEntries
     }
 
     /// Export as SDF to a user-selected file.
@@ -602,7 +608,7 @@ final class LigandDatabase {
     // MARK: - Codable Helpers
 
     /// Current on-disk format version.
-    private static let currentFormatVersion = 5
+    nonisolated private static let currentFormatVersion = 6
 
     /// v3: Serialized conformer within a chemical form.
     private struct SerializableConformer: Codable {
@@ -681,6 +687,10 @@ final class LigandDatabase {
         /// User-imported custom properties from CSV/SMI/SDF columns that don't
         /// map to a built-in field. Optional for backward compat with v3/v4.
         let userProperties: [String: String]?
+        // --- v6 fields ---
+        /// Per-atom partial and formal charges (nil when all zero / pre-v6 files).
+        let atomCharges: [Float]?
+        let atomFormalCharges: [Int]?
     }
 
     /// Top-level wrapper for versioned on-disk format.
@@ -689,21 +699,25 @@ final class LigandDatabase {
         let entries: [SerializableEntry]
     }
 
-    private static func encodeAtoms(_ atoms: [Atom]) -> (data: [Float]?, elements: [Int]?, names: [String]?) {
-        guard !atoms.isEmpty else { return (nil, nil, nil) }
+    nonisolated private static func encodeAtoms(_ atoms: [Atom]) -> (data: [Float]?, elements: [Int]?, names: [String]?,
+                                                                      charges: [Float]?, formalCharges: [Int]?) {
+        guard !atoms.isEmpty else { return (nil, nil, nil, nil, nil) }
         return (
             atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] },
             atoms.map { $0.element.rawValue },
-            atoms.map(\.name)
+            atoms.map(\.name),
+            atoms.contains { $0.charge != 0 } ? atoms.map(\.charge) : nil,
+            atoms.contains { $0.formalCharge != 0 } ? atoms.map(\.formalCharge) : nil
         )
     }
 
-    private static func encodeBonds(_ bonds: [Bond]) -> [Int]? {
+    nonisolated private static func encodeBonds(_ bonds: [Bond]) -> [Int]? {
         guard !bonds.isEmpty else { return nil }
         return bonds.flatMap { [$0.atomIndex1, $0.atomIndex2, $0.order == .single ? 1 : $0.order == .double ? 2 : $0.order == .triple ? 3 : 4] }
     }
 
-    private static func decodeAtoms(data: [Float]?, elements: [Int]?, names: [String]?) -> [Atom] {
+    private static func decodeAtoms(data: [Float]?, elements: [Int]?, names: [String]?,
+                                    charges: [Float]? = nil, formalCharges: [Int]? = nil) -> [Atom] {
         guard let ad = data, let ae = elements, let an = names else { return [] }
         var atoms: [Atom] = []
         for i in stride(from: 0, to: ad.count - 2, by: 3) {
@@ -713,7 +727,9 @@ final class LigandDatabase {
                 id: idx, element: Element(rawValue: ae[idx]) ?? .C,
                 position: SIMD3(ad[i], ad[i+1], ad[i+2]),
                 name: an[idx], residueName: "LIG", residueSeq: 1, chainID: "L",
-                charge: 0, formalCharge: 0, isHetAtom: true
+                charge: charges.flatMap { idx < $0.count ? $0[idx] : nil } ?? 0,
+                formalCharge: formalCharges.flatMap { idx < $0.count ? $0[idx] : nil } ?? 0,
+                isHetAtom: true
             ))
         }
         return atoms
@@ -769,11 +785,11 @@ final class LigandDatabase {
 
     // MARK: - Encode (v4 flat format)
 
-    private func encodeToDisk() throws -> Data {
+    nonisolated private static func encode(_ entries: [LigandEntry]) throws -> Data {
         // Only encode top-level entries (skip legacy children)
         let topLevel = entries.filter { $0.parentID == nil }
         let serializable = topLevel.map { entry -> SerializableEntry in
-            let (atomData, atomElements, atomNames) = Self.encodeAtoms(entry.atoms)
+            let (atomData, atomElements, atomNames, atomCharges, atomFormalCharges) = Self.encodeAtoms(entry.atoms)
             let bondData = Self.encodeBonds(entry.bonds)
 
             // Encode per-entry conformers for the flat model
@@ -802,7 +818,9 @@ final class LigandDatabase {
                 formKind: entry.formKind?.rawValue,
                 formRelativeEnergy: entry.relativeEnergy,
                 entryConformers: entryConfs,
-                userProperties: entry.userProperties.isEmpty ? nil : entry.userProperties
+                userProperties: entry.userProperties.isEmpty ? nil : entry.userProperties,
+                atomCharges: atomCharges,
+                atomFormalCharges: atomFormalCharges
             )
         }
         let wrapper = DatabaseWrapper(version: Self.currentFormatVersion, entries: serializable)
@@ -811,25 +829,24 @@ final class LigandDatabase {
 
     // MARK: - Decode (v1 + v2 + v3 format)
 
-    private func decodeFromDisk(_ data: Data) throws {
+    static func decodeEntries(from data: Data) throws -> [LigandEntry] {
         if let wrapper = try? JSONDecoder().decode(DatabaseWrapper.self, from: data) {
             if wrapper.version >= 3 {
-                entries = Self.decodeEntriesV3(wrapper.entries)
-            } else {
-                // v2 format: flat parent+child hierarchy → migrate to forms
-                entries = Self.decodeEntriesV2(wrapper.entries)
+                return decodeEntriesV3(wrapper.entries)
             }
-            return
+            // v2 format: flat parent+child hierarchy → migrate to forms
+            return decodeEntriesV2(wrapper.entries)
         }
         // Fall back to legacy v1 format: plain [SerializableEntry] array
         let decoded = try JSONDecoder().decode([SerializableEntry].self, from: data)
-        entries = Self.decodeEntriesV2(decoded)
+        return decodeEntriesV2(decoded)
     }
 
     /// Decode v3/v4 entries (flat model with optional legacy forms migration).
     private static func decodeEntriesV3(_ serializableEntries: [SerializableEntry]) -> [LigandEntry] {
         serializableEntries.map { s in
-            let atoms = decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames)
+            let atoms = decodeAtoms(data: s.atomData, elements: s.atomElements, names: s.atomNames,
+                                    charges: s.atomCharges, formalCharges: s.atomFormalCharges)
             let bonds = decodeBonds(data: s.bondData)
             let desc = decodeDescriptors(s)
 

@@ -9,8 +9,12 @@ import simd
 
 /// Charge Equilibration method (Rappe & Goddard, J. Phys. Chem., 1991, 95, 3358).
 ///
-/// Uses shielded Coulomb interactions J_ij = 1 / sqrt(r_ij^2 + sigma_ij^2)
-/// with per-element parameters (no hybridization dependence).
+/// Off-diagonal interactions use the Klopman–Ohno shielded Coulomb kernel
+/// (Klopman, J. Am. Chem. Soc. 1964, 86, 4550; Ohno, Theor. Chim. Acta 1964, 2, 219):
+///   J_ij = k / sqrt(r_ij^2 + a_ij^2),  a_ij = k * (1/J_i + 1/J_j) / 2  [Å]
+/// with k = e^2/(4πε0) = 14.3996 eV·Å, so J_ij → harmonic mean of J_i, J_j as r → 0
+/// and J_ij → k/r at long range. Per-element chi/J are Rappé–Goddard (no hybridization
+/// dependence, no charge-dependent hydrogen hardness).
 final class QEqChargeCalculator: ChargeCalculator, @unchecked Sendable {
 
     private let device: MTLDevice?
@@ -29,12 +33,12 @@ final class QEqChargeCalculator: ChargeCalculator, @unchecked Sendable {
         .S:  (chi: 6.928,  J: 8.972),
         .Cl: (chi: 8.564,  J: 9.892),
         .Br: (chi: 7.790,  J: 8.850),
+        .I:  (chi: 6.822,  J: 7.524),
         .Zn: (chi: 5.106,  J: 10.59),
         .Fe: (chi: 4.670,  J: 8.860),
         .Mg: (chi: 3.951,  J: 7.335),
         .Ca: (chi: 3.231,  J: 5.710),
         .Mn: (chi: 4.330,  J: 8.440),
-        // Note: Iodine (I) not in Element enum (only goes to Kr=36). Uses Br fallback.
     ]
 
     /// Coulomb constant in eV*Angstrom (e^2 / 4*pi*eps0 in eV*A).
@@ -88,17 +92,17 @@ final class QEqChargeCalculator: ChargeCalculator, @unchecked Sendable {
         for i in 0..<n {
             // Diagonal: self-Coulomb (idempotential J_ii)
             A[i * dim + i] = J0[i]
-            // RHS: electronegativity (positive chi → atom attracts electrons → negative charge)
-            b[i] = chi[i]
+            // RHS: -electronegativity. Stationarity of E = Σ(χ_i q_i + ½J_i q_i²) + Σ J_ij q_i q_j
+            // gives J_i q_i + Σ_j J_ij q_j - μ = -χ_i (same as the GPU computeQEqMatrix kernel).
+            b[i] = -chi[i]
 
             // Off-diagonal: shielded Coulomb interaction
             for j in (i + 1)..<n {
                 let r2 = simd_distance_squared(atoms[i].position, atoms[j].position)
-                // Shielding parameter: sigma_ij = 1/(2*J_i) + 1/(2*J_j)
-                let sigma = 0.5 / J0[i] + 0.5 / J0[j]
-                let sigma2 = sigma * sigma
-                // J_ij = e^2/(4*pi*eps0) / sqrt(r^2 + sigma^2)
-                let jij = Self.coulombConstant / sqrt(r2 + sigma2)
+                // Klopman–Ohno shielding length a_ij = k * (1/(2J_i) + 1/(2J_j)) in Å
+                // (k/J converts the eV^-1 hardness inverse into a length; see class doc).
+                let a = Self.coulombConstant * (0.5 / J0[i] + 0.5 / J0[j])
+                let jij = Self.coulombConstant / sqrt(r2 + a * a)
                 A[i * dim + j] = jij
                 A[j * dim + i] = jij
             }
@@ -108,7 +112,8 @@ final class QEqChargeCalculator: ChargeCalculator, @unchecked Sendable {
             A[n * dim + i] = -1.0
         }
         A[n * dim + n] = 0.0
-        b[n] = Float(totalCharge)
+        // Constraint row is -Σq = -Q
+        b[n] = -Float(totalCharge)
 
         // Solve Ax = b using LAPACK sgesv
         var n_lapack = Int32(dim)

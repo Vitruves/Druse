@@ -249,13 +249,14 @@ enum FASPRVDWParameters {
         optAcceptorAngle: Float      // optimal acceptor angle (degrees)
     ) -> Float {
         let dist = simd_distance(donor, acceptor)
-        guard dist > minHbondDist, dist < maxHbondDist else { return 0 }
+        // Boundaries are inclusive, as in FASPR (rejects only dist > max || dist < min).
+        guard dist >= minHbondDist, dist <= maxHbondDist else { return 0 }
 
         let theta = SidechainTopologyStore.angleBetween(donorBase, donor, acceptor)
-        guard theta > minHbondTheta else { return 0 }
+        guard theta >= minHbondTheta else { return 0 }
 
         let phi = SidechainTopologyStore.angleBetween(donor, acceptor, acceptorBase)
-        guard phi > minHbondPhi else { return 0 }
+        guard phi >= minHbondPhi else { return 0 }
 
         let ratio = optHbondDist / dist
         let r10 = pow(ratio, 10)
@@ -279,13 +280,14 @@ enum FASPRVDWParameters {
         sg2: SIMD3<Float>, cb2: SIMD3<Float>, ca2: SIMD3<Float>
     ) -> Float {
         let dist = simd_distance(sg1, sg2)
-        guard dist > minSSbondDist, dist < maxSSbondDist else { return 0 }
+        // Boundaries are inclusive, as in FASPR.
+        guard dist >= minSSbondDist, dist <= maxSSbondDist else { return 0 }
 
         let ang1 = SidechainTopologyStore.angleBetween(cb1, sg1, sg2)
-        guard ang1 > minSSbondAngle, ang1 < maxSSbondAngle else { return 0 }
+        guard ang1 >= minSSbondAngle, ang1 <= maxSSbondAngle else { return 0 }
 
         let ang2 = SidechainTopologyStore.angleBetween(cb2, sg2, sg1)
-        guard ang2 > minSSbondAngle, ang2 < maxSSbondAngle else { return 0 }
+        guard ang2 >= minSSbondAngle, ang2 <= maxSSbondAngle else { return 0 }
 
         let torsion = SidechainTopologyStore.dihedral(cb1, sg1, sg2, cb2)
         let deg2rad: Float = .pi / 180.0
@@ -311,6 +313,450 @@ enum FASPRVDWParameters {
         var elib = -log(probability / maxProbability)
         if elib > 5.0 { elib = 5.0 }
         return weight * elib
+    }
+
+    // MARK: - Atom-Pair VDW
+
+    /// Number of sidechain atoms beyond CB in the FASPR topology for a residue type.
+    static let sidechainAtomCount: [Character: Int] = atomTypeIndices.mapValues { max(0, $0.count - 5) }
+
+    /// True for atom types whose equilibrium distance `vdwEquilibriumDistance`
+    /// can override (H-bond donors/acceptors and Cys S). Any pair involving an
+    /// atom outside this set uses the plain combined radius.
+    static func hasDistanceOverride(_ type: Int) -> Bool {
+        type >= 9 && type <= 17 && type != 12
+    }
+
+    /// VDW energy for one atom pair including the FASPR H-bond / S-S
+    /// equilibrium-distance override (SelfEnergy::VDWType + VDWEnergyAtomAndAtom).
+    static func pairVDW(
+        _ posA: SIMD3<Float>, _ typeA: Int, _ radA: Float, _ depA: Float,
+        _ posB: SIMD3<Float>, _ typeB: Int, _ radB: Float, _ depB: Float
+    ) -> Float {
+        let dist = simd_distance(posA, posB)
+        let rij = vdwEquilibriumDistance(typeA: typeA, typeB: typeB,
+                                         combinedRadius: radA + radB, distance: dist)
+        return vdwEnergy(dstar: dist / rij, epsilon: (depA * depB).squareRoot())
+    }
+
+    // MARK: - Polar Sidechain Terms
+
+    /// Sidechain-vs-backbone H-bond energy for one rotamer of `t1` against the
+    /// backbone of another residue. `b1` = [N, CA, C, O, CB] of residue 1 (CB
+    /// required), `s1` = its sidechain atoms beyond CB in topology order,
+    /// `b2` = [N, CA, C, O, ...] of residue 2. Callers skip sequence neighbours.
+    /// Translated from SelfEnergy::EnergyPolarSidechainAndBackbone().
+    static func polarSidechainBackbone(
+        t1: Character, b1: [SIMD3<Float>], s1: [SIMD3<Float>], b2: [SIMD3<Float>]
+    ) -> Float {
+        var energy: Float = 0
+        if t1 == "D" {
+            energy = hb(b2[1], b2[0], s1[1], s1[0], 120.0, 120.0) +
+                hb(b2[1], b2[0], s1[2], s1[0], 120.0, 120.0)
+        } else if t1 == "E" {
+            energy = hb(b2[1], b2[0], s1[2], s1[1], 120.0, 120.0) +
+                hb(b2[1], b2[0], s1[3], s1[1], 120.0, 120.0)
+        } else if t1 == "K" {
+            energy = hb(s1[2], s1[3], b2[3], b2[2], 109.5, 120.0)
+        } else if t1 == "R" {
+            energy = hb(s1[3], s1[4], b2[3], b2[2], 120.0, 120.0) +
+                hb(s1[3], s1[5], b2[3], b2[2], 120.0, 120.0) +
+                hb(s1[1], s1[2], b2[3], b2[2], 120.0, 120.0)
+        } else if t1 == "W" {
+            energy = hb(s1[1], s1[3], b2[3], b2[2], 120.0, 120.0)
+        } else if t1 == "H" {
+            energy = hb(s1[0], s1[1], b2[3], b2[2], 120.0, 120.0) +
+                hb(b2[1], b2[0], s1[4], s1[2], 120.0, 120.0)
+        } else if t1 == "N" {
+            energy = hb(s1[0], s1[2], b2[3], b2[2], 120.0, 120.0) +
+                hb(b2[1], b2[0], s1[1], s1[0], 120.0, 120.0)
+        } else if t1 == "Q" {
+            energy = hb(s1[1], s1[3], b2[3], b2[2], 120.0, 120.0) +
+                hb(b2[1], b2[0], s1[2], s1[1], 120.0, 120.0)
+        } else if t1 == "S" {
+            energy = hb(b1[4], s1[0], b2[3], b2[2], 109.5, 120.0) +
+                hb(b2[1], b2[0], s1[0], b1[4], 120.0, 109.5)
+        } else if t1 == "T" {
+            energy = hb(b1[4], s1[0], b2[3], b2[2], 109.5, 120.0) +
+                hb(b2[1], b2[0], s1[0], b1[4], 120.0, 109.5)
+        } else if t1 == "Y" {
+            energy = hb(s1[5], s1[6], b2[3], b2[2], 120.0, 120.0) +
+                hb(b2[1], b2[0], s1[6], s1[5], 120.0, 120.0)
+        }
+        return energy
+    }
+
+    /// Sidechain-vs-sidechain H-bond / disulfide energy between rotamers of two
+    /// residues. Backbones must include CB; sidechains must be complete.
+    /// Translated from SelfEnergy::EnergyPolarSidechainAndSidechain().
+    static func polarSidechainSidechain(
+        t1: Character, b1: [SIMD3<Float>], s1: [SIMD3<Float>],
+        t2: Character, b2: [SIMD3<Float>], s2: [SIMD3<Float>]
+    ) -> Float {
+        var energy: Float = 0
+        if t1 == "C" {
+            if t2 == "C" {
+                energy = ss(b1[1], b1[4], s1[0], s2[0], b2[4], b2[1])
+            }
+        } else if t1 == "D" {
+            if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[2], s2[3], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[3], s2[4], s1[2], s1[0], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[2], s1[0], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[1], s2[3], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[0], s2[1], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[0], s2[2], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[1], s2[3], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[1], s1[0], 109.5, 120.0) +
+                    hb(b2[4], s2[0], s1[2], s1[0], 109.5, 120.0)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[1], s1[0], 109.5, 120.0) +
+                    hb(b2[4], s2[0], s1[2], s1[0], 109.5, 120.0)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[5], s2[6], s1[2], s1[0], 120.0, 120.0)
+            }
+        } else if t1 == "E" {
+            if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[2], s1[1], 109.5, 120.0) +
+                    hb(s2[2], s2[3], s1[3], s1[1], 109.5, 120.0)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[3], s2[4], s1[3], s1[1], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[3], s1[1], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[3], s1[1], 120.0, 120.0)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[1], s2[3], s1[3], s1[1], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[0], s2[1], s1[3], s1[1], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[0], s2[2], s1[3], s1[1], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[1], s2[3], s1[3], s1[1], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[2], s1[1], 109.5, 120.0) +
+                    hb(b2[4], s2[0], s1[3], s1[1], 109.5, 120.0)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[2], s1[1], 109.5, 120.0) +
+                    hb(b2[4], s2[0], s1[3], s1[1], 109.5, 120.0)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[5], s2[6], s1[3], s1[1], 120.0, 120.0)
+            }
+        } else if t1 == "K" {
+            if t2 == "D" {
+                energy = hb(s1[2], s1[3], s2[1], s2[0], 109.5, 120.0) +
+                    hb(s1[2], s1[3], s2[2], s2[0], 109.5, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[2], s1[3], s2[2], s2[1], 109.5, 120.0) +
+                    hb(s1[2], s1[3], s2[3], s2[1], 109.5, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s1[2], s1[3], s2[4], s2[2], 109.5, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s1[2], s1[3], s2[1], s2[0], 109.5, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s1[2], s1[3], s2[2], s2[1], 109.5, 120.0)
+            } else if t2 == "S" {
+                energy = hb(s1[2], s1[3], s2[0], b2[4], 109.5, 109.5)
+            } else if t2 == "T" {
+                energy = hb(s1[2], s1[3], s2[0], b2[4], 109.5, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s1[2], s1[3], s2[6], s2[5], 109.5, 120.0)
+            }
+        } else if t1 == "R" {
+            if t2 == "D" {
+                energy = hb(s1[3], s1[4], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[3], s1[4], s2[2], s2[0], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[2], s2[0], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[3], s1[4], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[3], s1[4], s2[3], s2[1], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[3], s2[1], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s1[3], s1[4], s2[4], s2[2], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[4], s2[2], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[4], s2[2], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s1[3], s1[4], s2[2], s2[0], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[2], s2[0], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s1[3], s1[4], s2[3], s2[1], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[3], s2[1], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(s1[3], s1[4], s2[0], b2[4], 120.0, 109.5) +
+                    hb(s1[3], s1[5], s2[0], b2[4], 120.0, 109.5) +
+                    hb(s1[1], s1[2], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "T" {
+                energy = hb(s1[3], s1[4], s2[0], b2[4], 120.0, 109.5) +
+                    hb(s1[3], s1[5], s2[0], b2[4], 120.0, 109.5) +
+                    hb(s1[1], s1[2], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s1[3], s1[4], s2[6], s2[5], 120.0, 120.0) +
+                    hb(s1[3], s1[5], s2[6], s2[5], 120.0, 120.0) +
+                    hb(s1[1], s1[2], s2[6], s2[5], 120.0, 120.0)
+            }
+        } else if t1 == "W" {
+            if t2 == "D" {
+                energy = hb(s1[1], s1[3], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[1], s1[3], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s1[1], s1[3], s2[4], s2[2], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s1[1], s1[3], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s1[1], s1[3], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(s1[1], s1[3], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "T" {
+                energy = hb(s1[1], s1[3], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s1[1], s1[3], s2[6], s2[5], 120.0, 120.0)
+            }
+        } else if t1 == "H" {
+            if t2 == "D" {
+                energy = hb(s1[0], s1[1], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[0], s1[1], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[0], s1[1], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[0], s1[1], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[4], s1[2], 109.5, 120.0)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[4], s1[2], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[4], s1[2], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[4], s1[2], 120.0, 120.0)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[1], s2[3], s1[2], s1[0], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s1[0], s1[1], s2[4], s2[2], 120.0, 120.0) +
+                    hb(s2[0], s2[1], s1[4], s1[2], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s1[0], s1[1], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s2[0], s2[2], s1[4], s1[2], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s1[0], s1[1], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s2[1], s2[3], s1[4], s1[2], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(s1[0], s1[1], s2[0], b2[4], 120.0, 109.5) +
+                    hb(b2[4], s2[0], s1[4], s1[2], 120.0, 109.5)
+            } else if t2 == "T" {
+                energy = hb(s1[0], s1[1], s2[0], b2[4], 120.0, 109.5) +
+                    hb(b2[4], s2[0], s1[4], s1[2], 120.0, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s1[0], s1[1], s2[6], s2[5], 120.0, 120.0) +
+                    hb(s2[5], s2[6], s1[4], s1[2], 120.0, 120.0)
+            }
+        } else if t1 == "N" {
+            if t2 == "D" {
+                energy = hb(s1[0], s1[2], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[0], s1[2], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[0], s1[2], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[0], s1[2], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[1], s1[0], 109.5, 120.0)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[1], s1[0], 120.0, 120.0)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[1], s1[0], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s1[0], s1[2], s2[4], s2[2], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s1[0], s1[2], s2[1], s2[0], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[1], s1[0], 120.0, 120.0) +
+                    hb(s1[0], s1[2], s2[2], s2[1], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[1], s1[0], 109.5, 120.0) +
+                    hb(s1[0], s1[2], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[1], s1[0], 109.5, 120.0) +
+                    hb(s1[0], s1[2], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[1], s1[0], 109.5, 120.0) +
+                    hb(s1[0], s1[2], s2[6], s2[5], 120.0, 120.0)
+            }
+        } else if t1 == "Q" {
+            if t2 == "D" {
+                energy = hb(s1[1], s1[3], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[1], s1[3], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[2], s1[1], 109.5, 120.0)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[2], s1[1], 120.0, 120.0)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[2], s1[1], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[4], s2[2], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[1], s2[0], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[2], s1[1], 120.0, 120.0) +
+                    hb(s1[1], s1[3], s2[2], s2[1], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[2], s1[1], 109.5, 120.0) +
+                    hb(s1[1], s1[3], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[2], s1[1], 109.5, 120.0) +
+                    hb(s1[1], s1[3], s2[0], b2[4], 120.0, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[2], s1[1], 109.5, 120.0) +
+                    hb(s1[1], s1[3], s2[6], s2[5], 120.0, 120.0)
+            }
+        } else if t1 == "S" {
+            if t2 == "D" {
+                energy = hb(b1[4], s1[0], s2[1], s2[0], 120.0, 120.0) +
+                    hb(b1[4], s1[0], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(b1[4], s1[0], s2[2], s2[1], 120.0, 120.0) +
+                    hb(b1[4], s1[0], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[0], b1[4], 109.5, 109.5)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[0], b1[4], 120.0, 109.5) +
+                    hb(s2[3], s2[5], s1[0], b1[4], 120.0, 109.5) +
+                    hb(s2[1], s2[2], s1[0], b1[4], 120.0, 109.5)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[0], b1[4], 120.0, 109.5)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[0], b1[4], 120.0, 109.5) +
+                    hb(b1[4], s1[0], s2[4], s2[2], 109.5, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[0], b1[4], 120.0, 109.5) +
+                    hb(b1[4], s1[0], s2[1], s2[0], 109.5, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[0], b1[4], 120.0, 109.5) +
+                    hb(b1[4], s1[0], s2[2], s2[1], 109.5, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[0], b1[4], 109.5, 109.5)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[0], b1[4], 109.5, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[0], b1[4], 120.0, 109.5)
+            }
+        } else if t1 == "T" {
+            if t2 == "D" {
+                energy = hb(b1[4], s1[0], s2[1], s2[0], 120.0, 120.0) +
+                    hb(b1[4], s1[0], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(b1[4], s1[0], s2[2], s2[1], 120.0, 120.0) +
+                    hb(b1[4], s1[0], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[0], b1[4], 109.5, 109.5)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[0], b1[4], 120.0, 109.5) +
+                    hb(s2[3], s2[5], s1[0], b1[4], 120.0, 109.5) +
+                    hb(s2[1], s2[2], s1[0], b1[4], 120.0, 109.5)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[0], b1[4], 120.0, 109.5)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[0], b1[4], 120.0, 109.5) +
+                    hb(b1[4], s1[0], s2[4], s2[2], 109.5, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[0], b1[4], 120.0, 109.5) +
+                    hb(b1[4], s1[0], s2[1], s2[0], 109.5, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[0], b1[4], 120.0, 109.5) +
+                    hb(b1[4], s1[0], s2[2], s2[1], 109.5, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[0], b1[4], 109.5, 109.5)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[0], b1[4], 109.5, 109.5)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[0], b1[4], 120.0, 109.5)
+            }
+        } else if t1 == "Y" {
+            if t2 == "D" {
+                energy = hb(s1[5], s1[6], s2[1], s2[0], 120.0, 120.0) +
+                    hb(s1[5], s1[6], s2[2], s2[0], 120.0, 120.0)
+            } else if t2 == "E" {
+                energy = hb(s1[5], s1[6], s2[2], s2[1], 120.0, 120.0) +
+                    hb(s1[5], s1[6], s2[3], s2[1], 120.0, 120.0)
+            } else if t2 == "K" {
+                energy = hb(s2[2], s2[3], s1[6], s1[5], 109.5, 120.0)
+            } else if t2 == "R" {
+                energy = hb(s2[3], s2[4], s1[6], s1[5], 120.0, 120.0) +
+                    hb(s2[3], s2[5], s1[6], s1[5], 120.0, 120.0) +
+                    hb(s2[1], s2[2], s1[6], s1[5], 120.0, 120.0)
+            } else if t2 == "W" {
+                energy = hb(s2[1], s2[3], s1[6], s1[5], 120.0, 120.0)
+            } else if t2 == "H" {
+                energy = hb(s2[0], s2[1], s1[6], s1[5], 120.0, 120.0) +
+                    hb(s1[5], s1[6], s2[4], s2[2], 120.0, 120.0)
+            } else if t2 == "N" {
+                energy = hb(s2[0], s2[2], s1[6], s1[5], 120.0, 120.0) +
+                    hb(s1[5], s1[6], s2[1], s2[0], 120.0, 120.0)
+            } else if t2 == "Q" {
+                energy = hb(s2[1], s2[3], s1[6], s1[5], 120.0, 120.0) +
+                    hb(s1[5], s1[6], s2[2], s2[1], 120.0, 120.0)
+            } else if t2 == "S" {
+                energy = hb(b2[4], s2[0], s1[6], s1[5], 109.5, 120.0)
+            } else if t2 == "T" {
+                energy = hb(b2[4], s2[0], s1[6], s1[5], 109.5, 120.0)
+            } else if t2 == "Y" {
+                energy = hb(s2[5], s2[6], s1[6], s1[5], 120.0, 120.0)
+            }
+        }
+        return energy
+    }
+
+    private static func hb(
+        _ db: SIMD3<Float>, _ d: SIMD3<Float>, _ a: SIMD3<Float>, _ ab: SIMD3<Float>,
+        _ dAngle: Float, _ aAngle: Float
+    ) -> Float {
+        hbondEnergy(donorBase: db, donor: d, acceptor: a, acceptorBase: ab,
+                    optDonorAngle: dAngle, optAcceptorAngle: aAngle)
+    }
+
+    private static func ss(
+        _ ca1: SIMD3<Float>, _ cb1: SIMD3<Float>, _ sg1: SIMD3<Float>,
+        _ sg2: SIMD3<Float>, _ cb2: SIMD3<Float>, _ ca2: SIMD3<Float>
+    ) -> Float {
+        ssbondEnergy(ca1: ca1, cb1: cb1, sg1: sg1, sg2: sg2, cb2: cb2, ca2: ca2)
     }
 }
 

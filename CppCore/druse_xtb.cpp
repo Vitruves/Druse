@@ -40,15 +40,21 @@
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
 #include <mutex>
+#include <atomic>
 
 // ============================================================================
 // MARK: - GPU Acceleration Context (set by Swift Metal layer)
 // ============================================================================
 
-static DruseXTBGPUContext *g_xtb_gpu = nullptr;
+// Written from the Swift/Metal setup thread, read from calculation threads.
+static std::atomic<DruseXTBGPUContext *> g_xtb_gpu{nullptr};
 
 extern "C" void druse_xtb_set_gpu_context(DruseXTBGPUContext *ctx) {
-    g_xtb_gpu = ctx;
+    g_xtb_gpu.store(ctx, std::memory_order_release);
+}
+
+static DruseXTBGPUContext *xtb_gpu() {
+    return g_xtb_gpu.load(std::memory_order_acquire);
 }
 
 // ============================================================================
@@ -100,8 +106,14 @@ static constexpr double GFN2_THIRDORDER_S = 1.0;
 static constexpr double GFN2_THIRDORDER_P = 0.5;
 static constexpr double GFN2_THIRDORDER_D = 0.25;
 
-// Repulsion parameters
+// Repulsion distance exponent: 1.5 for every pair involving an atom heavier than He,
+// 1.0 when both atoms are H/He (tblite gfn2 rep_kexp / rep_kexp_light).
 static constexpr double GFN2_KEXP = 1.5;
+static constexpr double GFN2_KEXP_LIGHT = 1.0;
+
+static inline double gfn2RepExponent(int Zi, int Zj) {
+    return (Zi > 2 || Zj > 2) ? GFN2_KEXP : GFN2_KEXP_LIGHT;
+}
 
 // Maximum supported atomic number
 static constexpr int MAX_ATOMIC_NUM = 86;
@@ -112,7 +124,7 @@ static constexpr int MAX_ATOMIC_NUM = 86;
 //   For row 3+: s=0, p=1, d=2
 //   For transition metals: d=2 is listed first (matching tblite convention)
 static GFN2Element gfn2Params[MAX_ATOMIC_NUM + 1];
-static bool gfn2ParamsInitialized = false;
+static std::once_flag gfn2ParamsOnce;
 
 /// Helper to set up one element's parameters.
 /// shpoly: raw values from param file (NOT pre-divided by 100)
@@ -158,8 +170,7 @@ static void setElement(int Z, int nShells,
 
 /// Initialize the GFN2 parameter table for all supported elements.
 /// Values taken directly from tblite gfn2-molmom.toml parametrization.
-static void initGFN2Params() {
-    if (gfn2ParamsInitialized) return;
+static void fillGFN2Params() {
     std::memset(gfn2Params, 0, sizeof(gfn2Params));
 
     // H (Z=1): 1s  — atomicRad=0.32 Å
@@ -330,8 +341,13 @@ static void initGFN2Params() {
         double kc[] = {-0.050615, 0.0084766, 0.3077127}; int ng[] = {4, 4, 3};
         setElement(53, 3, am, sl, lv, ro, 0.383124, lg, 0.12, 63.319176, 1.017946, 2.66, sp, kc, ng, 1.36);
     }
+}
 
-    gfn2ParamsInitialized = true;
+/// Thread-safe one-time initialization: concurrent callers (charge, energy,
+/// gradient, optimization run on independent threads) must never observe the
+/// table while another thread is memset-ing or filling it.
+static void initGFN2Params() {
+    std::call_once(gfn2ParamsOnce, fillGFN2Params);
 }
 
 /// Number of basis functions for a given angular momentum.
@@ -770,8 +786,9 @@ static void computeCN(const double *pos_bohr, const int *Z, int natom,
     cn.assign(natom, 0.0);
 
     // GPU path: dispatch to Metal compute if available
-    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_cn && natom >= 8) {
-        g_xtb_gpu->gpu_compute_cn(g_xtb_gpu->context, pos_bohr,
+    DruseXTBGPUContext *gpu = xtb_gpu();
+    if (gpu && gpu->gpu_compute_cn && natom >= 8) {
+        gpu->gpu_compute_cn(gpu->context, pos_bohr,
                                    reinterpret_cast<const int32_t*>(Z),
                                    natom, cn.data());
         return;
@@ -838,8 +855,9 @@ static double shell_gamma(double r_bohr, double gam_i, double lgam_i,
 /// Z_eff is the effective nuclear charge, and arep controls the steepness.
 static double computeRepulsion(const double *pos_bohr, const int *Z, int natom) {
     // GPU path
-    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_repulsion && natom >= 8) {
-        return g_xtb_gpu->gpu_compute_repulsion(g_xtb_gpu->context, pos_bohr,
+    DruseXTBGPUContext *gpu = xtb_gpu();
+    if (gpu && gpu->gpu_compute_repulsion && natom >= 8) {
+        return gpu->gpu_compute_repulsion(gpu->context, pos_bohr,
                                                  reinterpret_cast<const int32_t*>(Z),
                                                  natom, nullptr);
     }
@@ -860,7 +878,7 @@ static double computeRepulsion(const double *pos_bohr, const int *Z, int natom) 
             if (r < 1e-6) continue;
 
             double alpha = std::sqrt(pi.arep * pj.arep);
-            double kexp = GFN2_KEXP;
+            double kexp = gfn2RepExponent(Z[i], Z[j]);
             double rk = std::pow(r, kexp);
             double rep = pi.zeff * pj.zeff / r * std::exp(-alpha * rk);
             Erep += rep;
@@ -1238,6 +1256,40 @@ static void mullikenCharges(const std::vector<double> &P,
     }
 }
 
+/// Constrain mixed SCC charges to the molecule's electron count and rebuild
+/// atom charges from shell charges.
+///
+/// Internal charges are population excess (pop - refOcc), so for a molecule of
+/// net charge Q they must sum to -Q (the density matrix itself always holds
+/// Σ refOcc - Q electrons). The per-atom correction is split over that atom's
+/// shells in proportion to their reference occupation, so atom charges remain
+/// the exact sum of their shell charges.
+static void enforceElectronCount(const std::vector<ShellInfo> &shells,
+                                 int natom, int totalCharge,
+                                 std::vector<double> &shellCharges,
+                                 std::vector<double> &atomCharges) {
+    atomCharges.assign(natom, 0.0);
+    std::vector<double> atomRefOcc(natom, 0.0);
+    std::vector<int> atomShellCount(natom, 0);
+    for (size_t si = 0; si < shells.size(); si++) {
+        int a = shells[si].atomIdx;
+        atomCharges[a] += shellCharges[si];
+        atomRefOcc[a] += shells[si].refOcc;
+        atomShellCount[a]++;
+    }
+
+    double qsum = std::accumulate(atomCharges.begin(), atomCharges.end(), 0.0);
+    double shift = (-(double)totalCharge - qsum) / natom;
+    for (int a = 0; a < natom; a++) atomCharges[a] += shift;
+    for (size_t si = 0; si < shells.size(); si++) {
+        int a = shells[si].atomIdx;
+        double weight = atomRefOcc[a] > 0.0
+            ? shells[si].refOcc / atomRefOcc[a]
+            : 1.0 / std::max(1, atomShellCount[a]);
+        shellCharges[si] += shift * weight;
+    }
+}
+
 // ============================================================================
 // MARK: - SCC Potential (Charge-Dependent Hamiltonian Shift)
 // ============================================================================
@@ -1399,9 +1451,24 @@ static double computeD4Dispersion(const double *pos_bohr, const int *Z, int nato
                                    double *gradient = nullptr);
 // Remove default from actual definition below (only one default allowed)
 
-extern "C" {
+/// Allocate a zeroed xTB result carrying an error message. Used when inputs are
+/// invalid or an exception (e.g. std::bad_alloc for huge systems) would
+/// otherwise escape across the extern "C" boundary into Swift.
+template <typename Result>
+static Result *xtbErrorResult(int32_t atomCount, const char *message) {
+    auto *result = new Result();
+    std::memset(result, 0, sizeof(Result));
+    result->atomCount = atomCount;
+    result->success = false;
+    std::snprintf(result->errorMessage, sizeof(result->errorMessage), "%s", message);
+    return result;
+}
 
-DruseXTBChargeResult* druse_xtb_compute_charges(
+static bool xtbInputsValid(const float *positions, const int32_t *atomicNumbers, int32_t atomCount) {
+    return positions && atomicNumbers && atomCount > 0;
+}
+
+static DruseXTBChargeResult* computeChargesImpl(
     const float *positions,
     const int32_t *atomicNumbers,
     int32_t atomCount,
@@ -1415,12 +1482,6 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
     auto *result = new DruseXTBChargeResult();
     std::memset(result, 0, sizeof(DruseXTBChargeResult));
     result->atomCount = atomCount;
-
-    if (atomCount <= 0) {
-        result->success = false;
-        std::snprintf(result->errorMessage, 512, "Invalid atom count: %d", atomCount);
-        return result;
-    }
 
     // Validate elements
     for (int i = 0; i < atomCount; i++) {
@@ -1710,23 +1771,7 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
             hasHistory = true;
         }
 
-        // Recompute atom charges from shell charges
-        std::fill(atomCharges.begin(), atomCharges.end(), 0.0);
-        for (size_t si = 0; si < shells.size(); si++) {
-            atomCharges[shells[si].atomIdx] += shellCharges[si];
-        }
-
-        // Enforce charge neutrality: shift charges so they sum to totalCharge
-        double qsum = std::accumulate(atomCharges.begin(), atomCharges.end(), 0.0);
-        double shift = (totalCharge - qsum) / atomCount;
-        for (int a = 0; a < atomCount; a++) {
-            atomCharges[a] += shift;
-        }
-        // Distribute shift back to shell charges proportionally
-        for (size_t si = 0; si < shells.size(); si++) {
-            shellCharges[si] += shift * shells[si].refOcc /
-                std::max(1.0, (double)gfn2Params[Z[shells[si].atomIdx]].nShells);
-        }
+        enforceElectronCount(shells, atomCount, totalCharge, shellCharges, atomCharges);
     }
 
     if (!converged) {
@@ -1790,6 +1835,26 @@ DruseXTBChargeResult* druse_xtb_compute_charges(
     }
 
     return result;
+}
+
+extern "C" {
+
+DruseXTBChargeResult* druse_xtb_compute_charges(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    int32_t maxIterations)
+{
+    if (!xtbInputsValid(positions, atomicNumbers, atomCount))
+        return xtbErrorResult<DruseXTBChargeResult>(atomCount, "Invalid input: no atoms");
+    try {
+        return computeChargesImpl(positions, atomicNumbers, atomCount, totalCharge, maxIterations);
+    } catch (const std::exception &e) {
+        return xtbErrorResult<DruseXTBChargeResult>(atomCount, e.what());
+    } catch (...) {
+        return xtbErrorResult<DruseXTBChargeResult>(atomCount, "Unknown error in xTB charge calculation");
+    }
 }
 
 void druse_xtb_free_result(DruseXTBChargeResult *result) {
@@ -2040,15 +2105,7 @@ static bool runSCC(const float *positions, const int32_t *atomicNumbers,
             hasHistory = true;
         }
 
-        std::fill(ws.atomCharges.begin(), ws.atomCharges.end(), 0.0);
-        for (int si = 0; si < ws.nshells; si++)
-            ws.atomCharges[ws.shells[si].atomIdx] += ws.shellCharges[si];
-        double qsum = std::accumulate(ws.atomCharges.begin(), ws.atomCharges.end(), 0.0);
-        double shift = (totalCharge - qsum) / atomCount;
-        for (int a = 0; a < atomCount; a++) ws.atomCharges[a] += shift;
-        for (int si = 0; si < ws.nshells; si++)
-            ws.shellCharges[si] += shift * ws.shells[si].refOcc /
-                std::max(1.0, (double)gfn2Params[ws.Z[ws.shells[si].atomIdx]].nShells);
+        enforceElectronCount(ws.shells, atomCount, totalCharge, ws.shellCharges, ws.atomCharges);
     }
 
     if (!ws.converged) {
@@ -2152,9 +2209,10 @@ static double computeD4Dispersion(const double *pos_bohr, const int *Z, int nato
                                    const std::vector<double> &cn,
                                    double *gradient) {
     // GPU path
-    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_d4 && natom >= 8) {
+    DruseXTBGPUContext *gpu = xtb_gpu();
+    if (gpu && gpu->gpu_compute_d4 && natom >= 8) {
         if (gradient) std::memset(gradient, 0, 3 * natom * sizeof(double));
-        return g_xtb_gpu->gpu_compute_d4(g_xtb_gpu->context, pos_bohr,
+        return gpu->gpu_compute_d4(gpu->context, pos_bohr,
                                           reinterpret_cast<const int32_t*>(Z),
                                           natom, cn.data(), gradient);
     }
@@ -2272,8 +2330,18 @@ static double getVdwRad(int Z) {
     return 3.4; // fallback (~1.80 Å)
 }
 
-/// Compute Born radii using the Still/OBC-II method.
-/// Reference: Onufriev, Bashford, Case, Proteins 2004, 55, 383-394
+/// Compute Born radii (OBC-II) and Gaussian-burial SASA.
+/// Must stay identical to the Metal kernel xtb_born_radii (used for natom >= 8):
+/// HCT pairwise descreening integral (Hawkins, Cramer, Truhlar, J. Phys. Chem. 1996,
+/// 100, 19824) with the OBC-II rescaling (Onufriev, Bashford, Case, Proteins 2004,
+/// 55, 383), following OpenMM's ReferenceObc:
+///   ρ̃_i = ρ_i - offset,  s_j = ρ̃_j * scale
+///   I_ij = 1/L - 1/U + r/4 (1/U² - 1/L²) + ln(L/U)/(2r) + s_j²/(4r) (1/L² - 1/U²)
+///          with L = max(ρ̃_i, |r - s_j|), U = r + s_j  (only when ρ̃_i < r + s_j),
+///          plus 2 (1/ρ̃_i - 1/L) when atom i lies inside the descreening sphere of j
+///   ψ_i = ½ ρ̃_i Σ_j I_ij
+///   B_i = 1 / (1/ρ̃_i - tanh(αψ - βψ² + γψ³) / ρ_i),  (α, β, γ) = (1.0, 0.8, 4.85)
+/// SASA: 4π(ρ_i + r_probe)² * exp(-0.5 * burial)
 static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
                               double probeRad_bohr, double offset_bohr, double bornScale,
                               std::vector<double> &brad,
@@ -2282,8 +2350,9 @@ static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
     sasa.resize(natom);
 
     // GPU path
-    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_born && natom >= 8) {
-        g_xtb_gpu->gpu_compute_born(g_xtb_gpu->context, pos_bohr,
+    DruseXTBGPUContext *gpu = xtb_gpu();
+    if (gpu && gpu->gpu_compute_born && natom >= 8) {
+        gpu->gpu_compute_born(gpu->context, pos_bohr,
                                      reinterpret_cast<const int32_t*>(Z),
                                      natom, (float)probeRad_bohr, (float)offset_bohr,
                                      (float)bornScale, brad.data(), sasa.data());
@@ -2291,15 +2360,18 @@ static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
     }
 
     // CPU fallback
-    // Step 1: Compute psi (descreening integral) for each atom
-    std::vector<double> psi(natom, 0.0);
+    static constexpr double obc_alpha = 1.0;
+    static constexpr double obc_beta  = 0.8;
+    static constexpr double obc_gamma = 4.85;
 
     for (int i = 0; i < natom; i++) {
-        double ri = getVdwRad(Z[i]) + offset_bohr;
+        double rhoI = getVdwRad(Z[i]);
+        double rhoOffI = rhoI - offset_bohr;
 
+        // Step 1: HCT pairwise descreening integral
+        double sum = 0.0;
         for (int j = 0; j < natom; j++) {
             if (i == j) continue;
-            double rj = getVdwRad(Z[j]) + offset_bohr;
 
             double dx = pos_bohr[3*i]   - pos_bohr[3*j];
             double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
@@ -2307,40 +2379,32 @@ static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
             double rij = std::sqrt(dx*dx + dy*dy + dz*dz);
             if (rij < 1e-8) continue;
 
-            double sj = rj * bornScale;
+            double sj = (getVdwRad(Z[j]) - offset_bohr) * bornScale;
+            if (rhoOffI >= rij + sj) continue;   // descreening sphere of j lies inside atom i
 
-            // Compute the descreening contribution
-            if (rij > ri + sj) {
-                // No overlap: standard 1/r contribution
-                psi[i] += 0.5 * (1.0/(rij - sj) - 1.0/(rij + sj)
-                    + sj * 0.25 * (1.0/((rij + sj)*(rij + sj)) - 1.0/((rij - sj)*(rij - sj)))
-                    + 0.5 * std::log((rij - sj)/(rij + sj)) / rij);
-            } else if (rij > std::fabs(ri - sj)) {
-                // Partial overlap
-                double d = rij - sj;
-                if (std::fabs(d) < 1e-8) d = 1e-8;
-                psi[i] += 0.25 * (2.0/rij - 1.0/(rij + sj) - ri/(4.0*sj*rij)
-                    + 0.25 * (1.0/(sj*sj) - 1.0/(ri*ri))
-                    + 0.5 * std::log(std::fabs(d)/(rij + sj)) / rij);
+            double invR = 1.0 / rij;
+            double invL = 1.0 / std::max(rhoOffI, std::fabs(rij - sj));
+            double invU = 1.0 / (rij + sj);
+            double invL2 = invL * invL;
+            double invU2 = invU * invU;
+
+            double term = invL - invU
+                        + 0.25 * rij * (invU2 - invL2)
+                        + 0.5 * invR * std::log(invU / invL)
+                        + 0.25 * sj * sj * invR * (invL2 - invU2);
+            if (rhoOffI < sj - rij) {
+                term += 2.0 * (1.0 / rhoOffI - invL);
             }
-            // else fully buried: different formula omitted for simplicity
+            sum += term;
         }
 
-        // OBC-II correction: apply three-parameter scaling
-        // Reference: Onufriev, Bashford, Case (2004)
-        double br = psi[i] * ri;
-        static constexpr double obc_alpha = 1.0;
-        static constexpr double obc_beta  = 0.8;
-        static constexpr double obc_gamma = 4.85;
+        // OBC-II three-parameter correction
+        double psi = 0.5 * rhoOffI * sum;
+        double targ = psi * (obc_alpha - psi * (obc_beta - psi * obc_gamma));
+        brad[i] = 1.0 / (1.0 / rhoOffI - std::tanh(targ) / rhoI);
 
-        double arg = br * (obc_alpha - br * (obc_beta - br * obc_gamma));
-        double tanh_arg = std::tanh(arg);
-
-        brad[i] = 1.0 / (1.0/ri - tanh_arg/ri);
-
-        // Approximate SASA: each atom's solvent-accessible surface area
-        // Simple Gaussian approximation (fast)
-        double probe_sum = getVdwRad(Z[i]) + probeRad_bohr;
+        // Step 2: Gaussian SASA burial approximation
+        double probe_sum = rhoI + probeRad_bohr;
         double area = 4.0 * PI * probe_sum * probe_sum;
         double burial = 0.0;
         for (int j = 0; j < natom; j++) {
@@ -2357,16 +2421,93 @@ static void computeBornRadii(const double *pos_bohr, const int *Z, int natom,
     }
 }
 
-/// Compute GBSA/ALPB solvation energy (and optionally gradient).
-/// Returns solvation free energy in Hartree.
-static double computeSolvation(const double *pos_bohr, const int *Z, int natom,
+/// Generalized Born polar solvation energy (Still et al., JACS 1990):
+///   E_GB = -1/2 * (1 - 1/eps) * Σ_i Σ_j q_i q_j / f_GB(r_ij)
+/// with the full double sum (self terms included once, each i≠j pair twice),
+/// f_GB = sqrt(r² + B_i B_j exp(-r²/(4 B_i B_j))). A single ion therefore gets
+/// the Born energy -1/2 (1 - 1/eps) q²/B.
+static double generalizedBornEnergy(const double *pos_bohr, int natom,
+                                    const std::vector<double> &atomCharges,
+                                    const std::vector<double> &brad,
+                                    double keps) {
+    double pairSum = 0.0;
+    for (int i = 0; i < natom; i++) {
+        // Sign convention: atomCharges are pop-refOcc (internal), negate for real charges
+        double qi = -atomCharges[i];
+        pairSum += qi * qi / brad[i];
+        for (int j = i + 1; j < natom; j++) {
+            double qj = -atomCharges[j];
+            double dx = pos_bohr[3*i]   - pos_bohr[3*j];
+            double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
+            double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double BiBj = brad[i] * brad[j];
+            double fGB = std::sqrt(r2 + BiBj * std::exp(-r2 / (4.0 * BiBj)));
+            pairSum += 2.0 * qi * qj / fGB;
+        }
+    }
+    return -0.5 * keps * pairSum;
+}
+
+/// ALPB electrostatic size A_det (Sigalov, Fenley, Onufriev, J. Chem. Phys. 2006,
+/// 124, 124902; Ehlert et al., JCTC 2021, 17, 4250), as in tblite get_adet:
+/// the molecule is modelled as a set of uniform spheres of radius ρ_i centred on
+/// their ρ³-weighted centroid; with the inertia-like tensor
+///   I = Σ_i ρ_i³ ((|v_i|² + 2/5 ρ_i²) 1 - v_i ⊗ v_i),  v_i = R_i - centroid,
+/// A_det = sqrt(det(I)^(1/3) / (2/5 Σ_i ρ_i³)), which equals ρ for a single sphere.
+/// Radii are the same Bondi radii used for the Born radii.
+static double alpbElectrostaticSize(const double *pos_bohr, const int *Z, int natom) {
+    static constexpr double tof = 2.0 / 5.0;
+    double vol = 0.0;
+    double center[3] = {0.0, 0.0, 0.0};
+    for (int i = 0; i < natom; i++) {
+        double r = getVdwRad(Z[i]);
+        double r3 = r * r * r;
+        vol += r3;
+        for (int d = 0; d < 3; d++) center[d] += r3 * pos_bohr[3*i + d];
+    }
+    for (int d = 0; d < 3; d++) center[d] /= vol;
+
+    double inertia[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    for (int i = 0; i < natom; i++) {
+        double r = getVdwRad(Z[i]);
+        double r2 = r * r;
+        double r3 = r2 * r;
+        double v[3] = {pos_bohr[3*i] - center[0],
+                       pos_bohr[3*i+1] - center[1],
+                       pos_bohr[3*i+2] - center[2]};
+        double diag = v[0]*v[0] + v[1]*v[1] + v[2]*v[2] + tof * r2;
+        for (int a = 0; a < 3; a++) {
+            for (int b = 0; b < 3; b++) {
+                inertia[a][b] += r3 * ((a == b ? diag : 0.0) - v[a] * v[b]);
+            }
+        }
+    }
+    double det = inertia[0][0] * (inertia[1][1]*inertia[2][2] - inertia[1][2]*inertia[2][1])
+               - inertia[0][1] * (inertia[1][0]*inertia[2][2] - inertia[1][2]*inertia[2][0])
+               + inertia[0][2] * (inertia[1][0]*inertia[2][1] - inertia[1][1]*inertia[2][0]);
+    return std::sqrt(std::cbrt(det) / (tof * vol));
+}
+
+/// Solvation free energy (Hartree) at one geometry: polar GB/ALPB + SASA non-polar.
+///
+/// GBSA:  E_pol = -1/2 (1 - 1/ε) Σ_ij q_i q_j / f_GB(r_ij)
+/// ALPB (Ehlert et al., JCTC 2021, 17, 4250; tblite alpb.f90), with ε_in = 1:
+///   E_pol = -1/2 (1 - 1/ε)/(1 + αβ) Σ_ij q_i q_j (1/f_GB(r_ij) + αβ/A_det)
+///   αβ = α/ε, α = 0.571412,
+/// i.e. a GB term scaled by 1/(1+αβ) plus a shape term ∝ Q_total² / A_det.
+/// Deviations from xtb/tblite: the Still f_GB kernel and the Bondi radii /
+/// Gaussian SASA used throughout this file are kept (xtb's ALPB uses the P16
+/// kernel and its own fitted radii and surface tensions).
+static double solvationEnergyAt(const double *pos_bohr, const int *Z, int natom,
                                 const std::vector<double> &atomCharges,
-                                DruseXTBSolvationConfig solv,
-                                double *gradient = nullptr) {
-    if (solv.model == DRUSE_XTB_SOLV_NONE) return 0.0;
+                                const DruseXTBSolvationConfig &solv) {
+    static constexpr double ALPB_ALPHA = 0.571412;
 
     double eps = solv.dielectricConstant;
-    double keps = (1.0 - 1.0 / eps); // Born prefactor: E_GB = -0.5 * (1 - 1/ε) * Σ q_i*q_j/f_GB
+    double keps = (1.0 - 1.0 / eps); // Born prefactor (see generalizedBornEnergy)
+    double alpbet = (solv.model == DRUSE_XTB_SOLV_ALPB) ? ALPB_ALPHA / eps : 0.0;
+    keps /= (1.0 + alpbet);
 
     double probeRad_bohr = solv.probeRadius * ANG_TO_BOHR;
     double offset_bohr = solv.bornOffset * ANG_TO_BOHR;
@@ -2374,60 +2515,14 @@ static double computeSolvation(const double *pos_bohr, const int *Z, int natom,
     std::vector<double> brad, sasa;
     computeBornRadii(pos_bohr, Z, natom, probeRad_bohr, offset_bohr, solv.bornScale, brad, sasa);
 
-    double Eborn = 0.0;
-    double Esasa = 0.0;
+    double Epol = generalizedBornEnergy(pos_bohr, natom, atomCharges, brad, keps);
 
-    // Generalized Born energy: E_GB = -0.5 * keps * Σ_ij q_i*q_j / f_GB(r_ij)
-    // f_GB = sqrt(r²_ij + B_i*B_j * exp(-r²_ij/(4*B_i*B_j)))  (Still formula)
-    for (int i = 0; i < natom; i++) {
+    if (alpbet > 0.0) {
         // Sign convention: atomCharges are pop-refOcc (internal), negate for real charges
-        double qi = -atomCharges[i];
-        for (int j = i; j < natom; j++) {
-            double qj = -atomCharges[j];
-
-            double r2;
-            if (i == j) {
-                r2 = 0.0;
-            } else {
-                double dx = pos_bohr[3*i]   - pos_bohr[3*j];
-                double dy = pos_bohr[3*i+1] - pos_bohr[3*j+1];
-                double dz = pos_bohr[3*i+2] - pos_bohr[3*j+2];
-                r2 = dx*dx + dy*dy + dz*dz;
-            }
-
-            double BiBj = brad[i] * brad[j];
-            double expfac = std::exp(-r2 / (4.0 * BiBj));
-            double fGB = std::sqrt(r2 + BiBj * expfac);
-
-            double contrib = qi * qj / fGB;
-            if (i == j)
-                Eborn += 0.5 * contrib;
-            else
-                Eborn += contrib;
-        }
-    }
-    Eborn *= -0.5 * keps;
-
-    // ALPB correction for non-spherical charge distributions
-    if (solv.model == DRUSE_XTB_SOLV_ALPB) {
-        // α_ALPB = 0.571412 (Ehlert et al., JCTC 2021)
-        static constexpr double ALPB_ALPHA = 0.571412;
         double qtot = 0.0;
-        for (int i = 0; i < natom; i++) qtot += -atomCharges[i];
-        // Shape correction: E_alpb = α * keps * q_tot² / (4π * <r²>)
-        if (std::fabs(qtot) > 1e-8) {
-            // Compute geometric mean radius
-            double r2avg = 0.0;
-            for (int i = 0; i < natom; i++) {
-                double x = pos_bohr[3*i], y = pos_bohr[3*i+1], z = pos_bohr[3*i+2];
-                r2avg += x*x + y*y + z*z;
-            }
-            r2avg /= natom;
-            double reff = std::sqrt(r2avg);
-            if (reff > 1e-6) {
-                Eborn += ALPB_ALPHA * keps * qtot * qtot / (4.0 * PI * reff);
-            }
-        }
+        for (int i = 0; i < natom; i++) qtot -= atomCharges[i];
+        double aDet = alpbElectrostaticSize(pos_bohr, Z, natom);
+        Epol += -0.5 * keps * alpbet / aDet * qtot * qtot;
     }
 
     // SASA non-polar contribution: E_sasa = γ * Σ SASA_i
@@ -2435,70 +2530,38 @@ static double computeSolvation(const double *pos_bohr, const int *Z, int natom,
     //   1 dyn/cm = 1e-3 J/m², 1 Bohr² = 2.8003e-21 m², 1 Hartree = 4.3597e-18 J
     //   γ(Hartree/Bohr²) = γ(dyn/cm) * 1e-3 * 2.8003e-21 / 4.3597e-18
     double gamma_au = solv.surfaceTension * 6.4232e-7;
-    for (int i = 0; i < natom; i++) {
-        Esasa += gamma_au * sasa[i];
-    }
+    double Esasa = 0.0;
+    for (int i = 0; i < natom; i++) Esasa += gamma_au * sasa[i];
 
-    // Gradient (numerical for solvation — exact analytical is complex)
+    return Epol + Esasa;
+}
+
+/// Compute GBSA/ALPB solvation energy (and optionally gradient).
+/// Returns solvation free energy in Hartree; the gradient (Hartree/Bohr) is
+/// accumulated into `gradient` by central finite differences at fixed charges.
+static double computeSolvation(const double *pos_bohr, const int *Z, int natom,
+                                const std::vector<double> &atomCharges,
+                                DruseXTBSolvationConfig solv,
+                                double *gradient = nullptr) {
+    if (solv.model == DRUSE_XTB_SOLV_NONE) return 0.0;
+
+    double Esolv = solvationEnergyAt(pos_bohr, Z, natom, atomCharges, solv);
+
     if (gradient) {
         double h = 1e-4; // Bohr
-        std::vector<double> pos_plus(3 * natom);
-        for (int a = 0; a < natom; a++) {
-            for (int d = 0; d < 3; d++) {
-                std::copy(pos_bohr, pos_bohr + 3 * natom, pos_plus.begin());
-                pos_plus[3*a + d] += h;
-                std::vector<double> brad_p, sasa_p;
-                computeBornRadii(pos_plus.data(), Z, natom, probeRad_bohr, offset_bohr, solv.bornScale, brad_p, sasa_p);
-                double Ep = 0.0;
-                for (int i = 0; i < natom; i++) {
-                    double qi = -atomCharges[i];
-                    for (int j = i; j < natom; j++) {
-                        double qj = -atomCharges[j];
-                        double r2 = 0;
-                        if (i != j) {
-                            double dx2 = pos_plus[3*i]-pos_plus[3*j];
-                            double dy2 = pos_plus[3*i+1]-pos_plus[3*j+1];
-                            double dz2 = pos_plus[3*i+2]-pos_plus[3*j+2];
-                            r2 = dx2*dx2+dy2*dy2+dz2*dz2;
-                        }
-                        double BiBj = brad_p[i]*brad_p[j];
-                        double fGB = std::sqrt(r2 + BiBj*std::exp(-r2/(4.0*BiBj)));
-                        double c = qi*qj/fGB;
-                        Ep += (i==j) ? 0.5*c : c;
-                    }
-                }
-                Ep *= -0.5 * keps;
-                for (int i = 0; i < natom; i++) Ep += gamma_au * sasa_p[i];
-
-                pos_plus[3*a + d] -= 2.0 * h;
-                computeBornRadii(pos_plus.data(), Z, natom, probeRad_bohr, offset_bohr, solv.bornScale, brad_p, sasa_p);
-                double Em = 0.0;
-                for (int i = 0; i < natom; i++) {
-                    double qi = -atomCharges[i];
-                    for (int j = i; j < natom; j++) {
-                        double qj = -atomCharges[j];
-                        double r2 = 0;
-                        if (i != j) {
-                            double dx2 = pos_plus[3*i]-pos_plus[3*j];
-                            double dy2 = pos_plus[3*i+1]-pos_plus[3*j+1];
-                            double dz2 = pos_plus[3*i+2]-pos_plus[3*j+2];
-                            r2 = dx2*dx2+dy2*dy2+dz2*dz2;
-                        }
-                        double BiBj = brad_p[i]*brad_p[j];
-                        double fGB = std::sqrt(r2 + BiBj*std::exp(-r2/(4.0*BiBj)));
-                        double c = qi*qj/fGB;
-                        Em += (i==j) ? 0.5*c : c;
-                    }
-                }
-                Em *= -0.5 * keps;
-                for (int i = 0; i < natom; i++) Em += gamma_au * sasa_p[i];
-
-                gradient[3*a + d] += (Ep - Em) / (2.0 * h);
-            }
+        std::vector<double> pos_shift(pos_bohr, pos_bohr + 3 * natom);
+        for (int k = 0; k < 3 * natom; k++) {
+            double x0 = pos_shift[k];
+            pos_shift[k] = x0 + h;
+            double Ep = solvationEnergyAt(pos_shift.data(), Z, natom, atomCharges, solv);
+            pos_shift[k] = x0 - h;
+            double Em = solvationEnergyAt(pos_shift.data(), Z, natom, atomCharges, solv);
+            pos_shift[k] = x0;
+            gradient[k] += (Ep - Em) / (2.0 * h);
         }
     }
 
-    return Eborn + Esasa;
+    return Esolv;
 }
 
 // ============================================================================
@@ -2508,9 +2571,10 @@ static double computeSolvation(const double *pos_bohr, const int *Z, int natom,
 static void computeRepulsionGradient(const double *pos_bohr, const int *Z, int natom,
                                       double *gradient) {
     // GPU path: compute repulsion with gradient enabled
-    if (g_xtb_gpu && g_xtb_gpu->gpu_compute_repulsion && natom >= 8) {
+    DruseXTBGPUContext *gpu = xtb_gpu();
+    if (gpu && gpu->gpu_compute_repulsion && natom >= 8) {
         // GPU repulsion kernel computes energy+gradient in one dispatch
-        g_xtb_gpu->gpu_compute_repulsion(g_xtb_gpu->context, pos_bohr,
+        gpu->gpu_compute_repulsion(gpu->context, pos_bohr,
                                           reinterpret_cast<const int32_t*>(Z),
                                           natom, gradient);
         return;
@@ -2532,21 +2596,21 @@ static void computeRepulsionGradient(const double *pos_bohr, const int *Z, int n
             if (r < 1e-6) continue;
 
             double alpha = std::sqrt(pi.arep * pj.arep);
-            double kexp = GFN2_KEXP;  // 1.5
+            double kexp = gfn2RepExponent(Z[i], Z[j]);
             double rk = std::pow(r, kexp);
             double zz = pi.zeff * pj.zeff;
             double exa = std::exp(-alpha * rk);
 
-            // E_rep_ij = zz / r * exp(-alpha * r^kexp)
-            // dE/dr = zz * exp(-alpha*r^k) * (-1/r² - alpha*k*r^(k-2)/r)
-            //       = -zz * exa * (1/r² + alpha * kexp * r^(kexp-1) / r)
-            // Factor out 1/r:
-            double dEdr = -zz * exa * (1.0/r2 + alpha * kexp * std::pow(r, kexp - 2.0));
+            // E_rep_ij = zz / r * exp(-alpha * r^k)
+            // dE/dr    = -zz * exa * (1/r² + alpha * k * r^(k-2))
+            //          = -zz * exa * (1 + alpha * k * r^k) / r²
+            double dEdr = -zz * exa * (1.0 + alpha * kexp * rk) / r2;
 
-            // dE/dR_i = dEdr * (R_i - R_j) / r
-            double gx = dEdr * dx;
-            double gy = dEdr * dy;
-            double gz = dEdr * dz;
+            // dE/dR_i = dE/dr * (R_i - R_j) / r
+            double dEdr_over_r = dEdr / r;
+            double gx = dEdr_over_r * dx;
+            double gy = dEdr_over_r * dy;
+            double gz = dEdr_over_r * dz;
 
             gradient[3*i]   += gx;
             gradient[3*i+1] += gy;
@@ -2829,9 +2893,7 @@ struct LBFGSState {
 // MARK: - C API: Full Energy (extern "C")
 // ============================================================================
 
-extern "C" {
-
-DruseXTBEnergyResult* druse_xtb_compute_energy(
+static DruseXTBEnergyResult* computeEnergyImpl(
     const float *positions,
     const int32_t *atomicNumbers,
     int32_t atomCount,
@@ -2874,18 +2936,11 @@ DruseXTBEnergyResult* druse_xtb_compute_energy(
     return result;
 }
 
-void druse_xtb_free_energy_result(DruseXTBEnergyResult *result) {
-    if (result) {
-        delete[] result->charges;
-        delete result;
-    }
-}
-
 // ============================================================================
 // MARK: - C API: Gradient
 // ============================================================================
 
-DruseXTBGradientResult* druse_xtb_compute_gradient(
+static DruseXTBGradientResult* computeGradientImpl(
     const float *positions,
     const int32_t *atomicNumbers,
     int32_t atomCount,
@@ -2933,19 +2988,11 @@ DruseXTBGradientResult* druse_xtb_compute_gradient(
     return result;
 }
 
-void druse_xtb_free_gradient_result(DruseXTBGradientResult *result) {
-    if (result) {
-        delete[] result->gradient;
-        delete[] result->charges;
-        delete result;
-    }
-}
-
 // ============================================================================
 // MARK: - C API: Geometry Optimization (L-BFGS)
 // ============================================================================
 
-DruseXTBOptResult* druse_xtb_optimize_geometry(
+static DruseXTBOptResult* optimizeGeometryImpl(
     const float *positions,
     const int32_t *atomicNumbers,
     int32_t atomCount,
@@ -3020,7 +3067,7 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
             result->success = false;
             std::snprintf(result->errorMessage, 512,
                          "SCC failed at optimization step %d", step);
-            break;
+            return result;
         }
 
         // Compute gradient
@@ -3039,21 +3086,19 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
                 for (int c = 0; c < 3; c++) {
                     double dr = (double)pos[3*i + c] - (double)referencePositions[3*i + c];
                     Erestraint += 0.5 * k * dr * dr;
-                    // Gradient in Hartree/Angstrom (positions are in Angstrom)
-                    // totalGrad is in Hartree/Bohr, so add restraint as Hartree/Ang
-                    // and let the conversion below handle the Bohr→Ang factor.
-                    // Actually, we add directly to freeGrad after extraction, see below.
                 }
             }
             Etotal += Erestraint;
         }
 
-        // Extract free-coordinate gradient (convert Hartree/Bohr → Hartree/Angstrom)
+        // Extract free-coordinate gradient (convert Hartree/Bohr → Hartree/Angstrom).
+        // Chain rule: R_bohr = R_ang * ANG_TO_BOHR, so dE/dR_ang = dE/dR_bohr * ANG_TO_BOHR.
         std::vector<double> freeGrad(nfree);
         for (int k = 0; k < nfree; k++)
-            freeGrad[k] = totalGrad[freeMap[k]] * BOHR_TO_ANG; // chain rule: dE/dR_ang = dE/dR_bohr * bohr/ang
+            freeGrad[k] = totalGrad[freeMap[k]] * ANG_TO_BOHR;
 
-        // Add restraint gradient (already in Hartree/Angstrom, add directly)
+        // Add restraint gradient: E = k/2 (r - r0)² with r in Angstrom and k in
+        // Hartree/Angstrom², so dE/dr = k (r - r0) is already in Hartree/Angstrom.
         if (referencePositions && restraintStrength > 0.0f) {
             double kk = (double)restraintStrength;
             for (int k = 0; k < nfree; k++) {
@@ -3063,10 +3108,24 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
             }
         }
 
-        // Gradient norm (RMS per free atom, in Hartree/Bohr)
+        // Gradient norm of the optimized objective (RMS per free atom, in
+        // Hartree/Bohr). Frozen atoms keep a non-zero gradient forever and the
+        // restraint term shifts the minimum, so both must be accounted for or
+        // the threshold can never be met.
+        // The restraint gradient is in Hartree/Angstrom: dE/dR_bohr =
+        // dE/dR_ang * BOHR_TO_ANG (Angstrom per Bohr) expresses it per Bohr.
+        const bool restrained = referencePositions && restraintStrength > 0.0f;
         double gnorm2 = 0.0;
-        for (int i = 0; i < 3 * atomCount; i++) gnorm2 += totalGrad[i] * totalGrad[i];
-        double gnorm = std::sqrt(gnorm2 / atomCount);
+        for (int k = 0; k < nfree; k++) {
+            int posIdx = freeMap[k];
+            double gBohr = totalGrad[posIdx];
+            if (restrained) {
+                double dr = (double)pos[posIdx] - (double)referencePositions[posIdx];
+                gBohr += (double)restraintStrength * dr * BOHR_TO_ANG;
+            }
+            gnorm2 += gBohr * gBohr;
+        }
+        double gnorm = std::sqrt(gnorm2 / (nfree / 3));
 
         // Check convergence
         double dE = Etotal - prevEnergy;
@@ -3143,6 +3202,88 @@ DruseXTBOptResult* druse_xtb_optimize_geometry(
     }
 
     return result;
+}
+
+extern "C" {
+
+DruseXTBEnergyResult* druse_xtb_compute_energy(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    int32_t maxIterations,
+    DruseXTBSolvationConfig solvation)
+{
+    if (!xtbInputsValid(positions, atomicNumbers, atomCount))
+        return xtbErrorResult<DruseXTBEnergyResult>(atomCount, "Invalid input: no atoms");
+    try {
+        return computeEnergyImpl(positions, atomicNumbers, atomCount, totalCharge,
+                                 maxIterations, solvation);
+    } catch (const std::exception &e) {
+        return xtbErrorResult<DruseXTBEnergyResult>(atomCount, e.what());
+    } catch (...) {
+        return xtbErrorResult<DruseXTBEnergyResult>(atomCount, "Unknown error in xTB energy calculation");
+    }
+}
+
+void druse_xtb_free_energy_result(DruseXTBEnergyResult *result) {
+    if (result) {
+        delete[] result->charges;
+        delete result;
+    }
+}
+
+DruseXTBGradientResult* druse_xtb_compute_gradient(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    int32_t maxIterations,
+    DruseXTBSolvationConfig solvation)
+{
+    if (!xtbInputsValid(positions, atomicNumbers, atomCount))
+        return xtbErrorResult<DruseXTBGradientResult>(atomCount, "Invalid input: no atoms");
+    try {
+        return computeGradientImpl(positions, atomicNumbers, atomCount, totalCharge,
+                                   maxIterations, solvation);
+    } catch (const std::exception &e) {
+        return xtbErrorResult<DruseXTBGradientResult>(atomCount, e.what());
+    } catch (...) {
+        return xtbErrorResult<DruseXTBGradientResult>(atomCount, "Unknown error in xTB gradient calculation");
+    }
+}
+
+void druse_xtb_free_gradient_result(DruseXTBGradientResult *result) {
+    if (result) {
+        delete[] result->gradient;
+        delete[] result->charges;
+        delete result;
+    }
+}
+
+DruseXTBOptResult* druse_xtb_optimize_geometry(
+    const float *positions,
+    const int32_t *atomicNumbers,
+    int32_t atomCount,
+    int32_t totalCharge,
+    DruseXTBSolvationConfig solvation,
+    DruseXTBOptLevel optLevel,
+    int32_t maxSteps,
+    const bool *freezeMask,
+    const float *referencePositions,
+    float restraintStrength)
+{
+    if (!xtbInputsValid(positions, atomicNumbers, atomCount))
+        return xtbErrorResult<DruseXTBOptResult>(atomCount, "Invalid input: no atoms");
+    try {
+        return optimizeGeometryImpl(positions, atomicNumbers, atomCount, totalCharge,
+                                    solvation, optLevel, maxSteps, freezeMask,
+                                    referencePositions, restraintStrength);
+    } catch (const std::exception &e) {
+        return xtbErrorResult<DruseXTBOptResult>(atomCount, e.what());
+    } catch (...) {
+        return xtbErrorResult<DruseXTBOptResult>(atomCount, "Unknown error in xTB geometry optimization");
+    }
 }
 
 void druse_xtb_free_opt_result(DruseXTBOptResult *result) {

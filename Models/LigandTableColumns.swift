@@ -91,7 +91,7 @@ enum LigandColumnKind: Equatable, Hashable, Codable {
         case .tpsa: return 40
         case .rotB: return 34
         case .lipinski: return 28
-        case .atoms: return 38
+        case .atoms: return 48
         case .userProperty: return 70
         }
     }

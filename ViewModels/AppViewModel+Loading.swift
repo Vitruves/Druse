@@ -128,7 +128,9 @@ extension AppViewModel {
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
         log.info("[Loading] Importing \(format) file: \(url.lastPathComponent) (\(fileSize / 1024) KB)", category: .molecule)
 
-        if format != .pdb {
+        // Only formats that replace the protein invalidate its raw PDB text; ligand formats
+        // (SDF/MOL/MOL2/SMI/CSV) leave the loaded receptor and its PDB source untouched.
+        if format == .mmcif {
             molecules.rawPDBContent = nil
         }
 
@@ -270,12 +272,17 @@ extension AppViewModel {
         workspace.searchResults = []
         log.info("Searching RCSB for '\(query)'...", category: .network)
 
-        Task {
+        // A newer search supersedes an in-flight one; otherwise a slower earlier response
+        // could overwrite the newer results and clear the spinner too early.
+        pdbSearchTask?.cancel()
+        pdbSearchTask = Task {
             do {
                 let results = try await PDBService.shared.search(query: query)
+                guard !Task.isCancelled else { return }
                 workspace.searchResults = results
                 log.success("Found \(results.count) results for '\(query)'", category: .network)
             } catch {
+                guard !Task.isCancelled else { return }
                 log.error("Search failed: \(error.localizedDescription)", category: .network)
             }
             workspace.isSearching = false

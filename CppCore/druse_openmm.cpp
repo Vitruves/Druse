@@ -37,13 +37,46 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <utility>
 
 using namespace OpenMM;
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Load OpenMM plugins once per process. Each loadPluginsFromDirectory call
+/// re-runs every plugin's registration hook (registering duplicate Platform
+/// instances) and mutates OpenMM's global platform list, which is not safe to
+/// do concurrently from multiple refinement calls.
+static void ensureOpenMMPluginsLoaded() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        try {
+            Platform::loadPluginsFromDirectory(Platform::getDefaultPluginsDirectory());
+        } catch (...) {
+            // Built-in Reference platform remains available.
+        }
+    });
+}
+
+static std::unique_ptr<Context> makeContext(System &system, Integrator &integrator) {
+    Platform *platform = nullptr;
+    try {
+        platform = &Platform::getPlatformByName("CPU");
+    } catch (...) {
+        try {
+            platform = &Platform::getPlatformByName("Reference");
+        } catch (...) {
+            // Fall through to default
+        }
+    }
+    if (platform) return std::make_unique<Context>(system, integrator, *platform);
+    return std::make_unique<Context>(system, integrator);
+}
 
 static double estimateBondForceConstant(int atomicNum1, int atomicNum2) {
     // Approximate harmonic bond force constants (kJ/mol/nm²)
@@ -95,8 +128,7 @@ DruseOpenMMResult* druse_openmm_refine(
     }
 
     try {
-        // Load plugins (CPU platform)
-        Platform::loadPluginsFromDirectory(Platform::getDefaultPluginsDirectory());
+        ensureOpenMMPluginsLoaded();
 
         // -------------------------------------------------------------------
         // 1. Create System
@@ -122,7 +154,7 @@ DruseOpenMMResult* druse_openmm_refine(
         auto *bondForce = new HarmonicBondForce();
         bondForce->setForceGroup(0);
 
-        for (int i = 0; i < proteinBondCount; i++) {
+        for (int i = 0; i < proteinBondCount && proteinBonds; i++) {
             int a1 = proteinBonds[i].atom1;
             int a2 = proteinBonds[i].atom2;
             if (a1 < 0 || a1 >= proteinAtomCount || a2 < 0 || a2 >= proteinAtomCount) continue;
@@ -219,25 +251,7 @@ DruseOpenMMResult* druse_openmm_refine(
         // 5. Set up integrator, context, positions
         // -------------------------------------------------------------------
         VerletIntegrator integrator(0.001);  // 1 fs (not used for dynamics, just required)
-
-        // Try CPU platform explicitly
-        Platform *platform = nullptr;
-        try {
-            platform = &Platform::getPlatformByName("CPU");
-        } catch (...) {
-            try {
-                platform = &Platform::getPlatformByName("Reference");
-            } catch (...) {
-                // Fall through to default
-            }
-        }
-
-        Context *context;
-        if (platform) {
-            context = new Context(system, integrator, *platform);
-        } else {
-            context = new Context(system, integrator);
-        }
+        auto context = makeContext(system, integrator);
 
         // Set positions (convert protein from Å to nm; ligand already in nm)
         std::vector<Vec3> positions(totalParticles);
@@ -286,7 +300,6 @@ DruseOpenMMResult* druse_openmm_refine(
         }
 
         result->success = true;
-        delete context;
 
     } catch (const std::exception &e) {
         std::strncpy(result->errorMessage, e.what(), 255);
@@ -341,7 +354,7 @@ DruseOpenMMLoopResult* druse_openmm_refine_loop(
     }
 
     try {
-        Platform::loadPluginsFromDirectory(Platform::getDefaultPluginsDirectory());
+        ensureOpenMMPluginsLoaded();
 
         System system;
         for (int i = 0; i < atomCount; i++) {
@@ -353,13 +366,15 @@ DruseOpenMMLoopResult* druse_openmm_refine_loop(
         // ---------------------------------------------------------------
         auto *bondForce = new HarmonicBondForce();
         bondForce->setForceGroup(0);
-        for (int i = 0; i < bondCount; i++) {
+        std::vector<std::pair<int, int>> bondPairs;
+        for (int i = 0; i < bondCount && bonds; i++) {
             int a1 = bonds[i].atom1;
             int a2 = bonds[i].atom2;
-            if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount) continue;
+            if (a1 < 0 || a1 >= atomCount || a2 < 0 || a2 >= atomCount || a1 == a2) continue;
             double lengthNm = bonds[i].lengthNm;
             double k = estimateBondForceConstant(atoms[a1].atomicNum, atoms[a2].atomicNum);
             bondForce->addBond(a1, a2, lengthNm, k);
+            bondPairs.emplace_back(a1, a2);
         }
         system.addForce(bondForce);
 
@@ -429,51 +444,45 @@ DruseOpenMMLoopResult* druse_openmm_refine_loop(
         // ---------------------------------------------------------------
         // 5. Steric repulsion — loop vs. non-loop atoms
         // ---------------------------------------------------------------
-        auto *steric = new CustomNonbondedForce(
-            "4*epsilon*(sigma/r)^12; "
-            "sigma=0.5*(sigma1+sigma2); "
-            "epsilon=sqrt(epsilon1*epsilon2)"
-        );
-        steric->addPerParticleParameter("sigma");
-        steric->addPerParticleParameter("epsilon");
-        steric->setNonbondedMethod(CustomNonbondedForce::NoCutoff);
-        steric->setForceGroup(4);
-
         std::set<int> loopGroup, nonLoopGroup;
         for (int i = 0; i < atomCount; i++) {
-            double sigma = atoms[i].sigmaNm > 0 ? atoms[i].sigmaNm : 0.34;
-            double epsilon = atoms[i].epsilonKJ > 0 ? atoms[i].epsilonKJ : 0.36;
-            std::vector<double> params = {sigma, epsilon};
-            steric->addParticle(params);
             if (isLoopAtom[i]) {
                 loopGroup.insert(i);
             } else {
                 nonLoopGroup.insert(i);
             }
         }
+        // Without an interaction group a CustomNonbondedForce evaluates every
+        // pair, so only add the force when both groups exist.
         if (!loopGroup.empty() && !nonLoopGroup.empty()) {
+            auto *steric = new CustomNonbondedForce(
+                "4*epsilon*(sigma/r)^12; "
+                "sigma=0.5*(sigma1+sigma2); "
+                "epsilon=sqrt(epsilon1*epsilon2)"
+            );
+            steric->addPerParticleParameter("sigma");
+            steric->addPerParticleParameter("epsilon");
+            steric->setNonbondedMethod(CustomNonbondedForce::NoCutoff);
+            steric->setForceGroup(4);
+            for (int i = 0; i < atomCount; i++) {
+                double sigma = atoms[i].sigmaNm > 0 ? atoms[i].sigmaNm : 0.34;
+                double epsilon = atoms[i].epsilonKJ > 0 ? atoms[i].epsilonKJ : 0.36;
+                std::vector<double> params = {sigma, epsilon};
+                steric->addParticle(params);
+            }
+            // Loop anchors are covalently bonded to the stems; exclude 1-2, 1-3
+            // and 1-4 pairs (as in standard force fields) so the r^-12 wall does
+            // not fight the bond/angle/torsion terms across the junction.
+            steric->createExclusionsFromBonds(bondPairs, 3);
             steric->addInteractionGroup(loopGroup, nonLoopGroup);
+            system.addForce(steric);
         }
-        system.addForce(steric);
 
         // ---------------------------------------------------------------
         // 6. Context setup + minimize
         // ---------------------------------------------------------------
         VerletIntegrator integrator(0.001);
-
-        Platform *platform = nullptr;
-        try { platform = &Platform::getPlatformByName("CPU"); }
-        catch (...) {
-            try { platform = &Platform::getPlatformByName("Reference"); }
-            catch (...) {}
-        }
-
-        Context *context;
-        if (platform) {
-            context = new Context(system, integrator, *platform);
-        } else {
-            context = new Context(system, integrator);
-        }
+        auto context = makeContext(system, integrator);
 
         std::vector<Vec3> positions(atomCount);
         for (int i = 0; i < atomCount; i++) {
@@ -504,7 +513,6 @@ DruseOpenMMLoopResult* druse_openmm_refine_loop(
         }
 
         result->success = true;
-        delete context;
 
     } catch (const std::exception &e) {
         std::strncpy(result->errorMessage, e.what(), 255);

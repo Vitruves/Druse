@@ -39,6 +39,8 @@ struct DockingCoordinator {
 
     // Docking timing
     var dockingDuration: TimeInterval = 0
+    /// Final-population poses the last run scored before output selection (0 = unknown).
+    var dockingPosesEvaluated: Int = 0
     var dockingStartTime: Date?
 
     // Multi-pose selection
@@ -46,8 +48,6 @@ struct DockingCoordinator {
 
     /// Original ligand preserved before docking mutates the active ligand with pose transforms.
     var originalDockingLigand: Molecule?
-
-    // (Ensemble docking removed — each entry is docked independently as one job)
 
     // Batch docking state
     var batchResults: [(ligandName: String, results: [DockingResult])] = []
@@ -78,9 +78,6 @@ struct DockingCoordinator {
     var resultsEnergyCutoff: Float = 0
     var resultsMLScoreCutoff: Float = 0
     var resultsHasInitializedCutoffs: Bool = false
-
-    // Scaffold enforcement UI
-    var showScaffoldInput: Bool = false
 
     // Pharmacophore editor
     var showPharmacophoreEditor: Bool = false

@@ -4,7 +4,7 @@
 // ============================================================================
 // LBFGSOptimizer.swift — Pure Swift L-BFGS optimizer
 //
-// Limited-memory BFGS with backtracking line search (Wolfe conditions).
+// Limited-memory BFGS with a bracketing line search (weak Wolfe conditions).
 // No external dependencies (no Accelerate, no Eigen).
 //
 // Units: caller-defined (typically Angstrom / kcal·mol⁻¹ for molecular systems).
@@ -17,7 +17,7 @@ struct LBFGSOptimizer {
     struct Parameters {
         var m: Int = 8               // history size
         var maxIterations: Int = 200
-        var epsilon: Float = 1e-5    // gradient norm tolerance for convergence
+        var epsilon: Float = 1e-5    // RMS gradient tolerance for convergence
         var ftol: Float = 1e-4       // Armijo condition parameter
         var wolfe: Float = 0.9       // Wolfe condition parameter
         var maxLineSearch: Int = 20
@@ -56,12 +56,15 @@ struct LBFGSOptimizer {
         var gradNew = [Float](repeating: 0, count: n)
         var alphas = [Float](repeating: 0, count: params.m)
 
+        var xCandidate = [Float](repeating: 0, count: n)
+        var gradCandidate = [Float](repeating: 0, count: n)
+
         for iter in 0..<params.maxIterations {
 
-            // Check convergence: ||grad|| / max(1, ||x||) < epsilon
-            let gnorm = norm(grad)
-            let xnorm = max(1.0, norm(x0))
-            if gnorm / xnorm < params.epsilon {
+            // Convergence on the RMS gradient, which is independent of the coordinate
+            // origin and of the system size (unlike ||g|| / ||x||).
+            let gradRMS = sqrtf(dot(grad, grad, n: n) / Float(max(n, 1)))
+            if gradRMS < params.epsilon {
                 return (energy, iter, true)
             }
 
@@ -91,9 +94,17 @@ struct LBFGSOptimizer {
 
             let dgForLS = dot(direction, grad, n: n)
 
-            // --- Backtracking line search with Wolfe conditions ---
+            // --- Bracketing line search for the weak Wolfe conditions ---
+            // Without curvature history the direction is the raw gradient, so the
+            // trial step is scaled to move at most one length unit (liblbfgs: 1/||d||).
             var step: Float = 1.0
-            var lsSuccess = false
+            if sHistory.isEmpty {
+                let dnorm = sqrtf(dot(direction, direction, n: n))
+                if dnorm > 1 { step = 1 / dnorm }
+            }
+            var lower: Float = 0
+            var upper = Float.infinity
+            var candidateEnergy: Float?
 
             for _ in 0..<params.maxLineSearch {
                 // x_new = x + step * d
@@ -103,48 +114,55 @@ struct LBFGSOptimizer {
 
                 let fNew = evaluate(&xNew, &gradNew)
 
-                // Armijo (sufficient decrease)
+                // Armijo (sufficient decrease); false for NaN/Inf energies.
                 let armijo = fNew <= energy + params.ftol * step * dgForLS
-                // Curvature (Wolfe)
-                let dgNew = dot(direction, gradNew, n: n)
-                let curvature = dgNew >= params.wolfe * dgForLS
-
-                if armijo && curvature {
-                    // Accept step
-                    let s = subtract(xNew, x0, n: n)
-                    let y = subtract(gradNew, grad, n: n)
-                    let ys = dot(y, s, n: n)
-
-                    if ys > 1e-10 {
-                        // Update history (cyclic buffer)
-                        if sHistory.count == params.m {
-                            sHistory.removeFirst()
-                            yHistory.removeFirst()
-                            rhoHistory.removeFirst()
-                        }
-                        sHistory.append(s)
-                        yHistory.append(y)
-                        rhoHistory.append(1.0 / ys)
+                if !armijo {
+                    upper = step
+                } else {
+                    // Curvature (weak Wolfe): the slope must have flattened enough.
+                    let curvature = dot(direction, gradNew, n: n) >= params.wolfe * dgForLS
+                    // Keep the best Armijo point; it is the fallback if curvature never holds.
+                    if curvature || candidateEnergy.map({ fNew < $0 }) ?? true {
+                        candidateEnergy = fNew
+                        swap(&xCandidate, &xNew)
+                        swap(&gradCandidate, &gradNew)
                     }
-
-                    // Advance
-                    for i in 0..<n {
-                        x0[i] = xNew[i]
-                        grad[i] = gradNew[i]
-                    }
-                    energy = fNew
-                    lsSuccess = true
-                    break
+                    if curvature { break }
+                    lower = step
                 }
 
-                // Backtrack
-                step *= 0.5
+                // Too-long steps shrink by bisection; too-short steps (Armijo holds but the
+                // function is still decreasing steeply) expand until bracketed.
+                step = upper.isFinite ? 0.5 * (lower + upper) : 2 * lower
             }
 
-            if !lsSuccess {
-                // Line search failed; return current best
+            guard let fAccepted = candidateEnergy else {
+                // No step satisfied sufficient decrease; return current best
                 return (energy, iter + 1, false)
             }
+
+            let s = subtract(xCandidate, x0, n: n)
+            let y = subtract(gradCandidate, grad, n: n)
+            let ys = dot(y, s, n: n)
+
+            if ys > 1e-10 {
+                // Update history (cyclic buffer)
+                if sHistory.count == params.m {
+                    sHistory.removeFirst()
+                    yHistory.removeFirst()
+                    rhoHistory.removeFirst()
+                }
+                sHistory.append(s)
+                yHistory.append(y)
+                rhoHistory.append(1.0 / ys)
+            }
+
+            // Advance
+            for i in 0..<n {
+                x0[i] = xCandidate[i]
+                grad[i] = gradCandidate[i]
+            }
+            energy = fAccepted
         }
 
         return (energy, params.maxIterations, false)
@@ -217,11 +235,6 @@ struct LBFGSOptimizer {
             i += 1
         }
         return sum
-    }
-
-    @inline(__always)
-    private static func norm(_ a: [Float]) -> Float {
-        return sqrtf(dot(a, a, n: a.count))
     }
 
     /// y += alpha * x

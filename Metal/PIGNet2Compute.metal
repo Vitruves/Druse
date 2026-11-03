@@ -107,10 +107,9 @@ using namespace metal;
 #define PW_RAD_L2_W          59   // [1, 128]
 #define PW_RAD_L2_B          60   // [1]
 
-// Setup buffer layout: protein embeddings after 3x intra-GatedGAT.
+// Setup buffer layout: protein embeddings after 3x intra-GatedGAT (P x PIG_DIM).
 // InteractionNet projections are recomputed in the score kernel because protein
 // embeddings change after each interaction layer.
-#define PIG_SETUP_SECTIONS 1u
 
 // Per-pose intermediate: 64 ligand atoms × 3 floats = 192 floats
 #define PIG_POSE_LIG_POS_FLOATS (PIG_MAX_LIG * 3u)
@@ -156,193 +155,72 @@ inline void pigLinear(
     }
 }
 
-// Linear without bias - inlined for the same hot-loop reason as `pigLinear`.
-inline void pigLinearNoBias(
-    thread float *out,
-    thread const float *in_ptr,
-    device const float *W,
-    uint outDim, uint inDim)
-{
-    for (uint i = 0; i < outDim; i++) {
-        float sum = 0.0f;
-        for (uint j = 0; j < inDim; j++) {
-            sum += W[i * inDim + j] * in_ptr[j];
-        }
-        out[i] = sum;
-    }
-}
-
-// Linear from device memory input - inlined (hot-loop helper).
-inline void pigLinearFromDevice(
-    thread float *out,
-    device const float *in_ptr,
-    device const float *W,
-    device const float *b,
-    uint outDim, uint inDim)
-{
-    for (uint i = 0; i < outDim; i++) {
-        float sum = b ? b[i] : 0.0f;
-        for (uint j = 0; j < inDim; j++) {
-            sum += W[i * inDim + j] * in_ptr[j];
-        }
-        out[i] = sum;
-    }
-}
-
-// Linear without bias from device memory
-inline void pigLinearNoBiasFromDevice(
-    thread float *out,
-    device const float *in_ptr,
-    device const float *W,
-    uint outDim, uint inDim)
-{
-    for (uint i = 0; i < outDim; i++) {
-        float sum = 0.0f;
-        for (uint j = 0; j < inDim; j++) {
-            sum += W[i * inDim + j] * in_ptr[j];
-        }
-        out[i] = sum;
-    }
-}
-
 // ============================================================================
-// Helper: GatedGAT layer for a single atom
+// Helpers: GatedGAT (PIGNet2 layers/gated_gat.py)
 // ============================================================================
 //
-// GatedGAT message passing on CSR-format edges.
-//   x_updated[i] = z * x[i] + (1-z) * relu(weighted_sum)
-//   where z = sigmoid(gate([x[i], x_prime[i]]))
-//   x_prime[i] = sum_j( softmax(attn_score_ij) * Wx_j )
-//   attn_score_ij = (Wx_i^T * W2 * Wx_j) + (Wx_j^T * W2 * Wx_i)  (symmetrized)
+// Reference (PyG, add_self_loops=True, aggr="sum"):
+//   Wx      = W1(x)
+//   E_ij    = Wx_i^T W2 Wx_j + Wx_j^T W2 Wx_i            (symmetrized)
+//   A_ij    = softmax_j(E_ij) over in-edges j->i plus the self-loop
+//   x'_i    = relu(sum_j A_ij Wx_j)
+//   z_i     = sigmoid(gate([x_i, x'_i]))
+//   out_i   = z_i x_i + (1 - z_i) x'_i
 //
-// We operate on one atom at a time. The caller must provide the full node
-// embeddings array (in device mem) and the CSR-format neighbor list.
+// E_ij = Wx_j . u_i with u_i = (W2 + W2^T) Wx_i, so each atom needs one
+// matvec for u_i and a single dot product per neighbour. Wx is computed once
+// per atom per layer by the caller and shared by every neighbour that reads it.
 
-inline void pigGatedGATAtom(
-    thread float *x_out,           // [PIG_DIM] output for this atom
-    thread const float *x_self,    // [PIG_DIM] current embedding for this atom
-    device const float *allNodes,  // [N, PIG_DIM] all node embeddings
-    uint numNodes,
-    constant PIGNet2Edge *edges,
-    uint numEdges,
-    uint atomIdx,
-    device const float *W1_w,     // [128, 128]
-    device const float *W1_b,     // [128]
-    device const float *W2,       // [128, 128] (no bias, symmetric attention matrix)
-    device const float *gate_w,   // [1, 256]
-    device const float *gate_b)   // [1]
+// u = (W2 + W2^T) * Wx
+inline void pigGATSymVec(thread float *u, thread const float *Wx, device const float *W2)
 {
     constexpr uint D = PIG_DIM;
-
-    // Compute Wx_i = W1 @ x_self
-    float Wx_self[PIG_DIM];
-    pigLinear(Wx_self, x_self, W1_w, W1_b, D, D);
-
-    // W2 * Wx_i is reused for every neighbor in the symmetrized attention term.
-    float W2_Wxi[PIG_DIM];
     for (uint d = 0; d < D; d++) {
         float sum = 0.0f;
         for (uint k = 0; k < D; k++) {
-            sum += W2[d * D + k] * Wx_self[k];
+            sum += (W2[d * D + k] + W2[k * D + d]) * Wx[k];
         }
-        W2_Wxi[d] = sum;
+        u[d] = sum;
     }
+}
 
-    // Collect neighbors: iterate edges where src or dst == atomIdx
-    // Due to self-loops + bidirectional edges, we scan all edges that touch atomIdx.
-    // For efficiency, only process edges where dst == atomIdx (target convention from PyG).
-    // Self-loop is added implicitly.
-
-    // First pass: compute attention scores for all neighbors + self
-    float attn_scores[64]; // max neighbors (realistically ~10-20 for covalent bonds + self)
-    uint neighbor_indices[64];
-    float Wx_neighbors[64][PIG_DIM]; // Wx for each neighbor — stored for reuse
-    uint n_nbrs = 0;
-
-    // Add self-loop
-    neighbor_indices[n_nbrs] = atomIdx;
-    for (uint d = 0; d < D; d++) Wx_neighbors[n_nbrs][d] = Wx_self[d];
-    n_nbrs++;
-
-    // Scan edges for neighbors of atomIdx (dst == atomIdx, meaning source sends message to us)
-    for (uint e = 0; e < numEdges && n_nbrs < 63; e++) {
-        if (edges[e].dst == atomIdx) {
-            uint src = edges[e].src;
-            neighbor_indices[n_nbrs] = src;
-            // Compute Wx_j for this neighbor
-            device const float *x_j = allNodes + src * D;
-            for (uint d = 0; d < D; d++) {
-                float sum = W1_b[d];
-                for (uint k = 0; k < D; k++) {
-                    sum += W1_w[d * D + k] * x_j[k];
-                }
-                Wx_neighbors[n_nbrs][d] = sum;
-            }
-            n_nbrs++;
-        }
+// Streaming (online) softmax accumulation of one neighbour's Wx_j.
+template <typename WxPtr>
+inline void pigGATAccumulate(
+    thread const float *u, WxPtr Wx_j,
+    thread float &runMax, thread float &runSum, thread float *acc)
+{
+    constexpr uint D = PIG_DIM;
+    float score = 0.0f;
+    for (uint d = 0; d < D; d++) score += Wx_j[d] * u[d];
+    if (score > runMax) {
+        float rescale = exp(runMax - score);
+        runSum *= rescale;
+        for (uint d = 0; d < D; d++) acc[d] *= rescale;
+        runMax = score;
     }
+    float w = exp(score - runMax);
+    runSum += w;
+    for (uint d = 0; d < D; d++) acc[d] += w * Wx_j[d];
+}
 
-    // Compute attention scores: E_ij = Wx_i^T * W2 * Wx_j (symmetrized)
-    for (uint n = 0; n < n_nbrs; n++) {
-        // Compute W2 * Wx_j
-        float W2_Wxj[PIG_DIM];
-        for (uint d = 0; d < D; d++) {
-            float sum = 0.0f;
-            for (uint k = 0; k < D; k++) {
-                sum += W2[d * D + k] * Wx_neighbors[n][k];
-            }
-            W2_Wxj[d] = sum;
-        }
-        // E_ij = dot(Wx_i, W2*Wx_j)
-        float e_ij = 0.0f;
-        for (uint d = 0; d < D; d++) {
-            e_ij += Wx_self[d] * W2_Wxj[d];
-        }
-        // Symmetrize: + dot(Wx_j, W2*Wx_i)
-        float e_ji = 0.0f;
-        for (uint d = 0; d < D; d++) {
-            e_ji += Wx_neighbors[n][d] * W2_Wxi[d];
-        }
-        attn_scores[n] = e_ij + e_ji;
-    }
-
-    // Softmax over neighbor attention scores
-    float max_score = -1e30f;
-    for (uint n = 0; n < n_nbrs; n++) max_score = max(max_score, attn_scores[n]);
-    float sum_exp = 0.0f;
-    for (uint n = 0; n < n_nbrs; n++) {
-        attn_scores[n] = exp(attn_scores[n] - max_score);
-        sum_exp += attn_scores[n];
-    }
-    float inv_sum = 1.0f / max(sum_exp, 1e-8f);
-
-    // Weighted sum of neighbor Wx
-    float x_prime[PIG_DIM];
-    for (uint d = 0; d < D; d++) x_prime[d] = 0.0f;
-    for (uint n = 0; n < n_nbrs; n++) {
-        float w = attn_scores[n] * inv_sum;
-        for (uint d = 0; d < D; d++) {
-            x_prime[d] += w * Wx_neighbors[n][d];
-        }
-    }
-
-    // ReLU
-    for (uint d = 0; d < D; d++) x_prime[d] = max(x_prime[d], 0.0f);
-
-    // Gate: z = sigmoid(gate_w @ [x_self, x_prime] + gate_b)
-    float gate_input[PIG_DIM * 2];
-    for (uint d = 0; d < D; d++) gate_input[d] = x_self[d];
-    for (uint d = 0; d < D; d++) gate_input[D + d] = x_prime[d];
-
+// x_prime = relu(acc / sum); out = z * x_self + (1 - z) * x_prime.
+// `x_out` may alias `x_self` (element-wise update after z is known).
+inline void pigGATFinish(
+    thread float *x_out, thread const float *x_self,
+    thread float *acc, float runSum,
+    device const float *gate_w, device const float *gate_b)
+{
+    constexpr uint D = PIG_DIM;
+    float inv_sum = 1.0f / max(runSum, 1e-30f);
     float z_val = gate_b[0];
-    for (uint d = 0; d < D * 2; d++) {
-        z_val += gate_w[d] * gate_input[d];
+    for (uint d = 0; d < D; d++) {
+        acc[d] = max(acc[d] * inv_sum, 0.0f);
+        z_val += gate_w[d] * x_self[d] + gate_w[D + d] * acc[d];
     }
     float z = 1.0f / (1.0f + exp(-z_val));
-
-    // Output: z * x_self + (1-z) * x_prime
     for (uint d = 0; d < D; d++) {
-        x_out[d] = z * x_self[d] + (1.0f - z) * x_prime[d];
+        x_out[d] = z * x_self[d] + (1.0f - z) * acc[d];
     }
 }
 
@@ -403,15 +281,15 @@ inline void pigGRUCell(
 // Helper: Morse potential (PIGNet2-Morse variant)
 // ============================================================================
 //
-// E = epsilon * ((1 - exp(-A*(D-R)))^2 - 1)
+// E = epsilon * min((1 - exp(-A*(D-R)))^2 - 1, PIG_VDW_CLAMP)
 // With short-range variant: if D <= R, use short_range_A instead of A.
-// Clamped to PIG_VDW_CLAMP.
+// As in PIGNet2 physics.morse_potential, the clamp applies to the unitless
+// Morse term BEFORE scaling by the well depth epsilon.
 
 inline float pigMorsePotential(float D, float R, float epsilon, float A) {
     float use_A = (D > R) ? A : PIG_SHORT_RANGE_A;
     float x = 1.0f - exp(-use_A * (D - R));
-    float energy = epsilon * (x * x - 1.0f);
-    return min(energy, PIG_VDW_CLAMP);
+    return epsilon * min(x * x - 1.0f, PIG_VDW_CLAMP);
 }
 
 // ============================================================================
@@ -472,8 +350,15 @@ inline void pigApplyTorsions(
 // Kernel 0: ONE-TIME Setup — embed protein + 3× GatedGAT intra-conv
 // ============================================================================
 //
-// Dispatched once with P threads. Each thread processes one protein atom through
-// embedding + 3 GatedGAT layers (with threadgroup barriers between layers).
+// Dispatched once as a SINGLE threadgroup (threadgroup barriers do not
+// synchronise across threadgroups). Threads stride over protein atoms, so the
+// result does not depend on the threadgroup width; threads beyond P only take
+// part in the barriers.
+//
+// Per GatedGAT layer:
+//   phase 1: scratch[a] = W1 x_a + b         (Wx for every atom, computed once)
+//   phase 2: setup[a]   = GatedGAT update of atom a (reads Wx of neighbours from
+//            scratch, its own x from setup; writes only its own row)
 //
 // Output setup buffer layout (all in floats):
 //   [0 .. P*128) : protein embeddings after 3x GatedGAT
@@ -484,37 +369,28 @@ kernel void pignet2Setup(
     constant DruseAFWeightEntry    *weightEntries  [[buffer(2)]],
     constant PIGNet2Params         &params         [[buffer(3)]],
     device float                   *setupBuffer    [[buffer(4)]],   // output
-    constant PIGNet2Edge           *protEdges      [[buffer(5)]],   // CSR protein edges
-    device float                   *scratchBuffer  [[buffer(6)]],   // [P, 128] scratch for GatedGAT
+    constant PIGNet2Edge           *protEdges      [[buffer(5)]],   // protein intra edges (bidirectional)
+    device float                   *scratchBuffer  [[buffer(6)]],   // [P, 128] Wx scratch for GatedGAT
     uint                            tid            [[thread_position_in_grid]],
     uint                            tgSize         [[threads_per_threadgroup]])
 {
     uint P = params.numProteinAtoms;
-    if (tid >= P) return;
-
     constexpr uint D = PIG_DIM;
     uint numEdges = params.numProtIntraEdges;
 
     // Embed: Linear(47→128, no bias)
     device const float *embed_w = pigGetWeight(weights, weightEntries, PW_EMBED_W);
-    float x[PIG_DIM];
-    {
-        constant float *feat = protFeatures + tid * PIG_FEAT_DIM;
+    for (uint a = tid; a < P; a += tgSize) {
+        constant float *feat = protFeatures + a * PIG_FEAT_DIM;
         for (uint i = 0; i < D; i++) {
             float sum = 0.0f;
             for (uint j = 0; j < PIG_FEAT_DIM; j++) {
                 sum += embed_w[i * PIG_FEAT_DIM + j] * feat[j];
             }
-            x[i] = sum;
+            setupBuffer[a * D + i] = sum;
         }
     }
 
-    // Store initial embedding in setupBuffer (section 0)
-    device float *mySlot = setupBuffer + tid * D;
-    for (uint d = 0; d < D; d++) mySlot[d] = x[d];
-
-    // 3× GatedGAT layers using setupBuffer as shared node storage
-    // We use a ping-pong between setupBuffer and scratchBuffer
     uint gatWeightIdx[5 * 3] = {
         PW_GAT0_W2, PW_GAT0_W1_W, PW_GAT0_W1_B, PW_GAT0_GATE_W, PW_GAT0_GATE_B,
         PW_GAT1_W2, PW_GAT1_W1_W, PW_GAT1_W1_B, PW_GAT1_GATE_W, PW_GAT1_GATE_B,
@@ -522,42 +398,54 @@ kernel void pignet2Setup(
     };
 
     for (uint layer = 0; layer < PIG_N_GNN; layer++) {
-        // Barrier: wait for all atoms to finish writing current layer embeddings
-        threadgroup_barrier(mem_flags::mem_device);
-
-        // Read current embedding from setupBuffer
-        device const float *curNodes = setupBuffer;
-        device float *outNodes = scratchBuffer;
-
         device const float *W2_ptr = pigGetWeight(weights, weightEntries, gatWeightIdx[layer * 5 + 0]);
         device const float *W1_w   = pigGetWeight(weights, weightEntries, gatWeightIdx[layer * 5 + 1]);
         device const float *W1_b   = pigGetWeight(weights, weightEntries, gatWeightIdx[layer * 5 + 2]);
         device const float *gate_w = pigGetWeight(weights, weightEntries, gatWeightIdx[layer * 5 + 3]);
         device const float *gate_b = pigGetWeight(weights, weightEntries, gatWeightIdx[layer * 5 + 4]);
 
-        // Load own embedding from device
-        float x_self[PIG_DIM];
-        device const float *myNode = curNodes + tid * D;
-        for (uint d = 0; d < D; d++) x_self[d] = myNode[d];
+        // Previous layer's embeddings (or the initial embedding) are complete,
+        // and nobody is still reading last layer's Wx from scratch.
+        threadgroup_barrier(mem_flags::mem_device);
 
-        // GatedGAT for this atom
-        float x_new[PIG_DIM];
-        pigGatedGATAtom(x_new, x_self, curNodes, P, protEdges, numEdges,
-                        tid, W1_w, W1_b, W2_ptr, gate_w, gate_b);
-
-        // Write to scratch
-        device float *myOut = outNodes + tid * D;
-        for (uint d = 0; d < D; d++) myOut[d] = x_new[d];
+        // Phase 1: Wx for every atom.
+        for (uint a = tid; a < P; a += tgSize) {
+            float x_a[PIG_DIM];
+            for (uint d = 0; d < D; d++) x_a[d] = setupBuffer[a * D + d];
+            float wx[PIG_DIM];
+            pigLinear(wx, x_a, W1_w, W1_b, D, D);
+            for (uint d = 0; d < D; d++) scratchBuffer[a * D + d] = wx[d];
+        }
 
         threadgroup_barrier(mem_flags::mem_device);
 
-        // Copy scratch back to setupBuffer for next layer
-        for (uint d = 0; d < D; d++) {
-            setupBuffer[tid * D + d] = scratchBuffer[tid * D + d];
+        // Phase 2: attention over self-loop + in-edges, gated update in place.
+        for (uint a = tid; a < P; a += tgSize) {
+            float x_self[PIG_DIM], Wx_self[PIG_DIM];
+            for (uint d = 0; d < D; d++) {
+                x_self[d] = setupBuffer[a * D + d];
+                Wx_self[d] = scratchBuffer[a * D + d];
+            }
+            float u[PIG_DIM];
+            pigGATSymVec(u, Wx_self, W2_ptr);
+
+            float acc[PIG_DIM];
+            for (uint d = 0; d < D; d++) acc[d] = 0.0f;
+            float runMax = -1e30f;
+            float runSum = 0.0f;
+
+            pigGATAccumulate(u, (thread const float *)Wx_self, runMax, runSum, acc);
+            for (uint e = 0; e < numEdges; e++) {
+                if (protEdges[e].dst == a && protEdges[e].src < P) {
+                    pigGATAccumulate(u, (device const float *)(scratchBuffer + uint(protEdges[e].src) * D),
+                                     runMax, runSum, acc);
+                }
+            }
+
+            pigGATFinish(x_self, x_self, acc, runSum, gate_w, gate_b);
+            for (uint d = 0; d < D; d++) setupBuffer[a * D + d] = x_self[d];
         }
     }
-
-    threadgroup_barrier(mem_flags::mem_device);
 }
 
 
@@ -599,7 +487,7 @@ kernel void pignet2Encode(
 
     // Out-of-grid penalty
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridParams.origin + float3(gridParams.dims - 1u) * gridParams.spacing;
     float oopTotal = 0.0f;
     for (uint a = 0; a < L; a++) {
         float3 r = ligPositions[a];
@@ -670,9 +558,10 @@ kernel void pignet2Score(
         }
     }
 
-    // 3× GatedGAT on ligand intramolecular edges
-    // For ligand we keep embeddings in thread-local arrays.
-    // Self-loops are included, scanning edges where dst == atomIdx.
+    // 3× GatedGAT on ligand intramolecular edges (self-loop + in-edges, as in
+    // the reference add_self_loops=True). Wx for every atom is computed once per
+    // layer into lig_scratch; each atom's update only needs its own x, so lig_h
+    // is updated in place.
     uint gatWeightIdx[5 * 3] = {
         PW_GAT0_W2, PW_GAT0_W1_W, PW_GAT0_W1_B, PW_GAT0_GATE_W, PW_GAT0_GATE_B,
         PW_GAT1_W2, PW_GAT1_W1_W, PW_GAT1_W1_B, PW_GAT1_GATE_W, PW_GAT1_GATE_B,
@@ -687,84 +576,27 @@ kernel void pignet2Score(
         device const float *gate_b = pigGetWeight(weights, weightEntries, gatWeightIdx[layer * 5 + 4]);
 
         for (uint a = 0; a < L; a++) {
-            // Compute Wx_self
-            float Wx_self[PIG_DIM];
-            pigLinear(Wx_self, lig_h[a], W1_w, W1_b, D, D);
-
-            float W2_Wxi[PIG_DIM];
-            for (uint d = 0; d < D; d++) {
-                float sum = 0.0f;
-                for (uint k = 0; k < D; k++) sum += W2_ptr[d * D + k] * Wx_self[k];
-                W2_Wxi[d] = sum;
-            }
-
-            // Collect neighbors (self-loop + edges where dst == a)
-            float attn_scores[32];
-            float Wx_nbrs[32][PIG_DIM];
-            uint n_nbrs = 0;
-
-            // Self-loop
-            for (uint d = 0; d < D; d++) Wx_nbrs[n_nbrs][d] = Wx_self[d];
-            n_nbrs++;
-
-            for (uint e = 0; e < numLigEdges && n_nbrs < 31; e++) {
-                if (ligEdges[e].dst == a) {
-                    uint src = ligEdges[e].src;
-                    for (uint d = 0; d < D; d++) {
-                        float sum = W1_b[d];
-                        for (uint k = 0; k < D; k++) sum += W1_w[d * D + k] * lig_h[src][k];
-                        Wx_nbrs[n_nbrs][d] = sum;
-                    }
-                    n_nbrs++;
-                }
-            }
-
-            // Attention: E_ij = Wx_i^T * W2 * Wx_j + Wx_j^T * W2 * Wx_i
-            for (uint n = 0; n < n_nbrs; n++) {
-                float e_ij = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    float w2_wxj = 0.0f;
-                    for (uint k = 0; k < D; k++) {
-                        w2_wxj += W2_ptr[d * D + k] * Wx_nbrs[n][k];
-                    }
-                    e_ij += Wx_self[d] * w2_wxj + Wx_nbrs[n][d] * W2_Wxi[d];
-                }
-                attn_scores[n] = e_ij;
-            }
-
-            // Softmax
-            float max_s = -1e30f;
-            for (uint n = 0; n < n_nbrs; n++) max_s = max(max_s, attn_scores[n]);
-            float sum_exp = 0.0f;
-            for (uint n = 0; n < n_nbrs; n++) {
-                attn_scores[n] = exp(attn_scores[n] - max_s);
-                sum_exp += attn_scores[n];
-            }
-            float inv_sum = 1.0f / max(sum_exp, 1e-8f);
-
-            // Weighted sum
-            float x_prime[PIG_DIM];
-            for (uint d = 0; d < D; d++) x_prime[d] = 0.0f;
-            for (uint n = 0; n < n_nbrs; n++) {
-                float w = attn_scores[n] * inv_sum;
-                for (uint d = 0; d < D; d++) x_prime[d] += w * Wx_nbrs[n][d];
-            }
-
-            // ReLU + gate
-            for (uint d = 0; d < D; d++) x_prime[d] = max(x_prime[d], 0.0f);
-
-            float z_val = gate_b[0];
-            for (uint d = 0; d < D; d++) z_val += gate_w[d] * lig_h[a][d];
-            for (uint d = 0; d < D; d++) z_val += gate_w[D + d] * x_prime[d];
-            float z = 1.0f / (1.0f + exp(-z_val));
-
-            for (uint d = 0; d < D; d++) {
-                lig_scratch[a][d] = z * lig_h[a][d] + (1.0f - z) * x_prime[d];
-            }
+            pigLinear(lig_scratch[a], lig_h[a], W1_w, W1_b, D, D);
         }
-        // Copy scratch back
+
         for (uint a = 0; a < L; a++) {
-            for (uint d = 0; d < D; d++) lig_h[a][d] = lig_scratch[a][d];
+            float u[PIG_DIM];
+            pigGATSymVec(u, lig_scratch[a], W2_ptr);
+
+            float acc[PIG_DIM];
+            for (uint d = 0; d < D; d++) acc[d] = 0.0f;
+            float runMax = -1e30f;
+            float runSum = 0.0f;
+
+            pigGATAccumulate(u, (thread const float *)lig_scratch[a], runMax, runSum, acc);
+            for (uint e = 0; e < numLigEdges; e++) {
+                if (ligEdges[e].dst == a && ligEdges[e].src < L) {
+                    pigGATAccumulate(u, (thread const float *)lig_scratch[ligEdges[e].src],
+                                     runMax, runSum, acc);
+                }
+            }
+
+            pigGATFinish(lig_h[a], lig_h[a], acc, runSum, gate_w, gate_b);
         }
     }
 
@@ -951,9 +783,8 @@ kernel void pignet2Score(
         prot_next = tmp;
     }
 
-    // After the layer loop, prot_curr holds the final protein embeddings.
-    // Alias `prot_h` for the rest of the kernel to keep the existing Phase D code path.
-    device float *prot_h = prot_curr;
+    // After the layer loop, prot_curr holds the final protein embeddings and
+    // prot_next is free.
 
     // -------------------------------------------------------------------
     // Phase D: Pairwise physics energy computation
@@ -969,20 +800,50 @@ kernel void pignet2Score(
     float rotor_coeff2 = rotor_coeff_ptr[0] * rotor_coeff_ptr[0];
     float metal_coeff2 = metal_coeff_ptr[0] * metal_coeff_ptr[0];
 
+    // PIGNetMorse multiplies nn_dvdw by dev_vdw_radii_coeff (0.0 in
+    // pignet_morse.yaml), so R is just the sum of vdW radii and the nn_dvdw
+    // head never contributes.
+    static_assert(PIG_DEV_VDW_COEFF == 0.0f,
+                  "pignet2Score assumes dev_vdw_radii_coeff == 0 (nn_dvdw head not evaluated)");
+
     // Energy head weight pointers
     device const float *eps_l0_w = pigGetWeight(weights, weightEntries, PW_EPS_L0_W);
     device const float *eps_l0_b = pigGetWeight(weights, weightEntries, PW_EPS_L0_B);
     device const float *eps_l2_w = pigGetWeight(weights, weightEntries, PW_EPS_L2_W);
     device const float *eps_l2_b = pigGetWeight(weights, weightEntries, PW_EPS_L2_B);
-    device const float *dvdw_l0_w = pigGetWeight(weights, weightEntries, PW_DVDW_L0_W);
-    device const float *dvdw_l0_b = pigGetWeight(weights, weightEntries, PW_DVDW_L0_B);
-    device const float *dvdw_l2_w = pigGetWeight(weights, weightEntries, PW_DVDW_L2_W);
-    device const float *dvdw_l2_b = pigGetWeight(weights, weightEntries, PW_DVDW_L2_B);
-    // Morse-specific weight pointers
     device const float *width_l0_w = pigGetWeight(weights, weightEntries, PW_WIDTH_L0_W);
     device const float *width_l0_b = pigGetWeight(weights, weightEntries, PW_WIDTH_L0_B);
     device const float *width_l2_w = pigGetWeight(weights, weightEntries, PW_WIDTH_L2_W);
     device const float *width_l2_b = pigGetWeight(weights, weightEntries, PW_WIDTH_L2_B);
+
+    // The first Linear(256→128) of each pair head acts on cat(x_lig, x_prot), so
+    // W @ cat + b = W[:, :128] x_lig + (W[:, 128:] x_prot + b). Both halves are
+    // computed once per atom instead of once per (ligand, protein) pair.
+    // Protein halves overwrite the per-pose scratch: eps → prot_next, width →
+    // prot_curr (each row is read fully before it is overwritten).
+    device float *prot_eps_proj = prot_next;
+    device float *prot_width_proj = prot_curr;
+    for (uint pa = 0; pa < P; pa++) {
+        float ph[PIG_DIM];
+        for (uint d = 0; d < D; d++) ph[d] = prot_curr[pa * D + d];
+        float pe[PIG_DIM], pw[PIG_DIM];
+        for (uint i = 0; i < D; i++) {
+            float se = eps_l0_b[i];
+            float sw = width_l0_b[i];
+            device const float *we = eps_l0_w + i * (2u * D) + D;
+            device const float *ww = width_l0_w + i * (2u * D) + D;
+            for (uint j = 0; j < D; j++) {
+                se += we[j] * ph[j];
+                sw += ww[j] * ph[j];
+            }
+            pe[i] = se;
+            pw[i] = sw;
+        }
+        for (uint d = 0; d < D; d++) {
+            prot_eps_proj[pa * D + d] = pe[d];
+            prot_width_proj[pa * D + d] = pw[d];
+        }
+    }
 
     // Accumulate energies
     float E_vdw = 0.0f;
@@ -1001,6 +862,20 @@ kernel void pignet2Score(
         bool lig_hba = (lig_flags & PIG_FLAG_H_ACCEPTOR) != 0;
         bool lig_hydro = (lig_flags & PIG_FLAG_HYDROPHOBIC) != 0;
 
+        float le[PIG_DIM], lw[PIG_DIM];
+        for (uint i = 0; i < D; i++) {
+            float se = 0.0f;
+            float sw = 0.0f;
+            device const float *we = eps_l0_w + i * (2u * D);
+            device const float *ww = width_l0_w + i * (2u * D);
+            for (uint j = 0; j < D; j++) {
+                se += we[j] * lig_h[la][j];
+                sw += ww[j] * lig_h[la][j];
+            }
+            le[i] = se;
+            lw[i] = sw;
+        }
+
         for (uint pa = 0; pa < P; pa++) {
             float3 ppos = float3(protPositions[pa * 3], protPositions[pa * 3 + 1], protPositions[pa * 3 + 2]);
             float dist2 = dot(lpos - ppos, lpos - ppos);
@@ -1014,31 +889,17 @@ kernel void pignet2Score(
             bool prot_hba = (prot_flags & PIG_FLAG_H_ACCEPTOR) != 0;
             bool prot_hydro = (prot_flags & PIG_FLAG_HYDROPHOBIC) != 0;
 
-            float concat[PIG_DIM * 2];
-            for (uint d = 0; d < D; d++) concat[d] = lig_h[la][d];
-            for (uint d = 0; d < D; d++) concat[D + d] = prot_h[pa * D + d];
+            float R = lig_vdw + prot_vdw;
 
-            float dvdw_h[PIG_DIM];
-            pigLinear(dvdw_h, concat, dvdw_l0_w, dvdw_l0_b, D, D * 2);
-            for (uint d = 0; d < D; d++) dvdw_h[d] = max(dvdw_h[d], 0.0f);
-            float dvdw = dvdw_l2_b[0];
-            for (uint d = 0; d < D; d++) dvdw += dvdw_l2_w[d] * dvdw_h[d];
-            dvdw = tanh(dvdw) * PIG_DEV_VDW_COEFF;
-
-            float R = lig_vdw + prot_vdw + dvdw;
-
-            float eps_h[PIG_DIM];
-            pigLinear(eps_h, concat, eps_l0_w, eps_l0_b, D, D * 2);
-            for (uint d = 0; d < D; d++) eps_h[d] = max(eps_h[d], 0.0f);
+            device const float *pe = prot_eps_proj + pa * D;
+            device const float *pw = prot_width_proj + pa * D;
             float eps_raw = eps_l2_b[0];
-            for (uint d = 0; d < D; d++) eps_raw += eps_l2_w[d] * eps_h[d];
-            float epsilon = (1.0f / (1.0f + exp(-eps_raw))) * (PIG_VDW_EPS_HI - PIG_VDW_EPS_LO) + PIG_VDW_EPS_LO;
-
-            float width_h[PIG_DIM];
-            pigLinear(width_h, concat, width_l0_w, width_l0_b, D, D * 2);
-            for (uint d = 0; d < D; d++) width_h[d] = max(width_h[d], 0.0f);
             float width_raw = width_l2_b[0];
-            for (uint d = 0; d < D; d++) width_raw += width_l2_w[d] * width_h[d];
+            for (uint d = 0; d < D; d++) {
+                eps_raw += eps_l2_w[d] * max(le[d] + pe[d], 0.0f);
+                width_raw += width_l2_w[d] * max(lw[d] + pw[d], 0.0f);
+            }
+            float epsilon = (1.0f / (1.0f + exp(-eps_raw))) * (PIG_VDW_EPS_HI - PIG_VDW_EPS_LO) + PIG_VDW_EPS_LO;
             float morseWidth = (1.0f / (1.0f + exp(-width_raw))) * (PIG_VDW_WIDTH_HI - PIG_VDW_WIDTH_LO) + PIG_VDW_WIDTH_LO;
 
             if (!lig_metal && !prot_metal) {

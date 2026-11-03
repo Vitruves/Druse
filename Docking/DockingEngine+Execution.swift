@@ -175,9 +175,7 @@ extension DockingEngine {
             (torsionEdgeBuffer!, 5), (movingIndicesBuffer!, 6),
             (intraPairsBuffer!, 7)
         ]
-        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
-            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
-        }
+        buffers.append(contentsOf: pharmacophoreBindings())
         dispatchCompute(pipeline: explicitScorePipeline, buffers: buffers,
                         threadGroups: tgCount, threadGroupSize: tgSize)
     }
@@ -231,9 +229,7 @@ extension DockingEngine {
             (torsionEdgeBuffer!, 6), (movingIndicesBuffer!, 7),
             (intraPairsBuffer!, 8)
         ]
-        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
-            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
-        }
+        buffers.append(contentsOf: pharmacophoreBindings())
         dispatchCompute(pipeline: activeLocalSearchPipeline, buffers: buffers,
                         threadGroups: tgCount, threadGroupSize: tgSize)
     }
@@ -498,46 +494,16 @@ extension DockingEngine {
         }
 
         // Build flat pair list for intramolecular energy
-        var excluded = Set<UInt32>()
-        var adj: [[Int]] = Array(repeating: [], count: gpuLigAtoms.count)
-        for bond in heavyBonds {
-            let a = bond.atomIndex1, b = bond.atomIndex2
-            guard a < gpuLigAtoms.count, b < gpuLigAtoms.count else { continue }
-            adj[a].append(b)
-            adj[b].append(a)
-        }
+        let pairList = Self.intramolecularPairList(atomCount: gpuLigAtoms.count, bonds: heavyBonds)
+        // The GPU buffer needs at least one element; numIntraPairs (below) keeps the real count.
+        var pairStorage = pairList.isEmpty ? [UInt32(0)] : pairList
 
-        for i in 0..<gpuLigAtoms.count {
-            for j in adj[i] where j > i {
-                excluded.insert(UInt32(i) | (UInt32(j) << 16))
-                for k in adj[j] where k > i && k != i {
-                    let lo = min(i, k), hi = max(i, k)
-                    excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
-                }
-                for k in adj[i] where k != j {
-                    let lo = min(j, k), hi = max(j, k)
-                    excluded.insert(UInt32(lo) | (UInt32(hi) << 16))
-                }
-            }
-        }
-
-        var pairList = [UInt32]()
-        pairList.reserveCapacity(gpuLigAtoms.count * (gpuLigAtoms.count - 1) / 2)
-        for i in 0..<gpuLigAtoms.count {
-            for j in (i + 1)..<gpuLigAtoms.count {
-                let packed = UInt32(i) | (UInt32(j) << 16)
-                if !excluded.contains(packed) {
-                    pairList.append(packed)
-                }
-            }
-        }
-
-        let pairSize = max(pairList.count, 1) * MemoryLayout<UInt32>.stride
+        let pairSize = pairStorage.count * MemoryLayout<UInt32>.stride
         if pairSize > lastIntraPairsBufferCapacity {
-            intraPairsBuffer = device.makeBuffer(bytes: &pairList, length: pairSize, options: .storageModeShared)
+            intraPairsBuffer = device.makeBuffer(bytes: &pairStorage, length: pairSize, options: .storageModeShared)
             lastIntraPairsBufferCapacity = pairSize
         } else {
-            intraPairsBuffer?.contents().copyMemory(from: &pairList, byteCount: pairSize)
+            intraPairsBuffer?.contents().copyMemory(from: &pairStorage, byteCount: pairSize)
         }
         let referenceIntraEnergy = intramolecularReferenceEnergy(
             ligandAtoms: gpuLigAtoms,
@@ -559,32 +525,42 @@ extension DockingEngine {
             centroid: centroid)
 
         // Prepare DruseAF Metal ML scoring buffers
-        let useDruseAF = scoringMethod == .druseAffinity
+        let druseAFAvailable = scoringMethod == .druseAffinity
             && druseAFSetupPipeline != nil && druseAFEncodePipeline != nil
             && druseAFScorePipeline != nil && druseAFWeights != nil
-        if useDruseAF {
-            prepareDruseAFBuffers(
-                ligandAtoms: heavyAtoms,
-                ligandBonds: heavyBonds,
-                gpuLigAtoms: gpuLigAtoms,
-                pocket: pocket,
-                popSize: config.populationSize)
+        let useDruseAF = druseAFAvailable && prepareDruseAFBuffers(
+            ligandAtoms: heavyAtoms,
+            ligandBonds: heavyBonds,
+            gpuLigAtoms: gpuLigAtoms,
+            pocket: pocket,
+            popSize: config.populationSize)
+        if druseAFAvailable && !useDruseAF {
+            ActivityLog.shared.error(
+                "[Engine] DruseAF setup failed (empty heavy-atom pocket or GPU error) - scoring this run with Vina instead",
+                category: .dock
+            )
+            scoringMethod = .vina
         }
 
         // Prepare PIGNet2 physics-informed GNN scoring buffers.
         // PIGNet2 is a pose scorer, not a geometry-stable docking potential, so
         // docking search stays Vina-guided and PIGNet2 is applied as a reranker.
-        let usePIGNet2Rescore = scoringMethod == .pignet2
+        let pignet2Available = scoringMethod == .pignet2
             && pignet2SetupPipeline != nil && pignet2EncodePipeline != nil
             && pignet2ScorePipeline != nil && pignet2Weights != nil
-        if usePIGNet2Rescore {
-            preparePIGNet2Buffers(
-                ligandAtoms: heavyAtoms,
-                ligandBonds: heavyBonds,
-                gpuLigAtoms: gpuLigAtoms,
-                pocket: pocket,
-                popSize: config.populationSize)
-        } else if scoringMethod == .pignet2 {
+        let usePIGNet2Rescore = pignet2Available && preparePIGNet2Buffers(
+            ligandAtoms: heavyAtoms,
+            ligandBonds: heavyBonds,
+            gpuLigAtoms: gpuLigAtoms,
+            pocket: pocket,
+            popSize: config.populationSize)
+        if pignet2Available && !usePIGNet2Rescore {
+            ActivityLog.shared.error(
+                "[Engine] PIGNet2 setup failed (empty heavy-atom pocket or GPU error) - keeping Vina scores for this run",
+                category: .dock
+            )
+            scoringMethod = .vina
+        } else if scoringMethod == .pignet2 && !pignet2Available {
             // User picked PIGNet2 but the kernel failed to JIT-compile (typically
             // XPC_ERROR_CONNECTION_INTERRUPTED on the score kernel). Make this
             // visible; silently falling back to Vina is misleading.
@@ -705,6 +681,20 @@ extension DockingEngine {
         let localSearchFrequency = max(config.localSearchFrequency, 1)
         let liveUpdateFrequency = max(config.liveUpdateFrequency, 1)
 
+        // Vina scores are reported against the best pose's own intra energy (see
+        // rereferencedToBestPoseIntra); live poses use the same reference so the
+        // "best so far" readout matches the final ranking.
+        let usesBestPoseReference = scoringMethod == .vina && !(flexEngine?.isEnabled ?? false)
+        func publishLiveBest(_ best: DockingResult, interactions: [MolecularInteraction]) {
+            let shown = usesBestPoseReference
+                ? bestPoseReferenceShift(
+                    best, ligandAtoms: gpuLigAtoms, pairList: pairList,
+                    inputReferenceIntra: referenceIntraEnergy, numTorsions: numTorsions
+                  )?.applied(to: best) ?? best
+                : best
+            onPoseUpdate?(shown, interactions)
+        }
+
         func emitLiveUpdate(generation: Int) {
             if let best = extractBestPose(from: bestPopulationBuffer, ligandAtoms: heavyAtoms, centroid: centroid) {
                 bestEnergy = min(bestEnergy, best.energy)
@@ -715,7 +705,7 @@ extension DockingEngine {
                     ligandBonds: heavyBonds,
                     scoringMethod: scoringMethod
                 )
-                onPoseUpdate?(best, interactions)
+                publishLiveBest(best, interactions: interactions)
             }
             onGenerationComplete?(generation, bestEnergy)
         }
@@ -753,14 +743,23 @@ extension DockingEngine {
            let afBuf = affinityBuf,
            let tiBuf = typeIdxBuf {
 
-            let K = min(config.replicaExchange.numReplicas, Int(MAX_REPLICAS))
+            // At least one replica: popSize / K below would trap on K == 0.
+            let K = max(1, min(config.replicaExchange.numReplicas, Int(MAX_REPLICAS)))
             let popPerReplica = max(popSize / K, 4)
             let totalPoses = K * popPerReplica
             let totalPoseSize = totalPoses * MemoryLayout<DockPose>.stride
 
-            let replicaPopBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared)!
-            let replicaOffBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared)!
-            let replicaBestBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared)!
+            var repGAParams = gaParams
+            repGAParams.populationSize = UInt32(totalPoses)
+            guard let replicaPopBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared),
+                  let replicaOffBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared),
+                  let replicaBestBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared),
+                  let initGABuf = device.makeBuffer(bytes: &repGAParams, length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
+            else {
+                ActivityLog.shared.error("[Engine] REMC buffer allocation failed (\(totalPoses) poses)", category: .dock)
+                isRunning = false
+                return []
+            }
 
             do {
                 let ptr = replicaBestBuf.contents().bindMemory(to: DockPose.self, capacity: totalPoses)
@@ -787,8 +786,6 @@ extension DockingEngine {
             }
             replicaParamsBuffer = device.makeBuffer(bytes: &repParams, length: MemoryLayout<ReplicaParams>.stride, options: .storageModeShared)
 
-            var repGAParams = gaParams
-            repGAParams.populationSize = UInt32(totalPoses)
             let repGAParamsRing = (0..<3).compactMap { _ in
                 device.makeBuffer(length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
             }
@@ -796,19 +793,18 @@ extension DockingEngine {
             let repTgSize = MTLSize(width: min(totalPoses, 256), height: 1, depth: 1)
             let repTgCount = MTLSize(width: (totalPoses + 255) / 256, height: 1, depth: 1)
 
-            repGAParams.populationSize = UInt32(totalPoses)
-            let initGABuf = device.makeBuffer(bytes: &repGAParams, length: MemoryLayout<GAParams>.stride, options: .storageModeShared)!
             dispatchCompute(pipeline: initPopPipeline, buffers: [
                 (replicaPopBuf, 0), (gpBuf, 1), (initGABuf, 2)
             ], threadGroups: repTgCount, threadGroupSize: repTgSize)
 
+            let pharmaBuffers = pharmacophoreBindings()
             let vinaScoreBuffersRep: [(MTLBuffer, Int)] = [
                 (replicaPopBuf, 0), (ligBuf, 1),
                 (afBuf, 2), (tiBuf, 3),
                 (gpBuf, 4), (initGABuf, 5),
                 (teBuf, 6), (miBuf, 7),
                 (emBuf, 8)
-            ]
+            ] + pharmaBuffers
             dispatchCompute(pipeline: scorePipeline, buffers: vinaScoreBuffersRep, threadGroups: repTgCount, threadGroupSize: repTgSize)
             copyPoseBuffer(from: replicaPopBuf, to: replicaBestBuf, poseCount: totalPoses)
 
@@ -866,7 +862,7 @@ extension DockingEngine {
                     (gpBuf, 4), (ringBuf, 5),
                     (teBuf, 6), (miBuf, 7),
                     (emBuf, 8)
-                ]
+                ] + pharmaBuffers
                 let acceptBuffers: [(MTLBuffer, Int)] = [
                     (replicaPopBuf, 0), (replicaOffBuf, 1),
                     (replicaBestBuf, 2), (ringBuf, 3), (repParamsBuf, 4)
@@ -890,14 +886,7 @@ extension DockingEngine {
                     let loTempPoses = popPerReplica
                     let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
                     let simdTgCount = MTLSize(width: loTempPoses, height: 1, depth: 1)
-                    let loScoreBuffers: [(MTLBuffer, Int)] = [
-                        (replicaOffBuf, 0), (ligBuf, 1),
-                        (afBuf, 2), (tiBuf, 3),
-                        (gpBuf, 4), (ringBuf, 5),
-                        (teBuf, 6), (miBuf, 7),
-                        (emBuf, 8)
-                    ]
-                    lastCmdBuf = dispatchComputeAsync(pipeline: activeLocalSearchPipeline, buffers: loScoreBuffers,
+                    lastCmdBuf = dispatchComputeAsync(pipeline: activeLocalSearchPipeline, buffers: scoreBuffers,
                                                        threadGroups: simdTgCount, threadGroupSize: simdTgSize)
                 } else {
                     lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: repTgCount, threadGroupSize: repTgSize)
@@ -929,7 +918,7 @@ extension DockingEngine {
                             ligandBonds: heavyBonds,
                             scoringMethod: scoringMethod
                         )
-                        onPoseUpdate?(best, interactions)
+                        publishLiveBest(best, interactions: interactions)
                     }
                     onGenerationComplete?(step, bestEnergy)
                 }
@@ -983,10 +972,14 @@ extension DockingEngine {
         }
 
         // Copy fragment-reconstructed poses into the population buffer (truncate or pad).
+        // Fragment poses carry zero torsion deltas (input conformer); numTorsions must match the
+        // torsion count the local search optimizes so extraction applies the same torsions.
         let fragCount = min(fragmentPoses.count, popSize)
         let popPtr = popBuf.contents().bindMemory(to: DockPose.self, capacity: popSize)
-        for i in 0..<fragCount { popPtr[i] = fragmentPoses[i] }
-        for i in fragCount..<popSize { popPtr[i] = fragmentPoses[0] }
+        for i in 0..<popSize {
+            popPtr[i] = fragmentPoses[i < fragCount ? i : 0]
+            popPtr[i].numTorsions = Int32(gaParams.numTorsions)
+        }
 
         ActivityLog.shared.info(
             "[Engine] Fragment search produced \(fragmentPoses.count) poses; refining \(fragCount) with Vina local search",
@@ -1082,7 +1075,7 @@ extension DockingEngine {
             _ = await diffEng.runDiffusionDockingV4(
                 numPoses: popSize,
                 numLigandAtoms: gpuLigAtoms.count,
-                numTorsions: numTorsions,
+                numTorsions: Int(gaParams.numTorsions),
                 config: config.diffusion,
                 gaParamsBuffer: gaBuf,
                 gridParamsBuffer: gpBuf,
@@ -1129,7 +1122,7 @@ extension DockingEngine {
             _ = await diffEng.runDiffusionDocking(
                 numPoses: popSize,
                 numLigandAtoms: gpuLigAtoms.count,
-                numTorsions: numTorsions,
+                numTorsions: Int(gaParams.numTorsions),
                 config: config.diffusion,
                 gaParamsBuffer: gaBuf,
                 gridParamsBuffer: gpBuf,
@@ -1296,11 +1289,7 @@ extension DockingEngine {
                         (teBuf, 6), (miBuf, 7),
                         (emBuf, 8)
                     ]
-                    if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
-                        vinaScoreBuffers.append(contentsOf: [
-                            (pcBuf, 15), (ppBuf, 16)
-                        ])
-                    }
+                    vinaScoreBuffers.append(contentsOf: pharmacophoreBindings())
                 }
                 let acceptBuffers: [(MTLBuffer, Int)] = [
                     (popBuf, 0), (offBuf, 1),
@@ -1447,13 +1436,35 @@ extension DockingEngine {
 
         } // end else (standard GA/ILS path)
 
-        let clustered = await clusterPoses(aggregatedResults)
+        // Vina-style output selection: only poses within the energy window of the best are
+        // clustered and reported (duplicates are dropped during clustering). Cluster
+        // representatives are then explicitly rescored/reranked below.
+        lastEvaluatedPoseCount = aggregatedResults.count
+        let clustered = await clusterPoses(
+            Self.withinOutputEnergyWindow(aggregatedResults, scoringMethod: scoringMethod)
+        )
+        ActivityLog.shared.info(
+            "[Engine] Output selection: \(clustered.count)/\(aggregatedResults.count) final poses kept " +
+            "(within \(Self.outputEnergyRangeKcal) kcal/mol of best, duplicates < \(Self.outputDuplicateRMSD) Å dropped, ≤ \(Self.outputMaxClusters) modes), " +
+            "\(Set(clustered.map(\.clusterID)).count) clusters",
+            category: .dock
+        )
         var reranked = rerankClusterRepresentativesExplicit(
             clustered,
             scoringMethod: scoringMethod,
             ligandAtoms: heavyAtoms,
             centroid: centroid
         )
+
+        if usesBestPoseReference {
+            reranked = rereferencedToBestPoseIntra(
+                reranked,
+                ligandAtoms: gpuLigAtoms,
+                pairList: pairList,
+                inputReferenceIntra: referenceIntraEnergy,
+                numTorsions: numTorsions
+            )
+        }
 
         // D4 dispersion single-point for top reranked poses
         if scoringMethod == .drusina, heavyAtoms.count >= 2 {
@@ -1554,34 +1565,11 @@ extension DockingEngine {
             options: .storageModeShared
         )
 
-        var excludedRR = Set<UInt32>()
-        var adjacency = Array(repeating: [Int](), count: gpuLigAtoms.count)
-        for bond in heavyBonds {
-            let a = bond.atomIndex1
-            let b = bond.atomIndex2
-            guard a < gpuLigAtoms.count, b < gpuLigAtoms.count else { continue }
-            adjacency[a].append(b)
-            adjacency[b].append(a)
-        }
-        for i in 0..<gpuLigAtoms.count {
-            for j in adjacency[i] where j > i {
-                excludedRR.insert(UInt32(i) | (UInt32(j) << 16))
-                for k in adjacency[j] where k > i && k != i {
-                    let lo = min(i, k), hi = max(i, k)
-                    excludedRR.insert(UInt32(lo) | (UInt32(hi) << 16))
-                }
-            }
-        }
-        var rrPairList = [UInt32]()
-        for i in 0..<gpuLigAtoms.count {
-            for j in (i + 1)..<gpuLigAtoms.count {
-                let packed = UInt32(i) | (UInt32(j) << 16)
-                if !excludedRR.contains(packed) { rrPairList.append(packed) }
-            }
-        }
+        let rrPairList = Self.intramolecularPairList(atomCount: gpuLigAtoms.count, bonds: heavyBonds)
+        var rrPairStorage = rrPairList.isEmpty ? [UInt32(0)] : rrPairList
         intraPairsBuffer = device.makeBuffer(
-            bytes: &rrPairList,
-            length: max(rrPairList.count, 1) * MemoryLayout<UInt32>.stride,
+            bytes: &rrPairStorage,
+            length: rrPairStorage.count * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         )
 
@@ -1611,6 +1599,14 @@ extension DockingEngine {
             length: MemoryLayout<DockPose>.stride,
             options: .storageModeShared
         )
+        // These buffers were replaced with exact-size ones; keep runDocking's reuse
+        // trackers in sync so it never copies a larger ligand into them, and force the
+        // population/offspring/best trio to be reallocated together.
+        lastLigandAtomBufferCapacity = ligandAtomBuffer?.length ?? 0
+        lastTorsionEdgeBufferCapacity = torsionEdgeBuffer?.length ?? 0
+        lastMovingIndicesBufferCapacity = movingIndicesBuffer?.length ?? 0
+        lastIntraPairsBufferCapacity = intraPairsBuffer?.length ?? 0
+        lastPopulationBufferCapacity = 0
 
         var gaParams = GAParams(
             populationSize: 1,
@@ -1658,6 +1654,17 @@ extension DockingEngine {
 
     // MARK: - GPU Dispatch Helpers
 
+    /// Bindings for buffers 15/16, which scorePoses, scorePosesExplicit and every localSearch*
+    /// kernel read unconditionally. Without prepared constraints, an empty set (numConstraints = 0)
+    /// is created so the kernels never read an unbound argument.
+    func pharmacophoreBindings() -> [(MTLBuffer, Int)] {
+        if pharmaConstraintBuffer == nil || pharmaParamsBuffer == nil {
+            prepareConstraintBuffers([], atoms: [], residues: [])
+        }
+        guard let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer else { return [] }
+        return [(pcBuf, 15), (ppBuf, 16)]
+    }
+
     func localOptimize(buffer: MTLBuffer, tg: MTLSize, tgs: MTLSize) {
         guard let ligBuf = ligandAtomBuffer,
               let affBuf = vinaAffinityGridBuffer,
@@ -1678,9 +1685,7 @@ extension DockingEngine {
             (teBuf, 6), (miBuf, 7),
             (ipBuf, 8)
         ]
-        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
-            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
-        }
+        buffers.append(contentsOf: pharmacophoreBindings())
         // SIMD local search kernel expects 32 threads per threadgroup (one pose per threadgroup)
         let effectiveTg: MTLSize
         let effectiveTgs: MTLSize
@@ -1716,9 +1721,7 @@ extension DockingEngine {
             (teBuf, 6), (miBuf, 7),
             (ipBuf, 8)
         ]
-        if let pcBuf = pharmaConstraintBuffer, let ppBuf = pharmaParamsBuffer {
-            buffers.append(contentsOf: [(pcBuf, 15), (ppBuf, 16)])
-        }
+        buffers.append(contentsOf: pharmacophoreBindings())
         dispatchCompute(pipeline: scorePipeline, buffers: buffers,
                         threadGroups: tg, threadGroupSize: tgs)
     }
@@ -1990,6 +1993,7 @@ extension DockingEngine {
               let teBuf = torsionEdgeBuffer,
               let miBuf = movingIndicesBuffer else { return nil }
 
+        guard poseCount > 0 else { return [] }
         let decompSize = MemoryLayout<DrusinaDecomposition>.stride * poseCount
         guard let decompBuf = device.makeBuffer(length: max(decompSize, 48), options: .storageModeShared) else { return nil }
 
@@ -2013,6 +2017,10 @@ extension DockingEngine {
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+        guard cmdBuf.status == .completed else {
+            ActivityLog.shared.error("[Engine] Drusina decomposition GPU error: \(cmdBuf.error?.localizedDescription ?? "unknown")", category: .dock)
+            return nil
+        }
 
         let ptr = decompBuf.contents().bindMemory(to: DrusinaDecomposition.self, capacity: poseCount)
         return Array(UnsafeBufferPointer(start: ptr, count: poseCount))

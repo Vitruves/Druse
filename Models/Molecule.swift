@@ -45,10 +45,6 @@ final class Molecule: Identifiable {
     var bondCount: Int { bonds.count }
     var heavyAtomCount: Int { atoms.filter { $0.element != .H }.count }
 
-    var molecularWeight: Float {
-        atoms.reduce(0) { $0 + $1.element.mass }
-    }
-
     var positions: [SIMD3<Float>] {
         atoms.map(\.position)
     }

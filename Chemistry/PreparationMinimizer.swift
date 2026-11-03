@@ -9,8 +9,10 @@
 // restraints: backbone atoms are strongly restrained, existing sidechains
 // moderately, and reconstructed/repacked atoms are free.
 //
-// Reuses bond/angle/torsion kernels from LoopRefineCompute.metal and adds
-// a VDW+restraint kernel from PreparationMinimizeCompute.metal.
+// Pairwise VDW + positional restraints run on the GPU
+// (PreparationMinimizeCompute.metal); harmonic bond terms are added on the CPU.
+// Bonded pairs are excluded from the VDW term (1-2, 1-3 skipped; 1-4 scaled) via a
+// host-built exclusion list, so covalent geometry is not distorted by LJ.
 // ============================================================================
 
 import Foundation
@@ -22,9 +24,6 @@ final class PreparationMinimizer: @unchecked Sendable {
     let device: MTLDevice
     let queue: MTLCommandQueue
 
-    private let bondPipeline: MTLComputePipelineState
-    private let anglePipeline: MTLComputePipelineState
-    private let torsionPipeline: MTLComputePipelineState
     private let vdwRestraintPipeline: MTLComputePipelineState
 
     // MARK: - Types
@@ -40,8 +39,6 @@ final class PreparationMinimizer: @unchecked Sendable {
         let atoms: [Atom]
         let bonds: [Bond]
         let atomRegions: [AtomRegion]
-        let angles: [(Int, Int, Int, Float)]    // (atom1, atom2_central, atom3, angleDeg)
-        let torsions: [(Int, Int, Int, Int)]     // omega torsions
     }
 
     struct MinimizationOutput {
@@ -55,24 +52,14 @@ final class PreparationMinimizer: @unchecked Sendable {
 
     init?(device: MTLDevice) {
         guard let queue = device.makeCommandQueue(),
-              let library = device.makeDefaultLibrary()
+              let library = device.makeDefaultLibrary(),
+              let vdwFunction = library.makeFunction(name: "prep_vdw_restraint"),
+              let vdwPipeline = try? device.makeComputePipelineState(function: vdwFunction)
         else { return nil }
 
         self.device = device
         self.queue = queue
-
-        do {
-            bondPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_bond_energy")!)
-            anglePipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_angle_energy")!)
-            torsionPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_torsion_energy")!)
-            vdwRestraintPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "prep_vdw_restraint")!)
-        } catch {
-            return nil
-        }
+        self.vdwRestraintPipeline = vdwPipeline
     }
 
     // MARK: - Buffer Helpers
@@ -121,13 +108,7 @@ final class PreparationMinimizer: @unchecked Sendable {
             x[i * 3 + 2] = input.atoms[i].position.z
         }
 
-        // Reference positions for restraints
-        let refPositions = input.atoms.map(\.position)
-
-        // Prepare GPU data
-        let regions = input.atomRegions.map(\.rawValue)
-
-        // Build bond data for LoopRefine kernels
+        // Build bond data (harmonic, evaluated on the CPU)
         let loopBonds = input.bonds.compactMap { bond -> LoopRefineBond? in
             let i1 = bond.atomIndex1
             let i2 = bond.atomIndex2
@@ -137,11 +118,25 @@ final class PreparationMinimizer: @unchecked Sendable {
                                   length: max(dist, 0.5), k: 300.0)  // kcal/mol/A^2
         }
 
-        // Prepare VDW parameters from elements
-        let sigma: [Float] = input.atoms.map { $0.element.vdwRadius * 0.8908987 }  // r_min -> sigma
-        let epsilon: [Float] = input.atoms.map { elementEpsilon($0.element) }
+        // Reference atoms carry the restraint anchors plus the per-atom LJ parameters
+        // (sigma, element epsilon) and region; they are constant for the run.
+        // The kernel mixes sigma_ij = (sigma_i + sigma_j) / 2, so sigma_i must be the
+        // like-pair value: the LJ minimum of a like pair is at the contact distance
+        // 2 * R_vdW, hence sigma_i = 2 * R_vdW * 2^(-1/6). This puts the LJ minimum
+        // of any pair at R_i + R_j (Bondi contact), not at their mean radius.
+        let refAtoms: [PrepMinAtom] = input.atoms.indices.map { i in
+            let atom = input.atoms[i]
+            let region = i < input.atomRegions.count ? input.atomRegions[i] : .existingSidechain
+            return PrepMinAtom(
+                position: atom.position,
+                sigma: 2 * atom.element.vdwRadius * 0.8908987,  // 2^(-1/6) * r_min
+                epsilon: elementEpsilon(atom.element),
+                region: region.rawValue,
+                _pad0: 0
+            )
+        }
 
-        let params = PrepMinParams(
+        var params = PrepMinParams(
             atomCount: UInt32(atomCount),
             restraintK_backbone: restraintK_backbone,
             restraintK_existing: restraintK_existing,
@@ -151,6 +146,31 @@ final class PreparationMinimizer: @unchecked Sendable {
             _pad0: 0,
             _pad1: 0
         )
+
+        let exclusions = Self.buildExclusions(atomCount: atomCount, bonds: input.bonds)
+
+        // Buffers are allocated once and reused by every energy/gradient evaluation;
+        // only the current positions are rewritten in `atomBuf` per call.
+        // Metal buffers cannot be empty, so the partner/scale arrays get a dummy entry.
+        guard let atomBuf = makeBuffer(refAtoms),
+              let refBuf = makeBuffer(refAtoms),
+              let paramBuf = device.makeBuffer(bytes: &params,
+                                               length: MemoryLayout<PrepMinParams>.stride,
+                                               options: .storageModeShared),
+              let energyBuf = makeBuffer(count: atomCount, type: Float.self),
+              let gradBuf = makeBuffer(count: atomCount, type: SIMD3<Float>.self),
+              let exclOffsetBuf = makeBuffer(exclusions.offsets),
+              let exclPartnerBuf = makeBuffer(exclusions.partners.isEmpty ? [UInt32(0)] : exclusions.partners),
+              let exclScaleBuf = makeBuffer(exclusions.scales.isEmpty ? [Float(0)] : exclusions.scales)
+        else {
+            return MinimizationOutput(positions: input.atoms.map(\.position), finalEnergy: 0,
+                                      iterations: 0, converged: false)
+        }
+        let buffers = EvaluationBuffers(atoms: atomBuf, reference: refBuf, params: paramBuf,
+                                        energies: energyBuf, gradients: gradBuf,
+                                        exclusionOffsets: exclOffsetBuf,
+                                        exclusionPartners: exclPartnerBuf,
+                                        exclusionScales: exclScaleBuf)
 
         // L-BFGS minimization
         let result = LBFGSOptimizer.minimize(
@@ -168,12 +188,9 @@ final class PreparationMinimizer: @unchecked Sendable {
                 evaluateEnergyAndGradient(
                     positions: positions,
                     gradient: &gradient,
-                    refPositions: refPositions,
-                    regions: regions,
-                    sigma: sigma,
-                    epsilon: epsilon,
+                    atomCount: atomCount,
                     bonds: loopBonds,
-                    params: params
+                    buffers: buffers
                 )
             }
         )
@@ -192,82 +209,111 @@ final class PreparationMinimizer: @unchecked Sendable {
         )
     }
 
+    // MARK: - Bonded Exclusions
+
+    /// LJ scale for 1-4 pairs. AMBER force fields divide 1-4 van der Waals by
+    /// SCNB = 2.0 (Cornell et al., J. Am. Chem. Soc. 1995, 117, 5179).
+    private static let oneFourVDWScale: Float = 0.5
+
+    /// CSR exclusion list: for atom i, partners[offsets[i] ..< offsets[i+1]] in
+    /// ascending order, with scale 0 for 1-2/1-3 pairs and `oneFourVDWScale` for 1-4.
+    private static func buildExclusions(
+        atomCount: Int,
+        bonds: [Bond]
+    ) -> (offsets: [UInt32], partners: [UInt32], scales: [Float]) {
+        var neighbors = [[Int]](repeating: [], count: atomCount)
+        for bond in bonds where bond.atomIndex1 < atomCount && bond.atomIndex2 < atomCount
+            && bond.atomIndex1 != bond.atomIndex2 {
+            neighbors[bond.atomIndex1].append(bond.atomIndex2)
+            neighbors[bond.atomIndex2].append(bond.atomIndex1)
+        }
+
+        var offsets = [UInt32](repeating: 0, count: atomCount + 1)
+        var partners: [UInt32] = []
+        var scales: [Float] = []
+
+        for i in 0..<atomCount {
+            var pairScale: [Int: Float] = [:]
+            for j in neighbors[i] {
+                pairScale[j] = 0                                   // 1-2
+                for k in neighbors[j] where k != i {
+                    pairScale[k] = 0                               // 1-3
+                }
+            }
+            for j in neighbors[i] {
+                for k in neighbors[j] where k != i {
+                    for l in neighbors[k] where l != i && l != j && pairScale[l] == nil {
+                        pairScale[l] = oneFourVDWScale             // 1-4
+                    }
+                }
+            }
+            for partner in pairScale.keys.sorted() {
+                partners.append(UInt32(partner))
+                scales.append(pairScale[partner]!)
+            }
+            offsets[i + 1] = UInt32(partners.count)
+        }
+
+        return (offsets, partners, scales)
+    }
+
     // MARK: - Energy + Gradient Evaluation
+
+    private struct EvaluationBuffers {
+        let atoms: MTLBuffer
+        let reference: MTLBuffer
+        let params: MTLBuffer
+        let energies: MTLBuffer
+        let gradients: MTLBuffer
+        let exclusionOffsets: MTLBuffer
+        let exclusionPartners: MTLBuffer
+        let exclusionScales: MTLBuffer
+    }
 
     private func evaluateEnergyAndGradient(
         positions: [Float],
         gradient: inout [Float],
-        refPositions: [SIMD3<Float>],
-        regions: [UInt32],
-        sigma: [Float],
-        epsilon: [Float],
+        atomCount: Int,
         bonds: [LoopRefineBond],
-        params: PrepMinParams
+        buffers: EvaluationBuffers
     ) -> Float {
-
-        let atomCount = Int(params.atomCount)
-
-        // Build PrepMinAtom array from current positions
-        var prepAtoms = [PrepMinAtom]()
-        prepAtoms.reserveCapacity(atomCount)
+        // Update current positions in place (sigma/epsilon/region stay as initialized)
+        let atomPtr = buffers.atoms.contents().bindMemory(to: PrepMinAtom.self, capacity: atomCount)
         for i in 0..<atomCount {
-            prepAtoms.append(PrepMinAtom(
-                position: SIMD3<Float>(positions[i*3], positions[i*3+1], positions[i*3+2]),
-                sigma: sigma[i],
-                epsilon: epsilon[i],
-                region: regions[i],
-                _pad0: 0
-            ))
+            atomPtr[i].position = SIMD3<Float>(positions[i*3], positions[i*3+1], positions[i*3+2])
         }
 
-        // Reference atoms
-        var refAtoms = [PrepMinAtom]()
-        refAtoms.reserveCapacity(atomCount)
-        for i in 0..<atomCount {
-            refAtoms.append(PrepMinAtom(
-                position: refPositions[i],
-                sigma: sigma[i],
-                epsilon: epsilon[i],
-                region: regions[i],
-                _pad0: 0
-            ))
-        }
-
-        // GPU dispatch
-        guard let atomBuf = makeBuffer(prepAtoms),
-              let refBuf = makeBuffer(refAtoms),
-              let paramBuf = makeBuffer([params]),
-              let energyBuf = makeBuffer(count: atomCount, type: Float.self),
-              let gradBuf = makeBuffer(count: atomCount, type: SIMD3<Float>.self),
-              let cmdBuf = queue.makeCommandBuffer()
+        guard let cmdBuf = queue.makeCommandBuffer(),
+              let encoder = cmdBuf.makeComputeCommandEncoder()
         else {
             return Float.greatestFiniteMagnitude
         }
 
         // VDW + Restraint kernel
-        if let encoder = cmdBuf.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(vdwRestraintPipeline)
-            encoder.setBuffer(atomBuf, offset: 0, index: 0)
-            encoder.setBuffer(refBuf, offset: 0, index: 1)
-            encoder.setBuffer(paramBuf, offset: 0, index: 2)
-            encoder.setBuffer(energyBuf, offset: 0, index: 3)
-            encoder.setBuffer(gradBuf, offset: 0, index: 4)
-            let (grid, tg) = threadgroupConfig(pipeline: vdwRestraintPipeline, count: atomCount)
-            encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
-            encoder.endEncoding()
-        }
+        encoder.setComputePipelineState(vdwRestraintPipeline)
+        encoder.setBuffer(buffers.atoms, offset: 0, index: 0)
+        encoder.setBuffer(buffers.reference, offset: 0, index: 1)
+        encoder.setBuffer(buffers.params, offset: 0, index: 2)
+        encoder.setBuffer(buffers.energies, offset: 0, index: 3)
+        encoder.setBuffer(buffers.gradients, offset: 0, index: 4)
+        encoder.setBuffer(buffers.exclusionOffsets, offset: 0, index: 5)
+        encoder.setBuffer(buffers.exclusionPartners, offset: 0, index: 6)
+        encoder.setBuffer(buffers.exclusionScales, offset: 0, index: 7)
+        let (grid, tg) = threadgroupConfig(pipeline: vdwRestraintPipeline, count: atomCount)
+        encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        encoder.endEncoding()
 
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
 
         // Read back results
         var totalEnergy: Float = 0
-        let energyPtr = energyBuf.contents().bindMemory(to: Float.self, capacity: atomCount)
+        let energyPtr = buffers.energies.contents().bindMemory(to: Float.self, capacity: atomCount)
         for i in 0..<atomCount {
             totalEnergy += energyPtr[i]
         }
 
-        let gradPtr = gradBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: atomCount)
+        let gradPtr = buffers.gradients.contents().bindMemory(to: SIMD3<Float>.self, capacity: atomCount)
         for i in 0..<atomCount {
             let g = gradPtr[i]
             gradient[i*3]     = g.x

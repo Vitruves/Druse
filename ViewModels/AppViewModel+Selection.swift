@@ -328,13 +328,20 @@ extension AppViewModel {
                 return
             }
 
-            gen.fieldType = workspace.surfaceType
-            gen.colorMode = workspace.surfaceColorMode
-            gen.probeRadius = workspace.surfaceProbeRadius
-            gen.gridSpacing = workspace.surfaceGridSpacing
-
+            let settings = currentSurfaceSettings()
             let atoms = prot.atoms.filter { $0.element != .H }
-            if let result = gen.generateSurface(atoms: atoms) {
+            // Runs off the main actor (grid + marching cubes + prefix sum on large proteins).
+            let result = await gen.generateSurface(atoms: atoms, settings: settings)
+
+            // The surface was hidden meanwhile, or a newer request with different settings
+            // is in flight: drop this result instead of overwriting the newer state.
+            guard workspace.showSurface else {
+                workspace.isGeneratingSurface = false
+                return
+            }
+            guard currentSurfaceSettings() == settings else { return }
+
+            if let result {
                 renderer.updateSurfaceMesh(result)
                 workspace.surfaceLegend = result.legend
                 log.success("Surface: \(result.vertexCount) vertices, \(result.indexCount / 3) triangles", category: .molecule)
@@ -346,6 +353,15 @@ extension AppViewModel {
             }
             workspace.isGeneratingSurface = false
         }
+    }
+
+    private func currentSurfaceSettings() -> SurfaceGenerator.Settings {
+        SurfaceGenerator.Settings(
+            fieldType: workspace.surfaceType,
+            colorMode: workspace.surfaceColorMode,
+            gridSpacing: workspace.surfaceGridSpacing,
+            probeRadius: workspace.surfaceProbeRadius
+        )
     }
 
     // MARK: - Context Menu Actions
@@ -701,7 +717,40 @@ extension AppViewModel {
         workspace.statusMessage = "\(seq.count)-residue sequence copied"
     }
 
+    /// Fills `secondaryStructureAssignments` from backbone geometry when the source file
+    /// carried no HELIX/SHEET records, so the ribbon, the Sequence step and structure-based
+    /// selection all read the same per-residue assignment.
+    func ensureSecondaryStructure() {
+        guard let prot = molecules.protein, prot.secondaryStructureAssignments.isEmpty else { return }
+        let backbone: [BackboneResidue] = prot.chains.filter { $0.type == .protein }.flatMap { chain in
+            chain.residueIndices.compactMap { idx -> BackboneResidue? in
+                guard idx < prot.residues.count, prot.residues[idx].isStandard else { return nil }
+                let residue = prot.residues[idx]
+                var named: [String: SIMD3<Float>] = [:]
+                for atomIdx in residue.atomIndices where atomIdx < prot.atoms.count {
+                    let atom = prot.atoms[atomIdx]
+                    let name = atom.name.trimmingCharacters(in: .whitespaces)
+                    if named[name] == nil { named[name] = atom.position }
+                }
+                guard let n = named["N"], let ca = named["CA"], let c = named["C"], let o = named["O"] else { return nil }
+                return BackboneResidue(
+                    chainID: residue.chainID, sequenceNumber: residue.sequenceNumber,
+                    n: n, ca: ca, c: c, o: o, h: named["H"] ?? named["HN"],
+                    isProline: residue.name == "PRO"
+                )
+            }
+        }
+        let segments = BackboneSecondaryStructure.segments(backbone, BackboneSecondaryStructure.assign(backbone))
+        guard !segments.isEmpty else { return }
+        prot.secondaryStructureAssignments = segments
+        pushToRenderer()
+        let helices = segments.filter { $0.type == .helix }.count
+        let strands = segments.filter { $0.type == .sheet }.count
+        log.info("Assigned secondary structure from backbone H-bonds: \(helices) helices, \(strands) strands", category: .molecule)
+    }
+
     func selectBySecondaryStructure(_ ssType: SecondaryStructure, chainID: String? = nil) {
+        ensureSecondaryStructure()
         guard let prot = molecules.protein else { return }
         workspace.selectedResidueIndices.removeAll()
         workspace.selectedAtomIndices.removeAll()
@@ -724,8 +773,22 @@ extension AppViewModel {
         }
         workspace.selectedAtomIndex = workspace.selectedAtomIndices.first
         pushToRenderer()
-        let ssName = switch ssType { case .helix: "helices"; case .sheet: "sheets"; case .coil: "coils"; case .turn: "turns" }
-        workspace.statusMessage = "\(workspace.selectedResidueIndices.count) \(ssName) selected"
+        let residueCount = workspace.selectedResidueIndices.count
+        let residueText = "\(residueCount) residue\(residueCount == 1 ? "" : "s")"
+        if ssType == .coil {
+            workspace.statusMessage = "\(residueText) in coil selected"
+        } else {
+            let segmentCount = prot.secondaryStructureAssignments.filter {
+                $0.type == ssType && (chainID == nil || $0.chain == chainID)
+            }.count
+            let segmentName = switch ssType {
+            case .helix: segmentCount == 1 ? "helix" : "helices"
+            case .sheet: segmentCount == 1 ? "strand" : "strands"
+            case .turn: segmentCount == 1 ? "turn" : "turns"
+            case .coil: ""
+            }
+            workspace.statusMessage = "\(segmentCount) \(segmentName) selected (\(residueText))"
+        }
     }
 
     func resetView() {
@@ -785,6 +848,9 @@ extension AppViewModel {
 
     func showContextMenu(event: NSEvent, view: NSView) {
         let menu = NSMenu(title: "Context")
+        // Item state below follows the current selection; AppKit's auto-enabling would
+        // ignore it and enable every item whose target answers its action.
+        menu.autoenablesItems = false
 
         let chainMenu = NSMenu(title: "Chains")
         let chainItem = NSMenuItem(title: "Select Chain", action: nil, keyEquivalent: "")
@@ -953,5 +1019,154 @@ extension AppViewModel {
 
         workspace.constraintSheetContext = context
         workspace.showingConstraintSheet = true
+    }
+}
+
+// MARK: - Secondary structure from backbone geometry
+
+/// Backbone atoms of one amino-acid residue, listed in chain order.
+struct BackboneResidue {
+    let chainID: String
+    let sequenceNumber: Int
+    let n: SIMD3<Float>
+    let ca: SIMD3<Float>
+    let c: SIMD3<Float>
+    let o: SIMD3<Float>
+    /// Amide hydrogen when the model carries one; otherwise it is placed geometrically.
+    let h: SIMD3<Float>?
+    let isProline: Bool
+}
+
+/// Kabsch–Sander (DSSP) secondary-structure assignment from backbone H-bonds, used when a
+/// structure ships without HELIX/SHEET records (CASF/PDBbind exports, predicted models,
+/// prepared or re-written PDBs). α (H), 3₁₀ (G) and π (I) helices map to `.helix`, ladder
+/// strands (E) to `.sheet`, H-bonded turns (T) to `.turn`; isolated bridges and bends stay coil.
+enum BackboneSecondaryStructure {
+    private enum Label { case none, alpha, strand, threeTen, pi, turn }
+
+    /// Electrostatic H-bond energy (kcal/mol) between the C=O of `acceptor` and the
+    /// N-H of the donor: E = 0.084·332·(1/rON + 1/rCH − 1/rOH − 1/rCN).
+    private static func hbondEnergy(acceptor a: BackboneResidue, donorN n: SIMD3<Float>, donorH h: SIMD3<Float>) -> Float {
+        let rON = simd_distance(a.o, n), rCH = simd_distance(a.c, h)
+        let rOH = simd_distance(a.o, h), rCN = simd_distance(a.c, n)
+        guard min(rON, rCH, rOH, rCN) > 0.5 else { return -9.9 }
+        return max(27.888 * (1 / rON + 1 / rCH - 1 / rOH - 1 / rCN), -9.9)
+    }
+
+    static func assign(_ res: [BackboneResidue]) -> [SecondaryStructure] {
+        let count = res.count
+        guard count >= 3 else { return Array(repeating: .coil, count: count) }
+
+        // linked[i]: residue i is peptide-bonded to residue i + 1.
+        let linked: [Bool] = (0..<count).map { i in
+            i + 1 < count && res[i].chainID == res[i + 1].chainID
+                && simd_distance(res[i].c, res[i + 1].n) < 2.5
+        }
+        func continuous(_ a: Int, _ b: Int) -> Bool {
+            guard a >= 0, b < count, a <= b else { return false }
+            return (a..<b).allSatisfy { linked[$0] }
+        }
+
+        // Amide H: model coordinate, else 1 Å from N opposite the preceding C=O (DSSP convention).
+        let amideH: [SIMD3<Float>?] = (0..<count).map { i in
+            if res[i].isProline { return nil }
+            if let h = res[i].h { return h }
+            guard i > 0, linked[i - 1] else { return nil }
+            return res[i].n + simd_normalize(res[i - 1].c - res[i - 1].o)
+        }
+
+        // accepts[i] = donors j whose N-H bonds to the C=O of i.
+        var accepts = [Set<Int>](repeating: [], count: count)
+        for i in 0..<count {
+            for j in 0..<count where abs(i - j) >= 2 {
+                guard let h = amideH[j], simd_distance(res[i].ca, res[j].ca) < 9 else { continue }
+                if hbondEnergy(acceptor: res[i], donorN: res[j].n, donorH: h) < -0.5 {
+                    accepts[i].insert(j)
+                }
+            }
+        }
+        func hb(_ i: Int, _ j: Int) -> Bool {
+            i >= 0 && i < count && j >= 0 && j < count && accepts[i].contains(j)
+        }
+        func turn(_ n: Int, at i: Int) -> Bool { hb(i, i + n) && continuous(i, i + n) }
+
+        var labels = [Label](repeating: .none, count: count)
+
+        // α-helix: two consecutive 4-turns at i-1 and i → residues i...i+3.
+        for i in 1..<count where turn(4, at: i - 1) && turn(4, at: i) {
+            for k in i...min(i + 3, count - 1) { labels[k] = .alpha }
+        }
+
+        // β-bridges, then ladders (consecutive bridges) become strands.
+        struct Bridge: Hashable { let i: Int; let j: Int; let parallel: Bool }
+        var bridges = Set<Bridge>()
+        for i in 1..<(count - 1) where continuous(i - 1, i + 1) {
+            for j in (i + 3)..<max(i + 3, count - 1) where continuous(j - 1, j + 1) {
+                if (hb(i - 1, j) && hb(j, i + 1)) || (hb(j - 1, i) && hb(i, j + 1)) {
+                    bridges.insert(Bridge(i: i, j: j, parallel: true))
+                }
+                if (hb(i, j) && hb(j, i)) || (hb(i - 1, j + 1) && hb(j - 1, i + 1)) {
+                    bridges.insert(Bridge(i: i, j: j, parallel: false))
+                }
+            }
+        }
+        for b in bridges {
+            let step = b.parallel ? 1 : -1
+            let inLadder = bridges.contains(Bridge(i: b.i + 1, j: b.j + step, parallel: b.parallel))
+                || bridges.contains(Bridge(i: b.i - 1, j: b.j - step, parallel: b.parallel))
+            guard inLadder else { continue }
+            for k in [b.i, b.j] where labels[k] == .none { labels[k] = .strand }
+        }
+        // Single-residue β-bulges inside a strand.
+        for i in 1..<(count - 1)
+        where labels[i] == .none && labels[i - 1] == .strand && labels[i + 1] == .strand && continuous(i - 1, i + 1) {
+            labels[i] = .strand
+        }
+
+        // 3₁₀ and π helices only where no α/strand residue is overwritten.
+        for (n, label) in [(3, Label.threeTen), (5, Label.pi)] {
+            for i in 1..<count where turn(n, at: i - 1) && turn(n, at: i) {
+                let span = i...min(i + n - 1, count - 1)
+                if span.allSatisfy({ labels[$0] == .none || labels[$0] == label }) {
+                    for k in span { labels[k] = label }
+                }
+            }
+        }
+
+        // H-bonded turns.
+        for n in 3...5 {
+            for i in 0..<count where turn(n, at: i) {
+                for k in (i + 1)..<min(i + n, count) where labels[k] == .none { labels[k] = .turn }
+            }
+        }
+
+        return labels.map { label in
+            switch label {
+            case .alpha, .threeTen, .pi: .helix
+            case .strand: .sheet
+            case .turn: .turn
+            case .none: .coil
+            }
+        }
+    }
+
+    /// Collapses per-residue assignments into contiguous non-coil segments.
+    static func segments(
+        _ res: [BackboneResidue], _ ss: [SecondaryStructure]
+    ) -> [(start: Int, end: Int, type: SecondaryStructure, chain: String)] {
+        var out: [(start: Int, end: Int, type: SecondaryStructure, chain: String)] = []
+        var runStart: Int?
+        for i in 0...res.count {
+            let continues = i < res.count && i > 0 && runStart != nil
+                && ss[i] == ss[i - 1] && res[i].chainID == res[i - 1].chainID
+                && res[i].sequenceNumber == res[i - 1].sequenceNumber + 1
+            if continues { continue }
+            if let s = runStart, ss[s] != .coil {
+                out.append((start: res[s].sequenceNumber, end: res[i - 1].sequenceNumber,
+                            type: ss[s], chain: res[s].chainID))
+            }
+            runStart = i < res.count ? i : nil
+        }
+        return out
     }
 }

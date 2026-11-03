@@ -28,7 +28,7 @@ struct DiagramScene {
     let ligandRings: [[Int]]                                  // aromatic rings (atom indices)
     let ligandAABB: CGRect
     let ligandCenter: CGPoint                                 // geometric center for outward normals
-    let pharmacophoreColors: [Int: Color]                     // ligand atom index → halo color (non-π)
+    let ligandHalos: [Int: DiagramHalo]                       // ligand atom index → halo kind (non-π)
 
     // --- Residues ---
     let residues: [ResidueDraw]
@@ -38,8 +38,7 @@ struct DiagramScene {
         let template: SideChainTemplate?
         let scPositions: [CGPoint]
         let interactingAtomNames: Set<String>
-        let propertyFill: Color
-        let propertyBorder: Color
+        let residueClass: DiagramResidueClass
         let dominantType: MolecularInteraction.InteractionType
         let interactions: [MolecularInteraction]
     }
@@ -74,6 +73,84 @@ private let kDiagramHydroAllowed: [String: Set<String>] = [
 ]
 
 // MARK: - Scene Builder
+
+/// Re-index a 2D depiction (atoms in SMILES parse order) onto the ligand's heavy-atom order,
+/// which is the order interaction `ligandAtomIndex` values refer to. A SMILES derived from an
+/// SDF/PDB ligand is RDKit-canonical, so its atom order differs from the file's; matching the
+/// two molecular graphs (element + bonds) puts every contact on the right depicted atom.
+/// Returns nil when the graphs are not the same molecule.
+func alignDepiction(
+    _ coords: RDKitBridge.Coords2D,
+    toHeavyAtoms atoms: [Atom],
+    bonds: [Bond]
+) -> RDKitBridge.Coords2D? {
+    let n = atoms.count
+    guard coords.positions.count == n, coords.bonds.count == bonds.count else { return nil }
+    let ligandElement = atoms.map { $0.element.rawValue }
+    var depictionAdj = Array(repeating: Set<Int>(), count: n)
+    for (a, b, _) in coords.bonds where a < n && b < n {
+        depictionAdj[a].insert(b); depictionAdj[b].insert(a)
+    }
+    var ligandAdj = Array(repeating: Set<Int>(), count: n)
+    for bond in bonds where bond.atomIndex1 < n && bond.atomIndex2 < n {
+        ligandAdj[bond.atomIndex1].insert(bond.atomIndex2); ligandAdj[bond.atomIndex2].insert(bond.atomIndex1)
+    }
+
+    // ligand atom → depiction atom
+    var map = Array(repeating: -1, count: n)
+    let identity = (0..<n).allSatisfy { coords.atomicNums[$0] == ligandElement[$0] && depictionAdj[$0] == ligandAdj[$0] }
+    if identity {
+        map = Array(0..<n)
+    } else {
+        // Visit ligand atoms breadth-first so each one (after a component's first) has an
+        // already-mapped neighbour that narrows its candidates to that neighbour's neighbours.
+        var order: [Int] = []
+        var queued = Array(repeating: false, count: n)
+        for root in 0..<n where !queued[root] {
+            queued[root] = true
+            var head = order.count
+            order.append(root)
+            while head < order.count {
+                for next in ligandAdj[order[head]].sorted() where !queued[next] {
+                    queued[next] = true
+                    order.append(next)
+                }
+                head += 1
+            }
+        }
+        var used = Array(repeating: false, count: n)
+        var budget = 200_000 // backtracking steps; symmetric molecules resolve far sooner
+        func assign(_ k: Int) -> Bool {
+            if k == order.count { return true }
+            budget -= 1
+            if budget < 0 { return false }
+            let atom = order[k]
+            let mappedNeighbors = ligandAdj[atom].filter { map[$0] >= 0 }
+            let pool = mappedNeighbors.first.map { depictionAdj[map[$0]] } ?? Set(0..<n)
+            for candidate in pool.sorted() where !used[candidate]
+                && coords.atomicNums[candidate] == ligandElement[atom]
+                && depictionAdj[candidate].count == ligandAdj[atom].count
+                && mappedNeighbors.allSatisfy({ depictionAdj[candidate].contains(map[$0]) }) {
+                map[atom] = candidate
+                used[candidate] = true
+                if assign(k + 1) { return true }
+                map[atom] = -1
+                used[candidate] = false
+            }
+            return false
+        }
+        guard assign(0) else { return nil }
+    }
+
+    var depictionToLigand = Array(repeating: 0, count: n)
+    for (ligandIndex, depictionIndex) in map.enumerated() { depictionToLigand[depictionIndex] = ligandIndex }
+    return RDKitBridge.Coords2D(
+        positions: map.map { coords.positions[$0] },
+        atomicNums: map.map { coords.atomicNums[$0] },
+        bonds: coords.bonds.map { (depictionToLigand[$0.0], depictionToLigand[$0.1], $0.2) },
+        isAromatic: map.map { coords.isAromatic[$0] }
+    )
+}
 
 /// Compute a complete diagram scene from raw input data. Pure function.
 func buildDiagramScene(
@@ -216,14 +293,13 @@ func buildDiagramScene(
             guard ixn.proteinAtomIndex < proteinAtoms.count else { return nil }
             return proteinAtoms[ixn.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces)
         })
-        let (fill, border) = residuePropertyColors(key.name)
         let dominant = dominantInteractionType(ixns)
 
         residues.append(DiagramScene.ResidueDraw(
             key: key, center: center, template: template,
             scPositions: scPositions,
             interactingAtomNames: interactingAtomNames,
-            propertyFill: fill, propertyBorder: border,
+            residueClass: DiagramResidueClass(residueName: key.name),
             dominantType: dominant, interactions: ixns))
     }
 
@@ -370,15 +446,13 @@ func buildDiagramScene(
         }
     }
 
-    // --- Pharmacophore halo colors per ligand atom (excluding π types) ---
-    // π interactions are now visualized as a translucent fill on the whole
-    // aromatic ring, so we don't add per-atom halos for them.
-    var pharmaColors: [Int: Color] = [:]
+    // --- Pharmacophore halos per ligand atom (excluding π types) ---
+    // π interactions are visualized by the line targeting the ring centroid,
+    // so we don't add per-atom halos for them.
+    var halos: [Int: DiagramHalo] = [:]
     for i in 0..<projected.count {
-        if let c = pharmacophoreColor(forLigandAtomIndex: i,
-                                       interactions: interactions,
-                                       rings: rings) {
-            pharmaColors[i] = c
+        if let halo = pharmacophoreHalo(forLigandAtomIndex: i, interactions: interactions) {
+            halos[i] = halo
         }
     }
 
@@ -402,7 +476,7 @@ func buildDiagramScene(
         ligandRings: rings,
         ligandAABB: ligandAABB,
         ligandCenter: ligandCenter,
-        pharmacophoreColors: pharmaColors,
+        ligandHalos: halos,
         residues: residues,
         directionalLines: directionalLines,
         hydrophobicMarks: hydrophobicMarks)
@@ -487,23 +561,121 @@ private func sideChainRingCentroid(template: SideChainTemplate,
 // parallel lines (inner line shortened, offset toward ring centroid for ring
 // bonds).
 
-struct SkeletalStyle {
-    let bondWidth: CGFloat
-    let bondColor: Color
-    let heteroatomFontSize: CGFloat
-    let backgroundColor: Color
-    let aromaticCircleScale: CGFloat        // 0.55 of average vertex radius
-    let heteroatomLabelInset: CGFloat       // bond inset around heteroatom labels
+/// Unified RDKit-style skeletal geometry used for both the ligand and the
+/// side chains so they look visually consistent. Colors come from `DiagramPalette`.
+private enum Skeletal {
+    static let bondWidth: CGFloat = 2.2
+    static let heteroatomFontSize: CGFloat = NSFont.systemFontSize   // 13 pt, matches `.body`
+    static let aromaticCircleScale: CGFloat = 0.55                   // of average vertex radius
+    static let heteroatomLabelInset: CGFloat = 9                     // bond inset around heteroatom labels
 }
 
-extension SkeletalStyle {
-    /// Unified RDKit-style skeletal rendering used for both the ligand and the
-    /// side chains so they look visually consistent.
-    static let classic = SkeletalStyle(
-        bondWidth: 2.2, bondColor: Color.primary.opacity(0.85),
-        heteroatomFontSize: 13,
-        backgroundColor: Color(nsColor: .controlBackgroundColor),
-        aromaticCircleScale: 0.55, heteroatomLabelInset: 9)
+// MARK: - Palette
+//
+// Every color the diagram draws, resolved once for a concrete appearance.
+// Tokens are dynamic (light/dark); resolving them explicitly against an
+// NSAppearance keeps on-screen drawing in sync with the window and lets
+// exports always use the light ("white paper") variant.
+
+/// Ligand-atom halo kinds (directional pharmacophore contacts).
+enum DiagramHalo: Sendable {
+    case hbond, saltBridge, metal, chalcogen, other
+}
+
+/// Residue property class driving the residue bubble colors.
+enum DiagramResidueClass: Sendable, CaseIterable {
+    case polar, acidic, basic, hydrophobic
+
+    init(residueName: String) {
+        switch residueName {
+        case "ASP", "GLU":                                     self = .acidic
+        case "ARG", "LYS", "HIS":                              self = .basic
+        case "SER", "THR", "ASN", "GLN", "TYR", "CYS", "TRP":  self = .polar
+        default:                                               self = .hydrophobic
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .polar:       "polar"
+        case .acidic:      "acidic"
+        case .basic:       "basic"
+        case .hydrophobic: "hydrophobic"
+        }
+    }
+
+    /// Dynamic theme color (for SwiftUI chrome such as legends).
+    var themeColor: Color {
+        switch self {
+        case .polar:       DS.Color.water
+        case .acidic:      DS.Color.danger
+        case .basic:       DS.Color.protein
+        case .hydrophobic: DS.Color.success
+        }
+    }
+}
+
+struct DiagramPalette: Sendable {
+    let paper: Color
+    let ink: Color
+    let secondaryInk: Color
+    let shadow: Color
+    private let interactions: [MolecularInteraction.InteractionType: Color]
+    private let residues: [DiagramResidueClass: Color]
+    private let halos: [DiagramHalo: Color]
+    private let elements: [Int: Color]
+    let chargePositive: Color
+    let chargeNegative: Color
+
+    func interaction(_ type: MolecularInteraction.InteractionType) -> Color { interactions[type] ?? ink }
+    func residue(_ cls: DiagramResidueClass) -> Color { residues[cls] ?? ink }
+    func halo(_ kind: DiagramHalo) -> Color { halos[kind] ?? secondaryInk }
+    func element(_ atomicNum: Int) -> Color { elements[atomicNum] ?? secondaryInk }
+
+    /// Element colors (CPK-derived data palette) tuned for contrast on diagram paper.
+    private static let elementTokens: [Int: Color] = [
+        7:  DS.dynamic(light: 0x2F5BD1, dark: 0x7AA2FF),   // N
+        8:  DS.dynamic(light: 0xCF222E, dark: 0xFF7B72),   // O
+        9:  DS.dynamic(light: 0x1A7F37, dark: 0x56D364),   // F
+        15: DS.dynamic(light: 0xBC4C00, dark: 0xF0883E),   // P
+        16: DS.dynamic(light: 0x9A6700, dark: 0xE3B341),   // S
+        17: DS.dynamic(light: 0x1A7F37, dark: 0x56D364),   // Cl
+        35: DS.dynamic(light: 0x8B2E2E, dark: 0xE08A8A),   // Br
+        53: DS.dynamic(light: 0x7A4FD6, dark: 0xB392F0),   // I
+    ]
+
+    @MainActor
+    static func resolved(dark: Bool) -> DiagramPalette {
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua) ?? NSAppearance.currentDrawing()
+        func r(_ color: Color) -> Color {
+            var out = NSColor(color)
+            appearance.performAsCurrentDrawingAppearance {
+                out = NSColor(color).usingColorSpace(.sRGB) ?? out
+            }
+            return Color(nsColor: out)
+        }
+        let ink = r(DS.Color.diagramInk)
+        let hbond = r(DS.Color.interactionHBond)
+        return DiagramPalette(
+            paper: r(DS.Color.diagramPaper),
+            ink: ink,
+            secondaryInk: ink.opacity(0.6),
+            shadow: Color(nsColor: .shadowColor).opacity(dark ? 0.35 : 0.12),
+            interactions: Dictionary(uniqueKeysWithValues:
+                MolecularInteraction.InteractionType.allCases.map { ($0, r($0.themeColor)) }),
+            residues: Dictionary(uniqueKeysWithValues:
+                DiagramResidueClass.allCases.map { ($0, r($0.themeColor)) }),
+            halos: [
+                .hbond: hbond,
+                .saltBridge: r(DS.Color.interactionSaltBridge),
+                .metal: r(DS.Color.interactionMetal),
+                .chalcogen: r(MolecularInteraction.InteractionType.chalcogen.themeColor),
+                .other: ink.opacity(0.45),
+            ],
+            elements: elementTokens.mapValues(r),
+            chargePositive: hbond,
+            chargeNegative: r(DS.Color.danger))
+    }
 }
 
 func drawSkeletal(
@@ -513,8 +685,8 @@ func drawSkeletal(
     atomicNums: [Int],
     rings: [[Int]],
     formalCharges: [Int],
-    style: SkeletalStyle,
-    halos: [Int: Color] = [:],
+    palette: DiagramPalette,
+    halos: [Int: DiagramHalo] = [:],
     labelOverrides: [Int: String] = [:]    // explicit labels (e.g. "NH", "OH")
 ) {
     // Per-ring info, kept 1:1 with `rings` so callers can index by position.
@@ -548,14 +720,17 @@ func drawSkeletal(
         let len = hypot(dx, dy)
         guard len > 0 else { return (p1, p2) }
         let ux = dx / len, uy = dy / len
-        let inset = style.heteroatomLabelInset
+        let inset = Skeletal.heteroatomLabelInset
         let q1 = isHetA ? CGPoint(x: p1.x + ux * inset, y: p1.y + uy * inset) : p1
         let q2 = isHetB ? CGPoint(x: p2.x - ux * inset, y: p2.y - uy * inset) : p2
         return (q1, q2)
     }
 
+    let bondColor = palette.ink.opacity(0.85)
+
     // --- Halos (drawn first, behind everything) ---
-    for (idx, color) in halos where idx < positions.count {
+    for (idx, kind) in halos where idx < positions.count {
+        let color = palette.halo(kind)
         let p = positions[idx]
         let isHet = idx < atomicNums.count && atomicNums[idx] != 6
         let r: CGFloat = isHet ? 18 : 10
@@ -587,7 +762,7 @@ func drawSkeletal(
             }
             // Outer line on the original bond axis
             var outer = Path(); outer.move(to: p1); outer.addLine(to: p2)
-            context.stroke(outer, with: .color(style.bondColor), lineWidth: style.bondWidth)
+            context.stroke(outer, with: .color(bondColor), lineWidth: Skeletal.bondWidth)
             // Inner line offset by ~3 px
             let off: CGFloat = 3.5
             let shrink: CGFloat = 0.18
@@ -596,8 +771,8 @@ func drawSkeletal(
             let i2 = CGPoint(x: p2.x - dx * shrink + nx * off,
                              y: p2.y - dy * shrink + ny * off)
             var inner = Path(); inner.move(to: i1); inner.addLine(to: i2)
-            context.stroke(inner, with: .color(style.bondColor),
-                           lineWidth: style.bondWidth * 0.85)
+            context.stroke(inner, with: .color(bondColor),
+                           lineWidth: Skeletal.bondWidth * 0.85)
         } else if bond.order == 3 {
             // Triple bond: three parallel lines
             let nx = -dy / len, ny = dx / len
@@ -606,25 +781,25 @@ func drawSkeletal(
                 var path = Path()
                 path.move(to: CGPoint(x: p1.x + nx * off * sign, y: p1.y + ny * off * sign))
                 path.addLine(to: CGPoint(x: p2.x + nx * off * sign, y: p2.y + ny * off * sign))
-                context.stroke(path, with: .color(style.bondColor),
-                               lineWidth: style.bondWidth * 0.85)
+                context.stroke(path, with: .color(bondColor),
+                               lineWidth: Skeletal.bondWidth * 0.85)
             }
         } else {
             // Single bond (or aromatic rendered as single line + ring circle)
             var path = Path(); path.move(to: p1); path.addLine(to: p2)
-            context.stroke(path, with: .color(style.bondColor), lineWidth: style.bondWidth)
+            context.stroke(path, with: .color(bondColor), lineWidth: Skeletal.bondWidth)
         }
     }
 
     // --- Aromatic ring inscribed circles ---
     for info in ringInfos {
         guard let info else { continue }
-        let r = info.avgRadius * style.aromaticCircleScale
+        let r = info.avgRadius * Skeletal.aromaticCircleScale
         let rect = CGRect(x: info.centroid.x - r, y: info.centroid.y - r,
                           width: r * 2, height: r * 2)
         context.stroke(Path(ellipseIn: rect),
-                       with: .color(style.bondColor.opacity(0.6)),
-                       lineWidth: style.bondWidth * 0.7)
+                       with: .color(bondColor.opacity(0.6)),
+                       lineWidth: Skeletal.bondWidth * 0.7)
     }
 
     // --- Atoms ---
@@ -632,10 +807,10 @@ func drawSkeletal(
         let z = i < atomicNums.count ? atomicNums[i] : 6
         // Carbon: bare vertex (skeletal style)
         if z == 6 { continue }
-        let (defaultSymbol, color) = atomDisplay(z)
-        let symbol = labelOverrides[i] ?? defaultSymbol
+        let symbol = labelOverrides[i] ?? elementSymbol(z)
+        let color = palette.element(z)
         // Background pill sized to the actual rendered text
-        let nsFont = NSFont.monospacedSystemFont(ofSize: style.heteroatomFontSize, weight: .bold)
+        let nsFont = NSFont.monospacedSystemFont(ofSize: Skeletal.heteroatomFontSize, weight: .bold)
         let textSize = NSAttributedString(string: symbol, attributes: [.font: nsFont]).size()
         let labelW = textSize.width + 6
         let labelH = textSize.height + 2
@@ -643,20 +818,18 @@ func drawSkeletal(
                                               y: pos.y - labelH / 2,
                                               width: labelW, height: labelH),
                                        cornerRadius: labelH / 2),
-                     with: .color(style.backgroundColor))
+                     with: .color(palette.paper))
         let text = Text(symbol)
-            .font(.system(size: style.heteroatomFontSize, weight: .bold, design: .monospaced))
+            .font(.system(.body, design: .monospaced).weight(.bold))
             .foregroundColor(color)
         context.draw(context.resolve(text), at: pos, anchor: .center)
 
         // Formal charge
         if i < formalCharges.count, formalCharges[i] != 0 {
             let label = formalCharges[i] > 0 ? "+" : "−"
-            let chargeColor: Color = formalCharges[i] > 0
-                ? Color(red: 0.3, green: 0.5, blue: 1.0)
-                : Color(red: 1.0, green: 0.3, blue: 0.2)
+            let chargeColor = formalCharges[i] > 0 ? palette.chargePositive : palette.chargeNegative
             context.draw(context.resolve(
-                Text(label).font(.system(size: 12, weight: .heavy, design: .rounded))
+                Text(label).font(.system(.callout, design: .rounded).weight(.heavy))
                     .foregroundColor(chargeColor)),
                 at: CGPoint(x: pos.x + 9, y: pos.y - 9), anchor: .center)
         }
@@ -668,7 +841,8 @@ func drawSkeletal(
 /// Draw a complete diagram scene with auto-fit. Returns the screen-space
 /// residue centers (after the auto-fit transform) for hover hit-testing.
 @discardableResult
-func drawScene(_ scene: DiagramScene, in context: GraphicsContext, size: CGSize)
+func drawScene(_ scene: DiagramScene, in context: GraphicsContext, size: CGSize,
+               palette: DiagramPalette)
     -> [(label: String, center: CGPoint, interactions: [MolecularInteraction])]
 {
     // --- Auto-fit ---
@@ -714,23 +888,23 @@ func drawScene(_ scene: DiagramScene, in context: GraphicsContext, size: CGSize)
                  atomicNums: scene.ligandAtomicNums,
                  rings: scene.ligandRings,
                  formalCharges: scene.ligandFormalCharges,
-                 style: .classic,
-                 halos: scene.pharmacophoreColors)
+                 palette: palette,
+                 halos: scene.ligandHalos)
 
     // --- Layer 2: hydrophobic eyelashes (LigPlot+ style) ---
-    let hydroColor = interactionColor(.hydrophobic)
+    let hydroColor = palette.interaction(.hydrophobic)
     for mark in scene.hydrophobicMarks {
         drawHydrophobicEyelash(context: ctx, mark: mark, color: hydroColor)
     }
 
     // --- Layer 3: directional interaction lines ---
     for line in scene.directionalLines {
-        drawDirectionalLine(context: ctx, line: line)
+        drawDirectionalLine(context: ctx, line: line, palette: palette)
     }
 
     // --- Layer 4: residue side chains + bubbles (on top of lines) ---
     for residue in scene.residues {
-        drawResidue(context: ctx, residue: residue)
+        drawResidue(context: ctx, residue: residue, palette: palette)
     }
 
     // --- Compute screen-space residue centers for hover ---
@@ -794,8 +968,9 @@ private func drawHydrophobicEyelash(
 
 // MARK: - Directional line
 
-private func drawDirectionalLine(context: GraphicsContext, line: DiagramScene.DirectionalLine) {
-    let color = interactionColor(line.type)
+private func drawDirectionalLine(context: GraphicsContext, line: DiagramScene.DirectionalLine,
+                                 palette: DiagramPalette) {
+    let color = palette.interaction(line.type)
     let lw: CGFloat = 2.0
 
     var path = Path()
@@ -828,20 +1003,21 @@ private func drawDirectionalLine(context: GraphicsContext, line: DiagramScene.Di
     }
     let distStr = String(format: "%.1f", line.distance)
     let sz = NSAttributedString(string: distStr,
-        attributes: [.font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)]).size()
+        attributes: [.font: NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize - 1, weight: .medium)]).size()
     let pill = CGRect(x: labelPt.x - sz.width / 2 - 4,
                       y: labelPt.y - sz.height / 2 - 2,
                       width: sz.width + 8, height: sz.height + 4)
-    context.fill(Path(roundedRect: pill, cornerRadius: 4),
-                 with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.9)))
+    context.fill(Path(roundedRect: pill, cornerRadius: DS.Radius.xs),
+                 with: .color(palette.paper.opacity(0.92)))
     context.draw(context.resolve(
-        Text(distStr).font(.footnote.monospaced().weight(.medium))
-            .foregroundColor(.secondary)), at: labelPt, anchor: .center)
+        Text(distStr).font(DS.Font.monoSmall.weight(.medium))
+            .foregroundColor(palette.secondaryInk)), at: labelPt, anchor: .center)
 }
 
 // MARK: - Residue (side chain + bubble)
 
-private func drawResidue(context: GraphicsContext, residue: DiagramScene.ResidueDraw) {
+private func drawResidue(context: GraphicsContext, residue: DiagramScene.ResidueDraw,
+                         palette: DiagramPalette) {
     // Side chain via the shared skeletal renderer
     if let tmpl = residue.template, !residue.scPositions.isEmpty,
        residue.scPositions.count == tmpl.atoms.count {
@@ -894,12 +1070,12 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
                      atomicNums: atomicNums,
                      rings: tmpl.aromaticRings,
                      formalCharges: formalCharges,
-                     style: .classic,
+                     palette: palette,
                      labelOverrides: labelOverrides)
 
         // Per-atom highlight ring for interacting atoms — but skip aromatic
         // ring carbons (the π line shows the ring interaction by itself).
-        let dominantColor = interactionColor(residue.dominantType)
+        let dominantColor = palette.interaction(residue.dominantType)
         for (i, atom) in tmpl.atoms.enumerated() where i < residue.scPositions.count {
             guard residue.interactingAtomNames.contains(atom.name) else { continue }
             if aromaticAtomIdx.contains(i) { continue }
@@ -909,9 +1085,6 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
                 Path(ellipseIn: CGRect(x: pos.x - r, y: pos.y - r, width: r * 2, height: r * 2)),
                 with: .color(dominantColor), lineWidth: 1.8)
         }
-
-        // (Donor hydrogens are now part of the heteroatom label itself —
-        // the "OH"/"NH"/"NH2" text already shows the explicit H atoms.)
 
         // Connector line: bubble edge → CB. The bubble itself is drawn next
         // and will cover the inner end of this line.
@@ -923,7 +1096,7 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
         connector.move(to: residue.center)
         connector.addLine(to: CGPoint(x: residue.center.x + cdx / clen * (clen - 2),
                                       y: residue.center.y + cdy / clen * (clen - 2)))
-        context.stroke(connector, with: .color(Color.primary.opacity(0.85)), lineWidth: 2.2)
+        context.stroke(connector, with: .color(palette.ink.opacity(0.85)), lineWidth: Skeletal.bondWidth)
     }
 
     // Core bubble (residue label) drawn on top of side chain + connector
@@ -935,26 +1108,28 @@ private func drawResidue(context: GraphicsContext, residue: DiagramScene.Residue
                       y: residue.center.y - bubbleH / 2,
                       width: bubbleW, height: bubbleH)
 
-    context.fill(Path(roundedRect: rect.offsetBy(dx: 1.5, dy: 1.5), cornerRadius: 8),
-                 with: .color(Color(nsColor: .shadowColor).opacity(0.12)))
-    context.fill(Path(roundedRect: rect, cornerRadius: 8), with: .color(residue.propertyFill))
-    context.stroke(Path(roundedRect: rect, cornerRadius: 8),
-                   with: .color(residue.propertyBorder), lineWidth: 2)
+    let border = palette.residue(residue.residueClass)
+    let bubble = Path(roundedRect: rect, cornerRadius: DS.Radius.m, style: .continuous)
+    context.fill(Path(roundedRect: rect.offsetBy(dx: 1.5, dy: 1.5), cornerRadius: DS.Radius.m, style: .continuous),
+                 with: .color(palette.shadow))
+    // Opaque paper first so lines underneath are hidden, then the class tint.
+    context.fill(bubble, with: .color(palette.paper))
+    context.fill(bubble, with: .color(border.opacity(0.14)))
+    context.stroke(bubble, with: .color(border), lineWidth: 2)
 
     context.draw(context.resolve(
-        Text(residue.key.label).font(.callout.weight(.bold)).foregroundColor(.primary)),
+        Text(residue.key.label).font(.callout.weight(.bold)).foregroundColor(palette.ink)),
         at: CGPoint(x: residue.center.x, y: residue.center.y - 4), anchor: .center)
     context.draw(context.resolve(
-        Text(residue.dominantType.label).font(.caption2.weight(.medium))
-            .foregroundColor(residue.propertyBorder)),
+        Text(residue.dominantType.label).font(DS.Font.caption.weight(.medium))
+            .foregroundColor(border)),
         at: CGPoint(x: residue.center.x, y: residue.center.y + 11), anchor: .center)
 }
 
-// MARK: - Pharmacophore halo color
+// MARK: - Pharmacophore halo
 
-private func pharmacophoreColor(forLigandAtomIndex index: Int,
-                                interactions: [MolecularInteraction],
-                                rings: [[Int]]) -> Color? {
+private func pharmacophoreHalo(forLigandAtomIndex index: Int,
+                               interactions: [MolecularInteraction]) -> DiagramHalo? {
     // Per-atom halos for directional interactions only.
     // - π types are visualized via the line targeting the ring centroid.
     // - hydrophobic is visualized via the eyelash on the ligand side.
@@ -963,58 +1138,27 @@ private func pharmacophoreColor(forLigandAtomIndex index: Int,
         .filter { $0.ligandAtomIndex == index && !excluded.contains($0.type) }
         .map(\.type)
     guard !types.isEmpty else { return nil }
-    if types.contains(.hbond) || types.contains(.halogen) {
-        return Color(red: 0.2, green: 0.6, blue: 1.0)
-    }
-    if types.contains(.saltBridge) {
-        return Color(red: 1.0, green: 0.5, blue: 0.1)
-    }
-    if types.contains(.metalCoord) {
-        return Color(red: 1.0, green: 0.85, blue: 0.0)
-    }
-    if types.contains(.chalcogen) {
-        return Color(red: 0.5, green: 0.8, blue: 0.2)
-    }
-    return Color.gray.opacity(0.5)
+    if types.contains(.hbond) || types.contains(.halogen) { return .hbond }
+    if types.contains(.saltBridge) { return .saltBridge }
+    if types.contains(.metalCoord) { return .metal }
+    if types.contains(.chalcogen) { return .chalcogen }
+    return .other
 }
 
 // MARK: - Shared helpers
 
-func interactionColor(_ type: MolecularInteraction.InteractionType) -> Color {
-    let c = type.color
-    return Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z))
-}
-
-func atomDisplay(_ atomicNum: Int) -> (String, Color) {
+private func elementSymbol(_ atomicNum: Int) -> String {
     switch atomicNum {
-    case 7:  return ("N", .blue)
-    case 8:  return ("O", .red)
-    case 9:  return ("F", .green)
-    case 15: return ("P", .orange)
-    case 16: return ("S", .yellow)
-    case 17: return ("Cl", .green)
-    case 35: return ("Br", Color(red: 0.6, green: 0.2, blue: 0.2))
-    case 53: return ("I", .purple)
-    default:
-        let elem = Element(rawValue: atomicNum)
-        return (elem?.symbol ?? "?", .gray)
+    case 7:  "N"
+    case 8:  "O"
+    case 9:  "F"
+    case 15: "P"
+    case 16: "S"
+    case 17: "Cl"
+    case 35: "Br"
+    case 53: "I"
+    default: Element(rawValue: atomicNum)?.symbol ?? "?"
     }
-}
-
-func residuePropertyColors(_ residueName: String) -> (fill: Color, border: Color) {
-    let acidic = Set(["ASP", "GLU"])
-    let basic = Set(["ARG", "LYS", "HIS"])
-    let polar = Set(["SER", "THR", "ASN", "GLN", "TYR", "CYS", "TRP"])
-    if acidic.contains(residueName) {
-        return (Color(red: 0.95, green: 0.85, blue: 0.85), Color(red: 0.8, green: 0.2, blue: 0.2))
-    }
-    if basic.contains(residueName) {
-        return (Color(red: 0.85, green: 0.85, blue: 0.95), Color(red: 0.3, green: 0.3, blue: 0.9))
-    }
-    if polar.contains(residueName) {
-        return (Color(red: 0.85, green: 0.92, blue: 0.95), Color(red: 0.2, green: 0.6, blue: 0.7))
-    }
-    return (Color(red: 0.88, green: 0.92, blue: 0.85), Color(red: 0.4, green: 0.6, blue: 0.3))
 }
 
 func dominantInteractionType(_ interactions: [MolecularInteraction]) -> MolecularInteraction.InteractionType {

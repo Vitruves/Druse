@@ -9,7 +9,6 @@
 #include <cmath>
 #include <GraphMol/MolStandardize/Tautomer.h>
 #include <GraphMol/Substruct/SubstructMatch.h>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -45,12 +44,9 @@ static double embed_and_minimize(RWMol &mol) {
         try { RDDepict::compute2DCoords(mol); } catch (...) {}
         return NAN;
     }
-    std::vector<std::pair<int, double>> results;
-    MMFF::MMFFOptimizeMoleculeConfs(mol, results);
-    if (!results.empty() && results[0].first >= 0) {
-        return results[0].second;
-    }
-    return NAN;
+    double energy = NAN;
+    if (!mmff_minimize_single(mol, cid, &energy)) return NAN;
+    return energy;
 }
 
 DruseVariantSet* druse_enumerate_tautomers(
@@ -123,7 +119,7 @@ DruseVariantSet* druse_enumerate_tautomers(
         if (count == 0) return set;
 
         set->count = count;
-        set->variants = new DruseMoleculeResult*[count];
+        set->variants = new DruseMoleculeResult*[count]();
         set->scores = new double[count];
         set->infos = new DruseVariantInfo[count];
 
@@ -264,7 +260,7 @@ DruseVariantSet* druse_enumerate_protomers(
         if (count == 0) return set;
 
         set->count = count;
-        set->variants = new DruseMoleculeResult*[count];
+        set->variants = new DruseMoleculeResult*[count]();
         set->scores = new double[count];
         set->infos = new DruseVariantInfo[count];
 
@@ -685,6 +681,9 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         // Parallelize across forms (see druse_core_protonation_tools.cpp for
         // rationale). Inner numThreads=1 to avoid nested-parallelism oversubscription.
         tbb::parallel_for(0, (int)allForms.size(), [&](int fi) {
+          // An RDKit failure on one form must not abort the whole ensemble
+          // (TBB would rethrow it on the calling thread).
+          try {
             auto &form = allForms[fi];
             auto mol = std::make_unique<RWMol>(*form.mol);
             MolOps::addHs(*mol, false, true);
@@ -715,54 +714,38 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
                     *mol, mmffResults, /*numThreads=*/1, /*maxIters=*/1000, /*mmffVariant=*/"MMFF94"
                 );
             } catch (...) {
+                mmffResults.clear();
             }
 
             try { computeGasteigerCharges(*mol); } catch (...) {}
 
             std::vector<std::pair<int, double>> indexed;
             for (int ci = 0; ci < (int)cids.size(); ci++) {
-                double e = std::numeric_limits<double>::quiet_NaN();
-                if (ci < (int)mmffResults.size()) {
-                    if (mmffResults[ci].first == 0) {
-                        e = mmffResults[ci].second;
-                    } else {
-                        continue;
-                    }
-                }
+                // MMFFOptimizeMoleculeConfs: 0 = converged, 1 = more iterations
+                // needed (geometry and energy still valid), -1 = no MMFF setup.
+                // Without MMFF parameters keep the ETKDG geometry with NaN energy
+                // instead of dropping the whole chemical form.
+                double e = conformer_mmff_energy(mmffResults, ci);
+                if (e > 1e6) continue;
 
-                if (std::isnan(e) || e > 1e6) continue;
-
-                bool hasClash = false;
-                const Conformer &conf = mol->getConformer(cids[ci]);
-                int nAtoms = mol->getNumAtoms();
-                for (int a = 0; a < nAtoms && !hasClash; a++) {
-                    if (mol->getAtomWithIdx(a)->getAtomicNum() == 1) continue;
-                    const auto &pa = conf.getAtomPos(a);
-                    if (pa.x == 0.0 && pa.y == 0.0 && pa.z == 0.0) { hasClash = true; break; }
-                    for (int b = a + 1; b < nAtoms && !hasClash; b++) {
-                        if (mol->getAtomWithIdx(b)->getAtomicNum() == 1) continue;
-                        if (mol->getBondBetweenAtoms(a, b)) continue;
-                        const auto &pb = conf.getAtomPos(b);
-                        double d2 = (pa.x-pb.x)*(pa.x-pb.x) + (pa.y-pb.y)*(pa.y-pb.y) + (pa.z-pb.z)*(pa.z-pb.z);
-                        if (d2 < 1.0) hasClash = true;
-                    }
-                }
-                if (hasClash) continue;
+                if (conformer_is_collapsed(*mol, mol->getConformer(cids[ci]))) continue;
 
                 indexed.push_back({ci, e});
             }
 
-            if (indexed.empty() && !cids.empty()) {
-                for (int ci = 0; ci < (int)cids.size(); ci++) {
-                    if (ci < (int)mmffResults.size() && mmffResults[ci].first == 0) {
-                        indexed.push_back({ci, mmffResults[ci].second});
-                        break;
-                    }
+            if (indexed.empty()) {
+                // Every minimum collapsed: replace the first conformer with a fresh valid
+                // embedding rather than handing a collapsed geometry downstream.
+                double e = std::numeric_limits<double>::quiet_NaN();
+                if (!reembed_valid_conformer(*mol, cids[0], &e)) {
+                    fprintf(stderr, "[druse] no valid conformer for form %d (%s), skipping\n",
+                            fi, form.smi.c_str());
+                    return;
                 }
+                indexed.push_back({0, e});
             }
 
-            std::sort(indexed.begin(), indexed.end(),
-                      [](const auto &a, const auto &b) { return a.second < b.second; });
+            std::sort(indexed.begin(), indexed.end(), energy_less_nan_last);
 
             std::vector<PreparedConformer> localConformers;
             localConformers.reserve(indexed.size());
@@ -796,7 +779,19 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
 
             std::lock_guard<std::mutex> lock(allConformersMutex);
             for (auto &c : localConformers) allConformers.push_back(std::move(c));
+          } catch (const std::exception &e) {
+            fprintf(stderr, "[druse] conformer preparation failed for form %d: %s\n", fi, e.what());
+          } catch (...) {
+            fprintf(stderr, "[druse] conformer preparation failed for form %d\n", fi);
+          }
         });
+
+        // Completion order of the parallel loop is nondeterministic; restore a
+        // stable (form, conformer) order so member indices are reproducible.
+        std::sort(allConformers.begin(), allConformers.end(),
+            [](const PreparedConformer &a, const PreparedConformer &b) {
+                return a.formIdx != b.formIdx ? a.formIdx < b.formIdx : a.confIdx < b.confIdx;
+            });
 
         // Per-form energy cutoff (see druse_core_protonation_tools.cpp for rationale).
         if (energyCutoff > 0 && !allConformers.empty()) {
@@ -838,8 +833,10 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
         for (size_t i = 0; i < allConformers.size(); i++) {
             const auto &c = allConformers[i];
             auto it = minEPerForm.find(c.formIdx);
-            if (it == minEPerForm.end()) continue;
-            double dE = std::isnan(c.energy) ? 50.0 : (c.energy - it->second);
+            // A form with no finite MMFF energy (no MMFF parameters) has no
+            // reference: weight its conformers uniformly within the form.
+            double dE = (it == minEPerForm.end()) ? 0.0
+                      : std::isnan(c.energy) ? 50.0 : (c.energy - it->second);
             double boltz = std::exp(-dE / kBT);
             withinFormBoltz[i] = boltz;
             partitionPerForm[c.formIdx] += boltz;
@@ -861,7 +858,7 @@ DruseEnsembleResult* druse_prepare_ligand_ensemble(
 
         int count = (int)allConformers.size();
         result->count = count;
-        result->members = new DruseEnsembleMember[count];
+        result->members = new DruseEnsembleMember[count]();
         result->success = true;
 
         for (int i = 0; i < count; i++) {

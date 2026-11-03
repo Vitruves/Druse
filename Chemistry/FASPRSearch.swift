@@ -352,16 +352,16 @@ enum FASPRSearch {
         var elimination = 0
         for i in 0..<pos.count {
             let ip = pos[i]
+            let neighbors = interactingNeighbors(of: i, pos: pos, eTablePair: eTablePair)
             for s in 0..<nrots[ip] {
                 if eTableSelf[ip][s] > DEAD_ENERGY { continue }
                 for r in 0..<nrots[ip] {
                     if r == s { continue }
                     if eTableSelf[ip][r] > DEAD_ENERGY { continue }
                     var ex = eTableSelf[ip][s] - eTableSelf[ip][r]
-                    for j in 0..<pos.count {
-                        if j == i { continue }
-                        let jp = pos[j]
-                        guard let pairIJ = eTablePair[ip]?[jp] else { continue }
+                    for nb in neighbors {
+                        let jp = nb.site
+                        let pairIJ = nb.pair
                         var ey: Float = 1e8
                         for t in 0..<nrots[jp] {
                             if eTableSelf[jp][t] > DEAD_ENERGY { continue }
@@ -392,33 +392,32 @@ enum FASPRSearch {
         var elimination = 0
         for i in 0..<pos.count {
             let ip = pos[i]
+            let neighbors = interactingNeighbors(of: i, pos: pos, eTablePair: eTablePair)
             for s in 0..<nrots[ip] {
                 if eTableSelf[ip][s] > DEAD_ENERGY { continue }
 
-                // Precompute min_t(pair[s,t] - pair[r,t]) for each (r, j)
-                var storeYjr = [[Float]](repeating: [Float](repeating: 0, count: pos.count), count: nrots[ip])
+                // Precompute min_t(pair[s,t] - pair[r,t]) for each (r, neighbour)
+                var storeYjr = [[Float]](repeating: [Float](repeating: 0, count: neighbors.count), count: nrots[ip])
                 for r in 0..<nrots[ip] {
                     if r == s { continue }
                     if eTableSelf[ip][r] > DEAD_ENERGY { continue }
-                    for j in 0..<pos.count {
-                        if j == i { continue }
-                        let jp = pos[j]
-                        guard let pairIJ = eTablePair[ip]?[jp] else { continue }
+                    for (n, nb) in neighbors.enumerated() {
+                        let jp = nb.site
+                        let pairIJ = nb.pair
                         var ey: Float = 1e8
                         for t in 0..<nrots[jp] {
                             if eTableSelf[jp][t] > DEAD_ENERGY { continue }
                             let em = pairIJ[s][t] - pairIJ[r][t]
                             if em < ey { ey = em }
                         }
-                        storeYjr[r][j] = ey
+                        storeYjr[r][n] = ey
                     }
                 }
 
                 var eliminated = false
-                for k in 0..<pos.count {
-                    if k == i { continue }
-                    let kp = pos[k]
-                    guard let pairIK = eTablePair[ip]?[kp] else { continue }
+                for (kn, nbK) in neighbors.enumerated() {
+                    let kp = nbK.site
+                    let pairIK = nbK.pair
 
                     var elim = [Int](repeating: 0, count: nrots[kp])
                     for r in 0..<nrots[ip] {
@@ -426,10 +425,8 @@ enum FASPRSearch {
                         if eTableSelf[ip][r] > DEAD_ENERGY { continue }
 
                         var ex = eTableSelf[ip][s] - eTableSelf[ip][r]
-                        for j in 0..<pos.count {
-                            if j == i || j == k { continue }
-                            guard eTablePair[ip]?[pos[j]] != nil else { continue }
-                            ex += storeYjr[r][j]
+                        for n in 0..<neighbors.count where n != kn {
+                            ex += storeYjr[r][n]
                         }
                         for v in 0..<nrots[kp] {
                             if eTableSelf[kp][v] > DEAD_ENERGY { continue }
@@ -450,6 +447,21 @@ enum FASPRSearch {
             }
         }
         return elimination
+    }
+
+    /// Positions in `pos` (other than `i`) that have a pair table with `pos[i]`,
+    /// with the table, so DEE inner loops skip the per-iteration dictionary lookups.
+    private static func interactingNeighbors(
+        of i: Int,
+        pos: [Int],
+        eTablePair: [Int: [Int: [[Float]]]]
+    ) -> [(site: Int, pair: [[Float]])] {
+        guard let row = eTablePair[pos[i]] else { return [] }
+        var result: [(site: Int, pair: [[Float]])] = []
+        for j in 0..<pos.count where j != i {
+            if let pair = row[pos[j]] { result.append((pos[j], pair)) }
+        }
+        return result
     }
 
     // MARK: - Graph Construction
@@ -719,11 +731,19 @@ enum FASPRSearch {
             var neighbors: Set<Int>
         }
 
-        var sortgraph = [VertexEntry]()
-        for (vertex, neibs) in graph {
-            sortgraph.append(VertexEntry(idx: vertex, neighbors: neibs))
+        // Stable sort by degree, as C++ std::stable_sort, so ties keep their
+        // current order and the decomposition is deterministic.
+        func stableSortByDegree(_ entries: inout [VertexEntry]) {
+            entries = entries.enumerated().sorted { a, b in
+                let da = a.element.neighbors.count
+                let db = b.element.neighbors.count
+                return da != db ? da < db : a.offset < b.offset
+            }.map(\.element)
         }
-        sortgraph.sort { $0.neighbors.count < $1.neighbors.count }
+
+        // Seed in ascending vertex order (std::map iteration order in FASPR).
+        var sortgraph = graph.keys.sorted().map { VertexEntry(idx: $0, neighbors: graph[$0] ?? []) }
+        stableSortByDegree(&sortgraph)
 
         // 2. Construct bags by greedy elimination
         var bags = [TreeBag]()
@@ -754,7 +774,7 @@ enum FASPRSearch {
 
             // Add edges between all pairs of vertices in left (fill-in)
             if newbag.left.count > 1 {
-                let leftArray = Array(newbag.left)
+                let leftArray = newbag.left.sorted()
                 // Ensure all left vertices exist in sortgraph
                 for v in leftArray {
                     if !sortgraph.contains(where: { $0.idx == v }) {
@@ -783,7 +803,7 @@ enum FASPRSearch {
             }
 
             // Re-sort by degree
-            sortgraph.sort { $0.neighbors.count < $1.neighbors.count }
+            stableSortByDegree(&sortgraph)
         }
 
         // 3. Connect bags into a tree (process from last bag to first = root is last)
@@ -978,6 +998,15 @@ enum FASPRSearch {
         }
     }
 
+    /// Pair tables between each left site and each right site of a bag
+    /// (nil = no interaction), looked up once instead of per rotamer combination.
+    private static func leftRightPairTables(
+        bag: TreeBag,
+        eTablePair: [Int: [Int: [[Float]]]]
+    ) -> [[[[Float]]?]] {
+        bag.lsites.map { l in bag.rsites.map { r in eTablePair[l]?[r] } }
+    }
+
     // MARK: - Leaf Bag Energy Calculation
 
     private static func leafBagCalcEnergy(
@@ -998,6 +1027,7 @@ enum FASPRSearch {
 
         var Rltmp = [Int]()
         getLeftBagRotamerCombination(bag: bag, depth: 0, current: &Rltmp, result: &Rclcom)
+        let leftRightPairs = leftRightPairTables(bag: bag, eTablePair: eTablePair)
 
         for idx2 in 0..<Rclcom.count {
             var emin: Float = 1e8
@@ -1006,7 +1036,7 @@ enum FASPRSearch {
                 var eval: Float = 0
                 for idx4 in 0..<Rclcom[idx2].count {
                     for idx5 in 0..<Rrcom[idx3].count {
-                        if let pairLR = eTablePair[bag.lsites[idx4]]?[bag.rsites[idx5]] {
+                        if let pairLR = leftRightPairs[idx4][idx5] {
                             eval += pairLR[Rclcom[idx2][idx4]][Rrcom[idx3][idx5]]
                         }
                     }
@@ -1076,25 +1106,26 @@ enum FASPRSearch {
 
         childBag.indices = subsetCheck(leafLsites: childBag.lsites, parTsites: parentBag.tsites)
 
+        // The parent sites matching the child's left sites depend only on the
+        // subset indices, not on the rotamer combination.
+        let nL = parentBag.lsites.count
+        let ppartsite = childBag.indices.map { $0 >= nL ? parentBag.rsites[$0 - nL] : parentBag.lsites[$0] }
+        guard ppartsite == childBag.lsites else { return }
+
+        // Child left-combinations are distinct (Cartesian product of distinct
+        // rotamers), so each parent combination matches at most one of them:
+        // a hash lookup replaces FASPR's linear scan over all of Rclcom.
+        var comboIndex = [[Int]: Int](minimumCapacity: Rclcom.count)
+        for (j, combo) in Rclcom.enumerated() { comboIndex[combo] = j }
+
+        var ppartrot = [Int](repeating: 0, count: childBag.indices.count)
         for idx2 in 0..<Rlcom.count {
             for idx3 in 0..<Rrcom.count {
-                var ppartrot = [Int]()
-                var ppartsite = [Int]()
-                for j in 0..<childBag.indices.count {
-                    if childBag.indices[j] >= parentBag.lsites.count {
-                        let rIdx = childBag.indices[j] - parentBag.lsites.count
-                        ppartrot.append(Rrcom[idx3][rIdx])
-                        ppartsite.append(parentBag.rsites[rIdx])
-                    } else {
-                        ppartrot.append(Rlcom[idx2][childBag.indices[j]])
-                        ppartsite.append(parentBag.lsites[childBag.indices[j]])
-                    }
+                for (j, pIdx) in childBag.indices.enumerated() {
+                    ppartrot[j] = pIdx >= nL ? Rrcom[idx3][pIdx - nL] : Rlcom[idx2][pIdx]
                 }
-
-                for j in 0..<Rclcom.count {
-                    if ppartsite == childBag.lsites && ppartrot == Rclcom[j] {
-                        parentBag.Etcom[idx2][idx3] += childBag.Etcom[j][0]
-                    }
+                if let j = comboIndex[ppartrot] {
+                    parentBag.Etcom[idx2][idx3] += childBag.Etcom[j][0]
                 }
             }
         }
@@ -1179,13 +1210,14 @@ enum FASPRSearch {
             eTableSelf: eTableSelf, eTablePair: eTablePair
         )
 
+        let leftRightPairs = leftRightPairTables(bag: rootbag, eTablePair: eTablePair)
         rootbag.EGMEC = 1e8
         for idx2 in 0..<Rlcom.count {
             for idx3 in 0..<Rrcom.count {
                 var energy = Elcom[idx2]
                 for idx4 in 0..<Rlcom[idx2].count {
                     for idx5 in 0..<Rrcom[idx3].count {
-                        if let pairLR = eTablePair[rootbag.lsites[idx4]]?[rootbag.rsites[idx5]] {
+                        if let pairLR = leftRightPairs[idx4][idx5] {
                             energy += pairLR[Rlcom[idx2][idx4]][Rrcom[idx3][idx5]]
                         }
                     }

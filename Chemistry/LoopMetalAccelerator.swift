@@ -9,7 +9,8 @@
 //
 // Architecture:
 //   Swift minimizer loop → Metal compute dispatch (energy + gradient)
-//   → CPU line search + position update → repeat until converged
+//   → CPU steepest-descent update (fixed step factor, per-atom displacement
+//     clamped; no line search) → repeat until converged
 //
 // All computation in float32 / kcal/mol / Angstrom.
 // ============================================================================
@@ -30,21 +31,21 @@ final class LoopMetalAccelerator: @unchecked Sendable {
 
     init?(device: MTLDevice) {
         guard let queue = device.makeCommandQueue(),
-              let library = device.makeDefaultLibrary()
+              let library = device.makeDefaultLibrary(),
+              let bondFn = library.makeFunction(name: "loop_bond_energy"),
+              let angleFn = library.makeFunction(name: "loop_angle_energy"),
+              let torsionFn = library.makeFunction(name: "loop_torsion_energy"),
+              let stericFn = library.makeFunction(name: "loop_steric_restraint")
         else { return nil }
 
         self.device = device
         self.queue = queue
 
         do {
-            bondPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_bond_energy")!)
-            anglePipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_angle_energy")!)
-            torsionPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_torsion_energy")!)
-            stericPipeline = try device.makeComputePipelineState(
-                function: library.makeFunction(name: "loop_steric_restraint")!)
+            bondPipeline = try device.makeComputePipelineState(function: bondFn)
+            anglePipeline = try device.makeComputePipelineState(function: angleFn)
+            torsionPipeline = try device.makeComputePipelineState(function: torsionFn)
+            stericPipeline = try device.makeComputePipelineState(function: stericFn)
         } catch {
             return nil
         }
@@ -52,11 +53,16 @@ final class LoopMetalAccelerator: @unchecked Sendable {
 
     // MARK: - Buffer Helpers
 
+    /// Shared buffer holding `data`. Empty arrays get a one-element placeholder
+    /// (Metal rejects zero-length buffers; kernels never read it since the count is 0).
     private func makeBuffer<T>(_ data: [T]) -> MTLBuffer? {
         data.withUnsafeBufferPointer { ptr in
-            device.makeBuffer(bytes: ptr.baseAddress!,
-                              length: ptr.count * MemoryLayout<T>.stride,
-                              options: .storageModeShared)
+            guard let base = ptr.baseAddress, ptr.count > 0 else {
+                return device.makeBuffer(length: MemoryLayout<T>.stride, options: .storageModeShared)
+            }
+            return device.makeBuffer(bytes: base,
+                                     length: ptr.count * MemoryLayout<T>.stride,
+                                     options: .storageModeShared)
         }
     }
 
@@ -89,27 +95,46 @@ final class LoopMetalAccelerator: @unchecked Sendable {
     }
 
     /// Run GPU-accelerated loop refinement.
-    /// Steepest descent with backtracking line search, GPU energy+gradient evaluation.
+    /// Steepest descent with a fixed step factor and per-atom displacement clamped to
+    /// 0.5 Å (no line search); GPU energy+gradient evaluation.
     func refine(input: LoopRefineInput, maxIterations: Int = 500, tolerance: Float = 0.1) -> LoopRefineOutput {
         let natom = input.atoms.count
 
+        let initialPositions = input.atoms.map(\.position)
+        guard natom > 0 else {
+            return LoopRefineOutput(positions: initialPositions, finalEnergy: 0, iterations: 0)
+        }
+
         // Build GPU data structures
-        var gpuAtoms = buildGPUAtoms(input: input)
-        let refAtoms = gpuAtoms  // reference positions for restraints
+        let gpuAtoms = buildGPUAtoms(input: input)
         let gpuBonds = buildGPUBonds(input: input)
         let gpuAngles = buildGPUAngles(input: input)
         let gpuTorsions = buildGPUTorsions(input: input)
 
-        // Create persistent buffers
-        guard let bondBuf = makeBuffer(gpuBonds),
+        // Persistent buffers. The atom buffer is updated in place each step;
+        // the reference copy keeps the starting positions for restraints.
+        guard let atomBuf = makeBuffer(gpuAtoms),
+              let refBuf = makeBuffer(gpuAtoms),
+              let bondBuf = makeBuffer(gpuBonds),
               let angleBuf = makeBuffer(gpuAngles),
               let torsionBuf = makeBuffer(gpuTorsions),
-              let refBuf = makeBuffer(refAtoms),
               let energyBuf = makeBuffer(count: natom, type: Float.self),
               let gradBuf = makeBuffer(count: natom, type: SIMD3<Float>.self)
         else {
-            return LoopRefineOutput(positions: input.atoms.map(\.position), finalEnergy: .infinity, iterations: 0)
+            return LoopRefineOutput(positions: initialPositions, finalEnergy: .infinity, iterations: 0)
         }
+        let atomPtr = atomBuf.contents().bindMemory(to: LoopRefineAtom.self, capacity: natom)
+
+        var params = LoopRefineParams(
+            atomCount: UInt32(natom),
+            bondCount: UInt32(gpuBonds.count),
+            angleCount: UInt32(gpuAngles.count),
+            torsionCount: UInt32(gpuTorsions.count),
+            restraintK: 500.0,    // kcal/mol/A^2 for non-loop atoms
+            stericCutoff: 8.0,    // Angstrom
+            computeGrad: 1,
+            _pad0: 0
+        )
 
         var bestEnergy: Float = .infinity
         var iteration = 0
@@ -119,39 +144,29 @@ final class LoopMetalAccelerator: @unchecked Sendable {
             iteration = iter + 1
 
             // Zero energy and gradient buffers
-            zeroBuffer(energyBuf, count: natom, type: Float.self)
-            zeroBuffer(gradBuf, count: natom, type: SIMD3<Float>.self)
+            memset(energyBuf.contents(), 0, energyBuf.length)
+            memset(gradBuf.contents(), 0, gradBuf.length)
 
-            // Upload current positions
-            guard let atomBuf = makeBuffer(gpuAtoms) else { break }
-
-            var params = LoopRefineParams(
-                atomCount: UInt32(natom),
-                bondCount: UInt32(gpuBonds.count),
-                angleCount: UInt32(gpuAngles.count),
-                torsionCount: UInt32(gpuTorsions.count),
-                restraintK: 500.0,    // kcal/mol/A^2 for non-loop atoms
-                stericCutoff: 8.0,    // Angstrom
-                computeGrad: 1,
-                _pad0: 0
-            )
-
-            // Dispatch all kernels sequentially
-            dispatchBondKernel(atomBuf: atomBuf, bondBuf: bondBuf, params: &params,
-                               energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
-
+            // All terms in one command buffer: a serial compute encoder runs the
+            // dispatches in order (bond kernel assigns, the others accumulate).
+            guard let cmdBuf = queue.makeCommandBuffer(),
+                  let encoder = cmdBuf.makeComputeCommandEncoder() else { break }
+            encode(encoder, pipeline: bondPipeline, atomBuf: atomBuf, termBuf: bondBuf,
+                   params: &params, energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
             if !gpuAngles.isEmpty {
-                dispatchAngleKernel(atomBuf: atomBuf, angleBuf: angleBuf, params: &params,
-                                    energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
+                encode(encoder, pipeline: anglePipeline, atomBuf: atomBuf, termBuf: angleBuf,
+                       params: &params, energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
             }
-
             if !gpuTorsions.isEmpty {
-                dispatchTorsionKernel(atomBuf: atomBuf, torsionBuf: torsionBuf, params: &params,
-                                      energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
+                encode(encoder, pipeline: torsionPipeline, atomBuf: atomBuf, termBuf: torsionBuf,
+                       params: &params, energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
             }
-
-            dispatchStericKernel(atomBuf: atomBuf, refBuf: refBuf, params: &params,
-                                 energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
+            encode(encoder, pipeline: stericPipeline, atomBuf: atomBuf, termBuf: refBuf,
+                   params: &params, energyBuf: energyBuf, gradBuf: gradBuf, natom: natom)
+            encoder.endEncoding()
+            cmdBuf.commit()
+            cmdBuf.waitUntilCompleted()
+            guard cmdBuf.status == .completed else { break }
 
             // Read results
             let ePtr = energyBuf.contents().bindMemory(to: Float.self, capacity: natom)
@@ -177,14 +192,14 @@ final class LoopMetalAccelerator: @unchecked Sendable {
 
                 // Clamp step to avoid explosions
                 let scale = min(stepSize, 0.5 / gradLen)
-                gpuAtoms[i].position -= grad * scale
+                atomPtr[i].position -= grad * scale
             }
         }
 
         // Extract final positions
-        var positions = input.atoms.map(\.position)
+        var positions = initialPositions
         for i in 0..<natom where input.isLoopAtom[i] {
-            positions[i] = gpuAtoms[i].position
+            positions[i] = atomPtr[i].position
         }
 
         return LoopRefineOutput(positions: positions, finalEnergy: bestEnergy, iterations: iteration)
@@ -192,92 +207,24 @@ final class LoopMetalAccelerator: @unchecked Sendable {
 
     // MARK: - GPU Dispatch
 
-    private func dispatchBondKernel(
-        atomBuf: MTLBuffer, bondBuf: MTLBuffer,
+    /// Encode one loop-refinement kernel. All kernels share the binding layout
+    /// (atoms, per-term data, params, energies, gradients) and run one thread per atom.
+    private func encode(
+        _ encoder: MTLComputeCommandEncoder,
+        pipeline: MTLComputePipelineState,
+        atomBuf: MTLBuffer, termBuf: MTLBuffer,
         params: inout LoopRefineParams,
         energyBuf: MTLBuffer, gradBuf: MTLBuffer, natom: Int
     ) {
-        guard let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else { return }
-
-        encoder.setComputePipelineState(bondPipeline)
+        encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(atomBuf, offset: 0, index: 0)
-        encoder.setBuffer(bondBuf, offset: 0, index: 1)
+        encoder.setBuffer(termBuf, offset: 0, index: 1)
         encoder.setBytes(&params, length: MemoryLayout<LoopRefineParams>.stride, index: 2)
         encoder.setBuffer(energyBuf, offset: 0, index: 3)
         encoder.setBuffer(gradBuf, offset: 0, index: 4)
 
-        let (grid, tg) = threadgroupConfig(pipeline: bondPipeline, count: natom)
+        let (grid, tg) = threadgroupConfig(pipeline: pipeline, count: natom)
         encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
-    }
-
-    private func dispatchAngleKernel(
-        atomBuf: MTLBuffer, angleBuf: MTLBuffer,
-        params: inout LoopRefineParams,
-        energyBuf: MTLBuffer, gradBuf: MTLBuffer, natom: Int
-    ) {
-        guard let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else { return }
-
-        encoder.setComputePipelineState(anglePipeline)
-        encoder.setBuffer(atomBuf, offset: 0, index: 0)
-        encoder.setBuffer(angleBuf, offset: 0, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<LoopRefineParams>.stride, index: 2)
-        encoder.setBuffer(energyBuf, offset: 0, index: 3)
-        encoder.setBuffer(gradBuf, offset: 0, index: 4)
-
-        let (grid, tg) = threadgroupConfig(pipeline: anglePipeline, count: natom)
-        encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
-    }
-
-    private func dispatchTorsionKernel(
-        atomBuf: MTLBuffer, torsionBuf: MTLBuffer,
-        params: inout LoopRefineParams,
-        energyBuf: MTLBuffer, gradBuf: MTLBuffer, natom: Int
-    ) {
-        guard let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else { return }
-
-        encoder.setComputePipelineState(torsionPipeline)
-        encoder.setBuffer(atomBuf, offset: 0, index: 0)
-        encoder.setBuffer(torsionBuf, offset: 0, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<LoopRefineParams>.stride, index: 2)
-        encoder.setBuffer(energyBuf, offset: 0, index: 3)
-        encoder.setBuffer(gradBuf, offset: 0, index: 4)
-
-        let (grid, tg) = threadgroupConfig(pipeline: torsionPipeline, count: natom)
-        encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
-    }
-
-    private func dispatchStericKernel(
-        atomBuf: MTLBuffer, refBuf: MTLBuffer,
-        params: inout LoopRefineParams,
-        energyBuf: MTLBuffer, gradBuf: MTLBuffer, natom: Int
-    ) {
-        guard let cmdBuf = queue.makeCommandBuffer(),
-              let encoder = cmdBuf.makeComputeCommandEncoder() else { return }
-
-        encoder.setComputePipelineState(stericPipeline)
-        encoder.setBuffer(atomBuf, offset: 0, index: 0)
-        encoder.setBuffer(refBuf, offset: 0, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<LoopRefineParams>.stride, index: 2)
-        encoder.setBuffer(energyBuf, offset: 0, index: 3)
-        encoder.setBuffer(gradBuf, offset: 0, index: 4)
-
-        let (grid, tg) = threadgroupConfig(pipeline: stericPipeline, count: natom)
-        encoder.dispatchThreads(grid, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
     }
 
     // MARK: - Data Conversion
@@ -302,11 +249,15 @@ final class LoopMetalAccelerator: @unchecked Sendable {
             guard a1 >= 0, a1 < input.atoms.count, a2 >= 0, a2 < input.atoms.count else { return nil }
             // Only include bonds involving at least one loop atom
             guard input.isLoopAtom[a1] || input.isLoopAtom[a2] else { return nil }
-            let dist = simd_distance(input.atoms[a1].position, input.atoms[a2].position)
+            // Backbone bonds of a freshly built loop start far from ideal, so their
+            // target must be the ideal length (keeping the starting distance would
+            // freeze the bad geometry). Other bonds come from ideal templates.
+            let length = Self.idealBackboneBondLength(input.atoms[a1], input.atoms[a2])
+                ?? simd_distance(input.atoms[a1].position, input.atoms[a2].position)
             return LoopRefineBond(
                 atom1: UInt32(a1),
                 atom2: UInt32(a2),
-                length: dist,
+                length: length,
                 k: estimateBondK(z1: input.atoms[a1].element.rawValue, z2: input.atoms[a2].element.rawValue)
             )
         }
@@ -351,9 +302,23 @@ final class LoopMetalAccelerator: @unchecked Sendable {
         return 300.0  // fallback
     }
 
-    // MARK: - Utility
-
-    private func zeroBuffer(_ buffer: MTLBuffer, count: Int, type: Any.Type) {
-        memset(buffer.contents(), 0, buffer.length)
+    /// Ideal backbone bond length (Engh & Huber) for N–CA, CA–C, C=O, CA–CB within
+    /// a residue and the C–N peptide bond between residues; nil for other bonds.
+    /// Also used for the OpenMM loop refinement bond targets.
+    static func idealBackboneBondLength(_ a: Atom, _ b: Atom) -> Float? {
+        let names: Set<String> = [a.name.trimmingCharacters(in: .whitespaces),
+                                  b.name.trimmingCharacters(in: .whitespaces)]
+        let sameResidue = a.chainID == b.chainID && a.residueSeq == b.residueSeq
+            && a.insertionCode.trimmingCharacters(in: .whitespaces)
+                == b.insertionCode.trimmingCharacters(in: .whitespaces)
+        if sameResidue {
+            if names == ["N", "CA"] { return 1.458 }
+            if names == ["CA", "C"] { return 1.525 }
+            if names == ["C", "O"] { return 1.231 }
+            if names == ["CA", "CB"] { return 1.530 }
+        } else if names == ["C", "N"] {
+            return 1.335
+        }
+        return nil
     }
 }

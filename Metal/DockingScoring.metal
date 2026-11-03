@@ -35,7 +35,7 @@ kernel void scorePoses(
     transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
 
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridUpperBound(gridParams);
 
     float totalIntermolecular = 0.0f;
     float penalty = 0.0f;
@@ -109,7 +109,7 @@ kernel void scorePosesExplicit(
     transformAtoms(positions, ligandAtoms, nAtoms, pose, torsionEdges, movingIndices, nTorsions);
 
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridUpperBound(gridParams);
 
     float totalSteric = 0.0f;
     float totalHydrophobic = 0.0f;
@@ -594,13 +594,17 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     // ---- Screened Coulomb (ε=4r, grid-based) ----
     // Potential grid precomputed from protein charges: Φ(r) = Σ 332*q_p/(4*r²)
     // E_elec = Σ q_ligand * Φ(r_ligand) via trilinear interpolation
+    // Out-of-grid atoms are skipped explicitly: trilinearInterpolate returns a quadratic
+    // penalty there (not a potential), and small penalties (< 99) used to leak in as Φ.
     float coulombE = 0.0f;
+    float3 elecGridMin = gridParams.origin;
+    float3 elecGridMax = gridUpperBound(gridParams);
     for (uint a = 0; a < nAtoms; a++) {
         float3 r = positions[a];
+        if (any(r < elecGridMin) || any(r > elecGridMax)) continue;
         float phi = trilinearInterpolate(elecGrid, r, gridParams.origin,
                                           gridParams.spacing, gridParams.dims);
-        if (phi < 99.0f)  // skip out-of-grid penalty values
-            coulombE += ligandAtoms[a].charge * phi;
+        coulombE += ligandAtoms[a].charge * phi;
     }
     coulombTermE = params.wCoulomb * coulombE;
 
@@ -632,7 +636,9 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     float strainE = 0.0f;
     for (uint t = 0; t < params.numTorsionStrains; t++) {
         TorsionStrainInfo ts = torsionStrain[t];
-        if (ts.atom0 < 0 || uint(ts.atom3) >= nAtoms) continue;
+        if (ts.atom0 < 0 || ts.atom1 < 0 || ts.atom2 < 0 || ts.atom3 < 0 ||
+            uint(ts.atom0) >= nAtoms || uint(ts.atom1) >= nAtoms ||
+            uint(ts.atom2) >= nAtoms || uint(ts.atom3) >= nAtoms) continue;
         float3 b1 = positions[ts.atom1] - positions[ts.atom0];
         float3 b2 = positions[ts.atom2] - positions[ts.atom1];
         float3 b3 = positions[ts.atom3] - positions[ts.atom2];
@@ -853,7 +859,7 @@ kernel void scorePosesDrusina(
 
     // --- Base Vina scoring from grid maps ---
     float3 gridMin = gridParams.origin;
-    float3 gridMax = gridParams.origin + float3(gridParams.dims) * gridParams.spacing;
+    float3 gridMax = gridUpperBound(gridParams);
     float totalIntermolecular = 0.0f;
     float penalty = 0.0f;
 

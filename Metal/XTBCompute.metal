@@ -9,7 +9,6 @@
 //   • D4 dispersion energy + gradient (BJ rational damping)
 //   • Nuclear repulsion energy + gradient
 //   • Born radii + SASA (OBC-II implicit solvation)
-//   • Generalized Born solvation energy
 //   • CN gradient chain rule propagation
 //
 // Each kernel uses one thread per atom. The inner loop iterates over all
@@ -151,7 +150,8 @@ kernel void xtb_d4_dispersion(
 // ============================================================================
 
 /// E_rep = Σ_{i<j} Z_i * Z_j / r * exp(-α * r^k)
-/// where α = sqrt(arep_i * arep_j), k = 1.5 (GFN2).
+/// where α = sqrt(arep_i * arep_j), k = params.kexp (1.5), except k = 1.0 when
+/// both atoms are H/He (tblite gfn2 rep_kexp_light), flagged by `isLight` (1 = Z ≤ 2).
 kernel void xtb_repulsion(
     device const GFN2RepAtom *atoms     [[buffer(0)]],
     constant GFN2RepParams   &params    [[buffer(1)]],
@@ -164,6 +164,7 @@ kernel void xtb_repulsion(
     float3 pi = atoms[tid].position;
     float zi = atoms[tid].zeff;
     float ai = atoms[tid].arep;
+    bool lightI = atoms[tid].isLight > 0.5f;
     float ei = 0.0f;
     float3 gi = float3(0.0f);
 
@@ -186,7 +187,8 @@ kernel void xtb_repulsion(
         if (r < 1e-6f) continue;
 
         float alpha = sqrt(ai * atoms[j].arep);
-        float rk = pow(r, params.kexp);
+        float kexp = (lightI && atoms[j].isLight > 0.5f) ? 1.0f : params.kexp;
+        float rk = pow(r, kexp);
         float zz = zi * zj;
         float exa = exp(-alpha * rk);
 
@@ -195,11 +197,11 @@ kernel void xtb_repulsion(
             ei += zz / r * exa;
         }
 
-        // Gradient
+        // Gradient: dE/dR_i = (dE/dr) * diff / r
+        //   dE/dr = -zz * exa * (1/r² + α*k*r^(k-2)),  with r^(k-2) = r^k / r²
         if (params.computeGrad) {
-            // dE/dr = -zz * exa * (1/r² + α*k*r^(k-2))
-            float dEdr = -zz * exa * (1.0f / r2 + alpha * params.kexp * pow(r, params.kexp - 2.0f));
-            gi += dEdr * diff;
+            float dEdr = -zz * exa * (1.0f + alpha * kexp * rk) / r2;
+            gi += (dEdr / r) * diff;
         }
     }
 
@@ -213,10 +215,18 @@ kernel void xtb_repulsion(
 // MARK: - Born Radii + SASA (OBC-II)
 // ============================================================================
 
-/// Compute Born radii via OBC-II model and Gaussian SASA burial.
+/// Compute Born radii via the OBC-II model and Gaussian SASA burial.
 /// One thread per atom, inner loop over all neighbors.
 ///
-/// Born radius: 1 / (1/r_i - tanh(ψ_i * (α - ψ_i*(β - ψ_i*γ))) / r_i)
+/// Reference: Onufriev, Bashford, Case, Proteins 2004, 55, 383 (OBC-II);
+/// descreening integral of Hawkins, Cramer, Truhlar, J. Phys. Chem. 1996, 100, 19824,
+/// as implemented in OpenMM's ReferenceObc:
+///   ρ̃_i = ρ_i - offset,  s_j = ρ̃_j * scale
+///   I_ij = 1/L - 1/U + r/4 (1/U² - 1/L²) + ln(L/U)/(2r) + s_j²/(4r) (1/L² - 1/U²)
+///          with L = max(ρ̃_i, |r - s_j|), U = r + s_j  (only when ρ̃_i < r + s_j),
+///          plus 2 (1/ρ̃_i - 1/L) when atom i lies inside the descreening sphere of j
+///   ψ_i = ½ ρ̃_i Σ_j I_ij
+///   B_i = 1 / (1/ρ̃_i - tanh(αψ - βψ² + γψ³) / ρ_i)
 /// SASA: 4π(r_i + r_probe)² * exp(-0.5 * burial)
 kernel void xtb_born_radii(
     device const GFN2BornAtom *atoms   [[buffer(0)]],
@@ -228,36 +238,35 @@ kernel void xtb_born_radii(
     if (tid >= params.atomCount) return;
 
     float3 pi = atoms[tid].position;
-    float ri = atoms[tid].vdwRadius + params.bornOffset;
+    float rhoI = atoms[tid].vdwRadius;
+    float rhoOffI = rhoI - params.bornOffset;
 
-    // Step 1: Descreening integral (psi)
-    float psi = 0.0f;
+    // Step 1: HCT pairwise descreening integral
+    float sum = 0.0f;
     for (uint j = 0; j < params.atomCount; j++) {
         if (j == tid) continue;
 
-        float rj = atoms[j].vdwRadius + params.bornOffset;
         float3 diff = pi - atoms[j].position;
         float rij = length(diff);
         if (rij < 1e-8f) continue;
 
-        float sj = rj * params.bornScale;
+        float sj = (atoms[j].vdwRadius - params.bornOffset) * params.bornScale;
+        if (rhoOffI >= rij + sj) continue;   // descreening sphere of j lies inside atom i
 
-        if (rij > ri + sj) {
-            // No overlap: standard descreening
-            float rps = rij + sj;
-            float rms = rij - sj;
-            psi += 0.5f * (1.0f / rms - 1.0f / rps
-                + sj * 0.25f * (1.0f / (rps * rps) - 1.0f / (rms * rms))
-                + 0.5f * log(rms / rps) / rij);
-        } else if (rij > abs(ri - sj)) {
-            // Partial overlap
-            float d = rij - sj;
-            if (abs(d) < 1e-8f) d = 1e-8f;
-            float rps = rij + sj;
-            psi += 0.25f * (2.0f / rij - 1.0f / rps - ri / (4.0f * sj * rij)
-                + 0.25f * (1.0f / (sj * sj) - 1.0f / (ri * ri))
-                + 0.5f * log(abs(d) / rps) / rij);
+        float invR = 1.0f / rij;
+        float invL = 1.0f / max(rhoOffI, abs(rij - sj));
+        float invU = 1.0f / (rij + sj);
+        float invL2 = invL * invL;
+        float invU2 = invU * invU;
+
+        float term = invL - invU
+                   + 0.25f * rij * (invU2 - invL2)
+                   + 0.5f * invR * log(invU / invL)
+                   + 0.25f * sj * sj * invR * (invL2 - invU2);
+        if (rhoOffI < sj - rij) {
+            term += 2.0f * (1.0f / rhoOffI - invL);
         }
+        sum += term;
     }
 
     // OBC-II three-parameter correction
@@ -265,10 +274,10 @@ kernel void xtb_born_radii(
     constexpr float obc_beta  = 0.8f;
     constexpr float obc_gamma = 4.85f;
 
-    float br = psi * ri;
-    float targ = br * (obc_alpha - br * (obc_beta - br * obc_gamma));
+    float psi = 0.5f * rhoOffI * sum;
+    float targ = psi * (obc_alpha - psi * (obc_beta - psi * obc_gamma));
     float th = tanh(targ);
-    bradOut[tid] = 1.0f / (1.0f / ri - th / ri);
+    bradOut[tid] = 1.0f / (1.0f / rhoOffI - th / rhoI);
 
     // Step 2: Gaussian SASA burial approximation
     float probeSum = atoms[tid].vdwRadius + params.probeRadius;
@@ -285,57 +294,6 @@ kernel void xtb_born_radii(
     }
 
     sasaOut[tid] = area * exp(-0.5f * burial);
-}
-
-// ============================================================================
-// MARK: - Generalized Born Solvation Energy
-// ============================================================================
-
-/// E_GB = -0.5 * keps * Σ_{ij} q_i * q_j / f_GB(r_ij, B_i, B_j)
-/// f_GB = sqrt(r² + B_i*B_j * exp(-r²/(4*B_i*B_j)))  (Still formula)
-///
-/// Each thread computes the contribution from atom tid.
-/// Self-term (i==j) counted once; off-diagonal: j < tid for upper triangle.
-kernel void xtb_gb_solvation(
-    device const GFN2GBAtom *atoms    [[buffer(0)]],
-    constant GFN2GBParams   &params   [[buffer(1)]],
-    device float            *energies [[buffer(2)]],
-    uint tid [[thread_position_in_grid]])
-{
-    if (tid >= params.atomCount) return;
-
-    float qi = atoms[tid].charge;
-    float bi = atoms[tid].bornRadius;
-    float3 pi = atoms[tid].position;
-    float ei = 0.0f;
-
-    // Self-term (j == tid): r² = 0
-    {
-        float BiBj = bi * bi;
-        float fGB = sqrt(BiBj);  // = Bi when r=0
-        ei += 0.5f * qi * qi / fGB;
-    }
-
-    // Off-diagonal: j < tid (upper triangle)
-    for (uint j = 0; j < tid; j++) {
-        float qj = atoms[j].charge;
-        float bj = atoms[j].bornRadius;
-
-        float3 diff = pi - atoms[j].position;
-        float r2 = dot(diff, diff);
-        float BiBj = bi * bj;
-        float expfac = exp(-r2 / (4.0f * BiBj));
-        float fGB = sqrt(r2 + BiBj * expfac);
-
-        ei += qi * qj / fGB;
-    }
-
-    // Multiply by Born prefactor
-    energies[tid] = -0.5f * params.keps * ei;
-
-    // SASA non-polar contribution: γ * SASA_i
-    // (SASA was pre-computed in born_radii kernel and stored in the atom struct)
-    energies[tid] += params.gamma_au * atoms[tid].sasa;
 }
 
 // ============================================================================

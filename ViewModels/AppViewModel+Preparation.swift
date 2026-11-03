@@ -728,13 +728,18 @@ extension AppViewModel {
             ommAtoms.append(ommAtom)
         }
 
-        // Build OpenMM bond array
+        // Build OpenMM bond array. Backbone bonds of a freshly built loop start far
+        // from ideal, so their equilibrium length is the ideal (Engh & Huber) value;
+        // keeping the starting distance would freeze the bad geometry. Other bonds
+        // come from ideal templates and keep their current length.
         var ommBonds: [DruseOpenMMBond] = []
         for bond in bonds {
             let a1 = bond.atomIndex1
             let a2 = bond.atomIndex2
             guard a1 >= 0, a1 < atoms.count, a2 >= 0, a2 < atoms.count else { continue }
-            let dist = simd_distance(atoms[a1].position, atoms[a2].position) / 10.0  // Å → nm
+            let lengthAngstrom = LoopMetalAccelerator.idealBackboneBondLength(atoms[a1], atoms[a2])
+                ?? simd_distance(atoms[a1].position, atoms[a2].position)
+            let dist = lengthAngstrom / 10.0  // Å → nm
             var ommBond = DruseOpenMMBond()
             ommBond.atom1 = Int32(a1)
             ommBond.atom2 = Int32(a2)

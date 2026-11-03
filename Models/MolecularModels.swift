@@ -11,6 +11,7 @@ enum Element: Int, CaseIterable, Sendable {
     case Na, Mg, Al, Si, P, S, Cl, Ar
     case K, Ca, Sc, Ti, V, Cr, Mn, Fe, Co, Ni, Cu, Zn
     case Ga, Ge, As, Se, Br, Kr
+    case I = 53
 
     var symbol: String {
         switch self {
@@ -23,6 +24,7 @@ enum Element: Int, CaseIterable, Sendable {
         case .Mn: "Mn" case .Fe: "Fe" case .Co: "Co" case .Ni: "Ni"
         case .Cu: "Cu" case .Zn: "Zn" case .Ga: "Ga" case .Ge: "Ge"
         case .As: "As" case .Se: "Se" case .Br: "Br" case .Kr: "Kr"
+        case .I:  "I"
         }
     }
 
@@ -40,6 +42,7 @@ enum Element: Int, CaseIterable, Sendable {
         case .Ni: "Nickel"    case .Cu: "Copper"     case .Zn: "Zinc"
         case .Ga: "Gallium"   case .Ge: "Germanium"  case .As: "Arsenic"
         case .Se: "Selenium"  case .Br: "Bromine"    case .Kr: "Krypton"
+        case .I: "Iodine"
         }
     }
 
@@ -54,6 +57,7 @@ enum Element: Int, CaseIterable, Sendable {
         case .Mn: 54.938  case .Fe: 55.845  case .Co: 58.933  case .Ni: 58.693
         case .Cu: 63.546  case .Zn: 65.38   case .Ga: 69.723  case .Ge: 72.63
         case .As: 74.922  case .Se: 78.96   case .Br: 79.904  case .Kr: 83.798
+        case .I:  126.904
         }
     }
 
@@ -68,6 +72,7 @@ enum Element: Int, CaseIterable, Sendable {
         case .Mn: 2.05  case .Fe: 2.04  case .Co: 2.00  case .Ni: 1.97
         case .Cu: 1.96  case .Zn: 2.01  case .Ga: 1.87  case .Ge: 2.11
         case .As: 1.85  case .Se: 1.90  case .Br: 1.85  case .Kr: 2.02
+        case .I:  1.98
         }
     }
 
@@ -82,6 +87,7 @@ enum Element: Int, CaseIterable, Sendable {
         case .Mn: 1.39  case .Fe: 1.32  case .Co: 1.26  case .Ni: 1.24
         case .Cu: 1.32  case .Zn: 1.22  case .Ga: 1.22  case .Ge: 1.20
         case .As: 1.19  case .Se: 1.20  case .Br: 1.20  case .Kr: 1.16
+        case .I:  1.39
         }
     }
 
@@ -95,6 +101,7 @@ enum Element: Int, CaseIterable, Sendable {
         case .F:  SIMD4(0.56, 0.88, 0.31, 1.0) // green
         case .Cl: SIMD4(0.12, 0.94, 0.12, 1.0) // bright green
         case .Br: SIMD4(0.65, 0.16, 0.16, 1.0) // dark red
+        case .I:  SIMD4(0.58, 0.00, 0.58, 1.0) // purple (#940094)
         case .S:  SIMD4(0.90, 0.78, 0.20, 1.0) // yellow
         case .P:  SIMD4(1.00, 0.50, 0.00, 1.0) // orange
         case .Fe: SIMD4(0.88, 0.40, 0.20, 1.0) // dark orange
@@ -112,9 +119,14 @@ enum Element: Int, CaseIterable, Sendable {
         vdwRadius * 0.3
     }
 
+    /// Lowercased symbol → element, built once (parsers call `from(symbol:)` per atom).
+    private static let bySymbol: [String: Element] = Dictionary(
+        uniqueKeysWithValues: allCases.map { ($0.symbol.lowercased(), $0) }
+    )
+
+    /// Case-insensitive lookup; surrounding spaces/tabs are ignored.
     static func from(symbol: String) -> Element? {
-        let s = symbol.trimmingCharacters(in: .whitespaces)
-        return Element.allCases.first { $0.symbol.lowercased() == s.lowercased() }
+        bySymbol[symbol.trimmingCharacters(in: .whitespaces).lowercased()]
     }
 }
 

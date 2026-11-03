@@ -3,948 +3,839 @@
 
 import SwiftUI
 import AppKit
+import Charts
 
 // MARK: - Results Database Window
 
+/// Secondary window: batch ligands in the sidebar, the sortable pose table in
+/// the content column and the selected pose's details in the inspector.
 struct ResultsDatabaseWindow: View {
     @Environment(AppViewModel.self) private var viewModel
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.openWindow) private var openWindow
 
     @State private var selectedPoseIndex: Int? = nil
-    @State private var showInteractionDiagram: Bool = false
-    @State private var sortField: SortField = .energy
+    @State private var sortField: SortField = .score
     @State private var sortAscending: Bool = true
-
-    // Batch mode: which ligand is being inspected
     @State private var selectedBatchLigand: String? = nil
-
-    // Correlation analysis
     @State private var showCorrelation: Bool = false
+    @State private var showInspector: Bool = true
+    @State private var showSidebar: Bool = true
+    @AppStorage("ui.resultsSidebarWidth") private var sidebarWidth = 240.0
+    @AppStorage("ui.resultsInspectorWidth") private var inspectorWidth = 320.0
+    @State private var filterText: String = ""
 
     enum SortField: String, CaseIterable {
-        case rank = "Rank"
-        case energy = "Energy"
-        case vdw = "VdW"
+        case rank = "#"
+        case score = "Score"
+        case vdw = "vdW"
+        case hydrophobic = "Hydro"
         case hbond = "H-bond"
+        case torsion = "Torsion"
         case cluster = "Cluster"
+        case generation = "Gen"
     }
 
-    // Current results to display (either single docking or selected batch ligand)
-    private var displayedResults: [DockingResult] {
-        if let batchLigand = selectedBatchLigand,
-           let entry = viewModel.docking.batchResults.first(where: { $0.ligandName == batchLigand }) {
-            return entry.results
+    private var method: ScoringMethod { viewModel.docking.scoringMethod }
+    private var results: [DockingResult] { viewModel.docking.dockingResults }
+    private var batch: [(ligandName: String, results: [DockingResult])] { viewModel.docking.batchResults }
+
+    /// Poses in table order, paired with their index in `dockingResults` (the index every action uses).
+    private var sortedRows: [(index: Int, result: DockingResult)] {
+        let query = filterText.trimmingCharacters(in: .whitespaces).lowercased()
+        let rows = results.enumerated().map { (index: $0.offset, result: $0.element) }.filter { row in
+            guard batch.isEmpty, !query.isEmpty else { return true }
+            return "#\(row.index + 1)".contains(query) || "c\(row.result.clusterID)" == query
         }
-        return viewModel.docking.dockingResults
-    }
-
-    private var sortedResults: [DockingResult] {
-        let results = displayedResults
-        return results.sorted { a, b in
+        return rows.sorted { a, b in
             let cmp: Bool
             switch sortField {
-            case .rank:    cmp = a.id < b.id
-            case .energy:  cmp = a.energy < b.energy
-            case .vdw:     cmp = a.vdwEnergy < b.vdwEnergy
-            case .hbond:   cmp = a.hbondEnergy < b.hbondEnergy
-            case .cluster: cmp = a.clusterID < b.clusterID
+            case .rank:       cmp = a.index < b.index
+            case .score:      cmp = a.result.displayScore(method: method) < b.result.displayScore(method: method)
+            case .vdw:        cmp = a.result.stericEnergy < b.result.stericEnergy
+            case .hydrophobic: cmp = a.result.hydrophobicEnergy < b.result.hydrophobicEnergy
+            case .hbond:      cmp = a.result.hbondEnergy < b.result.hbondEnergy
+            case .torsion:    cmp = a.result.torsionPenalty < b.result.torsionPenalty
+            case .cluster:    cmp = a.result.clusterID < b.result.clusterID
+            case .generation: cmp = a.result.generation < b.result.generation
             }
             return sortAscending ? cmp : !cmp
         }
     }
 
+    private var selectedResult: DockingResult? {
+        guard let idx = selectedPoseIndex, idx < results.count else { return nil }
+        return results[idx]
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-
-            if viewModel.docking.dockingResults.isEmpty && viewModel.docking.batchResults.isEmpty {
-                emptyState
-            } else {
-                HSplitView {
-                    // Left: batch ligand list (if batch results)
-                    if !viewModel.docking.batchResults.isEmpty {
-                        batchLigandList
-                            .frame(minWidth: 180, idealWidth: 220, maxWidth: 260)
+        Group {
+            if results.isEmpty && batch.isEmpty {
+                DSEmptyState("No Docking Results",
+                             systemImage: "chart.bar.doc.horizontal",
+                             description: "Run docking in step 5 to browse poses, interactions and correlations here.") {
+                    Button("Go to Docking") {
+                        SidebarTab.dock.request(in: viewModel)
+                        openWindow(id: "main")
                     }
-
-                    // Center: pose table
-                    poseTableView
-                        .frame(minWidth: 500)
-
-                    // Right: detail panel (interaction diagram + info)
-                    if let idx = selectedPoseIndex, idx < displayedResults.count {
-                        detailPanel(result: displayedResults[idx], index: idx)
-                            .frame(minWidth: 420, idealWidth: 540, maxWidth: 700)
+                    .help("Show the Docking step in the main window (⌘5)")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                // Integrated panes, like the main window: NavigationSplitView's floating
+                // sidebar and `.inspector` mis-place their content in this window on macOS 26.
+                HStack(spacing: 0) {
+                    if showSidebar {
+                        sidebar
+                            .frame(width: Self.clamped(sidebarWidth, to: Self.sidebarRange))
+                            .overlay(alignment: .trailing) {
+                                PaneResizeHandle(width: $sidebarWidth, range: Self.sidebarRange, edge: .trailing)
+                            }
+                        Divider()
+                    }
+                    poseTable
+                        .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
+                        .frame(maxWidth: .infinity)
+                        .layoutPriority(1)
+                    if showInspector {
+                        Divider()
+                        inspector
+                            .frame(width: Self.clamped(inspectorWidth, to: Self.inspectorRange))
+                            .background(.background)
+                            .overlay(alignment: .leading) {
+                                PaneResizeHandle(width: $inspectorWidth, range: Self.inspectorRange, edge: .leading)
+                            }
                     }
                 }
-            }
-
-            Divider()
-            statusBar
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onChange(of: showInteractionDiagram) { _, show in
-            if show {
-                openWindow(id: "interaction-diagram")
-                showInteractionDiagram = false
+                .overlay(alignment: .top) { Divider() }
+                .clipped()
+                .searchable(text: $filterText, placement: .toolbar,
+                            prompt: batch.isEmpty ? "Filter poses (#3, C2)" : "Filter ligands")
             }
         }
+        .navigationSubtitle(windowSubtitle)
+        .toolbar { toolbarContent }
+        .onChange(of: results.count) { _, _ in selectedPoseIndex = nil }
         .sheet(isPresented: $showCorrelation) {
             correlationAnalysisSheet
-                .frame(minWidth: 600, minHeight: 500)
+                .frame(minWidth: 640, idealWidth: 720, minHeight: 540, idealHeight: 700)
         }
+    }
+
+    private var windowSubtitle: String {
+        if results.isEmpty && batch.isEmpty { return "" }
+        if !batch.isEmpty { return "\(batch.count) ligands · \(results.count) poses" }
+        if let name = viewModel.molecules.ligand?.name, !name.isEmpty { return "\(name) · \(results.count) poses" }
+        return "\(results.count) poses"
     }
 
     // MARK: - Toolbar
 
-    private var toolbar: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "chart.bar.xaxis")
-                .font(.body)
-                .foregroundStyle(.secondary)
+    private static let sidebarRange: ClosedRange<CGFloat> = 200...340
+    private static let inspectorRange: ClosedRange<CGFloat> = DS.Size.inspectorMin...480
 
-            Text("Results Database")
-                .font(.headline)
-
-            if let ligandName = viewModel.molecules.ligand?.name, !ligandName.isEmpty {
-                Text(ligandName)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(Color.accentColor.opacity(0.1)))
-            }
-
-            Spacer()
-
-            // Sort controls
-            HStack(spacing: 4) {
-                Text("Sort:")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $sortField) {
-                    ForEach(SortField.allCases, id: \.self) { field in
-                        Text(field.rawValue).tag(field)
-                    }
-                }
-                .pickerStyle(.menu)
-                .frame(width: 90)
-                .controlSize(.small)
-
-                Button(action: { sortAscending.toggle() }) {
-                    Image(systemName: sortAscending ? "arrow.up" : "arrow.down")
-                        .font(.footnote)
-                }
-                .buttonStyle(.plain)
-                .help(sortAscending ? "Sort descending" : "Sort ascending")
-            }
-
-            Divider().frame(height: 18)
-
-            // Correlation analysis button (when batch results with affinity data exist)
-            if !viewModel.docking.batchResults.isEmpty {
-                Button(action: { showCorrelation = true }) {
-                    Label("Correlation", systemImage: "chart.line.uptrend.xyaxis")
-                        .font(.footnote)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Analyze correlation between docking scores and experimental affinity")
-            }
-
-            // Export
-            HStack(spacing: 4) {
-                Button(action: { viewModel.exportDockingResultsSDF() }) {
-                    Label("SDF", systemImage: "doc.text")
-                        .font(.footnote)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Export poses as SDF file")
-
-                Button(action: { viewModel.exportDockingResultsCSV() }) {
-                    Label("CSV", systemImage: "tablecells")
-                        .font(.footnote)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Export results as CSV")
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color(nsColor: .controlBackgroundColor))
+    private static func clamped(_ width: Double, to range: ClosedRange<CGFloat>) -> CGFloat {
+        min(max(CGFloat(width), range.lowerBound), range.upperBound)
     }
 
-    // MARK: - Batch Ligand List
-
-    private var batchLigandList: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Label("Ligands", systemImage: "tray.full")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Text("\(viewModel.docking.batchResults.count)")
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button { showSidebar.toggle() } label: {
+                Label("Sidebar", systemImage: "sidebar.leading")
             }
-            .padding(8)
+            .disabled(results.isEmpty && batch.isEmpty)
+            .help(showSidebar ? "Hide Sidebar" : "Show Sidebar")
+        }
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button { showCorrelation = true } label: {
+                Label("Correlation…", systemImage: "chart.line.uptrend.xyaxis")
+            }
+            .disabled(batch.isEmpty)
+            .help("Correlate docking scores with experimental affinity (batch results)")
 
-            Divider()
+            Button {
+                if let idx = selectedPoseIndex { openDiagram(idx) }
+            } label: {
+                Label("Interaction Diagram", systemImage: "point.3.connected.trianglepath.dotted")
+            }
+            .disabled(selectedResult == nil)
+            .help("Open the 2D interaction diagram for the selected pose")
 
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(viewModel.docking.batchResults.enumerated()), id: \.offset) { rank, entry in
-                        let isSelected = selectedBatchLigand == entry.ligandName
-                        let bestEnergy = entry.results.first?.energy ?? .infinity
-                        let affinityData = ligandAffinityData(for: entry.ligandName)
+            Menu {
+                Button("Export Poses as SDF…") { viewModel.exportDockingResultsSDF() }
+                Button("Export Table as CSV…") { viewModel.exportDockingResultsCSV() }
+            } label: {
+                Label("Export", systemImage: "square.and.arrow.up")
+            }
+            .disabled(results.isEmpty)
+            .help("Export poses (SDF) or the results table (CSV)")
 
-                        HStack(spacing: 8) {
-                            Text("#\(rank + 1)")
-                                .font(.footnote.monospaced().weight(.bold))
-                                .foregroundStyle(rank == 0 ? .green : .secondary)
-                                .frame(width: 24, alignment: .trailing)
+            Button { showInspector.toggle() } label: {
+                Label("Inspector", systemImage: "sidebar.trailing")
+            }
+            .disabled(results.isEmpty && batch.isEmpty)
+            .help(showInspector ? "Hide Inspector" : "Show Inspector")
+        }
+    }
 
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(entry.ligandName)
-                                    .font(.footnote.weight(.medium))
-                                    .lineLimit(1)
-                                HStack(spacing: 8) {
-                                    Text(String(format: "%.1f", bestEnergy))
-                                        .font(.footnote.monospaced())
-                                        .foregroundStyle(energyColor(bestEnergy))
-                                    Text("\(entry.results.count)p")
-                                        .font(.footnote.monospaced())
-                                        .foregroundStyle(.secondary)
-                                    if let ki = affinityData?.ki {
-                                        Text(String(format: "Ki:%.1f", ki))
-                                            .font(.footnote.monospaced())
-                                            .foregroundStyle(.purple)
-                                    }
-                                }
-                            }
-                            Spacer()
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            selectedBatchLigand = entry.ligandName
-                            selectedPoseIndex = nil
-                            // Load this ligand's results into the main view model
-                            viewModel.docking.dockingResults = entry.results
-                            if let dbEntry = viewModel.ligandDB.entries.first(where: { $0.name == entry.ligandName }) {
-                                let mol = Molecule(name: dbEntry.name, atoms: dbEntry.atoms,
-                                                   bonds: dbEntry.bonds, title: dbEntry.smiles, smiles: dbEntry.smiles)
-                                viewModel.setLigandForDocking(mol)
-                                viewModel.docking.dockingResults = entry.results
-                            }
-                        }
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        List(selection: $selectedBatchLigand) {
+            if batch.isEmpty {
+                Section("Current Run") {
+                    HStack(spacing: DS.Space.s) {
+                        Circle().fill(DS.Color.ligand).frame(width: 8, height: 8)
+                        Text(viewModel.molecules.ligand?.name.nonEmpty ?? "Docking run")
+                            .font(DS.Font.label.weight(.medium))
+                            .lineLimit(1)
+                        Spacer(minLength: DS.Space.xs)
+                        DSTag("\(results.count)")
+                    }
+                }
+            } else {
+                Section("Batch Ligands") {
+                    ForEach(Array(filteredBatch.enumerated()), id: \.element.ligandName) { _, entry in
+                        batchLigandRow(entry: entry)
+                            .tag(entry.ligandName)
                     }
                 }
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
+        .listStyle(.sidebar)
+        .onChange(of: selectedBatchLigand) { _, name in
+            guard let name, let entry = batch.first(where: { $0.ligandName == name }) else { return }
+            selectedPoseIndex = nil
+            ResultsActions.loadBatchLigand(named: name, results: entry.results, viewModel: viewModel)
+        }
     }
 
-    // MARK: - Pose Table
+    private var filteredBatch: [(ligandName: String, results: [DockingResult])] {
+        let query = filterText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return batch }
+        return batch.filter { $0.ligandName.localizedCaseInsensitiveContains(query) }
+    }
 
-    private var poseTableView: some View {
+    private func batchLigandRow(entry: (ligandName: String, results: [DockingResult])) -> some View {
+        let rank = (batch.firstIndex(where: { $0.ligandName == entry.ligandName }) ?? 0) + 1
+        let best = entry.results.first?.displayScore(method: method)
+        let affinity = ligandAffinityData(for: entry.ligandName)
+        return HStack(spacing: DS.Space.s) {
+            Text(verbatim: "#\(rank)")
+                .font(DS.Font.monoSmall.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(rank == 1 ? AnyShapeStyle(DS.Color.success) : AnyShapeStyle(.secondary))
+                .frame(minWidth: 26, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.ligandName)
+                    .font(DS.Font.label.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                HStack(spacing: DS.Space.s) {
+                    if let best { scoreBadge(best) }
+                    Text(entry.results.count == 1 ? "1 pose" : "\(entry.results.count) poses")
+                        .font(DS.Font.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                    if let ki = affinity?.ki {
+                        Text(String(format: "Ki %.1f nM", ki))
+                            .font(DS.Font.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(DS.Color.pocket)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, DS.Space.xxs)
+    }
+
+    // MARK: - Pose table
+
+    private enum Column {
+        static let check: CGFloat = 24
+        static let rank: CGFloat = 56   // fits "#3000"
+        static let score: CGFloat = 124 // fits "Score (kcal/mol)" plus the sort chevron
+        static let term: CGFloat = 56
+        static let cluster: CGFloat = 58
+        static let generation: CGFloat = 46
+        static let actions: CGFloat = 60
+    }
+
+    private var poseTable: some View {
         VStack(spacing: 0) {
-            // Multi-pose action bar
             if viewModel.docking.selectedPoseIndices.count > 1 {
-                HStack {
-                    Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("View Selected Poses") {
-                        viewModel.showSelectedPoses()
-                    }
-                    .controlSize(.small)
-                    .buttonStyle(.borderedProminent)
-                    Button("Clear Selection") {
-                        viewModel.docking.selectedPoseIndices.removeAll()
-                    }
-                    .controlSize(.small)
-                    .buttonStyle(.bordered)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.accentColor.opacity(0.05))
+                multiSelectionBar
+                Divider()
             }
-
-            // Table header
-            HStack(spacing: 0) {
-                tableHeader("", width: 24)  // checkbox column
-                tableHeader("#", width: 40)
-                tableHeader("Energy", width: 80)
-                tableHeader("VdW", width: 65)
-                tableHeader("Elec", width: 65)
-                tableHeader("H-bond", width: 65)
-                tableHeader("Torsion", width: 65)
-                tableHeader("Cluster", width: 60)
-                tableHeader("Gen", width: 45)
-                Spacer()
-                tableHeader("Actions", width: 100)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color(nsColor: .controlBackgroundColor))
-
+            tableHeader
             Divider()
-
-            // Pose rows
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(sortedResults.enumerated()), id: \.offset) { idx, result in
-                        let origIdx = displayedResults.firstIndex(where: { $0.id == result.id }) ?? idx
-                        poseRow(index: origIdx, displayIndex: idx, result: result)
+                    ForEach(Array(sortedRows.enumerated()), id: \.element.index) { position, row in
+                        poseRow(index: row.index, position: position, result: row.result)
                     }
                 }
             }
         }
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
-    @ViewBuilder
-    private func tableHeader(_ title: String, width: CGFloat) -> some View {
-        Text(title)
-            .font(.footnote.monospaced().weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(width: width, alignment: .leading)
+    private var multiSelectionBar: some View {
+        HStack(spacing: DS.Space.m) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(DS.Color.accent)
+            Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
+                .monospacedDigit()
+            Spacer()
+            Button("View Selected Poses") { viewModel.showSelectedPoses() }
+                .buttonStyle(.borderedProminent)
+                .help("Overlay the selected poses in the 3D viewport")
+            Button("Clear Selection") { viewModel.docking.selectedPoseIndices.removeAll() }
+                .buttonStyle(.bordered)
+        }
+        .font(DS.Font.secondary)
+        .controlSize(.small)
+        .padding(.horizontal, DS.Space.l)
+        .padding(.vertical, DS.Space.s)
+        .background(DS.Color.accentSoft)
     }
 
-    @ViewBuilder
-    private func poseRow(index: Int, displayIndex: Int, result: DockingResult) -> some View {
-        let isSelected = selectedPoseIndex == index
+    private var tableHeader: some View {
         HStack(spacing: 0) {
-            // Multi-pose selection checkbox
-            Button(action: { viewModel.togglePoseSelection(at: index) }) {
-                Image(systemName: viewModel.docking.selectedPoseIndices.contains(index)
-                      ? "checkmark.circle.fill" : "circle")
-                    .font(.footnote)
-                    .foregroundStyle(viewModel.docking.selectedPoseIndices.contains(index) ? Color.blue : Color.gray.opacity(0.3))
+            Color.clear.frame(width: Column.check)
+            headerButton(.rank, width: Column.rank)
+            headerButton(.score, width: Column.score, title: "Score (\(method.unitLabel))")
+            headerButton(.vdw, width: Column.term)
+            headerButton(.hydrophobic, width: Column.term)
+            headerButton(.hbond, width: Column.term)
+            headerButton(.torsion, width: Column.term)
+            headerButton(.cluster, width: Column.cluster)
+            headerButton(.generation, width: Column.generation)
+            Spacer(minLength: 0)
+            Color.clear.frame(width: Column.actions)
+        }
+        .padding(.horizontal, DS.Space.m)
+        .frame(height: DS.Size.rowHeight + 4)
+        .background(.bar)
+    }
+
+    private func headerButton(_ field: SortField, width: CGFloat, title: String? = nil) -> some View {
+        let isActive = sortField == field
+        return Button {
+            if isActive { sortAscending.toggle() } else { sortField = field; sortAscending = true }
+        } label: {
+            HStack(spacing: DS.Space.xxs) {
+                Text(title ?? field.rawValue)
+                    .lineLimit(1)
+                if isActive {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(DS.Font.caption.weight(.bold))
+                }
             }
-            .buttonStyle(.plain)
-            .frame(width: 24)
+            .font(DS.Font.secondary.weight(isActive ? .semibold : .medium))
+            .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+            .frame(width: width, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Sort by \(field.rawValue)")
+    }
+
+    private func poseRow(index: Int, position: Int, result: DockingResult) -> some View {
+        let isSelected = selectedPoseIndex == index
+        let isChecked = viewModel.docking.selectedPoseIndices.contains(index)
+        return HStack(spacing: 0) {
+            Toggle("Select pose \(index + 1)", isOn: Binding(
+                get: { isChecked },
+                set: { _ in viewModel.togglePoseSelection(at: index) }
+            ))
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .frame(width: Column.check, alignment: .leading)
             .help("Select for multi-pose overlay")
 
-            Text("#\(index + 1)")
-                .font(.footnote.monospaced().weight(.bold))
+            Text(verbatim: "#\(index + 1)")
+                .font(DS.Font.monoSmall.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 40, alignment: .leading)
+                .frame(width: Column.rank, alignment: .leading)
 
-            Text(String(format: "%.2f", result.energy))
-                .font(.footnote.monospaced().weight(.semibold))
-                .foregroundStyle(energyColor(result.energy))
-                .frame(width: 80, alignment: .leading)
+            scoreBadge(result.displayScore(method: method))
+                .frame(width: Column.score, alignment: .leading)
 
-            Text(String(format: "%.1f", result.vdwEnergy))
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-                .frame(width: 65, alignment: .leading)
+            termCell(result.stericEnergy)
+            termCell(result.hydrophobicEnergy)
+            termCell(result.hbondEnergy)
+            termCell(result.torsionPenalty)
 
-            Text(String(format: "%.1f", result.elecEnergy))
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-                .frame(width: 65, alignment: .leading)
-
-            Text(String(format: "%.1f", result.hbondEnergy))
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-                .frame(width: 65, alignment: .leading)
-
-            Text(String(format: "%.1f", result.torsionPenalty))
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-                .frame(width: 65, alignment: .leading)
-
-            if result.clusterID >= 0 {
-                Text("C\(result.clusterID)")
-                    .font(.footnote.monospaced().weight(.medium))
-                    .foregroundStyle(.cyan)
-                    .frame(width: 60, alignment: .leading)
-                    .help("Cluster \(result.clusterID) — RMSD-based binding-mode group. Poses sharing this ID occupy the same pose family (RMSD < 2.0 Å); different IDs are structurally distinct binding modes.")
-            } else {
-                Text("-")
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 60, alignment: .leading)
-            }
-
-            Text("\(result.generation)")
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-                .frame(width: 45, alignment: .leading)
-
-            Spacer()
-
-            // Actions
-            HStack(spacing: 4) {
-                Button("View") {
-                    selectedPoseIndex = index
-                    viewModel.showDockingPose(at: index)
+            Group {
+                if result.clusterID >= 0 {
+                    DSTag("C\(result.clusterID)", monospaced: true)
+                        .help("Cluster \(result.clusterID) — RMSD-based binding-mode group. Poses sharing this ID occupy the same pose family (RMSD < 2.0 Å); different IDs are structurally distinct binding modes.")
+                } else {
+                    Text("—").foregroundStyle(.tertiary)
                 }
-                .controlSize(.mini)
-                .buttonStyle(.bordered)
-                .help("Show this pose in the 3D viewport")
-
-                Button {
-                    selectedPoseIndex = index
-                    viewModel.showDockingPose(at: index)
-                    viewModel.docking.interactionDiagramPoseIndex = index
-                    showInteractionDiagram = true
-                } label: {
-                    Image(systemName: "circle.hexagongrid")
-                        .font(.footnote)
-                }
-                .controlSize(.mini)
-                .buttonStyle(.bordered)
-                .help("2D Interaction Diagram")
             }
-            .frame(width: 100, alignment: .trailing)
+            .frame(width: Column.cluster, alignment: .leading)
+
+            Text(verbatim: "\(result.generation)")
+                .font(DS.Font.monoSmall)
+                .foregroundStyle(.secondary)
+                .frame(width: Column.generation, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: DS.Space.xxs) {
+                Button { select(index) } label: { Image(systemName: "eye") }
+                    .help("Show this pose in the 3D viewport")
+                    .accessibilityLabel("Show pose \(index + 1) in 3D")
+                Button { openDiagram(index) } label: { Image(systemName: "point.3.connected.trianglepath.dotted") }
+                    .help("2D Interaction Diagram")
+                    .accessibilityLabel("Interaction diagram for pose \(index + 1)")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .frame(width: Column.actions, alignment: .trailing)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(isSelected ? Color.accentColor.opacity(0.12) : (displayIndex % 2 == 0 ? Color.clear : Color.primary.opacity(0.02)))
+        .monospacedDigit()
+        .padding(.horizontal, DS.Space.m)
+        .frame(height: DS.Size.rowHeight + 4)
+        .background(isSelected ? DS.Color.accentSoft : (position % 2 == 1 ? DS.Color.cardFill : Color.clear))
         .contentShape(Rectangle())
-        .onTapGesture {
-            selectedPoseIndex = index
-            viewModel.showDockingPose(at: index)
+        .onTapGesture { select(index) }
+    }
+
+    private func termCell(_ value: Float) -> some View {
+        Text(String(format: "%.1f", value))
+            .font(DS.Font.monoSmall)
+            .foregroundStyle(.secondary)
+            .frame(width: Column.term, alignment: .leading)
+    }
+
+    private func select(_ index: Int) {
+        selectedPoseIndex = index
+        viewModel.showDockingPose(at: index)
+    }
+
+    private func openDiagram(_ index: Int) {
+        select(index)
+        viewModel.docking.interactionDiagramPoseIndex = index
+        openWindow(id: "interaction-diagram")
+    }
+
+    // MARK: - Status bar
+
+    private var statusBar: some View {
+        DSWindowStatusBar {
+            Text("\(results.count) poses")
+            if let best = results.first {
+                Text("·")
+                Text(String(format: "Best %.1f %@", best.displayScore(method: method), method.unitLabel))
+            }
+            if !batch.isEmpty {
+                Text("·")
+                Text("\(batch.count) ligands in batch")
+            }
+        } trailing: {
+            if let idx = selectedPoseIndex, let result = selectedResult {
+                Text(String(format: "Selected: Pose #%d (%.2f %@)",
+                            idx + 1, result.displayScore(method: method), method.unitLabel))
+            }
         }
     }
 
-    // MARK: - Detail Panel
+    // MARK: - Inspector
 
     @ViewBuilder
-    private func detailPanel(result: DockingResult, index: Int) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Label("Pose #\(index + 1)", systemImage: "cube")
-                    .font(.callout.weight(.semibold))
-                Spacer()
-                let sm = viewModel.docking.scoringMethod
-                Text(String(format: "%.2f %@", result.displayScore(method: sm), sm.unitLabel))
-                    .font(.subheadline.monospaced().weight(.bold))
-                    .foregroundStyle(scoreColor(result.displayScore(method: sm), method: sm))
-            }
-            .padding(12)
-            .background(Color(nsColor: .controlBackgroundColor))
-
-            Divider()
-
+    private var inspector: some View {
+        if let idx = selectedPoseIndex, let result = selectedResult {
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Energy breakdown
+                VStack(alignment: .leading, spacing: DS.Space.l) {
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
+                        Text(verbatim: "Pose #\(idx + 1)")
+                            .font(DS.Font.stepTitle)
+                        if result.clusterID >= 0 {
+                            DSTag("C\(result.clusterID)", monospaced: true)
+                        }
+                        Spacer(minLength: DS.Space.xs)
+                        scoreBadge(result.displayScore(method: method))
+                    }
                     energyBreakdownSection(result: result)
-
-                    Divider()
-
-                    // Interactions summary
                     interactionsSummary
-
-                    Divider()
-
-                    // Mini interaction map
                     miniInteractionDiagram
-
-                    Divider()
-
-                    // Action buttons
-                    VStack(spacing: 8) {
-                        Button(action: {
-                            viewModel.showDockingPose(at: index)
-                            viewModel.docking.interactionDiagramPoseIndex = index
-                            showInteractionDiagram = true
-                        }) {
-                            Label("2D Interaction Diagram", systemImage: "circle.hexagongrid")
-                                .frame(maxWidth: .infinity)
+                    VStack(spacing: DS.Space.s) {
+                        Button { openDiagram(idx) } label: {
+                            Label("2D Interaction Diagram", systemImage: "point.3.connected.trianglepath.dotted")
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .help("Open 2D interaction diagram for this pose")
-
-                        Button(action: {
-                            viewModel.showDockingPose(at: index)
+                        .buttonStyle(.dsSecondary)
+                        .help("Open the 2D interaction diagram for this pose")
+                        Button {
+                            viewModel.showDockingPose(at: idx)
                             bringMainViewportToFront()
-                        }) {
+                        } label: {
                             Label("Show in 3D Viewport", systemImage: "cube")
-                                .frame(maxWidth: .infinity)
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .help("Display this pose in the 3D viewer")
+                        .buttonStyle(.dsSecondary)
+                        .help("Display this pose in the 3D viewer and bring the main window forward")
                     }
                 }
-                .padding(12)
+                .padding(DS.Space.l)
             }
+        } else {
+            // Inspector-sized placeholder (the large step empty state overflows a 240 pt column).
+            VStack(spacing: DS.Space.s) {
+                Image(systemName: "cube")
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(.tertiary)
+                Text("No Selection")
+                    .font(DS.Font.sectionTitle)
+                    .foregroundStyle(.secondary)
+                Text("Select a pose to inspect its energy terms and contacts.")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(DS.Space.l)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(Color(nsColor: .controlBackgroundColor))
     }
 
-    @ViewBuilder
     private func energyBreakdownSection(result: DockingResult) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Energy Breakdown")
-                .font(.subheadline.weight(.semibold))
-
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Energy Breakdown")
+            Grid(alignment: .leading, horizontalSpacing: DS.Space.l, verticalSpacing: DS.Space.xs) {
                 GridRow {
-                    let sm2 = viewModel.docking.scoringMethod
-                    Text(sm2.isAffinityScore ? "pKi" : "Total").font(.footnote.weight(.medium))
-                    Text(String(format: "%.2f %@", result.displayScore(method: sm2), sm2.unitLabel))
-                        .font(.footnote.monospaced().weight(.bold))
-                        .foregroundStyle(scoreColor(result.displayScore(method: sm2), method: sm2))
+                    Text(method.isAffinityScore ? "pKi" : "Total")
+                        .font(DS.Font.label.weight(.medium))
+                    scoreBadge(result.displayScore(method: method))
+                        .gridColumnAlignment(.trailing)
                 }
-                GridRow {
-                    Text("Steric (vdW)").font(.footnote).foregroundStyle(.secondary)
-                    Text(String(format: "%.2f", result.stericEnergy))
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-                GridRow {
-                    Text("Hydrophobic").font(.footnote).foregroundStyle(.secondary)
-                    Text(String(format: "%.2f", result.hydrophobicEnergy))
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-                GridRow {
-                    Text("H-bond").font(.footnote).foregroundStyle(.secondary)
-                    Text(String(format: "%.2f", result.hbondEnergy))
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-                GridRow {
-                    Text("Torsion penalty").font(.footnote).foregroundStyle(.secondary)
-                    Text(String(format: "%.2f", result.torsionPenalty))
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
+                breakdownRow("Steric (vdW)", result.stericEnergy)
+                breakdownRow("Hydrophobic", result.hydrophobicEnergy)
+                breakdownRow("H-bond", result.hbondEnergy)
+                breakdownRow("Torsion penalty", result.torsionPenalty)
+                if !method.isAffinityScore {
+                    breakdownRow("Intramolecular & other", result.intraAndOtherEnergy)
                 }
                 if let refine = result.refinementEnergy {
                     GridRow {
-                        Text("Refined (OpenMM)").font(.footnote).foregroundStyle(.purple)
-                        Text(String(format: "%.2f", refine))
-                            .font(.footnote.monospaced().weight(.medium))
-                            .foregroundStyle(.purple)
+                        Text("Refined (OpenMM)").foregroundStyle(DS.Color.pocket)
+                        Text(String(format: "%.2f", refine)).foregroundStyle(DS.Color.pocket)
                     }
+                    .font(DS.Font.label)
+                    .monospacedDigit()
                 }
             }
-
-            // Cluster info
             if result.clusterID >= 0 {
-                HStack(spacing: 4) {
-                    Text("Cluster \(result.clusterID)")
-                        .font(.footnote.weight(.medium))
-                    Text("(rank \(result.clusterRank) within cluster)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(4)
-                .background(Capsule().fill(Color.cyan.opacity(0.1)))
+                Text("Cluster \(result.clusterID) · rank \(result.clusterRank) within cluster")
+                    .font(DS.Font.secondary)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
     }
 
-    @ViewBuilder
+    private func breakdownRow(_ label: String, _ value: Float) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(String(format: "%.2f", value))
+        }
+        .font(DS.Font.label)
+        .monospacedDigit()
+    }
+
     private var interactionsSummary: some View {
         let interactions = viewModel.docking.currentInteractions
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Interactions")
-                .font(.subheadline.weight(.semibold))
-
+        let grouped = Dictionary(grouping: interactions, by: \.type)
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Interactions", count: interactions.count)
             if interactions.isEmpty {
-                Text("Select a pose to see interactions")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                PanelHint(text: "No contacts detected for this pose under the current scoring method.",
+                          icon: "info.circle")
             } else {
-                let grouped = Dictionary(grouping: interactions, by: \.type)
                 ForEach(MolecularInteraction.InteractionType.allCases, id: \.rawValue) { type in
                     if let group = grouped[type] {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(interactionColor(type))
-                                .frame(width: 6, height: 6)
-                            Text(interactionLabel(type))
-                                .font(.footnote)
+                        HStack(spacing: DS.Space.m) {
+                            Capsule().fill(type.themeColor).frame(width: 14, height: 4)
+                            Text(type.label).font(DS.Font.label)
                             Spacer()
                             Text("\(group.count)")
-                                .font(.footnote.monospaced().weight(.medium))
+                                .font(DS.Font.monoSmall.weight(.medium))
+                                .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
                     }
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
     }
 
-    // MARK: - Mini Interaction Diagram
+    // MARK: - Mini Interaction Map
 
     @ViewBuilder
     private var miniInteractionDiagram: some View {
         let interactions = viewModel.docking.currentInteractions
         if let protein = viewModel.molecules.protein, !interactions.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Interaction Map")
-                    .font(.subheadline.weight(.semibold))
-
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                DSSectionHeader("Interaction Map")
                 Canvas { context, size in
                     drawMiniDiagram(context: context, size: size,
                                     interactions: interactions,
                                     proteinAtoms: protein.atoms)
                 }
                 .frame(height: 220)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                        .fill(DS.Color.diagramPaper)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous))
             }
+            .dsCard()
         }
     }
 
     private func drawMiniDiagram(context: GraphicsContext, size: CGSize,
-                                  interactions: [MolecularInteraction],
-                                  proteinAtoms: [Atom]) {
+                                 interactions: [MolecularInteraction],
+                                 proteinAtoms: [Atom]) {
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
         let radius = min(size.width, size.height) * 0.38
 
         // Group interactions by residue
         var residueInteractions: [String: [MolecularInteraction]] = [:]
+        var residueClasses: [String: DiagramResidueClass] = [:]
         for inter in interactions {
             guard inter.proteinAtomIndex < proteinAtoms.count else { continue }
             let pa = proteinAtoms[inter.proteinAtomIndex]
             let key = "\(pa.residueName)\(pa.residueSeq)"
             residueInteractions[key, default: []].append(inter)
+            residueClasses[key] = DiagramResidueClass(residueName: pa.residueName)
         }
 
         let residues = Array(residueInteractions.keys).sorted()
         guard !residues.isEmpty else { return }
 
-        // Draw ligand circle at center
+        // Ligand at the center
         let ligandRect = CGRect(x: center.x - 14, y: center.y - 14, width: 28, height: 28)
-        context.fill(Circle().path(in: ligandRect), with: .color(.green.opacity(0.25)))
-        context.stroke(Circle().path(in: ligandRect), with: .color(.green.opacity(0.8)), lineWidth: 1.5)
-        context.draw(Text("Lig").font(.system(size: 8, weight: .bold)).foregroundColor(.green), at: center)
+        context.fill(Circle().path(in: ligandRect), with: .color(DS.Color.ligand.opacity(0.22)))
+        context.stroke(Circle().path(in: ligandRect), with: .color(DS.Color.ligand), lineWidth: 1.5)
+        context.draw(Text("Lig").font(DS.Font.canvasLabel.weight(.bold)).foregroundColor(DS.Color.ligand), at: center)
 
-        // Draw residues radially
+        // Residues arranged radially
         for (i, resName) in residues.enumerated() {
             let angle = CGFloat(i) / CGFloat(residues.count) * 2.0 * .pi - .pi / 2.0
-            let resCenter = CGPoint(
-                x: center.x + cos(angle) * radius,
-                y: center.y + sin(angle) * radius
-            )
-
+            let resCenter = CGPoint(x: center.x + cos(angle) * radius,
+                                    y: center.y + sin(angle) * radius)
             guard let inters = residueInteractions[resName] else { continue }
 
-            // Draw interaction lines from ligand center to residue
             for inter in inters {
-                let lineColor = interactionColor(inter.type)
                 var path = Path()
                 path.move(to: center)
                 path.addLine(to: resCenter)
                 let dashPattern: [CGFloat] = inter.type == .hbond ? [3, 2] : []
-                context.stroke(path, with: .color(lineColor.opacity(0.6)),
-                              style: StrokeStyle(lineWidth: 1.5, dash: dashPattern))
+                context.stroke(path, with: .color(inter.type.themeColor.opacity(0.7)),
+                               style: StrokeStyle(lineWidth: 1.5, dash: dashPattern))
             }
 
-            // Draw residue bubble
-            let bubbleRadius: CGFloat = 18
+            let bubbleRadius: CGFloat = 19
             let bubbleRect = CGRect(x: resCenter.x - bubbleRadius, y: resCenter.y - bubbleRadius,
-                                     width: bubbleRadius * 2, height: bubbleRadius * 2)
-            let bubbleColor = miniResidueColor(resName)
+                                    width: bubbleRadius * 2, height: bubbleRadius * 2)
+            let bubbleColor = (residueClasses[resName] ?? .hydrophobic).themeColor
+            context.fill(Circle().path(in: bubbleRect), with: .color(DS.Color.diagramPaper))
             context.fill(Circle().path(in: bubbleRect), with: .color(bubbleColor.opacity(0.15)))
-            context.stroke(Circle().path(in: bubbleRect), with: .color(bubbleColor.opacity(0.7)), lineWidth: 1)
-
-            // Residue label
+            context.stroke(Circle().path(in: bubbleRect), with: .color(bubbleColor), lineWidth: 1)
             context.draw(
-                Text(resName).font(.system(size: 7, weight: .medium)).foregroundColor(bubbleColor),
+                Text(resName).font(DS.Font.canvasLabel).foregroundColor(DS.Color.diagramInk),
                 at: resCenter
             )
 
-            // Small colored dots for each unique interaction type in this residue
+            // One dot per interaction type under the bubble
             let uniqueTypes = Array(Set(inters.map(\.type))).sorted(by: { $0.rawValue < $1.rawValue })
-            if uniqueTypes.count > 0 {
-                let dotSpacing: CGFloat = 7
-                let totalWidth = CGFloat(uniqueTypes.count - 1) * dotSpacing
-                let startX = resCenter.x - totalWidth / 2
-                let dotY = resCenter.y + bubbleRadius + 5
-                for (di, iType) in uniqueTypes.enumerated() {
-                    let dotCenter = CGPoint(x: startX + CGFloat(di) * dotSpacing, y: dotY)
-                    let dotRect = CGRect(x: dotCenter.x - 2.5, y: dotCenter.y - 2.5, width: 5, height: 5)
-                    context.fill(Circle().path(in: dotRect), with: .color(interactionColor(iType)))
-                }
+            let dotSpacing: CGFloat = 7
+            let startX = resCenter.x - CGFloat(uniqueTypes.count - 1) * dotSpacing / 2
+            let dotY = resCenter.y + bubbleRadius + 5
+            for (di, iType) in uniqueTypes.enumerated() {
+                let dotRect = CGRect(x: startX + CGFloat(di) * dotSpacing - 2.5, y: dotY - 2.5, width: 5, height: 5)
+                context.fill(Circle().path(in: dotRect), with: .color(iType.themeColor))
             }
-        }
-    }
-
-    private func miniResidueColor(_ name: String) -> Color {
-        let resName = String(name.prefix(3))
-        switch resName {
-        case "ASP", "GLU":                              return .red     // acidic
-        case "LYS", "ARG", "HIS":                      return .blue    // basic
-        case "SER", "THR", "ASN", "GLN", "TYR", "CYS": return .purple  // polar
-        default:                                        return .green   // hydrophobic / other
         }
     }
 
     // MARK: - Correlation Analysis Sheet
 
-    @ViewBuilder
     private var correlationAnalysisSheet: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Label("Docking vs. Experimental Affinity", systemImage: "chart.line.uptrend.xyaxis")
-                    .font(.headline)
-                Spacer()
-                Button("Done") { showCorrelation = false }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
-            .padding(12)
-
-            Divider()
-
-            let pairs = affinityDockingPairs()
-
+        let pairs = affinityDockingPairs()
+        return DSSheetScaffold(
+            title: "Docking vs. Experimental Affinity",
+            subtitle: "Rank agreement between each ligand's best docking score and its measured affinity.",
+            systemImage: "chart.line.uptrend.xyaxis"
+        ) {
             if pairs.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "chart.line.uptrend.xyaxis")
-                        .font(.system(size: 36))
-                        .foregroundStyle(.secondary)
-                    Text("No Affinity Data Available")
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Text("Import Ki, pKi, or IC50 values in the Ligand Database\nto compute rank correlation with docking scores.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                DSEmptyState("No Affinity Data",
+                             systemImage: "chart.line.uptrend.xyaxis",
+                             description: "Import Ki, pKi or IC50 values in the Ligand Database to compute rank correlation with docking scores.")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        // Statistics
+                    VStack(alignment: .leading, spacing: DS.Space.xl) {
                         correlationStatistics(pairs: pairs)
-
-                        Divider()
-
-                        // Rank comparison table
+                        correlationScatter(pairs: pairs)
                         rankComparisonTable(pairs: pairs)
-
-                        Divider()
-
-                        // Cluster consensus
                         clusterConsensusSection
                     }
-                    .padding(16)
+                    .padding(DS.Space.xl)
                 }
             }
+        } footer: {
+            Button("Done") { showCorrelation = false }
+                .keyboardShortcut(.defaultAction)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    @ViewBuilder
     private func correlationStatistics(pairs: [(ligand: String, dockingEnergy: Float, pKi: Float)]) -> some View {
-        let n = pairs.count
         let dockingRanks = rankValues(pairs.map { $0.dockingEnergy })
         let affinityRanks = rankValues(pairs.map { -$0.pKi }) // higher pKi = better binder = lower rank
-
-        // Spearman rank correlation
         let spearman = spearmanCorrelation(dockingRanks, affinityRanks)
-
-        // Pearson correlation
-        let dE = pairs.map { Double($0.dockingEnergy) }
-        let pKi = pairs.map { Double($0.pKi) }
-        let pearson = pearsonCorrelation(dE, pKi)
-
-        // Kendall's tau
+        let pearson = pearsonCorrelation(pairs.map { Double($0.dockingEnergy) }, pairs.map { Double($0.pKi) })
         let kendall = kendallTau(dockingRanks, affinityRanks)
 
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Correlation Statistics (n=\(n))")
-                .font(.callout.weight(.semibold))
-
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
-                GridRow {
-                    Text("Spearman ρ").font(.subheadline)
-                    Text(String(format: "%.3f", spearman))
-                        .font(.subheadline.monospaced().weight(.bold))
-                        .foregroundStyle(abs(spearman) > 0.7 ? .green : abs(spearman) > 0.4 ? .yellow : .red)
-                }
-                GridRow {
-                    Text("Pearson r").font(.subheadline)
-                    Text(String(format: "%.3f", pearson))
-                        .font(.subheadline.monospaced().weight(.bold))
-                        .foregroundStyle(abs(pearson) > 0.7 ? .green : abs(pearson) > 0.4 ? .yellow : .red)
-                }
-                GridRow {
-                    Text("Kendall τ").font(.subheadline)
-                    Text(String(format: "%.3f", kendall))
-                        .font(.subheadline.monospaced().weight(.bold))
-                        .foregroundStyle(abs(kendall) > 0.6 ? .green : abs(kendall) > 0.3 ? .yellow : .red)
-                }
-                GridRow {
-                    Text("R²").font(.subheadline)
-                    Text(String(format: "%.3f", pearson * pearson))
-                        .font(.subheadline.monospaced())
-                        .foregroundStyle(.secondary)
-                }
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Correlation Statistics", count: pairs.count)
+            DSMetricGrid(columns: 4) {
+                DSMetric("Spearman ρ", value: String(format: "%.3f", spearman),
+                         tone: correlationTone(spearman, good: 0.7, fair: 0.4))
+                DSMetric("Pearson r", value: String(format: "%.3f", pearson),
+                         tone: correlationTone(pearson, good: 0.7, fair: 0.4))
+                DSMetric("Kendall τ", value: String(format: "%.3f", kendall),
+                         tone: correlationTone(kendall, good: 0.6, fair: 0.3))
+                DSMetric("R²", value: String(format: "%.3f", pearson * pearson))
             }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.05)))
         }
     }
 
-    @ViewBuilder
+    private func correlationTone(_ value: Double, good: Double, fair: Double) -> DSTone {
+        abs(value) > good ? .success : abs(value) > fair ? .warning : .danger
+    }
+
+    private func correlationScatter(pairs: [(ligand: String, dockingEnergy: Float, pKi: Float)]) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Score vs. pKi")
+            Chart {
+                ForEach(Array(pairs.enumerated()), id: \.offset) { _, pair in
+                    PointMark(
+                        x: .value("pKi", pair.pKi),
+                        y: .value("Docking score", pair.dockingEnergy)
+                    )
+                    .foregroundStyle(DS.Color.ligand)
+                    .symbolSize(44)
+                    .accessibilityLabel(pair.ligand)
+                }
+            }
+            .chartXAxisLabel("Experimental pKi")
+            .chartYAxisLabel("Best docking score (kcal/mol)")
+            .chartXAxis {
+                AxisMarks { _ in
+                    AxisGridLine().foregroundStyle(DS.Color.hairline)
+                    AxisValueLabel().font(DS.Font.caption)
+                }
+            }
+            .chartYAxis {
+                AxisMarks { _ in
+                    AxisGridLine().foregroundStyle(DS.Color.hairline)
+                    AxisValueLabel().font(DS.Font.caption)
+                }
+            }
+            .frame(height: 220)
+            .dsCard()
+        }
+    }
+
     private func rankComparisonTable(pairs: [(ligand: String, dockingEnergy: Float, pKi: Float)]) -> some View {
         let sortedByDocking = pairs.sorted { $0.dockingEnergy < $1.dockingEnergy }
         let sortedByAffinity = pairs.sorted { $0.pKi > $1.pKi }
 
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Rank Comparison")
-                .font(.callout.weight(.semibold))
-
-            // Header
-            HStack(spacing: 0) {
-                Text("Dock Rank").font(.footnote.weight(.semibold)).frame(width: 70, alignment: .leading)
-                Text("Ligand").font(.footnote.weight(.semibold)).frame(width: 120, alignment: .leading)
-                Text("Energy").font(.footnote.weight(.semibold)).frame(width: 70, alignment: .leading)
-                Text("pKi").font(.footnote.weight(.semibold)).frame(width: 60, alignment: .leading)
-                Text("Aff Rank").font(.footnote.weight(.semibold)).frame(width: 70, alignment: .leading)
-                Text("Δ Rank").font(.footnote.weight(.semibold)).frame(width: 60, alignment: .leading)
-            }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 6)
-
-            ForEach(Array(sortedByDocking.enumerated()), id: \.offset) { dockRank, pair in
-                let affRank = sortedByAffinity.firstIndex(where: { $0.ligand == pair.ligand }).map { $0 + 1 } ?? 0
-                let delta = abs(dockRank + 1 - affRank)
-
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Rank Comparison")
+            VStack(spacing: 0) {
                 HStack(spacing: 0) {
-                    Text("#\(dockRank + 1)")
-                        .font(.footnote.monospaced().weight(.bold))
-                        .frame(width: 70, alignment: .leading)
-
-                    Text(pair.ligand)
-                        .font(.footnote)
-                        .lineLimit(1)
-                        .frame(width: 120, alignment: .leading)
-
-                    Text(String(format: "%.1f", pair.dockingEnergy))
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(energyColor(pair.dockingEnergy))
-                        .frame(width: 70, alignment: .leading)
-
-                    Text(String(format: "%.1f", pair.pKi))
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(.purple)
-                        .frame(width: 60, alignment: .leading)
-
-                    Text("#\(affRank)")
-                        .font(.footnote.monospaced())
-                        .frame(width: 70, alignment: .leading)
-
-                    Text(delta == 0 ? "=" : "±\(delta)")
-                        .font(.footnote.monospaced().weight(.medium))
-                        .foregroundStyle(delta == 0 ? .green : delta <= 2 ? .yellow : .red)
-                        .frame(width: 60, alignment: .leading)
+                    rankHeader("Dock rank", width: 72)
+                    rankHeader("Ligand", width: 160)
+                    rankHeader("Energy", width: 72)
+                    rankHeader("pKi", width: 60)
+                    rankHeader("Aff. rank", width: 72)
+                    rankHeader("Δ rank", width: 60)
+                    Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(dockRank % 2 == 0 ? Color.clear : Color.primary.opacity(0.02))
+                .padding(.horizontal, DS.Space.s)
+                .padding(.vertical, DS.Space.xs)
+                Divider()
+                ForEach(Array(sortedByDocking.enumerated()), id: \.offset) { dockRank, pair in
+                    let affRank = sortedByAffinity.firstIndex(where: { $0.ligand == pair.ligand }).map { $0 + 1 } ?? 0
+                    let delta = abs(dockRank + 1 - affRank)
+                    let energyTone = DSScore.tone(energy: pair.dockingEnergy)
+                    HStack(spacing: 0) {
+                        Text(verbatim: "#\(dockRank + 1)").fontWeight(.semibold).frame(width: 72, alignment: .leading)
+                        Text(pair.ligand)
+                            .font(DS.Font.label)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(width: 160, alignment: .leading)
+                        Text(String(format: "%.1f", pair.dockingEnergy))
+                            .foregroundStyle(energyTone == .danger ? DS.Color.scorePoor : energyTone.color)
+                            .frame(width: 72, alignment: .leading)
+                        Text(String(format: "%.1f", pair.pKi)).frame(width: 60, alignment: .leading)
+                        Text(verbatim: "#\(affRank)").frame(width: 72, alignment: .leading)
+                        Text(delta == 0 ? "=" : "±\(delta)")
+                            .fontWeight(.medium)
+                            .foregroundStyle(delta == 0 ? DS.Color.success : delta <= 2 ? DS.Color.warning : DS.Color.scorePoor)
+                            .frame(width: 60, alignment: .leading)
+                        Spacer(minLength: 0)
+                    }
+                    .font(DS.Font.monoSmall)
+                    .monospacedDigit()
+                    .padding(.horizontal, DS.Space.s)
+                    .padding(.vertical, DS.Space.xxs)
+                    .background(dockRank % 2 == 1 ? DS.Color.cardFill : Color.clear)
+                }
             }
+            .dsCard(padding: DS.Space.xs)
         }
     }
 
-    @ViewBuilder
+    private func rankHeader(_ title: String, width: CGFloat) -> some View {
+        Text(title)
+            .font(DS.Font.secondary.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: .leading)
+    }
+
     private var clusterConsensusSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Binding Site Consensus")
-                .font(.callout.weight(.semibold))
-
-            Text("Most populated cluster across all docked ligands identifies the consensus binding site.")
-                .font(.footnote)
+        let clusterCounts = computeClusterConsensus()
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader("Binding Site Consensus")
+            Text("The most populated cluster across all docked ligands identifies the consensus binding site.")
+                .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
-
-            // Count ligands per cluster (using best pose of each ligand)
-            let clusterCounts = computeClusterConsensus()
             if clusterCounts.isEmpty {
-                Text("No cluster data available")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                PanelHint(text: "No cluster data available.", icon: "info.circle")
             } else {
                 ForEach(clusterCounts.prefix(5), id: \.cluster) { entry in
-                    HStack(spacing: 8) {
-                        Text("Cluster \(entry.cluster)")
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(.cyan)
+                    HStack(spacing: DS.Space.m) {
+                        DSTag("C\(entry.cluster)", tone: .accent, monospaced: true)
+                            .frame(width: 52, alignment: .leading)
                         ProgressView(value: Double(entry.count), total: Double(clusterCounts.first?.count ?? 1))
                             .progressViewStyle(.linear)
-                            .tint(.cyan)
+                            .tint(DS.Color.accent)
                         Text("\(entry.count) ligands")
-                            .font(.footnote.monospaced())
+                            .font(DS.Font.monoSmall)
+                            .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                 }
             }
         }
-    }
-
-    // MARK: - Empty State
-
-    private var emptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "chart.bar.xaxis")
-                .font(.system(size: 36))
-                .foregroundStyle(.secondary)
-            Text("No Docking Results")
-                .font(.body.weight(.medium))
-                .foregroundStyle(.secondary)
-            Text("Run docking from the Docking tab to see results here.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Status Bar
-
-    private var statusBar: some View {
-        HStack {
-            Text("\(displayedResults.count) poses")
-                .font(.footnote.monospaced())
-                .foregroundStyle(.secondary)
-
-            if let best = displayedResults.first {
-                let sm = viewModel.docking.scoringMethod
-                Text("•")
-                    .foregroundStyle(.secondary)
-                Text(String(format: "Best: %.1f %@", best.displayScore(method: sm), sm.unitLabel))
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-
-            if !viewModel.docking.batchResults.isEmpty {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                Text("\(viewModel.docking.batchResults.count) ligands in batch")
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            if let sel = selectedPoseIndex, sel < displayedResults.count {
-                let sm = viewModel.docking.scoringMethod
-                Text(String(format: "Selected: Pose #%d (%.2f %@)",
-                           sel + 1, displayedResults[sel].displayScore(method: sm), sm.unitLabel))
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
     }
 
     // MARK: - Window Helpers
@@ -974,6 +865,15 @@ struct ResultsDatabaseWindow: View {
     }
 
     // MARK: - Data Helpers
+
+    @ViewBuilder
+    private func scoreBadge(_ value: Float) -> some View {
+        if method.isAffinityScore {
+            DSScoreBadge(pK: value, label: method.unitLabel)
+        } else {
+            DSScoreBadge(energy: value, unit: method.unitLabel)
+        }
+    }
 
     private struct AffinityData {
         var ki: Float?      // nM
@@ -1085,53 +985,8 @@ struct ResultsDatabaseWindow: View {
         guard denom > 0 else { return 0 }
         return Double(concordant - discordant) / Double(denom)
     }
+}
 
-    // MARK: - Styling Helpers
-
-    private func energyColor(_ energy: Float) -> Color {
-        if energy < -8 { return .green }
-        if energy < -4 { return .yellow }
-        if energy < 0 { return .orange }
-        return .red
-    }
-
-    private func scoreColor(_ value: Float, method: ScoringMethod) -> Color {
-        if method.isAffinityScore {
-            if value > 8 { return .green }
-            if value > 5 { return .yellow }
-            if value > 3 { return .orange }
-            return .red
-        }
-        return energyColor(value)
-    }
-
-    private func interactionColor(_ type: MolecularInteraction.InteractionType) -> Color {
-        switch type {
-        case .hbond:       .blue
-        case .hydrophobic: .green
-        case .saltBridge:  .red
-        case .piStack:     .purple
-        case .piCation:    .orange
-        case .halogen:     .mint
-        case .metalCoord:  .yellow
-        case .chPi:        .teal
-        case .amideStack:  .brown
-        case .chalcogen:   .cyan
-        }
-    }
-
-    private func interactionLabel(_ type: MolecularInteraction.InteractionType) -> String {
-        switch type {
-        case .hbond:       "H-bond"
-        case .hydrophobic: "Hydrophobic"
-        case .saltBridge:  "Salt bridge"
-        case .piStack:     "π-π stacking"
-        case .piCation:    "π-cation"
-        case .halogen:     "Halogen bond"
-        case .metalCoord:  "Metal coord."
-        case .chPi:        "CH-π"
-        case .amideStack:  "Amide-π"
-        case .chalcogen:   "Chalcogen bond"
-        }
-    }
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
 }

@@ -166,8 +166,8 @@ extension AppViewModel {
                 "Score": String(format: "%.3f", result.displayScore(method: method)),
                 "ScoreUnit": method.unitLabel,
                 "Energy": String(format: "%.3f", result.energy),
-                "VdW": String(format: "%.3f", result.vdwEnergy),
-                "Elec": String(format: "%.3f", result.elecEnergy),
+                "VdW": String(format: "%.3f", result.stericEnergy),
+                "Hydrophobic": String(format: "%.3f", result.hydrophobicEnergy),
                 "HBond": String(format: "%.3f", result.hbondEnergy),
                 "Cluster": "\(result.clusterID)"
             ]
@@ -249,7 +249,7 @@ extension AppViewModel {
                 "\(idx + 1)",
                 "\(r.clusterID)",
                 String(format: "%.2f", r.energy),
-                String(format: "%.2f", r.vdwEnergy),
+                String(format: "%.2f", r.stericEnergy),
                 String(format: "%.2f", r.hbondEnergy),
                 String(format: "%.2f", r.torsionPenalty),
                 r.strainEnergy.map { String(format: "%.2f", $0) } ?? "",

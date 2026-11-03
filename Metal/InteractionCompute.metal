@@ -43,8 +43,6 @@ kernel void detectInteractions(
         uint ligFlags = ligAtom.flags;
         int ligCharge = ligAtom.formalCharge;
 
-        // Track whether this ligand atom found a strong (non-hydrophobic) interaction
-        bool hasStrongInteraction = false;
         uint hydroCount = 0;
         const uint maxHydroPerAtom = 2;
 
@@ -102,11 +100,6 @@ kernel void detectInteractions(
                 if (halogen && acceptor) {
                     type = 5; // halogen
                 }
-            }
-
-            // Mark strong interactions (anything except hydrophobic)
-            if (type != 0xFFFFFFFF) {
-                hasStrongInteraction = true;
             }
 
             // ---- Hydrophobic: 3.4-4.0 Angstrom, C/S <-> C/S ----

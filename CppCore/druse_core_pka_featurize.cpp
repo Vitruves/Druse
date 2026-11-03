@@ -67,19 +67,14 @@ DrusePKaGraphResult* druse_featurize_pka_graph(const char *smiles) {
     }
 
     try {
-        // Parse and canonicalize for deterministic atom ordering
+        // Keep the input atom order: callers interpret the per-atom predictions
+        // as indices into this same SMILES (druse_prepare_ligand_ensemble_ex,
+        // druse_detect_ionizable_sites). The message-passing GNN is
+        // permutation-equivariant, so canonical reordering is not needed.
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) {
             result->success = false;
             snprintf(result->errorMessage, 256, "Invalid SMILES");
-            return result;
-        }
-
-        std::string canon = MolToSmiles(*mol);
-        mol.reset(SmilesToMol(canon));
-        if (!mol) {
-            result->success = false;
-            snprintf(result->errorMessage, 256, "Failed to reparse canonical SMILES");
             return result;
         }
 
