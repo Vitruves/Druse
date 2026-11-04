@@ -416,15 +416,28 @@ extension AppViewModel {
             return
         }
 
+        let addedCount = selectResidues(within: distance, of: selectedPositions, extend: true)
+        log.info("Extended selection by \(addedCount) residues within \(String(format: "%.1f", distance)) \u{00C5}", category: .molecule)
+        workspace.statusMessage = "\(workspace.selectedResidueIndices.count) residues selected"
+    }
+
+    /// Selects the protein residues that have any atom within `distance` Å of `positions`
+    /// (a ligand, a pocket, another selection). With `extend` the current selection is kept
+    /// and grown; otherwise it is replaced. Returns the number of residues added.
+    @discardableResult
+    func selectResidues(within distance: Float, of positions: [SIMD3<Float>], extend: Bool) -> Int {
+        guard let prot = molecules.protein else { return 0 }
+        let protAtoms = prot.atoms
         let distSq = distance * distance
-        var newResidues: Set<Int> = workspace.selectedResidueIndices
+        let previous = extend ? workspace.selectedResidueIndices : []
+        var newResidues = previous
 
         for (resIdx, residue) in prot.residues.enumerated() {
             if newResidues.contains(resIdx) { continue }
             outer: for atomIdx in residue.atomIndices {
                 guard atomIdx < protAtoms.count else { continue }
                 let pos = protAtoms[atomIdx].position
-                for sp in selectedPositions {
+                for sp in positions {
                     if simd_distance_squared(pos, sp) <= distSq {
                         newResidues.insert(resIdx)
                         break outer
@@ -433,16 +446,31 @@ extension AppViewModel {
             }
         }
 
-        let addedCount = newResidues.count - workspace.selectedResidueIndices.count
+        if !extend { workspace.selectedAtomIndices.removeAll() }
         workspace.selectedResidueIndices = newResidues
-
         for resIdx in newResidues {
             guard resIdx < prot.residues.count else { continue }
             workspace.selectedAtomIndices.formUnion(prot.residues[resIdx].atomIndices)
         }
-
+        if !extend { workspace.selectedAtomIndex = workspace.selectedAtomIndices.first }
         pushToRenderer()
-        log.info("Extended selection by \(addedCount) residues within \(String(format: "%.1f", distance)) \u{00C5}", category: .molecule)
+        return newResidues.count - previous.count
+    }
+
+    /// Selects exactly these protein residues (indices into `protein.residues`), or adds them
+    /// to the current selection with `extend`.
+    func selectResidues(_ residueIndices: Set<Int>, extend: Bool) {
+        guard let prot = molecules.protein else { return }
+        if !extend {
+            workspace.selectedResidueIndices.removeAll()
+            workspace.selectedAtomIndices.removeAll()
+        }
+        for resIdx in residueIndices where resIdx < prot.residues.count {
+            workspace.selectedResidueIndices.insert(resIdx)
+            workspace.selectedAtomIndices.formUnion(prot.residues[resIdx].atomIndices)
+        }
+        workspace.selectedAtomIndex = workspace.selectedAtomIndices.first
+        pushToRenderer()
         workspace.statusMessage = "\(workspace.selectedResidueIndices.count) residues selected"
     }
 
@@ -685,14 +713,24 @@ extension AppViewModel {
         workspace.statusMessage = "Chain \(sourceID) merged into \(targetID)"
     }
 
-    func copySequenceToClipboard(chainID: String? = nil) {
-        guard let prot = molecules.protein else { return }
+    /// One-letter amino-acid sequence of the standard residues among `residueIndices`
+    /// (indices into `protein.residues`, in the given order); non-standard residues are skipped.
+    func oneLetterSequence(residueIndices: [Int]) -> String {
+        guard let prot = molecules.protein else { return "" }
         let threeToOne: [String: String] = [
             "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
             "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
             "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
             "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
         ]
+        return residueIndices.compactMap { idx -> String? in
+            guard idx < prot.residues.count, prot.residues[idx].isStandard else { return nil }
+            return threeToOne[prot.residues[idx].name] ?? "X"
+        }.joined()
+    }
+
+    func copySequenceToClipboard(chainID: String? = nil) {
+        guard let prot = molecules.protein else { return }
 
         let indices: [Int]
         if !workspace.selectedResidueIndices.isEmpty {
@@ -703,10 +741,7 @@ extension AppViewModel {
             indices = Array(0..<prot.residues.count)
         }
 
-        let seq = indices.compactMap { idx -> String? in
-            guard idx < prot.residues.count, prot.residues[idx].isStandard else { return nil }
-            return threeToOne[prot.residues[idx].name] ?? "X"
-        }.joined()
+        let seq = oneLetterSequence(residueIndices: indices)
 
         guard !seq.isEmpty else { return }
 

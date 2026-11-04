@@ -1080,8 +1080,8 @@ final class OpenMMPocketRefiner {
         pocketCenter: SIMD3<Float>,
         pocketHalfExtent: SIMD3<Float>
     ) async -> RefinementResult? {
-        let heavyProteinAtoms = proteinAtoms.filter { $0.element != .H }
-        let heavyLigandAtoms = ligandAtoms.filter { $0.element != .H }
+        let heavyProteinAtoms = Self.unitedAtomHeavyAtoms(proteinAtoms)
+        let heavyLigandAtoms = Self.unitedAtomHeavyAtoms(ligandAtoms)
         guard !heavyProteinAtoms.isEmpty, !heavyLigandAtoms.isEmpty else { return nil }
 
         return await refineNative(
@@ -1091,6 +1091,40 @@ final class OpenMMPocketRefiner {
             pocketCenter: pocketCenter,
             pocketHalfExtent: pocketHalfExtent
         )
+    }
+
+    /// The heavy atoms of `atoms`, in order, as united atoms: each carries the partial charges of the
+    /// hydrogens bonded to it (the nearest heavy atom of the same residue within 1.3 Å), and each residue's
+    /// charges are then shifted evenly so the residue keeps its integer formal charge. The OpenMM model is
+    /// heavy-atom only; dropping hydrogens (explicit ones, or the implicit-H share RDKit's Gasteiger leaves
+    /// out of heavy-atom charges) gave a prepared receptor a spurious net charge of about −180 e, and the
+    /// unscreened Coulomb term then dominated the interaction energy (+5000 kcal/mol) and distorted the pocket.
+    static func unitedAtomHeavyAtoms(_ atoms: [Atom]) -> [Atom] {
+        var heavy: [Atom] = []
+        var heavyByResidue: [String: [Int]] = [:]
+        for atom in atoms where atom.element != .H {
+            heavyByResidue["\(atom.chainID):\(atom.residueSeq)", default: []].append(heavy.count)
+            heavy.append(atom)
+        }
+        let bondCutoffSq: Float = 1.3 * 1.3
+        for hydrogen in atoms where hydrogen.element == .H && hydrogen.charge.isFinite {
+            let candidates = heavyByResidue["\(hydrogen.chainID):\(hydrogen.residueSeq)"] ?? []
+            let nearest = candidates.min {
+                simd_distance_squared(heavy[$0].position, hydrogen.position) < simd_distance_squared(heavy[$1].position, hydrogen.position)
+            }
+            guard let nearest, simd_distance_squared(heavy[nearest].position, hydrogen.position) <= bondCutoffSq else { continue }
+            heavy[nearest].charge += hydrogen.charge
+        }
+        var formalChargeOfResidue: [String: Int] = [:]
+        for atom in atoms { formalChargeOfResidue["\(atom.chainID):\(atom.residueSeq)", default: 0] += atom.formalCharge }
+        for (residue, members) in heavyByResidue {
+            let partial = members.reduce(Float(0)) { $0 + (heavy[$1].charge.isFinite ? heavy[$1].charge : 0) }
+            let shift = (Float(formalChargeOfResidue[residue] ?? 0) - partial) / Float(members.count)
+            for index in members {
+                heavy[index].charge = (heavy[index].charge.isFinite ? heavy[index].charge : 0) + shift
+            }
+        }
+        return heavy
     }
 
     // MARK: - Native C++ OpenMM Refinement
@@ -1125,13 +1159,6 @@ final class OpenMMPocketRefiner {
                 atomicNum: Int32(atom.element.rawValue),
                 isPocket: isPocket
             ))
-        }
-
-        // Build bond array from all protein atoms (heavy only)
-        // We need to find bonds between heavy atoms from the full atom list
-        var heavyIdMap: [Int: Int] = [:]  // original atom id → heavy-only index
-        for (newIdx, atom) in heavyProteinAtoms.enumerated() {
-            heavyIdMap[atom.id] = newIdx
         }
 
         var cBonds: [DruseOpenMMBond] = []

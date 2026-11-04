@@ -18,6 +18,7 @@ struct ResultsDatabaseWindow: View {
     @State private var sortAscending: Bool = true
     @State private var selectedBatchLigand: String? = nil
     @State private var showCorrelation: Bool = false
+    @State private var showMultiPoseAnalysis: Bool = false
     @State private var showInspector: Bool = true
     @State private var showSidebar: Bool = true
     @AppStorage("ui.resultsSidebarWidth") private var sidebarWidth = 240.0
@@ -115,6 +116,10 @@ struct ResultsDatabaseWindow: View {
         .navigationSubtitle(windowSubtitle)
         .toolbar { toolbarContent }
         .onChange(of: results.count) { _, _ in selectedPoseIndex = nil }
+        .sheet(isPresented: $showMultiPoseAnalysis) {
+            MultiPoseAnalysisSheet()
+                .environment(viewModel)
+        }
         .sheet(isPresented: $showCorrelation) {
             correlationAnalysisSheet
                 .frame(minWidth: 640, idealWidth: 720, minHeight: 540, idealHeight: 700)
@@ -150,14 +155,16 @@ struct ResultsDatabaseWindow: View {
             Button { showCorrelation = true } label: {
                 Label("Correlation…", systemImage: "chart.line.uptrend.xyaxis")
             }
+            .labelStyle(.titleAndIcon)
             .disabled(batch.isEmpty)
             .help("Correlate docking scores with experimental affinity (batch results)")
 
             Button {
                 if let idx = selectedPoseIndex { openDiagram(idx) }
             } label: {
-                Label("Interaction Diagram", systemImage: "point.3.connected.trianglepath.dotted")
+                Label("Diagram", systemImage: "point.3.connected.trianglepath.dotted")
             }
+            .labelStyle(.titleAndIcon)
             .disabled(selectedResult == nil)
             .help("Open the 2D interaction diagram for the selected pose")
 
@@ -286,11 +293,15 @@ struct ResultsDatabaseWindow: View {
             Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
                 .monospacedDigit()
             Spacer()
+            Button("Clear") { viewModel.docking.selectedPoseIndices.removeAll() }
+                .buttonStyle(.borderless)
+                .help("Untick all poses")
+            Button("Compare…") { showMultiPoseAnalysis = true }
+                .buttonStyle(.bordered)
+                .help("Pairwise RMSD and interaction fingerprints of the ticked poses")
             Button("View Selected Poses") { viewModel.showSelectedPoses() }
                 .buttonStyle(.borderedProminent)
-                .help("Overlay the selected poses in the 3D viewport")
-            Button("Clear Selection") { viewModel.docking.selectedPoseIndices.removeAll() }
-                .buttonStyle(.bordered)
+                .help("Overlay the ticked poses in the 3D viewport")
         }
         .font(DS.Font.secondary)
         .controlSize(.small)
@@ -368,7 +379,10 @@ struct ResultsDatabaseWindow: View {
 
             Group {
                 if result.clusterID >= 0 {
-                    DSTag("C\(result.clusterID)", monospaced: true)
+                    // Plain text: the cluster ID is a grouping key, not a headline next to the score.
+                    Text(verbatim: "C\(result.clusterID)")
+                        .font(DS.Font.monoSmall)
+                        .foregroundStyle(.secondary)
                         .help("Cluster \(result.clusterID) — RMSD-based binding-mode group. Poses sharing this ID occupy the same pose family (RMSD < 2.0 Å); different IDs are structurally distinct binding modes.")
                 } else {
                     Text("—").foregroundStyle(.tertiary)
@@ -479,6 +493,8 @@ struct ResultsDatabaseWindow: View {
                 }
                 .padding(DS.Space.l)
             }
+        } else if !viewModel.sortedSelectedPoseIndices.isEmpty {
+            tickedPosesPanel
         } else {
             // Inspector-sized placeholder (the large step empty state overflows a 240 pt column).
             VStack(spacing: DS.Space.s) {
@@ -488,7 +504,7 @@ struct ResultsDatabaseWindow: View {
                 Text("No Selection")
                     .font(DS.Font.sectionTitle)
                     .foregroundStyle(.secondary)
-                Text("Select a pose to inspect its energy terms and contacts.")
+                Text("Click a row to inspect its energy terms and contacts, or tick poses to compare them.")
                     .font(DS.Font.secondary)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
@@ -496,6 +512,68 @@ struct ResultsDatabaseWindow: View {
             }
             .padding(DS.Space.l)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// Ticked poses with no row inspected: list them (best first) so the
+    /// inspector reflects the checkboxes instead of reading "No Selection".
+    private var tickedPosesPanel: some View {
+        let indices = viewModel.sortedSelectedPoseIndices
+        return ScrollView {
+            VStack(alignment: .leading, spacing: DS.Space.l) {
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text(indices.count == 1 ? "1 Pose Ticked" : "\(indices.count) Poses Ticked")
+                        .font(DS.Font.stepTitle)
+                    Text("Click a pose to inspect it.")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                }
+                VStack(spacing: 0) {
+                    ForEach(Array(indices.enumerated()), id: \.element) { position, idx in
+                        if position > 0 { Divider() }
+                        Button { select(idx) } label: {
+                            HStack(spacing: DS.Space.s) {
+                                Text(verbatim: "#\(idx + 1)")
+                                    .font(DS.Font.monoSmall.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .frame(minWidth: 36, alignment: .leading)
+                                scoreBadge(results[idx].displayScore(method: method))
+                                Spacer(minLength: DS.Space.xs)
+                                if results[idx].clusterID >= 0 {
+                                    Text(verbatim: "C\(results[idx].clusterID)")
+                                        .font(DS.Font.monoSmall)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Image(systemName: "chevron.right")
+                                    .font(DS.Font.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.horizontal, DS.Space.m)
+                            .frame(height: DS.Size.rowHeight + DS.Space.s)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Inspect pose \(idx + 1)")
+                        .accessibilityLabel("Inspect pose \(idx + 1)")
+                    }
+                }
+                .dsCard(padding: 0)
+                if indices.count > 1 {
+                    VStack(spacing: DS.Space.s) {
+                        Button { viewModel.showSelectedPoses() } label: {
+                            Label("View in 3D Viewport", systemImage: "square.stack.3d.up")
+                        }
+                        .buttonStyle(.dsPrimary)
+                        .help("Overlay the ticked poses in the 3D viewport")
+                        Button { showMultiPoseAnalysis = true } label: {
+                            Label("Compare Poses…", systemImage: "square.grid.3x3")
+                        }
+                        .buttonStyle(.dsSecondary)
+                        .help("Pairwise RMSD and interaction fingerprints of the ticked poses")
+                    }
+                }
+            }
+            .padding(DS.Space.l)
         }
     }
 

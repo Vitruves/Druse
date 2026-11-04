@@ -13,6 +13,7 @@ struct ContentView: View {
     @AppStorage("ui.navigatorOpen") private var showNavigator = true
     @AppStorage("ui.inspectorOpen") private var showInspector = false
     @AppStorage("ui.consoleOpen") private var showConsole = false
+    @AppStorage(BottomPanel.storageKey) private var bottomPanel = BottomPanel.terminal
     @AppStorage("ui.navigatorWidth") private var navigatorWidth = Double(DS.Size.navigatorIdeal)
     @AppStorage("ui.inspectorWidth") private var inspectorWidth = Double(DS.Size.inspectorIdeal)
     @State private var consoleHeight: CGFloat = 130
@@ -20,9 +21,14 @@ struct ContentView: View {
     @State private var pipelineTab: SidebarTab = .search
     @State private var windowWidth: CGFloat = DS.Size.windowDefault.width
     @State private var stepBarWidth: CGFloat = 0
+    /// Set when the window got too narrow and the shell hid the inspector; widening the window
+    /// again brings it back. A user toggle clears it.
+    @State private var inspectorAutoCollapsed = false
 
     /// The inspector opens by itself on first load only when there is room for it.
     private static let inspectorAutoOpenMinWidth: CGFloat = 1400
+    /// Below this width the inspector steps aside so the canvas keeps a comfortable size.
+    private static let inspectorAutoCollapseWidth: CGFloat = 1300
     /// Side panes give way (down to their minimum widths) before the canvas gets narrower than this.
     private static let canvasMinWidth: CGFloat = 520
 
@@ -41,15 +47,15 @@ struct ContentView: View {
             }
 
             VStack(spacing: 0) {
-                CanvasStage()
-                StatusStripView(showConsole: $showConsole, consoleHeight: $consoleHeight, currentStep: pipelineTab)
+                CanvasStage(currentStep: pipelineTab)
+                StatusStripView(showPanel: $showConsole, panel: $bottomPanel, panelHeight: $consoleHeight, currentStep: pipelineTab)
             }
             .frame(maxWidth: .infinity)
             .layoutPriority(1)
 
             if showInspector {
                 Divider()
-                InspectorPanel(showInspector: $showInspector)
+                InspectorPanel()
                     .frame(width: widths.inspector)
                     .background(.background)
                     .overlay(alignment: .leading) {
@@ -63,7 +69,16 @@ struct ContentView: View {
         .clipped()
         .animation(DS.Motion.respecting(reduceMotion), value: showNavigator)
         .animation(DS.Motion.respecting(reduceMotion), value: showInspector)
-        .onGeometryChange(for: CGFloat.self, of: \.size.width) { windowWidth = $0 }
+        .onGeometryChange(for: CGFloat.self, of: \.size.width) { _, new in
+            // `windowWidth` starts at the default width, so a window that opens narrow also
+            // counts as a crossing and starts without the inspector.
+            autoCollapseInspector(from: windowWidth, to: new)
+            windowWidth = new
+        }
+        // Showing the inspector by any means (toolbar, menu, auto-open) ends the auto-collapse.
+        .onChange(of: showInspector) { _, isShown in
+            if isShown { inspectorAutoCollapsed = false }
+        }
         .toolbar { toolbarContent }
         .focusedSceneValue(\.selectedStep, $pipelineTab)
         .onChange(of: viewModel.workspace.requestedTabToken) { _, _ in
@@ -136,7 +151,7 @@ struct ContentView: View {
 
         ToolbarItemGroup(placement: .navigation) {
             Button { viewModel.importFile() } label: {
-                Label("Open File…", systemImage: "doc")
+                Label("Open File…", systemImage: "doc.badge.plus")
             }
             .help("Open a structure or ligand file (⌘O)")
 
@@ -173,30 +188,51 @@ struct ContentView: View {
 
         ToolbarItemGroup(placement: .primaryAction) {
             Toggle(isOn: Binding(
-                get: { showConsole },
-                set: { newValue in withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = newValue } }
+                get: { showConsole && bottomPanel == .terminal },
+                set: { newValue in
+                    if newValue { bottomPanel = .terminal }
+                    withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = newValue }
+                }
             )) {
-                Label("Console", systemImage: "terminal")
+                Label("Terminal", systemImage: BottomPanel.terminal.systemImage)
             }
-            .help(showConsole ? "Hide Console ⇧⌘Y" : "Show Console ⇧⌘Y")
+            .help(showConsole && bottomPanel == .terminal ? "Hide Terminal ⌃`" : "Show Terminal ⌃`")
 
             Toggle(isOn: $showInspector) {
                 Label("Inspector", systemImage: "sidebar.trailing")
             }
             .help(showInspector ? "Hide Inspector ⌥⌘0" : "Show Inspector ⌥⌘0")
             .accessibilityIdentifier(AccessibilityID.inspectorToggle)
+
+            SettingsLink {
+                Label("Settings", systemImage: "gearshape")
+            }
+            .help("Settings: CPU cores, terminal, command line (⌘,)")
         }
     }
 
     // MARK: - Layout
 
+    /// Hides the inspector when the window shrinks past `inspectorAutoCollapseWidth` and restores
+    /// it when the window grows past it again, if the shell was the one that hid it. Acts on
+    /// crossings only, so an inspector the user opens in a narrow window stays open.
+    private func autoCollapseInspector(from old: CGFloat, to new: CGFloat) {
+        let threshold = Self.inspectorAutoCollapseWidth
+        if old >= threshold, new < threshold, showInspector {
+            withAnimation(DS.Motion.respecting(reduceMotion)) { showInspector = false }
+            inspectorAutoCollapsed = true
+        } else if old < threshold, new >= threshold, inspectorAutoCollapsed {
+            withAnimation(DS.Motion.respecting(reduceMotion)) { showInspector = true }
+        }
+    }
+
     /// Toolbar budget. The step bar is centred in the window and has priority: it may use what is
     /// left between the two sides with the activity capsule at its minimum. The capsule then
     /// takes the trailing space the bar's chosen density leaves free.
     private var toolbarLayout: (stepBar: CGFloat, activity: CGFloat) {
-        // Traffic lights + navigator toggle + file group; console/inspector pair plus the glass
-        // padding around the capsule; minimum gap NSToolbar keeps between neighbouring items.
-        let leading: CGFloat = 256, trailingChrome: CGFloat = 128, gap: CGFloat = 20
+        // Traffic lights + navigator toggle + file group; console/inspector/settings group plus the
+        // glass padding around the capsule; minimum gap NSToolbar keeps between neighbouring items.
+        let leading: CGFloat = 256, trailingChrome: CGFloat = 164, gap: CGFloat = 20
         let activityRange: ClosedRange<CGFloat> = 132...320
         let stepBar = max(windowWidth - 2 * (max(leading, trailingChrome + activityRange.lowerBound) + gap), 0)
         let free = (windowWidth - min(stepBarWidth, stepBar)) / 2 - trailingChrome - gap

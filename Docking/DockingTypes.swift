@@ -300,7 +300,7 @@ struct VRAMEstimate: Sendable {
 // MARK: - Docking Result
 
 struct DockingResult: Identifiable, Sendable {
-    let id: Int
+    var id: Int
     var pose: DockPoseSwift
     var energy: Float           // total score (kcal/mol for Vina/Drusina/PIGNet2; -pKd*conf for DruseAF)
     var stericEnergy: Float     // gauss1 + gauss2 + repulsion

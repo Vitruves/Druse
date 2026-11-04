@@ -107,8 +107,42 @@ enum SDFWriter {
     /// Write all docking result poses as a multi-molecule SDF with score properties.
     @MainActor
     static func writeDockingResults(_ results: [DockingResult], ligand: Molecule) -> String {
-        // Poses carry heavy-atom positions only; bond indices must be remapped from
-        // the full (hydrogen-containing) atom list onto the heavy-atom list.
+        let template = heavyAtomTemplate(ligand)
+        return writeDockingResults(results, ligandName: ligand.name, atoms: template.atoms, bonds: template.bonds)
+    }
+
+    /// Docked poses as a multi-molecule SDF: the heavy-atom ligand at each pose's coordinates,
+    /// named `<ligand>_pose<rank>`, with every field of `DockingPoseRecord` (score in the run's
+    /// units, score terms, cluster, validity, refinement) as SDF properties. `rank` is the pose's
+    /// 1-based rank in the full results list, so filtered exports keep their original ranks.
+    @MainActor
+    static func writeDockingPoses(
+        _ poses: [(rank: Int, result: DockingResult)],
+        ligand: Molecule,
+        method: ScoringMethod
+    ) -> String {
+        let template = heavyAtomTemplate(ligand)
+        return poses.map { pose in
+            var atoms = template.atoms
+            for j in 0..<min(atoms.count, pose.result.transformedAtomPositions.count) {
+                atoms[j].position = pose.result.transformedAtomPositions[j]
+            }
+            var properties = Dictionary(
+                DockingPoseRecord.fields(rank: pose.rank, result: pose.result, method: method)
+                    .filter { !$0.value.isEmpty }
+                    .map { ($0.name, $0.value) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            if let smiles = ligand.smiles, !smiles.isEmpty { properties["SMILES"] = smiles }
+            return molBlock(name: "\(ligand.name)_pose\(pose.rank)", atoms: atoms, bonds: template.bonds,
+                            properties: properties)
+        }.joined()
+    }
+
+    /// The ligand's heavy atoms and the bonds between them, re-indexed onto that list.
+    /// Docked poses carry heavy-atom positions only, in this order.
+    @MainActor
+    static func heavyAtomTemplate(_ ligand: Molecule) -> (atoms: [Atom], bonds: [Bond]) {
         var heavyIndex: [Int: Int] = [:]
         var heavyAtoms: [Atom] = []
         for (i, atom) in ligand.atoms.enumerated() where atom.element != .H {
@@ -120,7 +154,7 @@ enum SDFWriter {
             guard let a = heavyIndex[bond.atomIndex1], let b = heavyIndex[bond.atomIndex2] else { continue }
             heavyBonds.append(Bond(id: heavyBonds.count, atomIndex1: a, atomIndex2: b, order: bond.order))
         }
-        return writeDockingResults(results, ligandName: ligand.name, atoms: heavyAtoms, bonds: heavyBonds)
+        return (heavyAtoms, heavyBonds)
     }
 
     /// Write multiple molecules to an SDF string.
@@ -204,5 +238,61 @@ enum SDFWriter {
     /// Write SDF string to a file URL.
     static func save(_ sdfContent: String, to url: URL) throws {
         try sdfContent.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+// MARK: - Docking pose record
+
+/// The exported description of one docked pose, shared by the pose SDF properties and the
+/// results CSV so both name and format every field identically. Optional quantities that a run
+/// did not compute (strain, GFN2 refinement, validity, chemical form), and non-finite values, are empty strings.
+enum DockingPoseRecord {
+
+    /// Ordered (name, value) fields of a pose. Energy-based scoring (Vina, Drusina, PIGNet2)
+    /// reports the intermolecular terms, torsion penalty and `Intra_and_Other` (ligand internal
+    /// energy plus penalties and corrections, so the terms sum to `Energy`); affinity scoring
+    /// (DruseAF) reports pKd and confidence instead, since its stored "terms" are not energies.
+    static func fields(rank: Int, result r: DockingResult, method: ScoringMethod) -> [(name: String, value: String)] {
+        let f3 = { (value: Float) in String(format: "%.3f", value) }
+        let optional = { (value: Float?) in value.flatMap { $0.isFinite ? f3($0) : nil } ?? "" }
+        var fields: [(name: String, value: String)] = [
+            ("Rank", "\(rank)"),
+            ("Scoring", method.rawValue),
+            ("Score", f3(r.displayScore(method: method))),
+            ("Score_Unit", method.unitLabel)
+        ]
+        if method.isAffinityScore {
+            fields += [
+                ("pKd", f3(r.displayScore(method: method))),
+                ("Confidence", f3(r.afConfidence))
+            ]
+        } else {
+            fields += [
+                ("Energy", f3(r.energy)),
+                ("Steric", f3(r.stericEnergy)),
+                ("Hydrophobic", f3(r.hydrophobicEnergy)),
+                ("HBond", f3(r.hbondEnergy)),
+                ("Torsion", f3(r.torsionPenalty)),
+                ("Intra_and_Other", f3(r.intraAndOtherEnergy)),
+                ("Drusina_Correction", f3(r.drusinaCorrection)),
+                ("Constraint_Penalty", f3(r.constraintPenalty))
+            ]
+        }
+        fields += [
+            ("Cluster", "\(r.clusterID)"),
+            ("Cluster_Rank", "\(r.clusterRank)"),
+            ("Generation", "\(r.generation)"),
+            ("Valid", r.validity.map { $0.passed ? "yes" : "no" } ?? ""),
+            ("Validity_Failures", r.validity?.failures.joined(separator: "; ") ?? ""),
+            ("Min_Protein_Distance", r.validity.flatMap { $0.minProteinDistance.isFinite ? f3($0.minProteinDistance) : nil } ?? ""),
+            ("Strain_Energy", optional(r.strainEnergy)),
+            ("Refinement_Energy", optional(r.refinementEnergy)),
+            ("GFN2_Energy", optional(r.gfn2Energy)),
+            ("GFN2_Dispersion", optional(r.gfn2DispersionEnergy)),
+            ("GFN2_Solvation", optional(r.gfn2SolvationEnergy)),
+            ("Form", r.formLabel ?? ""),
+            ("Form_Population", optional(r.formPopulation))
+        ]
+        return fields
     }
 }

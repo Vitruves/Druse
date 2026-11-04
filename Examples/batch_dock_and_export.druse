@@ -1,0 +1,27 @@
+# Dock a prepared ligand library into the 1add pocket one ligand after another, rank and export.
+# Run: druse Examples/batch_dock_and_export.druse
+# Writes the ranking to $out (/tmp; edit the "set out" line to write elsewhere).
+set onerror=stop
+set data = ../Benchmark/data/refined-set/1add
+set out = /tmp
+
+load $data/1add_protein.pdb
+load $data/1add_ligand.sdf
+prep waters=remove
+
+# Pocket from the crystal ligand, then the box around it
+pocket detect method=ligand
+pocket box fit around=ligand padding=6
+
+# Library: three analogues from SMILES plus the crystal ligand, dominant form only
+ligand prep set mode=dominant ph=7.4 conformers=3
+ligand smiles "Nc1ncnc2c1ncn2C1OC(CO)C(O)C1O" name=adenosine use=off
+ligand smiles "Nc1ncnc2c1nc[nH]2" name=adenine use=off
+ligand smiles "OC1C(O)C(CO)OC1n1cnc2c(O)ncnc21" name=inosine use=off
+ligand load $data/1add_ligand.sdf prep=on
+ligand list dockable
+
+dock batch ligands=prepared preset=fast
+results batch top=10
+
+export batch $out/1add_batch.csv

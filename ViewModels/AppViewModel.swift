@@ -28,6 +28,14 @@ final class AppViewModel {
     /// In-flight RCSB text search (cancelled when a new search starts).
     @ObservationIgnored var pdbSearchTask: Task<Void, Never>?
 
+    /// Preparation steps applied to the current protein, oldest first (shown by `prep report`).
+    /// Cleared whenever a new protein replaces the current one.
+    var preparationLog: [PreparationLogEntry] = []
+
+    /// Per-residue protonation states chosen by the most recent protonation of the current
+    /// protein (pKa shifts, His tautomers, charged residues); empty before protonation.
+    var protonationStates: [Protonation.ResiduePrediction] = []
+
     /// Activity log
     let log = ActivityLog.shared
 
@@ -120,9 +128,10 @@ final class AppViewModel {
             log.info("  SMILES: \(smiles.prefix(80))\(smiles.count > 80 ? "..." : "")", category: .molecule)
         }
         workspace.statusMessage = "\(molecule.name) ready for docking"
-        // Clear conformers when switching ligand (will be set separately if available)
-        workspace.ligandConformers = []
-        workspace.activeConformerIndex = 0
+        // The entry's prepared ensemble is docked alongside the active ligand (rings are rigid
+        // during docking, so each ring conformation is a separate start).
+        let entryConformers = entryID.flatMap { id in ligandDB.entries.first { $0.id == id } }?.conformers ?? []
+        setLigandConformers(entryConformers.map { ($0.atoms, $0.bonds, $0.energy) })
     }
 
     func setLigandConformers(_ conformers: [(atoms: [Atom], bonds: [Bond], energy: Double)]) {
@@ -199,7 +208,7 @@ final class AppViewModel {
             // Update existing entry instead of adding a duplicate
             ligandDB.entries[existingIdx].atoms = ligAtoms
             ligandDB.entries[existingIdx].bonds = ligBonds
-            ligandDB.entries[existingIdx].isPrepared = true
+            ligandDB.entries[existingIdx].isPrepared = false
             ligandDB.entries[existingIdx].sourceChainID = chainID
             if !smiles.isEmpty { ligandDB.entries[existingIdx].smiles = smiles }
             activeLigandEntryID = ligandDB.entries[existingIdx].id
@@ -210,8 +219,6 @@ final class AppViewModel {
                 smiles: smiles,
                 atoms: ligAtoms,
                 bonds: ligBonds,
-                isPrepared: true,
-                conformerCount: 1,
                 sourceChainID: chainID
             )
             ligandDB.add(dbEntry)
@@ -292,10 +299,36 @@ final class AppViewModel {
         workspace.statusMessage = "Chain \(chainID) removed"
     }
 
+    /// Forgets the preparation history; called whenever a new protein replaces the current one.
+    func resetPreparationHistory() {
+        preparationLog = []
+        protonationStates = []
+    }
+
+    /// Keeps only the listed chains of the protein (e.g. one copy of a homodimer). Returns the
+    /// IDs of the chains that were removed; chains that do not exist are ignored.
+    @discardableResult
+    func keepOnlyChains(_ chainIDs: Set<String>) -> [String] {
+        guard let prot = molecules.protein else { return [] }
+        let removed = prot.chains.map(\.id).filter { !chainIDs.contains($0) }
+        guard !removed.isEmpty, removed.count < prot.chains.count else { return [] }
+        let keep = prot.atoms.indices.filter { chainIDs.contains(prot.atoms[$0].chainID) }
+        let (atoms, bonds) = ProteinPreparation.remapSubstructure(atoms: prot.atoms, bonds: prot.bonds, selectedIndices: keep)
+        let filtered = Molecule(name: prot.name, atoms: atoms, bonds: bonds, title: prot.title)
+        filtered.secondaryStructureAssignments = prot.secondaryStructureAssignments.filter { chainIDs.contains($0.chain) }
+        molecules.protein = filtered
+        workspace.hiddenChainIDs.subtract(removed)
+        pushToRenderer()
+        renderer?.fitToContent()
+        log.info("Kept chain(s) \(chainIDs.sorted().joined(separator: ", ")); removed \(removed.joined(separator: ", "))", category: .molecule)
+        return removed
+    }
+
     /// Clear the entire protein.
     func clearProtein() {
         let name = molecules.protein?.name ?? "protein"
         molecules.protein = nil
+        resetPreparationHistory()
         molecules.rawPDBContent = nil
         molecules.preparationReport = nil
         docking.detectedPockets = []
@@ -904,6 +937,19 @@ final class AppViewModel {
         let averageDrift = totalDrift / Float(max(matchedCount, 1))
         return matchedCount == currentAtoms.count && averageDrift <= 0.15 && maxDrift <= 0.5
     }
+}
+
+// MARK: - Preparation history
+
+/// One preparation step applied to the protein, as reported by `prep report`.
+struct PreparationLogEntry: Sendable {
+    let date = Date()
+    /// Short name of the step ("Protonate", "Remove waters", …).
+    let step: String
+    /// What the step did, as logged.
+    let detail: String
+    /// Protonation pH in effect when the step ran.
+    let pH: Float
 }
 
 // MARK: - Context Menu Target (NSObject for @objc selectors)

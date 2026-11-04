@@ -4,10 +4,15 @@
 import SwiftUI
 import MetalKit
 
-@main
+/// Launched from App/main.swift, which routes `--headless` invocations to HeadlessRunner instead.
 struct DruseApp: App {
     @State private var viewModel = AppViewModel()
     @AppStorage("appTheme") private var appTheme: String = AppTheme.auto.rawValue
+
+    /// Applies the CPU core limit before any work starts (headless runs apply it in HeadlessRunner).
+    init() {
+        AppSettings.shared.applyThreadLimits()
+    }
 
     private var selectedColorScheme: ColorScheme? {
         (AppTheme(rawValue: appTheme) ?? .auto).colorScheme
@@ -23,7 +28,7 @@ struct DruseApp: App {
                     // Speed up tooltip display (default macOS delay is ~1.5 seconds)
                     UserDefaults.standard.set(300, forKey: "NSInitialToolTipDelay")
                 }
-                .frame(minWidth: DS.Size.windowMin.width, minHeight: DS.Size.windowMin.height)
+                .frame(minWidth: DS.Size.windowMin.width, minHeight: DS.Size.windowMin.height - DS.Size.toolbarHeight)
         }
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(DS.Size.windowDefault)
@@ -53,7 +58,7 @@ struct DruseApp: App {
             DruseHelpView()
                 .preferredColorScheme(selectedColorScheme)
         }
-        .defaultSize(width: 960, height: 750)
+        .defaultSize(width: 960, height: 820)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
@@ -64,6 +69,7 @@ struct DruseApp: App {
         }
         .windowStyle(.titleBar)
         .windowResizability(.contentSize)
+        .defaultSize(width: 720, height: 780)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
@@ -99,6 +105,7 @@ struct DruseApp: App {
         panel.allowedContentTypes = [.folder]
         panel.nameFieldStringValue = "\(viewModel.molecules.protein?.name ?? "Untitled").druse"
         panel.canCreateDirectories = true
+        panel.directoryURL = AppSettings.shared.defaultProjectDirectoryURL
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in
@@ -149,6 +156,17 @@ struct DruseApp: App {
             viewModel.log.info("Log file: \(logURL.path)", category: .system)
         }
 
+        Self.initializeComputeServices(viewModel)
+    }
+
+    /// Computation services shared by the GUI and headless mode (no renderer needed):
+    /// ML models and GPU-accelerated GFN2-xTB. The CPU thread limit is already applied by then.
+    @MainActor
+    static func initializeComputeServices(_ viewModel: AppViewModel) {
+        let settings = AppSettings.shared
+        viewModel.log.info("CPU thread limit: \(settings.appliedThreadLimit) of \(AppSettings.availableCores) cores"
+                           + (settings.sessionCoreOverride != nil ? " (--cores)" : ""), category: .system)
+
         // Load ML models in the background (non-blocking)
         viewModel.loadMLModels()
 
@@ -170,6 +188,7 @@ private struct DruseCommands: Commands {
     @AppStorage("ui.navigatorOpen") private var showNavigator = true
     @AppStorage("ui.inspectorOpen") private var showInspector = false
     @AppStorage("ui.consoleOpen") private var showConsole = false
+    @AppStorage(BottomPanel.storageKey) private var bottomPanel = BottomPanel.terminal
 
     private var currentStep: SidebarTab { selectedStep?.wrappedValue ?? .search }
 
@@ -196,8 +215,13 @@ private struct DruseCommands: Commands {
 
         CommandMenu("Workflow") {
             ForEach(SidebarTab.allCases, id: \.self) { tab in
-                Button("\(tab.shortcutNumber). \(tab.rawValue)") { tab.request(in: viewModel) }
-                    .keyboardShortcut(KeyEquivalent(Character(String(tab.shortcutNumber))), modifiers: .command)
+                // Tools (Sequence) are set apart from the seven pipeline steps.
+                if !tab.isPipelineStep { Divider() }
+                Button { tab.request(in: viewModel) } label: {
+                    Label(tab.isPipelineStep ? "\(tab.shortcutNumber). \(tab.rawValue)" : tab.rawValue,
+                          systemImage: tab.icon)
+                }
+                .keyboardShortcut(KeyEquivalent(Character(String(tab.shortcutNumber))), modifiers: .command)
             }
             Divider()
             Button("Next Step") { currentStep.nextStep?.request(in: viewModel) }
@@ -224,7 +248,9 @@ private struct DruseCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.control, .command])
             Button(showInspector ? "Hide Inspector" : "Show Inspector") { showInspector.toggle() }
                 .keyboardShortcut("0", modifiers: [.option, .command])
-            Button(showConsole ? "Hide Console" : "Show Console") { showConsole.toggle() }
+            panelToggle(.terminal)
+                .keyboardShortcut("`", modifiers: .control)
+            panelToggle(.logs)
                 .keyboardShortcut("y", modifiers: [.shift, .command])
             Divider()
             Button("Ligand Database") { openWindow(id: "ligand-database") }
@@ -238,6 +264,20 @@ private struct DruseCommands: Commands {
                 .keyboardShortcut("?", modifiers: .command)
             Divider()
             Button("Report Bug…") { openWindow(id: "bug-report") }
+        }
+    }
+
+    /// View ▸ Show/Hide Terminal or Logs: shows that surface of the bottom panel, or hides the
+    /// panel when the surface is already visible.
+    private func panelToggle(_ surface: BottomPanel) -> some View {
+        let isVisible = showConsole && bottomPanel == surface
+        return Button(isVisible ? "Hide \(surface.title)" : "Show \(surface.title)") {
+            if isVisible {
+                showConsole = false
+            } else {
+                bottomPanel = surface
+                showConsole = true
+            }
         }
     }
 }

@@ -91,3 +91,59 @@ struct DockingCoordinator {
     // Live ML scoring: cancellable task prevents stale predictions from blocking updates
     var liveScoringTask: Task<Void, Never>?
 }
+
+/// Search-budget presets shared by the Docking step's Preset buttons and the console
+/// (`dock preset=…`): population × generations × runs plus a matching torsion policy.
+enum DockingPreset: String, CaseIterable, Sendable {
+    case auto = "Auto"
+    case fast = "Fast"
+    case standard = "Standard"
+    case thorough = "Thorough"
+
+    /// One-line description (button tooltip and console help).
+    var help: String {
+        switch self {
+        case .auto: "Adapts parameters to protein/ligand complexity at launch"
+        case .fast: "Quick exploration: 50 × 30 × 3"
+        case .standard: "Balanced: 150 × 80 × 5"
+        case .thorough: "Deep search: 300 × 200 × 10"
+        }
+    }
+
+    /// Writes the preset's budget and torsion policy into `config`.
+    func apply(to config: inout DockingConfig) {
+        config.autoMode = self == .auto
+        switch self {
+        case .auto:
+            config.populationSize = 200
+            config.generationsPerRun = 150
+            config.numRuns = 3
+            config.applyTorsionSearchPreset(.balanced)
+        case .fast:
+            config.populationSize = 50
+            config.generationsPerRun = 30
+            config.numRuns = 3
+            config.applyTorsionSearchPreset(.balanced)
+        case .standard:
+            config.populationSize = 150
+            config.generationsPerRun = 80
+            config.numRuns = 5
+            config.applyTorsionSearchPreset(.balanced)
+        case .thorough:
+            config.populationSize = 300
+            config.generationsPerRun = 200
+            config.numRuns = 10
+            config.applyTorsionSearchPreset(.exploratory)
+        }
+    }
+
+    /// Whether `config` currently matches this preset (highlights the button, names the preset in `dock config`).
+    func isActive(in config: DockingConfig) -> Bool {
+        switch self {
+        case .auto:     config.autoMode
+        case .fast:     !config.autoMode && config.populationSize == 50 && config.generationsPerRun == 30 && config.numRuns == 3
+        case .standard: !config.autoMode && config.populationSize == 150 && config.generationsPerRun == 80 && config.numRuns == 5
+        case .thorough: !config.autoMode && config.populationSize == 300 && config.generationsPerRun == 200 && config.numRuns == 10
+        }
+    }
+}

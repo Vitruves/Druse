@@ -75,11 +75,14 @@ struct WelcomeScreen: View {
 
     private static let heroMarkSize: CGFloat = 96
 
+    /// One wording for the drop hint, shared with the Search step panel.
+    static let dropHint = "Or drop .pdb, .cif, .sdf, .mol2 or .smi files anywhere in the window."
+
     private var startColumn: some View {
         VStack(alignment: .leading, spacing: DS.Space.xxxl) {
             hero
             actionGrid
-            Label("Or drop a .pdb, .cif, .sdf, .mol2 or .smi file anywhere in the window", systemImage: "arrow.down.doc")
+            Label(Self.dropHint, systemImage: "arrow.down.doc")
                 .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
         }
@@ -89,8 +92,16 @@ struct WelcomeScreen: View {
     @ViewBuilder
     private var recentColumn: some View {
         if !recentEntries.isEmpty {
-            RecentColumn(entries: recentEntries)
-                .transition(.opacity)
+            RecentColumn(entries: recentEntries) { entry in
+                Task {
+                    await PDBService.shared.removeCachedEntry(id: entry.id)
+                    let entries = await PDBService.shared.cachedEntries()
+                    withAnimation(DS.Motion.respecting(reduceMotion)) {
+                        recentEntries = Array(entries.prefix(8))
+                    }
+                }
+            }
+            .transition(.opacity)
         }
     }
 
@@ -156,6 +167,7 @@ struct WelcomeScreen: View {
 private struct RecentColumn: View {
     @Environment(AppViewModel.self) private var viewModel
     let entries: [CachedPDBEntry]
+    let onRemove: (CachedPDBEntry) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.m) {
@@ -167,11 +179,15 @@ private struct RecentColumn: View {
 
             VStack(spacing: DS.Space.xxs) {
                 ForEach(entries) { entry in
-                    RecentRow(entry: entry) {
-                        SidebarTab.search.request(in: viewModel)
-                        viewModel.loadFromPDB(id: entry.id)
-                    }
-                    .disabled(viewModel.workspace.isLoading)
+                    RecentRow(
+                        entry: entry,
+                        isDisabled: viewModel.workspace.isLoading,
+                        action: {
+                            SidebarTab.search.request(in: viewModel)
+                            viewModel.loadFromPDB(id: entry.id)
+                        },
+                        onRemove: { onRemove(entry) }
+                    )
                 }
             }
         }
@@ -181,33 +197,56 @@ private struct RecentColumn: View {
 
 private struct RecentRow: View {
     let entry: CachedPDBEntry
+    let isDisabled: Bool
     let action: () -> Void
+    let onRemove: () -> Void
     @State private var isHovering = false
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
-        Button(action: action) {
-            HStack(spacing: DS.Space.m) {
-                Image(systemName: "cube")
-                    .font(DS.Font.label)
-                    .foregroundStyle(DS.Color.protein)
-                    .frame(width: 18)
-                Text(entry.id)
-                    .font(DS.Font.mono.weight(.semibold))
-                Text(entry.fetchedAt.formatted(.relative(presentation: .named)))
-                    .font(DS.Font.secondary)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
+        HStack(spacing: DS.Space.s) {
+            Button(action: action) {
+                HStack(spacing: DS.Space.m) {
+                    Image(systemName: "cube")
+                        .font(DS.Font.label)
+                        .foregroundStyle(DS.Color.protein)
+                        .frame(width: 18)
+                    Text(entry.id)
+                        .font(DS.Font.mono.weight(.semibold))
+                    Text(entry.fetchedAt.formatted(.relative(presentation: .named)))
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: DS.Space.xs)
+                    Text(ByteSize.string(entry.sizeBytes))
+                        .font(DS.Font.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, DS.Space.m)
-            .frame(height: DS.Size.rowHeight + DS.Space.s)
-            .background(shape.fill(isHovering ? DS.Color.controlFill : .clear))
-            .contentShape(shape)
+            .buttonStyle(.plain)
+            .disabled(isDisabled)
+            .help("Open \(entry.id) (cached)")
+
+            // Always present for keyboard and VoiceOver; quiet until the row is hovered.
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(DS.Font.label)
+                    .foregroundStyle(isHovering ? AnyShapeStyle(.secondary) : AnyShapeStyle(.quaternary))
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help("Remove \(entry.id) from the download cache")
+            .accessibilityLabel("Remove \(entry.id) from cache")
         }
-        .buttonStyle(.plain)
+        .padding(.leading, DS.Space.m)
+        .padding(.trailing, DS.Space.s)
+        .frame(height: DS.Size.rowHeight + DS.Space.s)
+        .background(shape.fill(isHovering ? DS.Color.controlFill : .clear))
         .onHover { isHovering = $0 }
-        .help("Open \(entry.id) (cached)")
     }
 }
 

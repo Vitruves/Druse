@@ -14,6 +14,8 @@ struct DockingTabView: View {
 
     @AppStorage("ui.confirmBeforeDocking") private var confirmBeforeDocking = true
     @AppStorage("ui.docking.advancedExpanded") private var advancedExpanded = false
+    @AppStorage("ui.docking.flexibilityExpanded") private var flexibilityExpanded = false
+    @AppStorage("ui.docking.refinementExpanded") private var refinementExpanded = false
     @State private var showPreDockSheet = false
 
     private var site: DockingSite { DockingSite(viewModel: viewModel) }
@@ -82,32 +84,40 @@ struct DockingTabView: View {
         let results = viewModel.docking.dockingResults
         let method = viewModel.docking.scoringMethod
         let clusters = Set(results.map(\.clusterID)).count
-        PanelHighlightRow(color: DS.Color.success) {
-            VStack(alignment: .leading, spacing: DS.Space.s) {
-                HStack(spacing: DS.Space.s) {
-                    Image(systemName: "checkmark.seal.fill")
-                        .foregroundStyle(DS.Color.success)
-                    Text("Done — \(results.count) poses")
-                        .font(DS.Font.label.weight(.medium))
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(DS.Color.success)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Docking complete")
+                        .font(DS.Font.label.weight(.semibold))
+                    Text("\(results.count) poses · \(clusters) clusters")
+                        .font(DS.Font.secondary)
                         .monospacedDigit()
-                    Spacer(minLength: DS.Space.xs)
-                    if let best = results.first {
-                        DSScoreBadge(best.displayScore(method: method), method: method)
-                    }
+                        .foregroundStyle(.secondary)
                 }
-                FlowLayout(spacing: DS.Space.xs) {
-                    DSTag("\(clusters) clusters", monospaced: true)
-                    if viewModel.docking.dockingDuration > 0 {
-                        DSTag(formatDuration(viewModel.docking.dockingDuration), systemImage: "clock", monospaced: true)
-                    }
-                    poseBustersTag(results)
-                }
-                HStack {
-                    Spacer()
-                    DSNextStepButton(.results)
+                Spacer(minLength: DS.Space.xs)
+                if let best = results.first {
+                    DSScoreBadge(best.displayScore(method: method), method: method)
+                        .help("Best pose score")
                 }
             }
+            FlowLayout(spacing: DS.Space.xs) {
+                if viewModel.docking.dockingDuration > 0 {
+                    DSTag(formatDuration(viewModel.docking.dockingDuration), systemImage: "clock")
+                        .help("Wall time")
+                }
+                poseBustersTag(results)
+            }
+            HStack {
+                Spacer(minLength: 0)
+                DSNextStepButton(.results)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard(padding: DS.Space.l)
+        .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder
@@ -118,8 +128,7 @@ struct DockingTabView: View {
             let failures = results.first(where: { $0.validity?.passed == false })?.validity?.failures ?? []
             DSTag("PoseBusters \(validCount)/\(results.count)",
                   tone: allPassed ? .success : .warning,
-                  systemImage: allPassed ? "checkmark.shield" : "exclamationmark.shield",
-                  monospaced: true)
+                  systemImage: allPassed ? "checkmark.shield" : "exclamationmark.shield")
                 .help(failures.isEmpty ? "All poses pass PoseBusters-style validity checks"
                                        : "First failure: " + failures.prefix(2).joined(separator: ", "))
         }
@@ -265,21 +274,28 @@ struct DockingTabView: View {
     }
 
     private var presetSection: some View {
-        VStack(alignment: .leading, spacing: DS.Space.s) {
-            PanelSubheader(title: "Preset")
-            PanelChoiceGrid(columns: 2) {
-                ForEach(["Auto", "Fast", "Standard", "Thorough"], id: \.self) { preset in
-                    PanelChoiceButton(
-                        title: preset,
-                        isSelected: isPresetActive(preset),
-                        help: presetHelp(preset)
-                    ) { applyPreset(preset) }
+        let config = viewModel.docking.dockingConfig
+        let active = DockingPreset.allCases.first { $0.isActive(in: config) }
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            HStack(spacing: DS.Space.s) {
+                PanelSubheader(title: "Preset")
+                Spacer(minLength: DS.Space.xs)
+                if active == nil {
+                    DSTag("Custom", tone: .accent)
+                        .help("The budget no longer matches a preset. Pick a preset to reset it.")
                 }
             }
-            if viewModel.docking.dockingConfig.autoMode {
+            DockPresetPicker(active: active) { preset in
+                preset.apply(to: &viewModel.docking.dockingConfig)
+            }
+            if config.autoMode {
                 PanelHint(text: "Parameters adapt to protein size, pocket shape, and ligand flexibility",
                           icon: "wand.and.stars",
                           color: DS.Color.accent)
+            } else if let active {
+                descriptionText(active.help)
+            } else {
+                descriptionText("Custom budget: \(budgetSummary) (population × generations × runs)")
             }
         }
     }
@@ -304,13 +320,20 @@ struct DockingTabView: View {
         PanelChoiceButton(
             title: method.shortLabel,
             icon: method.icon,
-            badge: method.isExperimental ? "BETA" : nil,
             isSelected: viewModel.docking.dockingConfig.searchMethod == method,
-            help: method.description
+            help: method.isExperimental ? "Experimental. " + method.description : method.description
         ) {
             viewModel.docking.dockingConfig.searchMethod = method
             if method == .diffusionGuided && viewModel.docking.scoringMethod != .druseAffinity {
                 viewModel.docking.scoringMethod = .druseAffinity
+            }
+        }
+        .overlay(alignment: .trailing) {
+            if method.isExperimental {
+                DSTag("BETA", tone: .warning)
+                    .padding(.trailing, DS.Space.m)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
         }
     }
@@ -328,8 +351,10 @@ struct DockingTabView: View {
                     ) { viewModel.docking.scoringMethod = method }
                 }
             }
-            descriptionText(viewModel.docking.scoringMethod.description)
-            ScoringInteractionsBadgeRow(method: viewModel.docking.scoringMethod)
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                descriptionText(viewModel.docking.scoringMethod.description)
+                ScoringInteractionsBadgeRow(method: viewModel.docking.scoringMethod)
+            }
         }
     }
 
@@ -695,11 +720,18 @@ struct DockingTabView: View {
     private var flexibilityCard: some View {
         @Bindable var vm = viewModel
         let config = viewModel.docking.flexibleResidueConfig
-        return PanelCard(
+        let summary: String = {
+            if config.autoFlex { return "Soft" }
+            if config.flexibleResidueIndices.isEmpty { return "Rigid" }
+            let n = config.flexibleResidueIndices.count
+            return "\(n) residue\(n == 1 ? "" : "s")"
+        }()
+        return DockCollapsibleCard(
             "Receptor Flexibility",
             icon: "figure.flexibility",
+            isExpanded: $flexibilityExpanded,
             accessory: {
-                if !config.flexibleResidueIndices.isEmpty && !config.autoFlex {
+                if flexibilityExpanded && !config.flexibleResidueIndices.isEmpty && !config.autoFlex {
                     Button("Clear") {
                         viewModel.docking.flexibleResidueConfig.flexibleResidueIndices.removeAll()
                     }
@@ -707,6 +739,8 @@ struct DockingTabView: View {
                     .font(DS.Font.secondary.weight(.medium))
                     .foregroundStyle(DS.Color.danger)
                     .help("Remove all flexible residues (use rigid receptor)")
+                } else {
+                    DSTag(summary, tone: summary == "Rigid" ? .neutral : .pocket)
                 }
             }
         ) {
@@ -794,9 +828,10 @@ struct DockingTabView: View {
             if xtbOn { return "GFN2-xTB" }
             return "Off"
         }()
-        return PanelCard(
+        return DockCollapsibleCard(
             "Post-docking Refinement",
             icon: "wand.and.rays",
+            isExpanded: $refinementExpanded,
             accessory: { DSTag(summary, tone: afOn || xtbOn ? .accent : .neutral) }
         ) {
             VStack(alignment: .leading, spacing: DS.Space.m) {
@@ -905,46 +940,24 @@ struct DockingTabView: View {
         .accessibilityIdentifier(AccessibilityID.dockStartButton)
     }
 
+    /// One-line recap of what will run; the Inputs card above holds the details.
     private var runSummary: some View {
         let config = viewModel.docking.dockingConfig
-        let ligands: String? = isBatchQueued
-            ? "\(viewModel.docking.batchQueue.count) queued"
-            : viewModel.molecules.ligand?.name
-        let search = [config.searchMethod.shortLabel, viewModel.docking.scoringMethod.shortLabel, budgetSummary]
-            .joined(separator: " · ")
-        // Full-width rows: the Inputs card already names protein and site, the footer only recaps what will run.
-        return Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.xxs) {
-            GridRow {
-                summaryLabel(isBatchQueued ? "Ligands" : "Ligand")
-                summaryValue(ligands)
-            }
-            GridRow {
-                summaryLabel("Site")
-                summaryValue(site.siteTitle)
-            }
-            GridRow {
-                summaryLabel("Search")
-                summaryValue(search)
-                    .help("Total evaluations: \(totalEvaluationsString)")
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func summaryLabel(_ text: String) -> some View {
-        Text(text)
-            .font(DS.Font.caption)
-            .foregroundStyle(.secondary)
-    }
-
-    private func summaryValue(_ text: String?) -> some View {
-        Text(text ?? "—")
-            .font(DS.Font.label)
+        let ligand: String = isBatchQueued
+            ? "\(viewModel.docking.batchQueue.count) ligands"
+            : (viewModel.molecules.ligand?.name ?? "No ligand")
+        let siteName = site.siteTitle ?? "No site"
+        let search = "\(config.searchMethod.shortLabel)·\(viewModel.docking.scoringMethod.shortLabel) \(budgetSummary)"
+        let line = [ligand, siteName, search].joined(separator: " · ")
+        return Text(line)
+            .font(DS.Font.secondary)
             .monospacedDigit()
-            .foregroundStyle(text == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+            .foregroundStyle(.secondary)
             .lineLimit(1)
             .truncationMode(.middle)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .help("\(line)\nTotal evaluations: \(totalEvaluationsString)")
+            .accessibilityLabel("Run summary: \(line)")
     }
 
     private var budgetSummary: String {
@@ -1042,55 +1055,6 @@ struct DockingTabView: View {
     private func formatDuration(_ seconds: TimeInterval) -> String {
         if seconds < 60 { return String(format: "%.1fs", seconds) }
         return "\(Int(seconds) / 60)m \(Int(seconds) % 60)s"
-    }
-
-    private func applyPreset(_ preset: String) {
-        viewModel.docking.dockingConfig.autoMode = false
-        switch preset {
-        case "Auto":
-            viewModel.docking.dockingConfig.autoMode = true
-            viewModel.docking.dockingConfig.populationSize = 200
-            viewModel.docking.dockingConfig.generationsPerRun = 150
-            viewModel.docking.dockingConfig.numRuns = 3
-            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.balanced)
-        case "Fast":
-            viewModel.docking.dockingConfig.populationSize = 50
-            viewModel.docking.dockingConfig.generationsPerRun = 30
-            viewModel.docking.dockingConfig.numRuns = 3
-            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.balanced)
-        case "Standard":
-            viewModel.docking.dockingConfig.populationSize = 150
-            viewModel.docking.dockingConfig.generationsPerRun = 80
-            viewModel.docking.dockingConfig.numRuns = 5
-            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.balanced)
-        case "Thorough":
-            viewModel.docking.dockingConfig.populationSize = 300
-            viewModel.docking.dockingConfig.generationsPerRun = 200
-            viewModel.docking.dockingConfig.numRuns = 10
-            viewModel.docking.dockingConfig.applyTorsionSearchPreset(.exploratory)
-        default: break
-        }
-    }
-
-    private func isPresetActive(_ preset: String) -> Bool {
-        let c = viewModel.docking.dockingConfig
-        switch preset {
-        case "Auto":     return c.autoMode
-        case "Fast":     return !c.autoMode && c.populationSize == 50 && c.generationsPerRun == 30 && c.numRuns == 3
-        case "Standard": return !c.autoMode && c.populationSize == 150 && c.generationsPerRun == 80 && c.numRuns == 5
-        case "Thorough": return !c.autoMode && c.populationSize == 300 && c.generationsPerRun == 200 && c.numRuns == 10
-        default: return false
-        }
-    }
-
-    private func presetHelp(_ preset: String) -> String {
-        switch preset {
-        case "Auto": return "Adapts parameters to protein/ligand complexity at launch"
-        case "Fast": return "Quick exploration: 50 × 30 × 3"
-        case "Standard": return "Balanced: 150 × 80 × 5"
-        case "Thorough": return "Deep search: 300 × 200 × 10"
-        default: return ""
-        }
     }
 
     private func ordinalSuffix(_ n: Int) -> String {
@@ -1206,8 +1170,8 @@ private struct ScoringInteractionsBadgeRow: View {
     var body: some View {
         if !types.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.xs) {
-                Text("Accounted interactions")
-                    .font(DS.Font.caption)
+                Text("Accounts for")
+                    .font(DS.Font.secondary)
                     .foregroundStyle(.secondary)
                 FlowLayout(spacing: DS.Space.xs) {
                     ForEach(types, id: \.self) { t in
@@ -1220,7 +1184,7 @@ private struct ScoringInteractionsBadgeRow: View {
                         .font(DS.Font.caption)
                         .padding(.horizontal, DS.Space.s)
                         .padding(.vertical, DS.Space.xxs)
-                        .background(Capsule().fill(DS.Color.controlFill))
+                        .background(RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous).fill(DS.Color.controlFill))
                     }
                 }
             }
@@ -1240,6 +1204,116 @@ private struct ScoringInteractionsBadgeRow: View {
         default:
             Color(red: Double(type.color.x), green: Double(type.color.y), blue: Double(type.color.z))
         }
+    }
+}
+
+// MARK: - Collapsible card
+
+/// PanelCard chrome whose body folds away behind its header; the accessory (usually a
+/// state summary tag) stays visible so a collapsed card still says what it will do.
+private struct DockCollapsibleCard<Accessory: View, Content: View>: View {
+    let title: String
+    let icon: String
+    @Binding var isExpanded: Bool
+    let accessory: Accessory
+    let content: Content
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(_ title: String, icon: String, isExpanded: Binding<Bool>,
+         @ViewBuilder accessory: () -> Accessory, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.icon = icon
+        self._isExpanded = isExpanded
+        self.accessory = accessory()
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.m) {
+            HStack(spacing: DS.Space.s) {
+                Button {
+                    withAnimation(DS.Motion.respecting(reduceMotion, DS.Motion.snappy)) { isExpanded.toggle() }
+                } label: {
+                    HStack(spacing: DS.Space.s) {
+                        Image(systemName: icon)
+                            .font(.system(size: DS.Size.toolIcon, weight: .medium))
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16, height: 16)
+                        Text(title)
+                            .font(DS.Font.sectionTitle)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        Spacer(minLength: DS.Space.xs)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse \(title)" : "Show \(title) options")
+                .accessibilityLabel(title)
+                .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+                accessory
+            }
+            if isExpanded {
+                content
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard(padding: PanelStyle.cardPadding)
+    }
+}
+
+// MARK: - Preset picker
+
+/// One-row segmented picker for the search-budget presets. Built from plain buttons (not a
+/// `Picker`) so each preset stays an AXButton named after the preset; no segment is selected
+/// while the budget is custom.
+private struct DockPresetPicker: View {
+    let active: DockingPreset?
+    let onSelect: (DockingPreset) -> Void
+
+    var body: some View {
+        let outer = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+        HStack(spacing: DS.Space.xxs) {
+            ForEach(DockingPreset.allCases, id: \.self) { preset in
+                DockPresetSegment(preset: preset, isSelected: preset == active) { onSelect(preset) }
+            }
+        }
+        .padding(DS.Space.xxs)
+        .background(outer.fill(DS.Color.controlFill))
+        .overlay(outer.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+    }
+}
+
+private struct DockPresetSegment: View {
+    let preset: DockingPreset
+    let isSelected: Bool
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+        Button(action: action) {
+            Text(preset.rawValue)
+                .font(DS.Font.label.weight(isSelected ? .medium : .regular))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .foregroundStyle(isSelected ? AnyShapeStyle(DS.Color.accent) : AnyShapeStyle(.primary))
+                .padding(.horizontal, DS.Space.s)
+                .frame(maxWidth: .infinity)
+                .frame(height: DS.Size.buttonHeight - 4)
+                .background(shape.fill(isSelected ? AnyShapeStyle(DS.Color.accentSoft)
+                                                  : AnyShapeStyle(isHovering ? DS.Color.controlFill : Color.clear)))
+                .overlay(shape.strokeBorder(isSelected ? DS.Color.accent : Color.clear, lineWidth: 1))
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(preset.help)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

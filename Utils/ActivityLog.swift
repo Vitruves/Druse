@@ -365,6 +365,14 @@ final class ActivityLog {
         mirrorToStdout = true
     }
 
+    /// Levels also written to stderr (headless `--log-level`); empty in the GUI.
+    private var stderrMirrorLevels: Set<LogLevel> = []
+
+    /// Mirror entries of the given levels to stderr (called by HeadlessRunner).
+    func enableStderrMirroring(levels: Set<LogLevel>) {
+        stderrMirrorLevels = levels
+    }
+
     private init() {
         startFileLogging()
         CrashReporter.install()
@@ -444,6 +452,9 @@ final class ActivityLog {
         if mirrorToStdout {
             print(entry.fileLine)
             fflush(stdout)
+        }
+        if stderrMirrorLevels.contains(level) {
+            FileHandle.standardError.write(Data("[\(level.tag)] [\(category.rawValue)] \(message)\n".utf8))
         }
 
         // Write-through: errors and warnings are always flushed immediately to survive crashes.

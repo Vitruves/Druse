@@ -192,6 +192,27 @@ enum RDKitBridge {
         return convertResult(result.pointee)
     }
 
+    /// Puts a prepared structure (`atoms`/`bonds`: hydrogens, charges, bond orders) on the
+    /// experimental heavy-atom coordinates of `template` (a crystal ligand), re-placing the
+    /// hydrogens and, with `minimize`, relaxing them under heavy-atom position restraints.
+    /// The result keeps the prepared structure's atom order; `energy` is its MMFF94 energy.
+    static func prepareOnTemplate(
+        template: (atoms: [Atom], bonds: [Bond]), atoms: [Atom], bonds: [Bond], name: String,
+        minimize: Bool, computeCharges: Bool
+    ) -> (molecule: MoleculeData?, energy: Double, error: String?) {
+        let templateBlock = SDFWriter.molBlock(name: name, atoms: template.atoms, bonds: template.bonds, includeTerminator: false)
+        let targetBlock = SDFWriter.molBlock(name: name, atoms: atoms, bonds: bonds, includeTerminator: false)
+        var energy = Double.nan
+        guard let result = druse_prepare_on_template(templateBlock, targetBlock, name, minimize, computeCharges, &energy) else {
+            return (nil, .nan, "RDKit call returned nil")
+        }
+        defer { druse_free_molecule_result(result) }
+        guard result.pointee.success, result.pointee.atomCount > 0 else {
+            return (nil, .nan, errorMessage(from: result.pointee))
+        }
+        return (convertResult(result.pointee), energy, nil)
+    }
+
     /// Convert an MDL mol block to canonical SMILES using RDKit's native parser.
     /// Handles both 2D and 3D mol blocks correctly.
     static func smilesFromMolBlock(_ molBlock: String) -> String? {
@@ -710,6 +731,31 @@ enum RDKitBridge {
     static func buildTorsionTreeMolBlock(_ molBlock: String) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])]? {
         guard let tree = druse_build_torsion_tree_molblock(molBlock) else { return nil }
         return convertTorsionTree(tree)
+    }
+
+    /// Distinct ring conformations among `conformers` (coordinate sets of the molecule in
+    /// `molBlock`, same atom order, best first), optionally augmented with mirror-image folds.
+    /// Nil when RDKit cannot read the mol block.
+    static func ringConformationVariants(
+        molBlock: String, conformers: [[SIMD3<Float>]], maxVariants: Int, addMirror: Bool
+    ) -> [(source: Int, mirrored: Bool, positions: [SIMD3<Float>])]? {
+        guard let atomCount = conformers.first?.count, atomCount > 0,
+              conformers.allSatisfy({ $0.count == atomCount }) else { return nil }
+        let flat = conformers.flatMap { $0.flatMap { [$0.x, $0.y, $0.z] } }
+        guard let set = druse_ring_conformation_variants(
+            molBlock, flat, Int32(conformers.count), Int32(atomCount), Int32(maxVariants), addMirror ? 1 : 0
+        ) else { return nil }
+        defer { druse_free_ring_variant_set(set) }
+
+        return (0..<Int(set.pointee.count)).map { v in
+            let base = v * atomCount * 3
+            let positions = (0..<atomCount).map { a in
+                SIMD3<Float>(set.pointee.positions[base + 3 * a],
+                             set.pointee.positions[base + 3 * a + 1],
+                             set.pointee.positions[base + 3 * a + 2])
+            }
+            return (Int(set.pointee.sourceIndex[v]), set.pointee.mirrored[v] != 0, positions)
+        }
     }
 
     private static func convertTorsionTree(_ tree: UnsafeMutablePointer<DruseTorsionTree>) -> [(atom1: Int, atom2: Int, movingAtoms: [Int])] {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import SwiftUI
+import AppKit
 
 /// Step 7 — Lead Optimization: generate analogs of a docked reference pose,
 /// filter them on ADMET rules, mini-dock them and hand them back to the pipeline.
@@ -9,8 +10,10 @@ struct LeadOptimizationTabView: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.openWindow) private var openWindow
 
-    /// Rows shown in the analog list before collapsing into a "+ N more" line.
+    /// Rows shown in the analog list until "Show all" is clicked.
     private static let visibleAnalogLimit = 40
+
+    @State private var showAllAnalogs = false
 
     var body: some View {
         if viewModel.leadOpt.hasReference {
@@ -93,12 +96,27 @@ struct LeadOptimizationTabView: View {
                         Text(lead.referenceSMILES)
                             .font(DS.Font.monoSmall)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .lineLimit(2)
                             .truncationMode(.middle)
                             .textSelection(.enabled)
                             .help(lead.referenceSMILES)
                     }
                     Spacer(minLength: 0)
+                    if !lead.referenceSMILES.isEmpty {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(lead.referenceSMILES, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(DS.Font.secondary.weight(.medium))
+                                .frame(width: DS.Size.rowHeight, height: DS.Size.rowHeight)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .help("Copy the reference SMILES")
+                        .accessibilityLabel("Copy reference SMILES")
+                    }
                 }
 
                 if let desc = lead.referenceDescriptors {
@@ -183,8 +201,8 @@ struct LeadOptimizationTabView: View {
                     .monospacedDigit()
                     .foregroundStyle(isNeutral ? AnyShapeStyle(.tertiary) : AnyShapeStyle(DS.Color.accent))
             }
-            Slider(value: value, in: -1...1, step: 0.1)
-                .controlSize(.mini)
+            Slider(value: snappedSliderBinding(value, range: -1...1, step: 0.1), in: -1...1)
+                .controlSize(.small)
                 .accessibilityLabel(label)
                 .accessibilityValue(directionDescription(value.wrappedValue, low: low, high: high))
             HStack {
@@ -193,9 +211,10 @@ struct LeadOptimizationTabView: View {
                 Text(high)
             }
             .font(DS.Font.caption)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)
             .lineLimit(1)
         }
+        .help("\(label): drag toward \(low.lowercased()) or \(high.lowercased()); centre is neutral")
     }
 
     private func directionDescription(_ value: Float, low: String, high: String) -> String {
@@ -211,11 +230,15 @@ struct LeadOptimizationTabView: View {
         @Bindable var vm = viewModel
         PanelCard("ADMET Filters", icon: "shield.checkered") {
             VStack(alignment: .leading, spacing: DS.Space.m) {
-                PanelChoiceGrid(columns: 2, spacing: DS.Space.m) {
-                    PanelToggleRow(title: "Lipinski",  isOn: $vm.leadOpt.filterLipinski)
-                    PanelToggleRow(title: "Veber",     isOn: $vm.leadOpt.filterVeber)
-                    PanelToggleRow(title: "hERG safe", isOn: $vm.leadOpt.filterHERG)
-                    PanelToggleRow(title: "CYP safe",  isOn: $vm.leadOpt.filterCYP)
+                VStack(alignment: .leading, spacing: DS.Space.s) {
+                    PanelToggleRow(title: "Lipinski", subtitle: "Rule of five: MW, LogP, HBD, HBA",
+                                   isOn: $vm.leadOpt.filterLipinski)
+                    PanelToggleRow(title: "Veber", subtitle: "Rotatable bonds and TPSA (oral bioavailability)",
+                                   isOn: $vm.leadOpt.filterVeber)
+                    PanelToggleRow(title: "hERG safe", subtitle: "Drop analogs with predicted hERG liability",
+                                   isOn: $vm.leadOpt.filterHERG)
+                    PanelToggleRow(title: "CYP safe", subtitle: "Drop predicted CYP2D6 / CYP3A4 inhibitors",
+                                   isOn: $vm.leadOpt.filterCYP)
                 }
                 PanelSliderRow(
                     label: "Max LogP",
@@ -249,17 +272,21 @@ struct LeadOptimizationTabView: View {
                     DSMetric("Failed", value: "\(failed)", tone: failed > 0 ? .danger : .neutral)
                 }
 
+                let visible = showAllAnalogs ? analogs.count : Self.visibleAnalogLimit
                 VStack(spacing: DS.Space.xxs) {
-                    ForEach(Array(analogs.prefix(Self.visibleAnalogLimit).enumerated()), id: \.element.id) { idx, analog in
+                    ForEach(Array(analogs.prefix(visible).enumerated()), id: \.element.id) { idx, analog in
                         analogRow(index: idx, analog: analog, refScore: refScore)
                     }
                     if analogs.count > Self.visibleAnalogLimit {
-                        Text("+ \(analogs.count - Self.visibleAnalogLimit) more")
-                            .font(DS.Font.secondary)
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, DS.Space.xs)
+                        Button(showAllAnalogs
+                               ? "Show top \(Self.visibleAnalogLimit)"
+                               : "Show all \(analogs.count) analogs") {
+                            showAllAnalogs.toggle()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(DS.Font.secondary.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, DS.Space.xs)
                     }
                 }
 
@@ -286,12 +313,14 @@ struct LeadOptimizationTabView: View {
                     .font(DS.Font.label.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                HStack(spacing: DS.Space.xs) {
-                    if let dMW = analog.deltaMW {
-                        DSTag("MW \(String(format: "%+.0f", dMW))", tone: deltaTone(dMW), monospaced: true)
-                    }
-                    if let dLogP = analog.deltaLogP {
-                        DSTag("LogP \(String(format: "%+.1f", dLogP))", tone: deltaTone(dLogP), monospaced: true)
+                HStack(spacing: DS.Space.s) {
+                    if let meta = propertyDeltaText(analog) {
+                        Text(meta)
+                            .font(DS.Font.monoSmall)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .help("Change versus the reference: molecular weight (Da) and LogP")
                     }
                     if analog.status == .filtered || analog.status == .failed {
                         DSTag(analog.status.label, tone: analog.status.tone)
@@ -318,15 +347,11 @@ struct LeadOptimizationTabView: View {
                 } label: {
                     Image(systemName: "eye")
                         .font(DS.Font.secondary.weight(.medium))
-                        .foregroundStyle(DS.Color.accent)
                         .frame(width: DS.Size.rowHeight, height: DS.Size.rowHeight)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
-                                .fill(DS.Color.accentSoft)
-                        )
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderless)
+                .foregroundStyle(isSelected ? AnyShapeStyle(DS.Color.accent) : AnyShapeStyle(.secondary))
                 .help(isDocked
                       ? "Show the docked pose of \(analog.name) as an overlay in the viewer"
                       : "Show the structure of \(analog.name) (dock it to see its pose)")
@@ -359,9 +384,12 @@ struct LeadOptimizationTabView: View {
             .accessibilityLabel("Change versus reference \(String(format: "%+.1f", delta)) \(method.unitLabel)")
     }
 
-    /// Property deltas carry no good/bad meaning on their own; tint only the direction.
-    private func deltaTone(_ value: Float) -> DSTone {
-        value > 0 ? .ligand : value < 0 ? .info : .neutral
+    /// "MW +16 · LogP −0.3": property deltas carry no good/bad meaning, so they stay neutral.
+    private func propertyDeltaText(_ analog: LeadOptAnalog) -> String? {
+        var parts: [String] = []
+        if let dMW = analog.deltaMW { parts.append("MW \(String(format: "%+.0f", dMW))") }
+        if let dLogP = analog.deltaLogP { parts.append("LogP \(String(format: "%+.1f", dLogP))") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     @ViewBuilder
@@ -425,6 +453,10 @@ struct LeadOptimizationTabView: View {
             }
         ) {
             VStack(alignment: .leading, spacing: DS.Space.m) {
+                if !canDockAll && !lead.isDocking && lead.dockedAnalogCount > 0 {
+                    PanelHint(text: "Every analog that passed the filters is docked. Generate new analogs to dock more.",
+                              icon: "checkmark.circle.fill", color: DS.Color.success)
+                } else {
                 HStack(spacing: DS.Space.s) {
                     PanelSecondaryButton(
                         title: lead.isDocking ? "Docking…" : "Dock All Analogs",
@@ -444,6 +476,7 @@ struct LeadOptimizationTabView: View {
                         .accessibilityIdentifier(AccessibilityID.leadStop)
                         .fixedSize()
                     }
+                }
                 }
 
                 if lead.isDocking {
@@ -497,19 +530,7 @@ struct LeadOptimizationTabView: View {
         if !lead.analogs.isEmpty {
             HStack(spacing: DS.Space.s) {
                 PanelSecondaryButton(
-                    title: "Clear",
-                    icon: "trash",
-                    tint: DS.Color.danger,
-                    isDisabled: lead.isGenerating || lead.isDocking,
-                    help: "Remove all generated analogs"
-                ) {
-                    viewModel.leadOpt.analogs.removeAll()
-                    viewModel.leadOpt.selectedAnalogIndex = nil
-                }
-                .accessibilityIdentifier(AccessibilityID.leadClear)
-
-                PanelSecondaryButton(
-                    title: "Comparison",
+                    title: "Compare with Reference…",
                     icon: "arrow.left.arrow.right",
                     isDisabled: selectedAnalog == nil,
                     help: selectedAnalog == nil
@@ -519,6 +540,25 @@ struct LeadOptimizationTabView: View {
                     viewModel.leadOpt.showComparison = true
                 }
                 .accessibilityIdentifier(AccessibilityID.leadComparison)
+
+                Menu {
+                    Button("Clear All Analogs", role: .destructive) {
+                        viewModel.leadOpt.analogs.removeAll()
+                        viewModel.leadOpt.selectedAnalogIndex = nil
+                    }
+                    .disabled(lead.isGenerating || lead.isDocking)
+                    .accessibilityIdentifier(AccessibilityID.leadClear)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(DS.Font.label.weight(.medium))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: DS.Size.buttonHeight, height: DS.Size.buttonHeight)
+                .background(RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous).fill(DS.Color.controlFill))
+                .overlay(RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous).strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+                .help("More analog actions")
+                .accessibilityLabel("More analog actions")
             }
         }
     }

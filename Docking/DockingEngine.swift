@@ -309,17 +309,22 @@ final class DockingEngine {
     }
 
     func vinaTypesForProtein(_ molecule: Molecule) -> [Int32] {
-        molecule.atoms.indices.map { vinaProteinAtomType(for: $0, in: molecule) }
+        let hydrogensPresent = molecule.atoms.contains { $0.element == .H }
+        return molecule.atoms.indices.map {
+            vinaProteinAtomType(for: $0, in: molecule, hydrogensPresent: hydrogensPresent)
+        }
     }
 
-    func vinaProteinAtomType(for atomIndex: Int, in molecule: Molecule) -> Int32 {
+    /// Receptor XS typing as AutoDock Vina derives it from AD4 types:
+    /// acceptor = AD4 OA (every O) or NA; donor = bonded to a polar H.
+    /// In a polymer the only NA nitrogens are unprotonated His ring N (HID NE2, HIE ND1, both when
+    /// the tautomer is unknown); amide, guanidinium, indole, ammonium and backbone N are never acceptors.
+    /// `hydrogensPresent` = the prepared receptor carries explicit H, so the protonation state
+    /// (HID/HIE/HIP, Lys/Ser/Tyr H) is read from attached hydrogens; otherwise atom names are used.
+    func vinaProteinAtomType(for atomIndex: Int, in molecule: Molecule, hydrogensPresent: Bool) -> Int32 {
         let atom = molecule.atoms[atomIndex]
         let name = atom.name.trimmingCharacters(in: .whitespaces)
         let res = atom.residueName.trimmingCharacters(in: .whitespaces)
-
-        // Vina-aligned atom typing: acceptor/donor from AD type logic.
-        // acceptor = AD_TYPE_OA or AD_TYPE_NA (has lone pair for H-bonding)
-        // donor    = bonded_to_HD (has attached hydrogen)
         let bondedToH = hasAttachedHydrogen(atomIndex: atomIndex, in: molecule)
 
         switch atom.element {
@@ -327,50 +332,29 @@ final class DockingEngine {
             return isBondedToHeteroatom(atomIndex: atomIndex, in: molecule) ? vinaTypeID(VINA_C_P) : vinaTypeID(VINA_C_H)
 
         case .N:
-            // Vina-aligned: acceptor = has lone pair (AD_TYPE_NA), donor = bonded to H (AD_TYPE_HD).
-            // Use connectivity when bonds are available, fall back to atom name heuristics otherwise.
             let nAcceptor: Bool
-            if atom.formalCharge > 0 {
+            if atom.formalCharge > 0 || (hydrogensPresent && bondedToH) {
                 nAcceptor = false
+            } else if !atom.isHetAtom {
+                nAcceptor = (name == "ND1" || name == "NE2") && Self.histidineResidueNames.contains(res)
             } else {
-                let neighbors = molecule.neighbors(of: atomIndex)
-                if !neighbors.isEmpty {
-                    // Bonds available: acceptor if < 3 heavy neighbors (has lone pair)
-                    let heavyNeighbors = neighbors.filter { molecule.atoms[$0].element != .H }.count
-                    nAcceptor = heavyNeighbors < 3
-                } else {
-                    // No bonds (e.g., PDB without CONECT): use residue-specific rules
-                    // HIS ring N can be acceptor; backbone N and charged sidechains are not
-                    nAcceptor = res == "HIS" && (name == "ND1" || name == "NE2")
-                }
+                // Non-polymer N (cofactor, modified residue): pyridine-like N with a lone pair.
+                let heavyNeighbors = molecule.neighbors(of: atomIndex).filter { molecule.atoms[$0].element != .H }.count
+                nAcceptor = heavyNeighbors > 0 && heavyNeighbors < 3
             }
-            let nDonor: Bool
-            if molecule.bonds.isEmpty {
-                // No bonds: use atom name heuristics for donor status
-                nDonor = name == "N" || name == "NZ" || name == "NE" ||
-                    name == "NH1" || name == "NH2" || name == "ND2" || name == "NE2"
-            } else {
-                nDonor = bondedToH
-            }
+            let nDonor = hydrogensPresent
+                ? bondedToH
+                : (name == "N" && res != "PRO") || Self.proteinDonorNitrogenNames.contains(name)
             if nDonor && nAcceptor { return vinaTypeID(VINA_N_DA) }
             if nAcceptor { return vinaTypeID(VINA_N_A) }
             if nDonor { return vinaTypeID(VINA_N_D) }
             return vinaTypeID(VINA_N_P)
 
         case .O:
-            // AD_TYPE_OA: nearly all oxygens are acceptors (lone pairs).
-            let oAcceptor = atom.formalCharge <= 0
-            let oDonor: Bool
-            if molecule.bonds.isEmpty {
-                // No bonds: use atom name heuristics (hydroxyl groups)
-                oDonor = name == "OG" || name == "OG1" || name == "OH" || name == "OXT"
-            } else {
-                oDonor = bondedToH
-            }
-            if oDonor && oAcceptor { return vinaTypeID(VINA_O_DA) }
-            if oAcceptor { return vinaTypeID(VINA_O_A) }
-            if oDonor { return vinaTypeID(VINA_O_D) }
-            return vinaTypeID(VINA_O_P)
+            let oDonor = hydrogensPresent
+                ? bondedToH
+                : name == "OG" || name == "OG1" || name == "OH" || Self.waterResidueNames.contains(res)
+            return oDonor ? vinaTypeID(VINA_O_DA) : vinaTypeID(VINA_O_A)
 
         case .S:  return vinaTypeID(VINA_S_P)
         case .P:  return vinaTypeID(VINA_P_P)
@@ -384,6 +368,11 @@ final class DockingEngine {
         default:  return vinaTypeID(VINA_OTHER)
         }
     }
+
+    private static let histidineResidueNames: Set<String> = ["HIS", "HID", "HIE", "HIP", "HSD", "HSE", "HSP"]
+    /// Side-chain N that carry H at physiological pH when the receptor has no explicit hydrogens.
+    private static let proteinDonorNitrogenNames: Set<String> = ["NZ", "NE", "NH1", "NH2", "ND2", "NE2", "NE1", "ND1"]
+    private static let waterResidueNames: Set<String> = ["HOH", "WAT", "DOD", "H2O"]
 
     func fallbackLigandVinaAtomType(for atomIndex: Int, in molecule: Molecule) -> Int32 {
         let atom = molecule.atoms[atomIndex]
@@ -523,6 +512,7 @@ final class DockingEngine {
         let heavyAtoms = protein.atoms.filter { $0.element != .H }
         self.proteinAtoms = heavyAtoms
 
+        let hydrogensPresent = protein.atoms.count != heavyAtoms.count
         let gpuAtoms = protein.atoms.enumerated().compactMap { atomIndex, atom -> GridProteinAtom? in
             guard atom.element != .H else { return nil }
             let atomName = atom.name.trimmingCharacters(in: .whitespaces)
@@ -545,7 +535,7 @@ final class DockingEngine {
                 position: atom.position,
                 vdwRadius: atom.element.vdwRadius,
                 charge: electrostaticCharge(for: atom),
-                vinaType: vinaProteinAtomType(for: atomIndex, in: protein),
+                vinaType: vinaProteinAtomType(for: atomIndex, in: protein, hydrogensPresent: hydrogensPresent),
                 flags: atomFlags, _pad1: 0
             )
         }

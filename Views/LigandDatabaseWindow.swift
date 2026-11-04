@@ -5,23 +5,6 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-// MARK: - pKa Method
-
-/// Controls how ionizable-site pKa values are determined during Populate & Prepare.
-enum PKaMethod: String, CaseIterable {
-    /// GNN-predicted pKa via Metal GPU (fast + accurate, ~0.1ms per molecule).
-    case gnn = "GNN"
-    /// Use the built-in SMARTS lookup table (fast, ~ms per molecule).
-    case table = "Table"
-
-    var description: String {
-        switch self {
-        case .gnn: return "GNN-predicted pKa (Metal GPU, MAE ~1.0)"
-        case .table: return "SMARTS lookup table (~230 rules)"
-        }
-    }
-}
-
 // MARK: - Ligand Database Manager Window
 
 struct LigandDatabaseWindow: View {
@@ -31,23 +14,18 @@ struct LigandDatabaseWindow: View {
     @State var selectedIDs: Set<UUID> = []
     @State var lastClickedID: UUID?
 
-    // Batch operation state
-    @State var batchProgress: (current: Int, total: Int) = (0, 0)
-    @State var isBatchProcessing: Bool = false
-
     // Search / filter
     @State var searchText: String = ""
     @State var lipinskiFilter: Bool = false
     @State var showOnlyPrepared: Bool = false
 
+    /// Parent compounds whose enumerated forms are folded away in the table.
+    @State var collapsedParents: Set<String> = []
+
     // Inline SMILES entry
     @State var showSMILESEntry: Bool = false
     @State var smilesInput: String = ""
     @State var nameInput: String = ""
-
-    // Processing state
-    @State var isProcessing: Bool = false
-    @State var processingMessage: String = ""
 
     // Draw structure
     @State var showChemDrawer: Bool = false
@@ -86,12 +64,6 @@ struct LigandDatabaseWindow: View {
     @State var renamingEntryID: UUID? = nil
     @State var renamingText: String = ""
 
-    // Single-entry preparation options
-    @State var prepAddHydrogens = true
-    @State var prepMinimize = true
-    @State var prepComputeCharges = true
-    @State var prepNumConformers = 10
-
     // Import mapping sheet
     @State var importPreview: ImportPreview?
     @State var showImportMapping: Bool = false
@@ -104,18 +76,6 @@ struct LigandDatabaseWindow: View {
     @State var conformers: [ConformerEntry] = []
     @State var selectedConformerIndex: Int = 0
 
-    // Cancellable populate task
-    @State var populateTask: Task<Void, Never>?
-
-    // Variant / enumeration options
-    @State var variantPH: Double = 7.4
-    @State var variantMaxTautomers: Int = 10
-    @State var variantMaxProtomers: Int = 8
-    @State var variantEnergyCutoff: Double = 10.0
-    @State var variantPkaThreshold: Double = 2.0
-    @State var variantMinPopulation: Double = 1.0
-    @State var pkaMethod: PKaMethod = .gnn
-
     struct ConformerEntry: Identifiable {
         let id: Int
         let molecule: MoleculeData
@@ -126,6 +86,14 @@ struct LigandDatabaseWindow: View {
     private let checkboxGutter: CGFloat = 40
 
     var db: LigandDatabase { viewModel.ligandDB }
+
+    // Preparation state lives in the shared service (also driven by the console).
+    var prep: LigandPreparationService { db.preparation }
+    var isProcessing: Bool { prep.isRunning }
+    /// A cancellable multi-ligand run (dominant or enumerate) rather than a single basic prepare.
+    var isBatchProcessing: Bool { prep.isRunning && prep.runningMode != .basic }
+    var batchProgress: (current: Int, total: Int) { prep.progress }
+    var processingMessage: String { prep.message }
 
     /// Filtered entries (search + Lipinski + prepared-only filters, sorted).
     var filteredEntries: [LigandEntry] {
@@ -141,6 +109,12 @@ struct LigandDatabaseWindow: View {
         }
         if showOnlyPrepared {
             entries = entries.filter { $0.isPrepared }
+        }
+        // Folded forms stay hidden unless a search is looking for them.
+        if searchText.isEmpty && !collapsedParents.isEmpty {
+            entries = entries.filter { entry in
+                entry.parentName.map { !collapsedParents.contains($0) } ?? true
+            }
         }
         if let field = sortField {
             entries.sort { a, b in
@@ -199,15 +173,16 @@ struct LigandDatabaseWindow: View {
                 }
             }
             .sheet(isPresented: $showEnumerationSheet) {
+                let settings = Bindable(prep).settings
                 EnumerationSheet(
-                    ph: $variantPH,
-                    pkaMethod: $pkaMethod,
-                    pkaThreshold: $variantPkaThreshold,
-                    numConformers: $prepNumConformers,
-                    maxTautomers: $variantMaxTautomers,
-                    maxProtomers: $variantMaxProtomers,
-                    energyCutoff: $variantEnergyCutoff,
-                    minPopulation: $variantMinPopulation,
+                    ph: settings.pH,
+                    pkaMethod: settings.pkaMethod,
+                    pkaThreshold: settings.pkaThreshold,
+                    numConformers: settings.conformersPerForm,
+                    maxTautomers: settings.maxTautomers,
+                    maxProtomers: settings.maxProtomers,
+                    energyCutoff: settings.energyCutoff,
+                    minPopulation: settings.minPopulationPercent,
                     entryCount: enumerationSheetEntries.count,
                     isProcessing: isProcessing,
                     progressMessage: processingMessage,
@@ -341,6 +316,7 @@ struct LigandDatabaseWindow: View {
                 } label: {
                     Label("Enumerate…", systemImage: "arrow.triangle.branch")
                 }
+                .labelStyle(.titleAndIcon)
                 .disabled(enumerableSelection.isEmpty || isProcessing)
                 .help("Configure and run tautomer / protomer enumeration")
             }
@@ -350,8 +326,11 @@ struct LigandDatabaseWindow: View {
             } label: {
                 Label("Analogs…", systemImage: "atom")
             }
+            .labelStyle(.titleAndIcon)
             .help("Generate analogs from a drawn scaffold (R-group decoration or whole-molecule transforms)")
         }
+
+        ToolbarSpacer(.fixed, placement: .primaryAction)
 
         ToolbarItem(placement: .primaryAction) {
             Button(action: useSelectedForDocking) {
@@ -360,8 +339,12 @@ struct LigandDatabaseWindow: View {
             }
             .labelStyle(.titleAndIcon)
             .disabled(preparedSelectionCount == 0)
-            .help("Send the prepared compounds in the selection to docking")
+            .help(preparedSelectionCount == 0
+                  ? "Prepare the selected compounds first, then send them to docking"
+                  : "Send the prepared compounds in the selection to docking")
         }
+
+        ToolbarSpacer(.fixed, placement: .primaryAction)
 
         ToolbarItemGroup(placement: .primaryAction) {
             Menu {
@@ -783,6 +766,16 @@ struct LigandDatabaseWindow: View {
         }
         .frame(height: DS.Size.rowHeight)
         .background(rowBackground(entry))
+        .overlay(alignment: .leading) {
+            // Ligand-coloured edge marks the active docking ligand, pinned like the checkbox.
+            if isActive {
+                Rectangle()
+                    .fill(DS.Color.ligand)
+                    .frame(width: 3)
+                    .offset(x: tableHorizontalScroll)
+                    .allowsHitTesting(false)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             // Selection update only — the .onChange(of: selectedIDs) handler
@@ -794,7 +787,7 @@ struct LigandDatabaseWindow: View {
             Button("Use for Docking") { useEntryForDocking(entry) }
                 .disabled(entry.atoms.isEmpty || isExpandedParent)
             Button("Prepare") { prepareSingleEntry(entry) }
-                .disabled(entry.smiles.isEmpty)
+                .disabled(entry.smiles.isEmpty || isProcessing)
             Button("Edit Structure…") {
                 editingEntryID = entry.id
                 showChemDrawer = true
@@ -846,26 +839,30 @@ struct LigandDatabaseWindow: View {
             case .smiles:
                 Text(entry.originalSMILES)
                     .font(DS.Font.monoSmall)
-                    .foregroundStyle(isExpandedParent ? .tertiary : .secondary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .help(entry.originalSMILES)
             case .popPercent:
                 if let pop = entry.populationWeight {
-                    Text(String(format: "%.1f%%", pop * 100))
+                    // Whole percents above 10 % keep "100%" inside the narrow column.
+                    Text(String(format: pop >= 0.0995 ? "%.0f%%" : "%.1f%%", pop * 100))
                         .font(DS.Font.secondary.weight(.medium))
+                        .monospacedDigit()
                         .foregroundStyle(Self.populationTone(pop).color)
+                        .help(String(format: "Boltzmann population %.1f %% at the target pH", pop * 100))
                 } else {
                     dashCell
                 }
             case .deltaE:
                 if let dE = entry.relativeEnergy {
-                    if dE < 0.01 {
-                        Text("best").font(DS.Font.caption.weight(.semibold)).foregroundStyle(DS.Color.success)
-                    } else {
-                        Text(String(format: "+%.1f", dE))
-                            .font(DS.Font.secondary).foregroundStyle(DS.Color.warning)
-                    }
+                    // Numbers only in a numeric column; the lowest form reads 0.0 in the success tone.
+                    Text(dE < 0.01 ? "0.0" : String(format: "+%.1f", dE))
+                        .font(DS.Font.secondary)
+                        .monospacedDigit()
+                        .foregroundStyle(dE < 0.01 ? DS.Color.success : DS.Color.warning)
+                        .help(dE < 0.01 ? "Lowest-energy form"
+                              : String(format: "%.1f kcal/mol above the lowest-energy form", dE))
                 } else {
                     dashCell
                 }
@@ -924,18 +921,32 @@ struct LigandDatabaseWindow: View {
         Text("—").font(DS.Font.secondary).foregroundStyle(.tertiary)
     }
 
-    /// The Name column cell — inline rename + active marker + enumeration arrow + form-kind badge.
+    /// The Name column cell: fold chevron for compounds with enumerated forms, an
+    /// indent for the forms themselves, the form-kind badge, inline rename and the
+    /// active-docking-ligand marker.
     @ViewBuilder
     private func nameCell(_ entry: LigandEntry, isActive: Bool, isExpandedParent: Bool) -> some View {
         HStack(spacing: DS.Space.xs) {
-            if isActive {
-                Circle().fill(DS.Color.ligand).frame(width: 6, height: 6)
-                    .help("Active docking ligand")
-            }
-            if entry.isEnumerated {
-                Image(systemName: "arrow.turn.down.right")
-                    .font(DS.Font.caption)
-                    .foregroundStyle(.tertiary)
+            if isExpandedParent {
+                let isCollapsed = collapsedParents.contains(entry.name)
+                Button {
+                    withAnimation(DS.Motion.snappy) {
+                        if isCollapsed { collapsedParents.remove(entry.name) } else { collapsedParents.insert(entry.name) }
+                    }
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                        .foregroundStyle(.secondary)
+                        .frame(width: Self.disclosureWidth, height: DS.Size.rowHeight)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isCollapsed ? "Show the enumerated forms" : "Hide the enumerated forms")
+                .accessibilityLabel(isCollapsed ? "Show forms of \(entry.name)" : "Hide forms of \(entry.name)")
+            } else {
+                // Children sit one step in from their parent; plain compounds keep the parents' text column.
+                Color.clear.frame(width: entry.isEnumerated ? Self.disclosureWidth * 2 : Self.disclosureWidth, height: 1)
             }
             if let kind = entry.formKind {
                 DSTag(kind.symbol, tint: Self.formKindColor(kind))
@@ -950,13 +961,23 @@ struct LigandDatabaseWindow: View {
                 .onExitCommand { renamingEntryID = nil }
             } else {
                 Text(entry.name)
-                    .font(DS.Font.secondary.weight(isActive ? .semibold : .regular))
-                    .foregroundStyle(isExpandedParent ? .tertiary : .primary)
+                    .font(DS.Font.secondary.weight(isActive || isExpandedParent ? .semibold : .regular))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
+                    .help(entry.name)
                     .onTapGesture(count: 2) {
                         renamingEntryID = entry.id
                         renamingText = entry.name
                     }
+            }
+            if isActive {
+                Image(systemName: "scope")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundStyle(DS.Color.ligand)
+                    .help("Active docking ligand")
+                    .accessibilityLabel("Active docking ligand")
             }
             if entry.preparationError != nil {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -966,6 +987,9 @@ struct LigandDatabaseWindow: View {
             }
         }
     }
+
+    /// Width of the fold chevron in the Name column (and of one indent step).
+    private static let disclosureWidth: CGFloat = 12
 
     // MARK: - Column Header Context Menu
 
@@ -1083,7 +1107,7 @@ struct LigandDatabaseWindow: View {
             }
             if let lig = viewModel.molecules.ligand {
                 if nSelected > 0 { statusSeparator }
-                Label("Docking ligand: \(lig.name)", systemImage: "circle.fill")
+                Label("Docking ligand: \(lig.name)", systemImage: "scope")
                     .labelStyle(StatusLabelStyle(tint: DS.Color.ligand))
             }
         }
@@ -1175,58 +1199,12 @@ struct LigandDatabaseWindow: View {
         viewModel.log.success("Queued \(selected.count) entries for docking", category: .dock)
     }
 
+    /// Basic RDKit preparation of one entry (hydrogens, MMFF94, Gasteiger charges, one conformer).
     func prepareSingleEntry(_ entry: LigandEntry) {
-        guard !entry.smiles.isEmpty || !entry.name.isEmpty else { return }
-        isProcessing = true
-        processingMessage = "Preparing \(entry.name)..."
-
+        let run = prep.prepare([entry], mode: .basic)
         Task {
-            let candidates: [(smiles: String, name: String)]
-            if !entry.smiles.isEmpty {
-                candidates = [(entry.smiles, entry.name), (entry.name, entry.smiles)]
-            } else {
-                candidates = [(entry.name, "Ligand")]
-            }
-
-            let ah = prepAddHydrogens, mn = prepMinimize, cc = prepComputeCharges
-
-            var prepared = false
-            for candidate in candidates {
-                let smi = candidate.smiles
-                let nm = candidate.name
-                let (mol, desc, _, _) = await Task.detached { @Sendable in
-                    RDKitBridge.prepareLigand(smiles: smi, name: nm,
-                                              numConformers: 1, addHydrogens: ah,
-                                              minimize: mn, computeCharges: cc)
-                }.value
-
-                if let mol {
-                    var updated = entry
-                    if smi == entry.name && !entry.smiles.isEmpty {
-                        updated.smiles = entry.name
-                        updated.name = entry.smiles
-                    }
-                    updated.atoms = mol.atoms
-                    updated.bonds = mol.bonds
-                    updated.descriptors = desc
-                    updated.isPrepared = true
-                    updated.conformerCount = 1
-                    db.update(updated)
-                    viewModel.log.success("Prepared \(updated.name)", category: .molecule)
-                    prepared = true
-                    // Refresh inspected entry
-                    if inspectedEntry?.id == entry.id {
-                        inspectedEntry = db.entries.first { $0.id == entry.id }
-                    }
-                    break
-                }
-            }
-
-            if !prepared {
-                viewModel.log.error("Failed to prepare \(entry.name): invalid SMILES", category: .molecule)
-            }
-            isProcessing = false
-            processingMessage = ""
+            _ = await run.value
+            refreshInspectedEntry()
         }
     }
 
@@ -1259,222 +1237,25 @@ struct LigandDatabaseWindow: View {
         }
     }
 
-    // MARK: - Prepare (Dominant Form)
+    // MARK: - Prepare (Dominant Form) / Enumerate
 
-    /// Prepare entries: add H → adjust protonation at target pH → minimize → charges → conformers.
-    /// Uses the C++ ensemble pipeline with maxTautomers=1 so protonation is adjusted but
-    /// tautomers are not enumerated. Keeps the dominant (most populated) protomer only.
+    /// Prepare entries: add H → adjust protonation at target pH → minimize → charges → conformers,
+    /// keeping the dominant (most populated) form of each, in place.
     func runPopulateAndPrepare(entries: [LigandEntry]) {
-        let toProcess = entries.filter { !$0.originalSMILES.isEmpty || !$0.name.isEmpty }
-        guard !toProcess.isEmpty else { return }
-
-        populateTask?.cancel()
-        isProcessing = true
-        isBatchProcessing = true
-        batchProgress = (0, toProcess.count)
-
-        let ph = variantPH
-        let confsPerForm = prepNumConformers
-        let pkaThreshold = variantPkaThreshold
-        let energyCutoff = variantEnergyCutoff
-        let useGNN = pkaMethod == .gnn
-
-        populateTask = Task {
-            var successCount = 0
-            var completedCount = 0
-
-            let maxConcurrency = max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
-            await withTaskGroup(of: (LigandEntry, RDKitBridge.EnsembleResult)?.self) { group in
-                var enqueued = 0
-                for entry in toProcess {
-                    if enqueued >= maxConcurrency {
-                        if let item = await group.next(), let (entry, result) = item {
-                            completedCount += 1
-                            batchProgress = (completedCount, toProcess.count)
-                            processingMessage = "Preparing \(completedCount)/\(toProcess.count): \(entry.name)"
-                            let ok = processPrepareResult(entry: entry, result: result)
-                            successCount += ok
-                        }
-                    }
-                    guard !Task.isCancelled else { break }
-
-                    let smi = !entry.originalSMILES.isEmpty ? entry.originalSMILES : entry.name
-                    let nm = entry.name
-                    group.addTask { [entry] in
-                        guard !Task.isCancelled else { return nil }
-                        let result = await Task.detached(priority: .userInitiated) {
-                            let predictions = useGNN ? PKaGNNPredictor.predict(smiles: smi) : []
-                            return RDKitBridge.prepareEnsembleWithSites(
-                                smiles: smi, name: nm,
-                                pH: ph, pkaThreshold: pkaThreshold,
-                                maxTautomers: 1, maxProtomers: 1,
-                                energyCutoff: energyCutoff, conformersPerForm: confsPerForm,
-                                sites: predictions
-                            )
-                        }.value
-                        return (entry, result)
-                    }
-                    enqueued += 1
-                }
-
-                for await item in group {
-                    guard !Task.isCancelled else { break }
-                    guard let (entry, result) = item else { continue }
-                    completedCount += 1
-                    batchProgress = (completedCount, toProcess.count)
-                    processingMessage = "Preparing \(completedCount)/\(toProcess.count): \(entry.name)"
-                    successCount += processPrepareResult(entry: entry, result: result)
-                }
-            }
-
-            isProcessing = false
-            isBatchProcessing = false
-            processingMessage = ""
-            populateTask = nil
-
-            if let inspID = inspectedEntry?.id,
-               let refreshed = db.entries.first(where: { $0.id == inspID }) {
-                inspectedEntry = refreshed
-            }
-
-            if !Task.isCancelled {
-                viewModel.log.success("Prepared \(successCount)/\(toProcess.count) molecules", category: .molecule)
-            }
+        let run = prep.prepare(entries, mode: .dominant)
+        Task {
+            _ = await run.value
+            refreshInspectedEntry()
         }
     }
 
-    /// Process a single prepare result — update entry in-place with dominant form. Returns 1 on success.
-    private func processPrepareResult(entry: LigandEntry, result: RDKitBridge.EnsembleResult) -> Int {
-        guard result.success, !result.members.isEmpty else {
-            var failed = entry
-            failed.preparationError = result.errorMessage
-            db.update(failed)
-            viewModel.log.error("Failed to prepare \(entry.name): \(result.errorMessage)", category: .molecule)
-            return 0
-        }
-
-        let forms = RDKitBridge.ensembleResultToForms(result)
-        guard let bestForm = forms.max(by: { $0.boltzmannWeight < $1.boltzmannWeight }) else { return 0 }
-
-        var updated = entry
-        updated.originalSMILES = bestForm.smiles
-        updated.atoms = bestForm.atoms
-        updated.bonds = bestForm.bonds
-        updated.isPrepared = true
-        updated.preparationDate = Date()
-        updated.conformerCount = bestForm.conformerCount
-        updated.conformers = bestForm.conformers
-        updated.preparationError = nil
-        // Drug-likeness descriptors (Crippen logP, HBD/HBA, Ro5, Veber) are
-        // defined on the neutral parent. The dominant form at pH is often
-        // ionized (carboxylate, protonated amines), which would shift logP by
-        // several units and inflate HBD — keep the parent's descriptors and
-        // only compute them (from the input SMILES) when the entry has none.
-        if updated.descriptors == nil {
-            updated.descriptors = RDKitBridge.computeDescriptors(smiles: entry.originalSMILES)
-        }
-        db.update(updated)
-        return 1
-    }
-
-    // MARK: - Enumerate (Full Tautomer/Protomer Expansion)
-
-    /// Enumerate entries: run full tautomer + protomer expansion at target pH.
-    /// Inserts N new rows after the original entry (which is kept as-is).
+    /// Enumerate entries: full tautomer + protomer expansion at target pH. Inserts one new row
+    /// per form after the original entry (which is kept as-is), then closes the sheet.
     func runEnumerate(entries: [LigandEntry]) {
-        let toProcess = entries.filter { !$0.originalSMILES.isEmpty || !$0.name.isEmpty }
-        guard !toProcess.isEmpty else { return }
-
-        populateTask?.cancel()
-        isProcessing = true
-        isBatchProcessing = true
-        batchProgress = (0, toProcess.count)
-
-        let ph = variantPH
-        let maxTauto = variantMaxTautomers
-        let maxProto = variantMaxProtomers
-        let energyCutoff = variantEnergyCutoff
-        let confsPerForm = prepNumConformers
-        let minPop = variantMinPopulation / 100.0
-        let pkaThreshold = minPop <= 0 ? 100.0 : variantPkaThreshold
-        let useGNN = pkaMethod == .gnn
-
-        populateTask = Task {
-            var totalNewEntries = 0
-            var totalConformers = 0
-            var completedCount = 0
-
-            let maxConcurrency = max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
-            await withTaskGroup(of: (LigandEntry, RDKitBridge.EnsembleResult, [PKaGNNPredictor.SitePrediction])?.self) { group in
-                var enqueued = 0
-                for entry in toProcess {
-                    if enqueued >= maxConcurrency {
-                        if let item = await group.next() {
-                            if let (entry, result, pkaResults) = item {
-                                completedCount += 1
-                                batchProgress = (completedCount, toProcess.count)
-                                processingMessage = "Enumerating \(completedCount)/\(toProcess.count): \(entry.name)"
-                                processEnumerateResult(entry: entry, result: result, pkaResults: pkaResults,
-                                                       minPop: minPop,
-                                                       totalNewEntries: &totalNewEntries,
-                                                       totalConformers: &totalConformers)
-                            }
-                        }
-                    }
-
-                    guard !Task.isCancelled else { break }
-
-                    let smi = !entry.originalSMILES.isEmpty ? entry.originalSMILES : entry.name
-                    let nm = entry.name
-                    group.addTask { [entry] in
-                        guard !Task.isCancelled else { return nil }
-                        let (result, pkaResults) = await Task.detached(priority: .userInitiated) {
-                            let predictions = useGNN ? PKaGNNPredictor.predict(smiles: smi) : []
-                            let result = RDKitBridge.prepareEnsembleWithSites(
-                                smiles: smi, name: nm,
-                                pH: ph, pkaThreshold: pkaThreshold,
-                                maxTautomers: maxTauto, maxProtomers: maxProto,
-                                energyCutoff: energyCutoff, conformersPerForm: confsPerForm,
-                                sites: predictions
-                            )
-                            return (result, predictions)
-                        }.value
-                        return (entry, result, pkaResults)
-                    }
-                    enqueued += 1
-                }
-
-                for await item in group {
-                    guard !Task.isCancelled else { break }
-                    guard let (entry, result, pkaResults) = item else { continue }
-                    completedCount += 1
-                    batchProgress = (completedCount, toProcess.count)
-                    processingMessage = "Enumerating \(completedCount)/\(toProcess.count): \(entry.name)"
-                    processEnumerateResult(entry: entry, result: result, pkaResults: pkaResults,
-                                           minPop: minPop,
-                                           totalNewEntries: &totalNewEntries,
-                                           totalConformers: &totalConformers)
-                }
-            }
-
-            isProcessing = false
-            isBatchProcessing = false
-            processingMessage = ""
-            populateTask = nil
-
-            if let inspID = inspectedEntry?.id,
-               let refreshed = db.entries.first(where: { $0.id == inspID }) {
-                inspectedEntry = refreshed
-            }
-
-            if !Task.isCancelled {
-                viewModel.log.success(
-                    "Enumerate: \(toProcess.count) molecules → \(totalNewEntries) new entries, \(totalConformers) conformers",
-                    category: .molecule
-                )
-            }
-
-            // Auto-dismiss the enumeration sheet on completion
+        let run = prep.prepare(entries, mode: .enumerate)
+        Task {
+            _ = await run.value
+            refreshInspectedEntry()
             if showEnumerationSheet {
                 showEnumerationSheet = false
                 enumerationSheetEntries = []
@@ -1482,91 +1263,15 @@ struct LigandDatabaseWindow: View {
         }
     }
 
-    /// Process a single enumerate result: insert N new entries after the original (which is kept).
-    private func processEnumerateResult(
-        entry: LigandEntry, result: RDKitBridge.EnsembleResult,
-        pkaResults: [PKaGNNPredictor.SitePrediction],
-        minPop: Double,
-        totalNewEntries: inout Int, totalConformers: inout Int
-    ) {
-        if !pkaResults.isEmpty {
-            let pkaLog = pkaResults.map { p in
-                "\(p.isAcid ? "acid" : "base")[\(p.atomIdx)]: \(String(format: "%.1f", p.pKa)) (p=\(String(format: "%.2f", p.ionizableProbability)))"
-            }.joined(separator: ", ")
-            viewModel.log.info("pKa(\(entry.name)): \(pkaLog)", category: .molecule)
-        }
-
-        guard result.success, !result.members.isEmpty else {
-            viewModel.log.error("Failed to enumerate \(entry.name): \(result.errorMessage)", category: .molecule)
-            return
-        }
-
-        var forms = RDKitBridge.ensembleResultToForms(result)
-        guard !forms.isEmpty else { return }
-
-        // Filter by minimum population (always keep dominant form)
-        if minPop > 0 && forms.count > 1 {
-            forms = forms.enumerated().filter { idx, form in
-                idx == 0 || form.boltzmannWeight >= minPop
-            }.map(\.element)
-            let weightSum = forms.reduce(0.0) { $0 + $1.boltzmannWeight }
-            if weightSum > 0 {
-                for i in forms.indices { forms[i].boltzmannWeight /= weightSum }
-            }
-        }
-
-        // Build new entries from forms (parent form keeps original name, variants get suffix)
-        var newEntries: [LigandEntry] = []
-        for form in forms {
-            let formName = form.kind == .parent
-                ? entry.name
-                : "\(entry.name)_\(form.label)"
-            var newEntry = LigandEntry(
-                name: formName,
-                smiles: form.smiles,
-                atoms: form.atoms,
-                bonds: form.bonds,
-                isPrepared: true,
-                conformerCount: form.conformerCount
-            )
-            newEntry.preparationDate = Date()
-            newEntry.parentName = entry.name
-            newEntry.populationWeight = form.boltzmannWeight
-            newEntry.formKind = form.kind
-            newEntry.relativeEnergy = form.relativeEnergy
-            newEntry.conformers = form.conformers
-            if let desc = RDKitBridge.computeDescriptors(smiles: form.smiles) {
-                newEntry.descriptors = desc
-            }
-            newEntry.ki = entry.ki
-            newEntry.pKi = entry.pKi
-            newEntry.ic50 = entry.ic50
-            newEntries.append(newEntry)
-        }
-
-        guard !newEntries.isEmpty else { return }
-
-        // Remove any previous enumerated siblings of this entry, then insert new ones after it
-        db.batchMutate { entries in
-            entries.removeAll { $0.parentName == entry.name }
-            if let idx = entries.firstIndex(where: { $0.id == entry.id }) {
-                entries.insert(contentsOf: newEntries, at: idx + 1)
-            } else {
-                entries.append(contentsOf: newEntries)
-            }
-        }
-
-        totalNewEntries += newEntries.count
-        totalConformers += newEntries.reduce(0) { $0 + $1.conformerCount }
+    func cancelPopulateAndPrepare() {
+        prep.cancel()
     }
 
-    func cancelPopulateAndPrepare() {
-        populateTask?.cancel()
-        populateTask = nil
-        isProcessing = false
-        isBatchProcessing = false
-        processingMessage = ""
-        viewModel.log.info("Cancelled", category: .molecule)
+    /// Re-reads the inspected entry after a preparation wrote new coordinates or forms.
+    private func refreshInspectedEntry() {
+        if let id = inspectedEntry?.id, let refreshed = db.entries.first(where: { $0.id == id }) {
+            inspectedEntry = refreshed
+        }
     }
 }
 

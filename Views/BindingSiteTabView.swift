@@ -8,6 +8,11 @@ import SwiftUI
 /// Pocket detection, pocket list, pocket view (Z-slab presets) and docking grid box.
 struct BindingSiteTabView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// True while a detection task started from this panel is running.
+    @State private var isDetecting = false
+    /// Manual centre / size sliders; remembered, collapsed by default (the pocket sets them).
+    @AppStorage("site.gridManualExpanded") private var gridManualExpanded = false
 
     private var site: DockingSite { DockingSite(viewModel: viewModel) }
 
@@ -38,43 +43,74 @@ struct BindingSiteTabView: View {
 
     // MARK: - Detect
 
+    /// One primary action (hybrid auto detection); the other ways to define a site are
+    /// secondary. Once pockets exist, re-running drops to the secondary style.
     private var detectCard: some View {
-        PanelCard("Detect", icon: "sparkle.magnifyingglass") {
+        let hasPockets = !viewModel.docking.detectedPockets.isEmpty
+        return PanelCard("Detect", icon: "sparkle.magnifyingglass") {
             VStack(alignment: .leading, spacing: DS.Space.m) {
-                PanelChoiceGrid(columns: 2) {
-                    PanelChoiceButton(
-                        title: "Auto", icon: "sparkles", isSelected: false,
-                        help: "Hybrid pocket detection: ML candidates plus geometric fallback"
-                    ) { detectPocketsAuto() }
-                    .accessibilityIdentifier(AccessibilityID.dockDetectAuto)
+                detectAutoButton(prominent: !hasPockets)
 
+                PanelLabeledDivider(title: "Or define it from")
+                PanelChoiceGrid(columns: 3) {
                     PanelChoiceButton(
-                        title: "ML", icon: "brain", isSelected: false,
-                        isDisabled: !viewModel.pocketDetectorML.isAvailable,
-                        help: "ML-based pocket detection (GNN)"
-                    ) { viewModel.detectPocketsML() }
+                        title: "ML Model", isSelected: false,
+                        isDisabled: !viewModel.pocketDetectorML.isAvailable || isDetecting,
+                        help: viewModel.pocketDetectorML.isAvailable
+                            ? "ML-only pocket detection (GNN)"
+                            : "The ML pocket model is not loaded"
+                    ) { track(viewModel.detectPocketsML()) }
                     .accessibilityIdentifier(AccessibilityID.dockDetectML)
 
                     PanelChoiceButton(
-                        title: "From Ligand", icon: "hexagon", isSelected: false,
+                        title: "Ligand", isSelected: false,
                         isDisabled: viewModel.molecules.ligand == nil,
-                        help: "Define pocket around current ligand"
+                        help: viewModel.molecules.ligand == nil
+                            ? "Load a ligand to define the pocket around it"
+                            : "Define the pocket around the current ligand"
                     ) { detectFromLigand() }
                     .accessibilityIdentifier(AccessibilityID.dockDetectLigand)
 
                     PanelChoiceButton(
-                        title: "From Selection", icon: "hand.tap", isSelected: false,
+                        title: "Selection", isSelected: false,
                         isDisabled: viewModel.workspace.selectedResidueIndices.isEmpty,
-                        help: "Define pocket from selected residues"
+                        help: viewModel.workspace.selectedResidueIndices.isEmpty
+                            ? "Select residues in the viewport or Sequence view first"
+                            : "Define the pocket from the selected residues"
                     ) { pocketFromSelection() }
                     .accessibilityIdentifier(AccessibilityID.dockDetectSelection)
                 }
                 if !viewModel.pocketDetectorML.isAvailable {
-                    PanelHint(text: "ML pocket model not loaded — Auto uses geometric detection.",
+                    PanelHint(text: "ML pocket model not loaded — Detect uses geometric detection.",
                               icon: "info.circle")
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func detectAutoButton(prominent: Bool) -> some View {
+        let label = HStack(spacing: DS.Space.s) {
+            if isDetecting {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "sparkles")
+            }
+            Text(isDetecting ? "Detecting Pockets…" : prominent ? "Detect Pockets" : "Detect Again")
+        }
+        let help = "Hybrid pocket detection: ML candidates plus geometric fallback, ranked by buriedness"
+        Group {
+            if prominent {
+                Button(action: detectPocketsAuto) { label }
+                    .buttonStyle(.dsPrimary)
+            } else {
+                Button(action: detectPocketsAuto) { label }
+                    .buttonStyle(.dsSecondary)
+            }
+        }
+        .disabled(isDetecting)
+        .help(help)
+        .accessibilityIdentifier(AccessibilityID.dockDetectAuto)
     }
 
     // MARK: - Pockets
@@ -101,52 +137,62 @@ struct BindingSiteTabView: View {
     private func pocketRow(_ pocket: BindingPocket) -> some View {
         let isSelected = viewModel.docking.selectedPocket?.id == pocket.id
         let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
-        return HStack(alignment: .top, spacing: DS.Space.m) {
-            Text("\(pocket.number)")
-                .font(DS.Font.caption.weight(.bold))
-                .monospacedDigit()
-                .foregroundStyle(isSelected ? DS.Color.accentOnFill : DS.Color.pocket)
-                .frame(width: 20, height: 20)
-                .background(Circle().fill(isSelected ? DS.Color.pocket : DS.Color.pocket.opacity(0.14)))
-
-            VStack(alignment: .leading, spacing: DS.Space.xs) {
-                HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
-                    Text(pocket.displayName)
-                        .font(DS.Font.label.weight(.medium))
-                    Spacer(minLength: DS.Space.xs)
-                    Text(String(format: "%.0f Å³", pocket.volume))
-                        .font(DS.Font.monoSmall)
+        return HStack(alignment: .top, spacing: DS.Space.s) {
+            // A real button: reachable with Tab / Space and announced by VoiceOver.
+            Button { selectPocket(pocket) } label: {
+                HStack(alignment: .top, spacing: DS.Space.m) {
+                    Text("\(pocket.number)")
+                        .font(DS.Font.caption.weight(.bold))
                         .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isSelected ? DS.Color.accentOnFill : DS.Color.pocket)
+                        .frame(width: 20, height: 20)
+                        .background(Circle().fill(isSelected ? DS.Color.pocket : DS.Color.pocket.opacity(0.14)))
+
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
+                            Text(pocket.displayName)
+                                .font(DS.Font.label.weight(.medium))
+                                .lineLimit(1)
+                            Spacer(minLength: DS.Space.xs)
+                            Text(String(format: "%.0f Å³", pocket.volume))
+                                .font(DS.Font.monoSmall)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
+                        }
+                        FlowLayout(spacing: DS.Space.xs) {
+                            DSTag("\(pocket.residueIndices.count) res", monospaced: true)
+                            DSTag(String(format: "Buried %.0f%%", pocket.buriedness * 100),
+                                  tone: pocket.buriedness >= 0.6 ? .pocket : .neutral)
+                            // `druggability` is each detector's ranking score (unbounded, not a 0–1
+                            // probability), so it is shown neutrally as a rank score.
+                            DSTag(String(format: "Score %.1f", pocket.druggability), monospaced: true)
+                                .help("Detector ranking score — compare between pockets of one detection run")
+                        }
+                    }
                 }
-                FlowLayout(spacing: DS.Space.xs) {
-                    DSTag("\(pocket.residueIndices.count) res", monospaced: true)
-                    DSTag(String(format: "Buried %.0f%%", pocket.buriedness * 100),
-                          tone: pocket.buriedness >= 0.6 ? .pocket : .neutral)
-                    // `druggability` is each detector's ranking score (unbounded, not a 0–1
-                    // probability), so it is shown neutrally as a rank score.
-                    DSTag(String(format: "Score %.1f", pocket.druggability), monospaced: true)
-                        .help("Detector ranking score — compare between pockets of one detection run")
-                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help(isSelected ? "\(pocket.displayName) is the docking site" : "Use \(pocket.displayName) as the docking site")
+            .accessibilityLabel("\(pocket.displayName), \(Int(pocket.volume)) cubic ångströms")
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
 
             Button { removePocket(pocket) } label: {
                 Image(systemName: "trash")
                     .font(DS.Font.secondary)
                     .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
-            .help("Remove this pocket and its grid box")
+            .help("Remove \(pocket.displayName) and its grid box")
+            .accessibilityLabel("Remove \(pocket.displayName)")
         }
         .padding(DS.Space.s)
         .background(shape.fill(isSelected ? DS.Color.pocket.opacity(0.12) : Color.clear))
         .overlay(shape.strokeBorder(isSelected ? DS.Color.pocket.opacity(0.45) : Color.clear, lineWidth: 1))
-        .contentShape(shape)
-        .onTapGesture { selectPocket(pocket) }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(pocket.displayName), \(Int(pocket.volume)) cubic ångströms")
-        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
-        .accessibilityAction { selectPocket(pocket) }
     }
 
     @ViewBuilder
@@ -177,6 +223,7 @@ struct BindingSiteTabView: View {
 
     private var pocketViewCard: some View {
         let hasPocket = viewModel.docking.selectedPocket != nil
+        let clipping = viewModel.workspace.enableClipping
         return PanelCard("Pocket View", icon: "rectangle.split.3x1") {
             VStack(alignment: .leading, spacing: DS.Space.m) {
                 PanelToggleRow(
@@ -187,28 +234,64 @@ struct BindingSiteTabView: View {
                         set: { setPocketClipping($0) }
                     )
                 )
+                .disabled(!hasPocket && !clipping)
+                .help("Clip the view to a slab through the pocket and show a translucent surface")
                 .accessibilityIdentifier(AccessibilityID.dockPocketViewToggle)
 
-                PanelChoiceGrid(columns: 3) {
-                    slabPresetButton("Tight", id: AccessibilityID.dockSlabTight, isDisabled: !hasPocket)
-                    slabPresetButton("Medium", id: AccessibilityID.dockSlabMedium, isDisabled: !hasPocket)
-                    slabPresetButton("Wide", id: AccessibilityID.dockSlabWide, isDisabled: !hasPocket)
+                // Slab presets only matter while clipping is on (progressive disclosure).
+                if clipping && hasPocket {
+                    VStack(alignment: .leading, spacing: DS.Space.s) {
+                        PanelSubheader(title: "Slab thickness")
+                        PanelChoiceGrid(columns: 3) {
+                            ForEach(SlabPreset.allCases, id: \.self) { preset in
+                                slabPresetButton(preset)
+                            }
+                        }
+                        PanelHint(text: "Fine-tune the thickness from the clipping control in the viewport.",
+                                  icon: "slider.horizontal.below.rectangle")
+                    }
+                    .transition(.opacity)
                 }
-                PanelHint(text: "Fine-tune thickness from the clipping control in the viewport.",
-                          icon: "slider.horizontal.below.rectangle")
             }
+            .animation(DS.Motion.respecting(reduceMotion, DS.Motion.snappy), value: clipping)
         }
     }
 
-    private func slabPresetButton(_ preset: String, id: String, isDisabled: Bool) -> some View {
-        PanelChoiceButton(
-            title: preset, isSelected: false, isDisabled: isDisabled,
-            help: "Z-slab \(preset.lowercased()) clipping around the pocket"
+    /// Slab thickness presets, as multiples of the pocket's largest half-extent.
+    private enum SlabPreset: String, CaseIterable {
+        case tight = "Tight", medium = "Medium", wide = "Wide"
+
+        var factor: Float {
+            switch self {
+            case .tight:  1.5
+            case .medium: 2.5
+            case .wide:   4.0
+            }
+        }
+
+        var accessibilityID: String {
+            switch self {
+            case .tight:  AccessibilityID.dockSlabTight
+            case .medium: AccessibilityID.dockSlabMedium
+            case .wide:   AccessibilityID.dockSlabWide
+            }
+        }
+
+        func thickness(for pocket: BindingPocket) -> Float {
+            max(pocket.size.x, max(pocket.size.y, pocket.size.z)) * factor
+        }
+    }
+
+    private func slabPresetButton(_ preset: SlabPreset) -> some View {
+        let pocket = viewModel.docking.selectedPocket
+        let isActive = pocket.map { abs(viewModel.workspace.slabThickness - preset.thickness(for: $0)) < 0.01 } ?? false
+        return PanelChoiceButton(
+            title: preset.rawValue, isSelected: isActive,
+            help: "\(preset.rawValue) slab: \(String(format: "%.1f", preset.factor))× the pocket's largest half-extent"
         ) {
-            if !viewModel.workspace.enableClipping { setPocketClipping(true) }
             applySlabPreset(preset)
         }
-        .accessibilityIdentifier(id)
+        .accessibilityIdentifier(preset.accessibilityID)
     }
 
     // MARK: - Grid box
@@ -261,17 +344,21 @@ struct BindingSiteTabView: View {
                         .accessibilityIdentifier(AccessibilityID.dockGridPocket)
                     }
                 }
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    PanelSubheader(title: "Center")
-                    PanelAxisSlider(axis: "X", value: gridCenterBinding(\.x), range: -200...200, onChange: { _ in site.applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Y", value: gridCenterBinding(\.y), range: -200...200, onChange: { _ in site.applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Z", value: gridCenterBinding(\.z), range: -200...200, onChange: { _ in site.applyGridBoxFromSliders() })
-                }
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    PanelSubheader(title: "Half-size")
-                    PanelAxisSlider(axis: "X", value: gridHalfBinding(\.x), range: 2...50, onChange: { _ in site.applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Y", value: gridHalfBinding(\.y), range: 2...50, onChange: { _ in site.applyGridBoxFromSliders() })
-                    PanelAxisSlider(axis: "Z", value: gridHalfBinding(\.z), range: 2...50, onChange: { _ in site.applyGridBoxFromSliders() })
+                PanelDisclosure("Adjust manually", icon: "slider.horizontal.3", isExpanded: $gridManualExpanded) {
+                    VStack(alignment: .leading, spacing: DS.Space.l) {
+                        VStack(alignment: .leading, spacing: DS.Space.xs) {
+                            PanelSubheader(title: "Center (Å)")
+                            PanelAxisSlider(axis: "X", value: gridCenterBinding(\.x), range: -200...200, onChange: { _ in site.applyGridBoxFromSliders() })
+                            PanelAxisSlider(axis: "Y", value: gridCenterBinding(\.y), range: -200...200, onChange: { _ in site.applyGridBoxFromSliders() })
+                            PanelAxisSlider(axis: "Z", value: gridCenterBinding(\.z), range: -200...200, onChange: { _ in site.applyGridBoxFromSliders() })
+                        }
+                        VStack(alignment: .leading, spacing: DS.Space.xs) {
+                            PanelSubheader(title: "Half-size (Å)")
+                            PanelAxisSlider(axis: "X", value: gridHalfBinding(\.x), range: 2...50, onChange: { _ in site.applyGridBoxFromSliders() })
+                            PanelAxisSlider(axis: "Y", value: gridHalfBinding(\.y), range: 2...50, onChange: { _ in site.applyGridBoxFromSliders() })
+                            PanelAxisSlider(axis: "Z", value: gridHalfBinding(\.z), range: 2...50, onChange: { _ in site.applyGridBoxFromSliders() })
+                        }
+                    }
                 }
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: "cube")
@@ -350,7 +437,17 @@ struct BindingSiteTabView: View {
         let excluded = viewModel.workspace.hiddenChainIDs
         let chainMsg = excluded.isEmpty ? "" : " (excluding chains: \(excluded.sorted().joined(separator: ", ")))"
         viewModel.log.info("Detecting binding pockets\(chainMsg)...", category: .dock)
-        viewModel.detectPockets(excludedChainIDs: excluded)
+        track(viewModel.detectPockets(excludedChainIDs: excluded))
+    }
+
+    /// Shows the in-button progress until a detection task finishes.
+    private func track(_ task: Task<Void, Never>?) {
+        guard let task else { return }
+        isDetecting = true
+        Task {
+            await task.value
+            isDetecting = false
+        }
     }
 
     private func detectFromLigand() {
@@ -408,15 +505,10 @@ struct BindingSiteTabView: View {
         vm.renderer?.setNeedsRedraw()
     }
 
-    private func applySlabPreset(_ preset: String) {
+    private func applySlabPreset(_ preset: SlabPreset) {
         guard let pocket = viewModel.docking.selectedPocket else { return }
-        let pocketRadius = max(pocket.size.x, max(pocket.size.y, pocket.size.z))
-        let thickness: Float
-        switch preset {
-        case "Tight":  thickness = pocketRadius * 1.5
-        case "Medium": thickness = pocketRadius * 2.5
-        default:       thickness = pocketRadius * 4.0
-        }
+        if !viewModel.workspace.enableClipping { setPocketClipping(true) }
+        let thickness = preset.thickness(for: pocket)
         viewModel.workspace.slabThickness = thickness
         viewModel.workspace.slabOffset = 0
         viewModel.renderer?.slabCenter = pocket.center

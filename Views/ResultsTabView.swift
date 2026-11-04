@@ -15,6 +15,7 @@ struct ResultsTabView: View {
     @State private var showMultiPoseAnalysis = false
     @State private var multiPoseInitialMode: MultiPoseAnalysisSheet.Mode = .rmsd
     @State private var activePoseIndex: Int?
+    @AppStorage("ui.results.detailsExpanded") private var detailsExpanded = false
 
     private static let poseListLimit = 50
     private static let topMeanCount = 10
@@ -122,12 +123,7 @@ struct ResultsTabView: View {
 
     private var summaryCard: some View {
         PanelCard("Summary", icon: "chart.bar.doc.horizontal", accessory: {
-            Button { openWindow(id: "results-database") } label: {
-                Label("Database", systemImage: "tablecells")
-            }
-            .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
-            .help("Open Results Database (⇧⌘R)")
-            .accessibilityIdentifier(AccessibilityID.resultsOpenDB)
+            if !showsPosesCard { databaseButton }
         }) {
             if hasDockingSummary {
                 dockingSummary
@@ -143,6 +139,16 @@ struct ResultsTabView: View {
                           icon: "hourglass")
             }
         }
+    }
+
+    private var databaseButton: some View {
+        Button { openWindow(id: "results-database") } label: {
+            Label("Database", systemImage: "tablecells")
+                .font(DS.Font.secondary.weight(.medium))
+        }
+        .buttonStyle(.borderless)
+        .help("Open the Results Database with every pose, scores and interactions (⇧⌘R)")
+        .accessibilityIdentifier(AccessibilityID.resultsOpenDB)
     }
 
     @ViewBuilder
@@ -165,18 +171,23 @@ struct ResultsTabView: View {
                 DSMetric("Poses", value: "\(results.count)")
                 DSMetric("Clusters", value: "\(clusters)")
             }
-            runDetails
             poseBustersRow
-            if let top = results.first {
-                bestPoseTerms(top)
-            }
-            if results.count > 1 {
-                ScoreLandscapeChart(
-                    scores: Array(scores.prefix(Self.poseListLimit)),
-                    isAffinity: method.isAffinityScore,
-                    unit: method.unitLabel,
-                    activeIndex: activePoseIndex
-                ) { index in viewPose(index) }
+            // Run details stay one click away so the pose list starts above the fold.
+            PanelDisclosure("Run details", icon: "list.bullet.rectangle", isExpanded: $detailsExpanded) {
+                VStack(alignment: .leading, spacing: DS.Space.m) {
+                    runDetails
+                    if let top = results.first {
+                        bestPoseTerms(top)
+                    }
+                    if results.count > 1 {
+                        ScoreLandscapeChart(
+                            scores: Array(scores.prefix(Self.poseListLimit)),
+                            isAffinity: method.isAffinityScore,
+                            unit: method.unitLabel,
+                            activeIndex: activePoseIndex
+                        ) { index in viewPose(index) }
+                    }
+                }
             }
         }
     }
@@ -323,13 +334,16 @@ struct ResultsTabView: View {
 
     private var posesCard: some View {
         PanelCard("Poses", icon: "list.number", accessory: {
-            HStack(spacing: DS.Space.s) {
+            HStack(spacing: DS.Space.m) {
                 DSTag("\(results.count)")
+                databaseButton
                 if viewModel.molecules.ligand != nil {
                     Button { viewModel.clearPosesFromView() } label: {
                         Image(systemName: "eye.slash")
+                        .font(DS.Font.secondary.weight(.medium))
                     }
                     .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
                     .help("Clear poses and interaction lines from the 3D viewport")
                     .accessibilityLabel("Clear Poses from View")
                     .accessibilityIdentifier(AccessibilityID.resultsClearPoses)
@@ -337,7 +351,10 @@ struct ResultsTabView: View {
             }
         }) {
             VStack(alignment: .leading, spacing: DS.Space.s) {
-                if !viewModel.docking.selectedPoseIndices.isEmpty {
+                if viewModel.docking.selectedPoseIndices.isEmpty {
+                    PanelHint(text: "Click a row to show it in 3D. Tick poses to overlay, compare or export them together.",
+                              icon: "hand.point.up.left")
+                } else {
                     selectionBar
                 }
                 let reference = results.first?.transformedAtomPositions ?? []
@@ -371,30 +388,42 @@ struct ResultsTabView: View {
     private var selectionBar: some View {
         let count = viewModel.docking.selectedPoseIndices.count
         return PanelHighlightRow(color: DS.Color.accent) {
-            HStack(spacing: DS.Space.m) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(DS.Color.accent)
-                Text("\(count) selected")
-                    .font(DS.Font.secondary.weight(.medium))
-                    .monospacedDigit()
-                Spacer(minLength: DS.Space.xs)
-                Button("View") { viewModel.showSelectedPoses() }
-                    .help("Show selected poses in the 3D viewport (best as primary, others as ghosts)")
-                    .accessibilityIdentifier(AccessibilityID.resultsViewSelected)
-                Menu("Export") {
-                    Button("Export as SDF…") { viewModel.exportSelectedDockingPosesSDF() }
-                    Button("Export as PDB…") { viewModel.exportSelectedDockingPosesPDB() }
-                    Button("Export as CSV…") { viewModel.exportSelectedDockingPosesCSV() }
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                HStack(spacing: DS.Space.m) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(DS.Color.accent)
+                    Text("\(count) selected")
+                        .font(DS.Font.secondary.weight(.medium))
+                        .monospacedDigit()
+                    Spacer(minLength: DS.Space.xs)
+                    Button("View") { viewModel.showSelectedPoses() }
+                        .help("Show selected poses in the 3D viewport (best as primary, others as ghosts)")
+                        .accessibilityIdentifier(AccessibilityID.resultsViewSelected)
+                    Menu("Export") {
+                        Button("Export as SDF…") { viewModel.exportSelectedDockingPosesSDF() }
+                        Button("Export as PDB…") { viewModel.exportSelectedDockingPosesPDB() }
+                        Button("Export as CSV…") { viewModel.exportSelectedDockingPosesCSV() }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Export selected poses (SDF / PDB / CSV)")
+                    Button("Clear") { viewModel.docking.selectedPoseIndices.removeAll() }
+                        .help("Clear the pose selection")
+                        .accessibilityIdentifier(AccessibilityID.resultsClearSelection)
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Export selected poses (SDF / PDB / CSV)")
-                Button("Clear") { viewModel.docking.selectedPoseIndices.removeAll() }
-                    .help("Clear the pose selection")
-                    .accessibilityIdentifier(AccessibilityID.resultsClearSelection)
+                .font(DS.Font.secondary)
+                .buttonStyle(.borderless)
+                Button {
+                    multiPoseInitialMode = count >= 2 ? .rmsd : .interactions
+                    showMultiPoseAnalysis = true
+                } label: {
+                    Label("Multi-Pose Analysis…", systemImage: "square.stack.3d.up")
+                }
+                .buttonStyle(.dsSecondary)
+                .help(count >= 2
+                      ? "Pairwise RMSD and per-residue interaction fingerprints of the \(count) selected poses"
+                      : "Interaction fingerprint of the selected pose (tick 2 or more to compare RMSD)")
             }
-            .font(DS.Font.secondary)
-            .buttonStyle(.borderless)
         }
     }
 
@@ -618,7 +647,6 @@ struct ResultsTabView: View {
 
     private var footer: some View {
         let hasPoses = !results.isEmpty
-        let selected = viewModel.docking.selectedPoseIndices.count
         return VStack(spacing: DS.Space.s) {
             HStack(spacing: DS.Space.s) {
                 PanelSecondaryButton(title: "Export SDF", icon: "doc.text",
@@ -634,20 +662,8 @@ struct ResultsTabView: View {
                 }
                 .accessibilityIdentifier(AccessibilityID.resultsExportCSV)
             }
-            HStack(spacing: DS.Space.m) {
-                Button {
-                    multiPoseInitialMode = selected >= 2 ? .rmsd : .interactions
-                    showMultiPoseAnalysis = true
-                } label: {
-                    Label("Multi-Pose Analysis…", systemImage: "square.stack.3d.up")
-                        .font(DS.Font.label)
-                }
-                .buttonStyle(.borderless)
-                .disabled(selected < 1)
-                .help(selected < 1
-                      ? "Tick poses in the list to compare RMSD and interaction fingerprints"
-                      : "Pairwise RMSD and per-residue interaction fingerprints of the selected poses")
-                Spacer(minLength: DS.Space.xs)
+            HStack {
+                Spacer(minLength: 0)
                 DSNextStepButton(.leadOptimization)
             }
         }
@@ -745,38 +761,40 @@ private struct PoseRow: View {
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
-        VStack(alignment: .leading, spacing: DS.Space.xxs) {
-            HStack(spacing: DS.Space.s) {
-                Toggle("Select pose \(index + 1)", isOn: Binding(get: { isChecked }, set: { _ in onToggle() }))
-                    .toggleStyle(.checkbox)
-                    .labelsHidden()
-                    .help("Select for multi-pose overlay and analysis")
-                    .accessibilityIdentifier(AccessibilityID.resultsCheckbox(index))
-                Text(verbatim: "#\(index + 1)")
-                    .font(DS.Font.monoSmall.weight(.semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 24, alignment: .trailing)
-                DSScoreBadge(result.displayScore(method: method), method: method)
-                if result.clusterID >= 0 {
-                    DSTag("C\(result.clusterID)", monospaced: true)
-                        .help("Cluster \(result.clusterID) — RMSD-based binding-mode group")
-                }
-                Spacer(minLength: DS.Space.xs)
-                if let rmsd {
-                    Text(String(format: "%.1f Å", rmsd))
-                        .font(DS.Font.monoSmall)
+        HStack(alignment: .center, spacing: DS.Space.s) {
+            Toggle("Select pose \(index + 1)", isOn: Binding(get: { isChecked }, set: { _ in onToggle() }))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .help("Select for multi-pose overlay and analysis")
+                .accessibilityIdentifier(AccessibilityID.resultsCheckbox(index))
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
+                    Text(verbatim: "#\(index + 1)")
+                        .font(DS.Font.monoSmall.weight(.semibold))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
-                        .help("Heavy-atom RMSD to pose #1")
+                        .frame(minWidth: 22, alignment: .leading)
+                    DSScoreBadge(result.displayScore(method: method), method: method)
+                    Spacer(minLength: DS.Space.xs)
+                    if let rmsd {
+                        Text(String(format: "%.1f Å", rmsd))
+                            .font(DS.Font.monoSmall)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .help("Heavy-atom RMSD to pose #1")
+                    }
+                }
+                terms
+                if !flags.isEmpty {
+                    FlowLayout(spacing: DS.Space.xs) {
+                        ForEach(flags, id: \.text) { flag in
+                            DSTag(flag.text, tone: flag.tone, monospaced: true).help(flag.help)
+                        }
+                    }
                 }
             }
-            HStack(spacing: DS.Space.xs) {
-                terms
-                Spacer(minLength: DS.Space.xs)
-                actions
-            }
-            .padding(.leading, 22)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            actions
         }
         .padding(.horizontal, DS.Space.s)
         .padding(.vertical, DS.Space.xs)
@@ -787,24 +805,22 @@ private struct PoseRow: View {
         .onHover { isHovering = $0 }
     }
 
+    /// Score terms on one line; the cluster id leads so binding modes read down the list.
     private var terms: some View {
-        FlowLayout(spacing: DS.Space.xs) {
+        HStack(spacing: DS.Space.s) {
+            if result.clusterID >= 0 {
+                Text(verbatim: "C\(result.clusterID)")
+                    .foregroundStyle(.secondary)
+                    .help("Cluster \(result.clusterID) — RMSD-based binding-mode group")
+            }
             term("vdW", result.stericEnergy)
             term("hyd", result.hydrophobicEnergy)
             term("hb", result.hbondEnergy)
-            if let strain = result.strainEnergy, strain > 4.0 {
-                DSTag(String(format: "str %.1f", strain), tone: strain > 10.0 ? .danger : .warning, monospaced: true)
-                    .help("Ligand strain energy (kcal/mol)")
-            }
-            if let gfn2 = result.gfn2Energy {
-                DSTag(String(format: "xtb %.1f", gfn2), tone: .pocket, monospaced: true)
-                    .help("GFN2-xTB energy (kcal/mol)")
-            }
-            if result.constraintPenalty > 0.01 {
-                DSTag(String(format: "cst %.1f", result.constraintPenalty), tone: .warning, monospaced: true)
-                    .help("Pharmacophore constraint penalty")
-            }
         }
+        .font(DS.Font.monoSmall)
+        .monospacedDigit()
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
     }
 
     private func term(_ label: String, _ value: Float) -> some View {
@@ -812,20 +828,49 @@ private struct PoseRow: View {
             Text(label).foregroundStyle(.tertiary)
             Text(String(format: "%.1f", value)).foregroundStyle(.secondary)
         }
-        .font(DS.Font.monoSmall)
-        .monospacedDigit()
     }
 
+    private struct Flag {
+        let text: String
+        let tone: DSTone
+        let help: String
+    }
+
+    /// Optional per-pose warnings and refinements, shown only when present.
+    private var flags: [Flag] {
+        var out: [Flag] = []
+        if let strain = result.strainEnergy, strain > 4.0 {
+            out.append(Flag(text: String(format: "str %.1f", strain), tone: strain > 10.0 ? .danger : .warning,
+                            help: "Ligand strain energy (kcal/mol)"))
+        }
+        if let gfn2 = result.gfn2Energy {
+            out.append(Flag(text: String(format: "xtb %.1f", gfn2), tone: .pocket, help: "GFN2-xTB energy (kcal/mol)"))
+        }
+        if result.constraintPenalty > 0.01 {
+            out.append(Flag(text: String(format: "cst %.1f", result.constraintPenalty), tone: .warning,
+                            help: "Pharmacophore constraint penalty"))
+        }
+        return out
+    }
+
+    /// Fixed 2 × 2 action column so every row lines up regardless of its terms.
     private var actions: some View {
-        HStack(spacing: DS.Space.xxs) {
-            actionButton("Show in 3D", systemImage: "eye", id: AccessibilityID.resultsViewPose(index), action: onView)
-            actionButton("2D Interaction Diagram", systemImage: "point.3.connected.trianglepath.dotted",
-                         id: AccessibilityID.resultsDiagram(index), action: onDiagram)
-            actionButton("Save pose (protein + ligand) as PDB", systemImage: "square.and.arrow.down",
-                         isDisabled: result.transformedAtomPositions.isEmpty, action: onSave)
-            if canOptimize {
-                actionButton("Use as lead-optimization reference", systemImage: "arrow.triangle.branch",
-                             id: AccessibilityID.resultsOptimize(index), action: onOptimize)
+        Grid(horizontalSpacing: DS.Space.xxs, verticalSpacing: DS.Space.xxs) {
+            GridRow {
+                actionButton("Show in 3D", systemImage: "eye", id: AccessibilityID.resultsViewPose(index), action: onView)
+                actionButton("Open 2D interaction diagram", systemImage: "point.3.connected.trianglepath.dotted",
+                             id: AccessibilityID.resultsDiagram(index), action: onDiagram)
+            }
+            GridRow {
+                actionButton("Save pose (protein + ligand) as PDB", systemImage: "square.and.arrow.down",
+                             isDisabled: result.transformedAtomPositions.isEmpty, action: onSave)
+                if canOptimize {
+                    actionButton("Optimize in Lead Opt — use this pose as the lead-optimization reference",
+                                 systemImage: "arrow.triangle.branch",
+                                 id: AccessibilityID.resultsOptimize(index), action: onOptimize)
+                } else {
+                    Color.clear.frame(width: 22, height: 20)
+                }
             }
         }
     }

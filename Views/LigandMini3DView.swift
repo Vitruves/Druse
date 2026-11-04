@@ -23,6 +23,10 @@ struct LigandMini3DView: View {
     let bonds: [Bond]
     let conformers: [LigandDatabaseWindow.ConformerEntry]
     @Binding var selectedConformerIndex: Int
+    /// A preparation is running (the empty state shows progress instead of its button).
+    var isPreparing: Bool = false
+    /// Prepares the compound from the empty state; nil hides the button.
+    var onPrepare: (() -> Void)? = nil
 
     @State private var renderer: Renderer?
 
@@ -32,14 +36,25 @@ struct LigandMini3DView: View {
                 MetalView(renderer: renderer)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if atoms.isEmpty {
-                VStack(spacing: DS.Space.xs) {
+                VStack(spacing: DS.Space.m) {
                     Image(systemName: "cube.transparent")
                         .font(.title2)
                         .symbolRenderingMode(.hierarchical)
-                    Text("Prepare the compound to see it in 3D")
-                        .font(DS.Font.caption)
+                        .foregroundStyle(.tertiary)
+                    Text(isPreparing ? "Preparing…" : "No 3D structure yet")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                    if isPreparing {
+                        ProgressView().controlSize(.small)
+                    } else if let onPrepare {
+                        Button(action: onPrepare) {
+                            Label("Prepare", systemImage: "wand.and.stars")
+                        }
+                        .controlSize(.small)
+                        .help("Generate 3D coordinates, charges and conformers for this compound")
+                    }
                 }
-                .foregroundStyle(.secondary)
+                .padding(DS.Space.l)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(DS.Color.cardFill)
             } else {

@@ -9,11 +9,15 @@ import SwiftUI
 /// (molecule chips, camera cluster, legends, display cluster, docking HUD, welcome, demo).
 /// `MetalView` is created once with a stable identity; overlays never wrap it.
 struct CanvasStage: View {
+    /// Step shown in the navigator: the interaction legend only appears where poses are reviewed.
+    let currentStep: SidebarTab
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.openWindow) private var openWindow
     @State private var metalTimedOut = false
 
-    private var hasContent: Bool { viewModel.molecules.protein != nil || viewModel.isDemoRunning }
+    private var hasContent: Bool {
+        viewModel.molecules.protein != nil || viewModel.molecules.ligand != nil || viewModel.isDemoRunning
+    }
     private var metalUnavailable: Bool { viewModel.renderer == nil && metalTimedOut }
 
     var body: some View {
@@ -89,16 +93,16 @@ struct CanvasStage: View {
     private var overlays: some View {
         ZStack {
             if hasContent {
-                VStack(alignment: .trailing, spacing: DS.Space.m) {
-                    // Legends get their own row under the camera cluster so a wide legend
-                    // never takes width from the molecule chips.
+                VStack(alignment: .leading, spacing: DS.Space.m) {
                     HStack(alignment: .top, spacing: DS.Space.l) {
                         MoleculeChips()
                         Spacer(minLength: DS.Space.l)
                         CameraCluster()
                     }
-                    legends
                     Spacer(minLength: DS.Space.l)
+                    // Legends sit in the bottom-left corner, sized to their content, on their own
+                    // row above the HUD and display cluster so they never cover them.
+                    legends
                     VStack(spacing: DS.Space.m) {
                         if viewModel.docking.isDocking && !viewModel.isDemoRunning {
                             DockingHUD()
@@ -119,13 +123,29 @@ struct CanvasStage: View {
         }
     }
 
+    private var showsInteractionLegend: Bool {
+        switch currentStep {
+        case .dock, .results, .leadOptimization: !viewModel.docking.currentInteractions.isEmpty
+        default: false
+        }
+    }
+
     @ViewBuilder
     private var legends: some View {
-        if viewModel.workspace.showSurface, let legend = viewModel.workspace.surfaceLegend {
-            SurfaceLegendView(mode: viewModel.workspace.surfaceColorMode, legend: legend)
-        }
-        if !viewModel.docking.currentInteractions.isEmpty {
-            InteractionLegendView(interactions: viewModel.docking.currentInteractions)
+        let surfaceLegend = viewModel.workspace.showSurface ? viewModel.workspace.surfaceLegend : nil
+        if surfaceLegend != nil || showsInteractionLegend {
+            HStack(alignment: .bottom, spacing: DS.Space.m) {
+                if let surfaceLegend {
+                    SurfaceLegendView(mode: viewModel.workspace.surfaceColorMode, legend: surfaceLegend)
+                }
+                if showsInteractionLegend {
+                    InteractionLegendView(interactions: viewModel.docking.currentInteractions)
+                }
+            }
+            .fixedSize()
+            // Opaque material: glass would smear the atoms behind a legend.
+            .dsFloatingStyle(.solid)
+            .transition(.opacity)
         }
     }
 }
@@ -168,11 +188,11 @@ private struct CameraCluster: View {
                 .accessibilityIdentifier(AccessibilityID.renderFitToView)
             DSCanvasToolButton("Center on Ligand", systemImage: "viewfinder",
                                help: "Center on ligand") { viewModel.fitToLigand() }
-                .canvasEnabled(viewModel.molecules.ligand != nil)
+                .disabled(viewModel.molecules.ligand == nil)
                 .accessibilityIdentifier(AccessibilityID.renderFitToLigand)
             DSCanvasToolButton("Center on Protein", systemImage: "cube",
                                help: "Center on protein") { viewModel.fitToProtein() }
-                .canvasEnabled(viewModel.molecules.protein != nil)
+                .disabled(viewModel.molecules.protein == nil)
                 .accessibilityIdentifier(AccessibilityID.renderFitToProtein)
             DSCanvasToolButton("Reset Camera", systemImage: "arrow.counterclockwise",
                                help: "Reset camera") {
@@ -199,21 +219,25 @@ private struct DisplayCluster: View {
 
     var body: some View {
         // Collapses the "Look" and opacity groups into a single "…" when the canvas is narrow.
+        // Four groups: representation | visibility | colour | lighting & view.
         ViewThatFits(in: .horizontal) {
             DSCanvasToolCluster {
                 styleGroup
-                groupDivider
+                DSCanvasToolDivider()
                 showGroup
-                groupDivider
+                DSCanvasToolDivider()
+                colorGroup
+                DSCanvasToolDivider()
                 lookGroup
-                groupDivider
                 opacityButton
             }
             DSCanvasToolCluster {
                 styleGroup
-                groupDivider
+                DSCanvasToolDivider()
                 showGroup
-                groupDivider
+                DSCanvasToolDivider()
+                colorGroup
+                DSCanvasToolDivider()
                 DSCanvasToolButton("More", systemImage: "ellipsis", isOn: showMore,
                                    help: "Lighting, clipping, probe and opacity") { showMore.toggle() }
                     .popover(isPresented: $showMore, arrowEdge: .top) {
@@ -221,10 +245,6 @@ private struct DisplayCluster: View {
                     }
             }
         }
-    }
-
-    private var groupDivider: some View {
-        Divider().frame(height: 18).padding(.horizontal, DS.Space.xxs)
     }
 
     // A. Style
@@ -240,7 +260,7 @@ private struct DisplayCluster: View {
         }
     }
 
-    // B. Show
+    // B. Visibility
     @ViewBuilder
     private var showGroup: some View {
         let workspace = viewModel.workspace
@@ -253,7 +273,7 @@ private struct DisplayCluster: View {
                 ? (workspace.showHydrogens ? "Hide hydrogens (⌃⌘H)" : "Show hydrogens (⌃⌘H)")
                 : "No hydrogens — add them in Preparation"
         ) { viewModel.toggleHydrogens() }
-            .canvasEnabled(hAvailable)
+            .disabled(!hAvailable)
             .accessibilityIdentifier(AccessibilityID.renderHydrogens)
 
         let isRibbon = workspace.renderMode == .ribbon
@@ -262,7 +282,7 @@ private struct DisplayCluster: View {
                            help: isRibbon
                                ? "Side chains: \(workspace.sideChainDisplay.rawValue)"
                                : "Side chains (Ribbon mode only)") { showSideChains.toggle() }
-            .canvasEnabled(isRibbon)
+            .disabled(!isRibbon)
             .popover(isPresented: $showSideChains, arrowEdge: .top) {
                 CanvasPopover("Side Chains") {
                     Picker("Side chains", selection: Binding(
@@ -280,13 +300,31 @@ private struct DisplayCluster: View {
                            help: workspace.showSurface ? "Hide molecular surface" : "Show molecular surface") {
             viewModel.toggleSurface()
         }
-        .canvasEnabled(viewModel.molecules.protein != nil && !workspace.isGeneratingSurface)
+        .disabled(viewModel.molecules.protein == nil || workspace.isGeneratingSurface)
         .accessibilityIdentifier(AccessibilityID.renderSurface)
 
+        DSCanvasToolButton("Probe Radius", systemImage: "circle.dashed",
+                           isOn: workspace.showSurface && workspace.surfaceProbeRadius != 1.4,
+                           help: workspace.showSurface
+                               ? String(format: "Surface probe %.1f Å, grid %.1f Å",
+                                        workspace.surfaceProbeRadius, workspace.surfaceGridSpacing)
+                               : "Surface probe (show the surface first)") { showProbe.toggle() }
+            .disabled(!workspace.showSurface)
+            .popover(isPresented: $showProbe, arrowEdge: .top) {
+                CanvasPopover("Surface Probe") { ProbeControls() }
+            }
+    }
+
+    // C. Colour
+    @ViewBuilder
+    private var colorGroup: some View {
+        let workspace = viewModel.workspace
         DSCanvasToolButton("Surface Coloring", systemImage: surfaceColorIcon,
                            isOn: workspace.showSurface && workspace.surfaceColorMode != .uniform,
-                           help: "Surface coloring: \(workspace.surfaceColorMode.rawValue)") { showSurfaceColor.toggle() }
-            .canvasEnabled(workspace.showSurface)
+                           help: workspace.showSurface
+                               ? "Surface coloring: \(workspace.surfaceColorMode.rawValue)"
+                               : "Surface coloring (show the surface first)") { showSurfaceColor.toggle() }
+            .disabled(!workspace.showSurface)
             .accessibilityIdentifier(AccessibilityID.renderSurfaceColor)
             .popover(isPresented: $showSurfaceColor, arrowEdge: .top) {
                 CanvasPopover("Surface Coloring") {
@@ -319,7 +357,7 @@ private struct DisplayCluster: View {
             }
     }
 
-    // C. Look
+    // D. Lighting & view
     @ViewBuilder
     private var lookGroup: some View {
         let workspace = viewModel.workspace
@@ -342,18 +380,8 @@ private struct DisplayCluster: View {
                     CanvasPopover("Z-Slab Clipping") { ClippingControls() }
                 }
         }
-
-        DSCanvasToolButton("Probe Radius", systemImage: "circle.dashed",
-                           isOn: workspace.showSurface && workspace.surfaceProbeRadius != 1.4,
-                           help: String(format: "Surface probe %.1f Å, grid %.1f Å",
-                                        workspace.surfaceProbeRadius, workspace.surfaceGridSpacing)) { showProbe.toggle() }
-            .canvasEnabled(workspace.showSurface)
-            .popover(isPresented: $showProbe, arrowEdge: .top) {
-                CanvasPopover("Surface Probe") { ProbeControls() }
-            }
     }
 
-    // D. Opacity
     private var opacityButton: some View {
         DSCanvasToolButton("Opacity", systemImage: "circle.lefthalf.filled", isOn: showOpacity,
                            help: "Background and surface opacity") { showOpacity.toggle() }
@@ -635,6 +663,7 @@ private struct CanvasGlyphButton: View {
     let help: String
     let action: () -> Void
     @State private var isHovering = false
+    @Environment(\.isEnabled) private var isEnabled
 
     init(_ title: String, glyph: String, isOn: Bool, help: String, action: @escaping () -> Void) {
         self.title = title
@@ -645,15 +674,11 @@ private struct CanvasGlyphButton: View {
     }
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
         Button(action: action) {
             Text(glyph)
-                .font(.system(.body, design: .rounded).weight(.bold))
+                .font(.system(size: DS.Size.toolIcon, weight: .semibold, design: .rounded))
                 .frame(width: 16, height: 16)
-                .foregroundStyle(isOn ? AnyShapeStyle(DS.Color.accent) : AnyShapeStyle(Color.primary.opacity(0.85)))
-                .frame(width: DS.Size.toolButton, height: DS.Size.toolButton)
-                .background(shape.fill(isOn ? DS.Color.accentSoft : (isHovering ? DS.Color.controlFill : Color.clear)))
-                .contentShape(shape)
+                .dsCanvasToolChrome(isOn: isOn, isHovering: isHovering, isEnabled: isEnabled)
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
@@ -683,13 +708,6 @@ private struct CanvasDisclosureButton: View {
         .onHover { isHovering = $0 }
         .help(help)
         .accessibilityLabel(help)
-    }
-}
-
-private extension View {
-    /// Plain-style canvas buttons don't dim when disabled; do it explicitly.
-    func canvasEnabled(_ enabled: Bool) -> some View {
-        disabled(!enabled).opacity(enabled ? 1 : 0.4)
     }
 }
 

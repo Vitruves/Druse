@@ -47,9 +47,17 @@ struct SearchTabView: View {
         }
         loadStructureCard
         searchRCSBCard
-        if isLoadingCache || !cachedEntries.isEmpty {
+        // While the Welcome screen fills the canvas it owns the Recent list;
+        // the navigator shows it once a structure is open.
+        if !isWelcomeVisible && (isLoadingCache || !cachedEntries.isEmpty) {
             recentDownloadsCard
         }
+    }
+
+    /// Mirrors the canvas rule that shows `WelcomeScreen` (no molecule, no demo, Metal up).
+    private var isWelcomeVisible: Bool {
+        viewModel.molecules.protein == nil && viewModel.molecules.ligand == nil
+            && !viewModel.isDemoRunning && viewModel.renderer != nil
     }
 
     /// True when the global isLoading flag is set AND this card initiated
@@ -108,34 +116,45 @@ struct SearchTabView: View {
         clearID: String,
         onClear: @escaping () -> Void
     ) -> some View {
-        PanelHighlightRow(color: color) {
-            HStack(spacing: DS.Space.m) {
-                Circle()
-                    .fill(color)
-                    .frame(width: 8, height: 8)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(name)
-                        .font(DS.Font.label.weight(.medium))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(detail)
-                        .font(DS.Font.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: DS.Space.xs)
-                Button(action: onClear) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(DS.Font.label)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .help(clearHelp)
-                .accessibilityLabel(clearHelp)
-                .accessibilityIdentifier(clearID)
+        HStack(spacing: DS.Space.m) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name)
+                    .font(DS.Font.label.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(name)
+                Text(detail)
+                    .font(DS.Font.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+            Spacer(minLength: DS.Space.xs)
+            Button(action: onClear) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(DS.Font.body)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help(clearHelp)
+            .accessibilityLabel(clearHelp)
+            .accessibilityIdentifier(clearID)
         }
+        .padding(.horizontal, DS.Space.m)
+        .padding(.vertical, DS.Space.s)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // Neutral fill: the coloured dot alone carries the molecule kind, so a
+        // loaded row never reads as a selected one.
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(DS.Color.controlFill)
+        )
+        .accessibilityElement(children: .contain)
     }
 
     // MARK: - Load structure card
@@ -181,10 +200,7 @@ struct SearchTabView: View {
                     inlineLoadingIndicator()
                 }
 
-                PanelHint(
-                    text: "Or drop .pdb, .cif, .sdf or .mol2 files onto the viewport.",
-                    icon: "arrow.down.doc"
-                )
+                PanelHint(text: WelcomeScreen.dropHint, icon: "arrow.down.doc")
             }
         }
     }
@@ -385,7 +401,7 @@ private struct CachedEntryRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer(minLength: DS.Space.xs)
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(entry.sizeBytes), countStyle: .file))
+                    Text(ByteSize.string(entry.sizeBytes))
                         .font(DS.Font.caption)
                         .monospacedDigit()
                         .foregroundStyle(.tertiary)

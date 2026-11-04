@@ -229,7 +229,6 @@ struct PanelLabeledRow<Content: View>: View {
 struct PanelChoiceButton: View {
     let title: String
     var icon: String? = nil
-    var badge: String? = nil
     let isSelected: Bool
     var isDisabled: Bool = false
     var help: String? = nil
@@ -246,9 +245,6 @@ struct PanelChoiceButton: View {
                 Text(title)
                     .font(DS.Font.label.weight(isSelected ? .semibold : .regular))
                     .lineLimit(1)
-                if let badge {
-                    DSTag(badge, tone: .info)
-                }
             }
             .padding(.horizontal, DS.Space.xs)
             .frame(maxWidth: .infinity)
@@ -259,7 +255,7 @@ struct PanelChoiceButton: View {
                                    lineWidth: isSelected ? 1 : 0.5)
             )
             .foregroundStyle(isSelected ? DS.Color.accent : Color.primary)
-            .opacity(isDisabled ? 0.4 : 1.0)
+            .opacity(isDisabled ? DS.Opacity.disabled : 1.0)
             .contentShape(shape)
         }
         .buttonStyle(.plain)
@@ -313,7 +309,7 @@ struct PanelToggleRow: View {
                 }
             }
             Spacer()
-            Toggle("", isOn: $isOn)
+            Toggle(title, isOn: $isOn)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
@@ -506,19 +502,20 @@ struct PanelDisclosure<Content: View>: View {
 
 // MARK: - Highlight box (used for batch ligand info, single-ligand chip, etc.)
 
+/// A lightly toned row: a faint wash plus a hairline in `color`, so it reads as a status or
+/// entity hint without looking like a selection.
 struct PanelHighlightRow<Content: View>: View {
     let color: Color
     @ViewBuilder let content: () -> Content
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
         content()
             .padding(.horizontal, DS.Space.m)
             .padding(.vertical, DS.Space.s)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
-                    .fill(color.opacity(0.10))
-            )
+            .background(shape.fill(color.opacity(0.06)))
+            .overlay(shape.strokeBorder(color.opacity(0.22), lineWidth: 0.5))
     }
 }
 

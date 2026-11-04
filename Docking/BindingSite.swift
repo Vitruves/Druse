@@ -827,7 +827,7 @@ enum BindingSiteDetector {
         nonisolated(unsafe) var allFilteredPositions: [SIMD3<Float>] = []
         allFilteredPositions.reserveCapacity(max(nx * ny * nz / 20, 256))
 
-        DispatchQueue.concurrentPerform(iterations: nx) { ix in
+        CPUBudget.concurrentPerform(iterations: nx) { ix in
             let gx = gridMin.x + Float(ix) * gridSpacing
             var sliceProbes: [SIMD3<Float>] = []
             sliceProbes.reserveCapacity(ny * nz / 10)
@@ -865,7 +865,7 @@ enum BindingSiteDetector {
         nonisolated(unsafe) var buriedProbes: [BuriedProbe] = []
         buriedProbes.reserveCapacity(probeCount / 3)
 
-        DispatchQueue.concurrentPerform(iterations: probeCount) { i in
+        CPUBudget.concurrentPerform(iterations: probeCount) { i in
             let b = buriednessAt(
                 point: allFilteredPositions[i],
                 positions: positions,

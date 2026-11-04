@@ -2,20 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import SwiftUI
+import Metal
 
 // MARK: - Pocket Detection, Docking, Pose Display, ML, Export
 
 extension AppViewModel {
 
+    /// Metal device for compute work: the renderer's device in the GUI, the system default
+    /// device when no renderer exists (headless runs).
+    var computeDevice: MTLDevice? {
+        renderer?.device ?? MTLCreateSystemDefaultDevice()
+    }
+
     // MARK: - Pocket Detection
 
-    func detectPockets(excludedChainIDs: Set<String> = []) {
-        guard let prot = molecules.protein else { return }
-        let usesHybrid = excludedChainIDs.isEmpty && pocketDetectorML.isAvailable
+    /// Detects pockets (hybrid ML + geometric when `allowML` and no chain is excluded).
+    /// Returns nil without a protein; otherwise a task that completes once pockets are set.
+    @discardableResult
+    func detectPockets(excludedChainIDs: Set<String> = [], allowML: Bool = true) -> Task<Void, Never>? {
+        guard let prot = molecules.protein else { return nil }
+        let usesHybrid = allowML && excludedChainIDs.isEmpty && pocketDetectorML.isAvailable
         log.info(usesHybrid ? "Detecting binding pockets (hybrid)..." : "Detecting binding pockets...", category: .dock)
         workspace.statusMessage = "Detecting pockets..."
 
-        Task {
+        return Task {
             let geometricPockets = BindingSiteDetector.detectPockets(
                 protein: prot,
                 excludedChainIDs: excludedChainIDs
@@ -43,16 +53,18 @@ extension AppViewModel {
         }
     }
 
-    func detectLigandGuidedPocket() {
-        guard let prot = molecules.protein, let lig = molecules.ligand else { return }
+    /// Returns whether a pocket could be defined around the current ligand.
+    @discardableResult
+    func detectLigandGuidedPocket() -> Bool {
+        guard let prot = molecules.protein, let lig = molecules.ligand else { return false }
         log.info("Defining pocket from ligand position...", category: .dock)
 
-        if let pocket = BindingSiteDetector.ligandGuidedPocket(protein: prot, ligand: lig) {
-            docking.detectedPockets = [pocket]
-            docking.selectedPocket = pocket
-            showGridBoxForPocket(pocket)
-            log.success("Ligand-guided pocket: \(String(format: "%.0f", pocket.volume)) ų, \(pocket.residueIndices.count) residues", category: .dock)
-        }
+        guard let pocket = BindingSiteDetector.ligandGuidedPocket(protein: prot, ligand: lig) else { return false }
+        docking.detectedPockets = [pocket]
+        docking.selectedPocket = pocket
+        showGridBoxForPocket(pocket)
+        log.success("Ligand-guided pocket: \(String(format: "%.0f", pocket.volume)) ų, \(pocket.residueIndices.count) residues", category: .dock)
+        return true
     }
 
     func pocketFromSelection() {
@@ -211,13 +223,41 @@ extension AppViewModel {
         return ligand
     }
 
-    func runDocking() {
+    /// Ring conformations docked per run.
+    static let maxRingConformationVariants = 4
+
+    /// The distinct ring conformations of `ligand` (first) and of the active ligand's prepared
+    /// conformers, plus mirror-image folds of achiral molecules, as copies of `ligand` with
+    /// new coordinates. Just `ligand` when no ring is non-planar.
+    private func ringConformationVariants(of ligand: Molecule) -> [Molecule] {
+        let elements = ligand.atoms.map(\.element)
+        let ensemble = [ligand.atoms.map(\.position)] + workspace.ligandConformers
+            .filter { $0.atoms.map(\.element) == elements }
+            .map { $0.atoms.map(\.position) }
+        let molBlock = SDFWriter.molBlock(name: ligand.name, atoms: ligand.atoms, bonds: ligand.bonds)
+        guard let variants = RDKitBridge.ringConformationVariants(
+            molBlock: molBlock, conformers: ensemble,
+            maxVariants: Self.maxRingConformationVariants, addMirror: true
+        ), variants.count > 1 else { return [ligand] }
+        return variants.map { variant in
+            var atoms = ligand.atoms
+            for i in atoms.indices { atoms[i].position = variant.positions[i] }
+            return Molecule(name: ligand.name, atoms: atoms, bonds: ligand.bonds,
+                            title: ligand.title, smiles: ligand.smiles)
+        }
+    }
+
+    /// Docks the active ligand into the selected pocket. Returns nil when protein, ligand or
+    /// pocket is missing; otherwise a task that completes after post-processing and yields
+    /// whether any pose was produced.
+    @discardableResult
+    func runDocking() -> Task<Bool, Never>? {
         guard let pocket = docking.selectedPocket,
               let prot = molecules.protein,
               let lig = molecules.ligand
         else {
             log.error("Need protein, ligand, and pocket to dock", category: .dock)
-            return
+            return nil
         }
 
         let dockingLigand = ensureLigandHasSMILES(lig)
@@ -259,8 +299,8 @@ extension AppViewModel {
         log.info("  Config: torsionFlex=\(cfg.enableFlexibility), numRuns=\(cfg.numRuns)", category: .dock)
         log.info("  Config: torsionSearch=\(cfg.torsionSearchPreset.rawValue), exact=\(String(format: "%.0f", cfg.torsionExactFraction * 100))%, local=\(String(format: "%.0f", cfg.torsionLocalFraction * 100))%, reset=\(String(format: "%.0f", cfg.torsionRandomResetProbability * 100))%", category: .dock)
 
-        Task {
-            if docking.dockingEngine == nil, let device = renderer?.device {
+        return Task {
+            if docking.dockingEngine == nil, let device = computeDevice {
                 docking.dockingEngine = DockingEngine(device: device)
             }
             guard let engine = docking.dockingEngine else {
@@ -269,7 +309,7 @@ extension AppViewModel {
                 docking.dockingBestEnergy = .infinity
                 docking.dockingResults = []
                 workspace.statusMessage = "Docking engine unavailable"
-                return
+                return false
             }
 
             let dockingPH = molecules.protonationPH
@@ -307,7 +347,7 @@ extension AppViewModel {
             let chiStep = isAutoFlex ? FlexibleResidueConfig.softChiStep : FlexibleResidueConfig.fullChiStep
 
             if !flexConfig.flexibleResidueIndices.isEmpty {
-                if docking.flexDockingEngine == nil, let device = renderer?.device {
+                if docking.flexDockingEngine == nil, let device = computeDevice {
                     docking.flexDockingEngine = FlexDockingEngine(device: device, commandQueue: engine.commandQueue)
                 }
                 if let flexEngine = docking.flexDockingEngine {
@@ -358,9 +398,7 @@ extension AppViewModel {
                          category: .dock)
             }
 
-            log.info("Computing grid maps (spacing=\(String(format: "%.2f", docking.dockingConfig.gridSpacing)) Å)...", category: .dock)
-            engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
-            log.success("Grid maps computed — \(scoringProtein.atoms.count) receptor atoms", category: .dock)
+            attachReceptor(scoringProtein, to: engine)
 
             let origLig = self.docking.originalDockingLigand ?? dockingLigand
 
@@ -386,12 +424,6 @@ extension AppViewModel {
                 }
             }
 
-            engine.onGenerationComplete = { [weak self] gen, energy in
-                Task { @MainActor [weak self] in
-                    self?.docking.dockingGeneration = gen
-                }
-            }
-
             // Prepare pharmacophore constraint buffers (zero-cost if no constraints)
             let activeConstraints = docking.pharmacophoreConstraints.filter(\.isEnabled)
             engine.prepareConstraintBuffers(
@@ -405,13 +437,43 @@ extension AppViewModel {
 
             log.info("Launching GA docking engine...", category: .dock)
 
-            // One entry = one docking job (flat model)
-            let allResults = await engine.runDocking(
-                ligand: dockingLigand, pocket: pocket,
-                config: docking.dockingConfig,
-                scoringMethod: docking.scoringMethod)
+            // Rings stay rigid during the search, so each distinct ring conformation of the
+            // ligand is docked as its own job (sequentially: the engine runs one job at a time).
+            let variants = ringConformationVariants(of: dockingLigand)
+            let generationsPerVariant = docking.dockingTotalGenerations
+            docking.dockingTotalGenerations = generationsPerVariant * variants.count
+            var allResults: [DockingResult] = []
+            var variantOfResult: [Int: Int] = [:]
+            var evaluatedPoses = 0
+            for (index, variant) in variants.enumerated() {
+                guard index == 0 || docking.isDocking else { break }
+                let generationOffset = index * generationsPerVariant
+                engine.onGenerationComplete = { [weak self] gen, _ in
+                    Task { @MainActor [weak self] in
+                        self?.docking.dockingGeneration = generationOffset + gen
+                    }
+                }
+                let variantResults = await engine.runDocking(
+                    ligand: variant, pocket: pocket,
+                    config: docking.dockingConfig,
+                    scoringMethod: docking.scoringMethod)
+                evaluatedPoses += engine.lastEvaluatedPoseCount
+                for var result in variantResults {
+                    result.id = allResults.count
+                    variantOfResult[result.id] = index
+                    allResults.append(result)
+                }
+            }
+            if variants.count > 1 {
+                allResults = await engine.clusterPoses(
+                    DockingEngine.withinOutputEnergyWindow(allResults, scoringMethod: docking.scoringMethod))
+                log.info("\(variants.count) ring conformations docked", category: .dock)
+            }
 
             let results = allResults.sorted { $0.energy < $1.energy }
+            if let best = results.first, let index = variantOfResult[best.id] {
+                docking.originalDockingLigand = variants[index]
+            }
 
             log.info("GA complete: \(results.count) poses returned", category: .dock)
             if let best = results.first {
@@ -438,7 +500,7 @@ extension AppViewModel {
                 }
                 workspace.statusMessage = "Docking produced no valid poses"
                 log.error("Docking produced no valid poses; skipping post-processing", category: .dock)
-                return
+                return false
             }
 
             // Signal that GA search is done — post-processing begins
@@ -449,20 +511,11 @@ extension AppViewModel {
             let openMMRefiner = OpenMMPocketRefiner.shared
             if openMMRefiner.isAvailable {
                 workspace.statusMessage = "OpenMM refinement..."
-                let refinement = await refineTopDockingResultsWithOpenMM(
-                    results: rankedResults,
-                    protein: scoringProtein,
-                    originalLigand: origLig,
-                    pocket: pocket
+                rankedResults = await applyOpenMMRefinement(
+                    to: rankedResults, top: Self.defaultOpenMMRefinedPoses,
+                    scoringProtein: scoringProtein, displayedProtein: prot,
+                    originalLigand: origLig, pocket: pocket
                 )
-                rankedResults = refinement.results
-                if let refinedPositions = refinement.bestProteinHeavyPositions,
-                   let updatedProteinAtoms = applyingRefinedHeavyAtomPositions(refinedPositions, to: prot.atoms) {
-                    let refinedProtein = Molecule(name: prot.name, atoms: updatedProteinAtoms, bonds: prot.bonds, title: prot.title)
-                    refinedProtein.secondaryStructureAssignments = prot.secondaryStructureAssignments
-                    molecules.protein = refinedProtein
-                    pushToRenderer()
-                }
             } else {
                 log.info("OpenMM refinement skipped: \(openMMRefiner.availabilitySummary)", category: .dock)
             }
@@ -509,7 +562,7 @@ extension AppViewModel {
             docking.dockingResults = rankedResults
             docking.isDocking = false
             docking.dockingDuration = Date().timeIntervalSince(docking.dockingStartTime ?? Date())
-            docking.dockingPosesEvaluated = engine.lastEvaluatedPoseCount
+            docking.dockingPosesEvaluated = evaluatedPoses
 
             if let best = docking.dockingResults.first {
                 applyDockingPose(best, originalLigand: origLig)
@@ -557,6 +610,7 @@ extension AppViewModel {
                     log.info("  Best pose interactions: \(hbonds) H-bonds, \(hydro) hydrophobic, \(pipi) π-stacking", category: .dock)
                 }
             }
+            return true
         }
     }
 
@@ -570,7 +624,192 @@ extension AppViewModel {
         log.info("Docking stopped", category: .dock)
     }
 
-    // (Ensemble machinery removed — each entry is docked independently as one job)
+    // MARK: - Receptor hand-off
+
+    /// Poses refined with OpenMM after every docking run.
+    static let defaultOpenMMRefinedPoses = 3
+
+    /// Hands the prepared receptor to the engine without building grid maps:
+    /// `DockingEngine.runDocking` builds them once the ligand's Vina atom types are known, so an
+    /// earlier type-less build only produced empty affinity maps (and the "No valid Vina atom
+    /// types" warning) that were thrown away.
+    func attachReceptor(_ protein: Molecule, to engine: DockingEngine) {
+        engine.proteinStructure = protein
+        engine.proteinAtoms = protein.atoms.filter { $0.element != .H }
+    }
+
+    /// OpenMM-refines the `top` best poses and shows the refined receptor of the best one.
+    /// Shared by the post-docking pipeline and `refineDockingResultsWithOpenMM(top:)`.
+    private func applyOpenMMRefinement(
+        to results: [DockingResult], top: Int,
+        scoringProtein: Molecule, displayedProtein: Molecule,
+        originalLigand: Molecule, pocket: BindingPocket
+    ) async -> [DockingResult] {
+        let refinement = await refineTopDockingResultsWithOpenMM(
+            results: results, top: top, protein: scoringProtein,
+            originalLigand: originalLigand, pocket: pocket
+        )
+        if let refinedPositions = refinement.bestProteinHeavyPositions,
+           let updatedProteinAtoms = applyingRefinedHeavyAtomPositions(refinedPositions, to: displayedProtein.atoms) {
+            let refinedProtein = Molecule(name: displayedProtein.name, atoms: updatedProteinAtoms,
+                                          bonds: displayedProtein.bonds, title: displayedProtein.title)
+            refinedProtein.secondaryStructureAssignments = displayedProtein.secondaryStructureAssignments
+            molecules.protein = refinedProtein
+            pushToRenderer()
+        }
+        return refinement.results
+    }
+
+    // MARK: - Post-docking operations on the current results
+
+    /// Why a post-docking operation on the current results could not run.
+    enum DockingPostProcessingError: LocalizedError {
+        case noResults
+        case busy
+        case missingInputs
+        case openMMUnavailable(String)
+        case noSMILES
+        case alreadyRefined
+        case unsupportedRescoring(ScoringMethod)
+        case scorerUnavailable(ScoringMethod)
+        case staleEngineState
+
+        var errorDescription: String? {
+            switch self {
+            case .noResults: "No docking results"
+            case .busy: "A docking run is in progress"
+            case .missingInputs: "The protein, the docked ligand and the docking pocket are all needed"
+            case .openMMUnavailable(let reason): "OpenMM is unavailable: \(reason)"
+            case .noSMILES: "The docked ligand has no SMILES, which the MMFF94 strain model needs (dock it from the Ligand Database or 'ligand smiles')"
+            case .alreadyRefined: "These poses are already GFN2-refined — dock again to refine with other settings"
+            case .unsupportedRescoring(let method): "\(method.rawValue) is not a rescoring model (use DruseAF or PIGNet2)"
+            case .scorerUnavailable(let method): "\(method.rawValue) scoring kernels or weights are unavailable in this build"
+            case .staleEngineState: "The docking engine has since been used for another ligand — dock this ligand again before rescoring"
+            }
+        }
+    }
+
+    /// Inputs shared by the post-docking operations; throws when results or inputs are missing.
+    private func postProcessingInputs() throws -> (ligand: Molecule, protein: Molecule, pocket: BindingPocket) {
+        guard !docking.dockingResults.isEmpty else { throw DockingPostProcessingError.noResults }
+        guard !docking.isDocking, !docking.isBatchDocking else { throw DockingPostProcessingError.busy }
+        guard let ligand = docking.originalDockingLigand ?? molecules.ligand,
+              let protein = molecules.protein,
+              let pocket = docking.selectedPocket else { throw DockingPostProcessingError.missingInputs }
+        return (ligand, protein, pocket)
+    }
+
+    /// Stores post-processed results and shows the new best pose with its interactions.
+    private func publishPostProcessedResults(_ results: [DockingResult]) {
+        docking.dockingResults = results
+        docking.selectedPoseIndices = []
+        showDockingPose(at: 0)
+    }
+
+    /// OpenMM pocket minimization of the `top` best current poses (the `refine openmm` command).
+    /// Returns how many poses received an OpenMM interaction energy.
+    @discardableResult
+    func refineDockingResultsWithOpenMM(top: Int) async throws -> Int {
+        let inputs = try postProcessingInputs()
+        let refiner = OpenMMPocketRefiner.shared
+        guard refiner.isAvailable else { throw DockingPostProcessingError.openMMUnavailable(refiner.availabilitySummary) }
+        let (scoringProtein, _) = await preparedProteinForDocking(
+            protein: inputs.protein, pH: molecules.protonationPH, chargeMethod: docking.chargeMethod
+        )
+        workspace.statusMessage = "OpenMM refinement..."
+        let refined = await applyOpenMMRefinement(
+            to: docking.dockingResults, top: top,
+            scoringProtein: scoringProtein, displayedProtein: inputs.protein,
+            originalLigand: inputs.ligand, pocket: inputs.pocket
+        )
+        publishPostProcessedResults(refined)
+        let count = refined.prefix(top).filter { $0.refinementEnergy != nil }.count
+        log.success("OpenMM refined \(count)/\(min(top, refined.count)) poses", category: .dock)
+        return count
+    }
+
+    /// GFN2-xTB optimization of the current poses with `config` (the `refine gfn2` command),
+    /// followed by PoseBusters re-validation of the moved geometries.
+    /// Returns (optimized, converged) pose counts.
+    @discardableResult
+    func refineDockingResultsWithGFN2(config: GFN2RefinementConfig) async throws -> (optimized: Int, converged: Int) {
+        let inputs = try postProcessingInputs()
+        let top = min(config.topPosesToRefine, docking.dockingResults.count)
+        guard !docking.dockingResults.prefix(top).contains(where: { $0.gfn2Energy != nil }) else {
+            throw DockingPostProcessingError.alreadyRefined
+        }
+        workspace.statusMessage = "GFN2-xTB refinement..."
+        log.info("GFN2-xTB refinement: top \(top) poses, \(config.solvation.rawValue), opt=\(config.optLevel.rawValue)", category: .dock)
+        let refined = await refineWithGFN2(results: docking.dockingResults, originalLigand: inputs.ligand, config: config)
+        let (scoringProtein, _) = await preparedProteinForDocking(
+            protein: inputs.protein, pH: molecules.protonationPH, chargeMethod: docking.chargeMethod
+        )
+        let validated = PoseValidator.validateBatch(
+            results: refined,
+            ligandHeavyAtoms: inputs.ligand.atoms.filter { $0.element != .H },
+            ligandHeavyBonds: buildHeavyBonds(from: inputs.ligand),
+            proteinHeavyAtoms: scoringProtein.atoms.filter { $0.element != .H }
+        )
+        publishPostProcessedResults(validated)
+        let optimized = validated.filter { $0.gfn2Energy != nil }.count
+        let converged = validated.filter { $0.gfn2Converged == true }.count
+        log.success("GFN2-xTB refinement complete: \(converged)/\(optimized) converged", category: .dock)
+        return (optimized, converged)
+    }
+
+    /// MMFF94 strain of the `top` best current poses with the given penalty (the `strain` command).
+    /// Returns (poses with a strain energy, poses above the threshold).
+    @discardableResult
+    func applyStrainPenaltiesToDockingResults(top: Int, threshold: Float, weight: Float) async throws -> (computed: Int, penalized: Int) {
+        let inputs = try postProcessingInputs()
+        let ligand = ensureLigandHasSMILES(inputs.ligand)
+        guard let smiles = nonEmptySMILES(ligand.smiles) ?? nonEmptySMILES(ligand.title) else {
+            throw DockingPostProcessingError.noSMILES
+        }
+        var config = docking.dockingConfig
+        config.strainPenaltyThreshold = threshold
+        config.strainPenaltyWeight = weight
+        let updated = await computeStrainPenalties(results: docking.dockingResults, smiles: smiles, config: config, top: top)
+        publishPostProcessedResults(updated)
+        let strained = updated.compactMap(\.strainEnergy)
+        return (strained.count, strained.filter { $0 > threshold }.count)
+    }
+
+    /// Rescores the current poses with DruseAF or PIGNet2 without moving them (the `rescore`
+    /// command) and makes that model the active scoring method, so results rank and display
+    /// in its units. Returns the number of rescored poses.
+    @discardableResult
+    func rescoreDockingResults(with method: ScoringMethod) async throws -> Int {
+        let inputs = try postProcessingInputs()
+        guard method == .druseAffinity || method == .pignet2 else {
+            throw DockingPostProcessingError.unsupportedRescoring(method)
+        }
+        guard let engine = docking.dockingEngine else { throw DockingPostProcessingError.staleEngineState }
+        let results = docking.dockingResults
+        let rescored = try engine.rescorePoses(results, ligand: inputs.ligand, pocket: inputs.pocket, method: method)
+        docking.scoringMethod = method
+        let ranked = rescored.sorted { $0.energy < $1.energy }
+        publishPostProcessedResults(ranked)
+        log.success("Rescored \(ranked.count) poses with \(method.rawValue)", category: .dock)
+        return ranked.count
+    }
+
+    // MARK: - Pharmacophore constraints
+
+    /// Adds a docking constraint, resolving receptor targets to 3D positions now so later
+    /// preparation of the receptor (added hydrogens, renumbering) cannot move them.
+    /// Shared by the constraint sheet and the `constraint add` command.
+    func addPharmacophoreConstraint(_ constraint: PharmacophoreConstraintDef) {
+        var constraint = constraint
+        if constraint.sourceType == .receptor, constraint.targetPositions.isEmpty, let protein = molecules.protein {
+            constraint.targetPositions = ConstraintAtomResolver.resolveTargetPositions(
+                constraint: constraint, atoms: protein.atoms, residues: protein.residues
+            )
+        }
+        constraint.groupID = docking.pharmacophoreConstraints.count
+        docking.pharmacophoreConstraints.append(constraint)
+        pushToRenderer()
+    }
 
     /// Remove all displayed poses and interaction lines from the 3D viewport.
     /// The docking results data is preserved for re-viewing later.
@@ -697,8 +936,12 @@ extension AppViewModel {
         workspace.statusMessage = "\(docking.selectedPoseIndices.count) poses displayed"
     }
 
+    /// OpenMM pocket minimization of the `top` best poses. The interaction energy is stored as
+    /// `refinementEnergy` (an annotation: ranking is unchanged); the refined receptor heavy-atom
+    /// positions of the best pose are returned so the caller can show them.
     func refineTopDockingResultsWithOpenMM(
         results: [DockingResult],
+        top: Int,
         protein: Molecule,
         originalLigand: Molecule,
         pocket: BindingPocket
@@ -708,12 +951,13 @@ extension AppViewModel {
         var refinedResults = results
         var refinedProteinByResultID: [Int: [SIMD3<Float>]] = [:]
         let refiner = OpenMMPocketRefiner.shared
-        let topN = min(3, refinedResults.count)
+        let topN = min(top, refinedResults.count)
 
         log.info("Refining top \(topN) docking poses with OpenMM pocket minimization...", category: .dock)
+        // Charges are folded while the hydrogens still sit at their input coordinates; poses carry heavy atoms only.
+        let heavyAtoms = OpenMMPocketRefiner.unitedAtomHeavyAtoms(originalLigand.atoms)
         for index in 0..<topN {
             let result = refinedResults[index]
-            let heavyAtoms = originalLigand.atoms.filter { $0.element != .H }
             var ligandAtoms = heavyAtoms
             for atomIndex in 0..<min(ligandAtoms.count, result.transformedAtomPositions.count) {
                 ligandAtoms[atomIndex].position = result.transformedAtomPositions[atomIndex]
@@ -725,6 +969,13 @@ extension AppViewModel {
                 pocketCenter: pocket.center,
                 pocketHalfExtent: pocket.size
             ) {
+                // A diverged minimization returns NaN energies/coordinates; keeping them would
+                // corrupt the displayed receptor and crash its next preparation.
+                guard refined.interactionEnergyKcal.isFinite,
+                      refined.refinedHeavyAtomPositions.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else {
+                    log.warn("OpenMM refinement of pose #\(index + 1) diverged (non-finite result) — pose and receptor left unchanged", category: .dock)
+                    continue
+                }
                 refinedResults[index].refinementEnergy = refined.interactionEnergyKcal
                 refinedProteinByResultID[result.id] = refined.refinedHeavyAtomPositions
             }
@@ -838,11 +1089,6 @@ extension AppViewModel {
         }
     }
 
-    // MARK: - ML Pocket Detection
-
-    // MARK: - Strain Penalty
-
-    /// Compute MMFF94 strain energy for top docking poses and apply penalty to scores.
     // MARK: - GFN2-xTB Post-Docking Refinement
 
     /// Refine top docked poses using GFN2-xTB geometry optimization.
@@ -867,13 +1113,21 @@ extension AppViewModel {
 
         var updated = results
 
-        // Process top poses in parallel (each on its own detached task)
+        // Process top poses in parallel, at most `maxConcurrentTasks` at a time (Settings / --cores).
+        let maxConcurrency = max(AppSettings.shared.maxConcurrentTasks, 1)
         let refinements: [(Int, GFN2RefinementResult?)] = await withTaskGroup(
             of: (Int, GFN2RefinementResult?).self
         ) { group in
+            var collected = [(Int, GFN2RefinementResult?)]()
+            var running = 0
             for i in 0..<topN {
                 let positions = results[i].transformedAtomPositions
                 guard positions.count == heavyAtoms.count else { continue }
+                if running >= maxConcurrency, let finished = await group.next() {
+                    collected.append(finished)
+                    running -= 1
+                }
+                running += 1
 
                 group.addTask {
                     // Build temporary atom array with docked coordinates
@@ -899,7 +1153,6 @@ extension AppViewModel {
                 }
             }
 
-            var collected = [(Int, GFN2RefinementResult?)]()
             for await result in group {
                 collected.append(result)
             }
@@ -952,12 +1205,17 @@ extension AppViewModel {
         return updated
     }
 
+    // MARK: - Strain Penalty
+
+    /// Computes the MMFF94 strain (docked − relaxed free ligand) of the `top` best poses and adds
+    /// `weight × (strain − threshold)` to the score of poses above the threshold. Poses that
+    /// already carry a strain energy keep it and are not penalized twice.
     func computeStrainPenalties(
-        results: [DockingResult], smiles: String, config: DockingConfig
+        results: [DockingResult], smiles: String, config: DockingConfig, top: Int = 50
     ) async -> [DockingResult] {
         workspace.statusMessage = "Computing ligand strain..."
 
-        let topN = min(results.count, 50) // only compute for top 50 poses (CPU-bound)
+        let topN = min(results.count, top) // CPU-bound: only the best poses
         let threshold = config.strainPenaltyThreshold
         let weight = config.strainPenaltyWeight
 
@@ -973,7 +1231,7 @@ extension AppViewModel {
 
         // Compute strain for each top pose
         var updated = results
-        let positionsSlice = results.prefix(topN).map { $0.transformedAtomPositions }
+        let positionsSlice = results.prefix(topN).map { $0.strainEnergy == nil ? $0.transformedAtomPositions : [] }
 
         let strainResults: [(Int, Float?)] = await Task.detached(priority: .userInitiated) {
             positionsSlice.enumerated().map { (i, positions) in
@@ -1009,17 +1267,18 @@ extension AppViewModel {
 
     // MARK: - ML Pocket Detection
 
-    func detectPocketsML() {
-        guard let prot = molecules.protein else { return }
+    /// Returns nil without a protein; otherwise a task that completes once pockets are set.
+    @discardableResult
+    func detectPocketsML() -> Task<Void, Never>? {
+        guard let prot = molecules.protein else { return nil }
         guard pocketDetectorML.isAvailable else {
             log.warn("PocketDetector model not available, falling back to auto detection", category: .dock)
-            detectPockets()
-            return
+            return detectPockets()
         }
         log.info("Detecting pockets (ML)...", category: .dock)
         workspace.statusMessage = "ML pocket detection..."
 
-        Task {
+        return Task {
             let pockets = await pocketDetectorML.detectPockets(protein: prot)
             docking.detectedPockets = pockets
             if let best = pockets.first {
@@ -1031,6 +1290,82 @@ extension AppViewModel {
                 log.warn("ML detected no pockets, try geometric method", category: .dock)
             }
             workspace.statusMessage = "\(pockets.count) pocket(s) found (ML)"
+        }
+    }
+}
+
+// MARK: - Post-hoc neural rescoring
+
+extension DockingEngine {
+
+    /// Scores finished poses with DruseAF or PIGNet2 without moving them and returns them with
+    /// the new score terms (same order). The engine's ligand buffers must still describe
+    /// `ligand`, which holds right after that ligand's docking run; when another ligand has
+    /// been docked since, `staleEngineState` is thrown instead of scoring the wrong molecule.
+    func rescorePoses(
+        _ results: [DockingResult], ligand: Molecule, pocket: BindingPocket, method: ScoringMethod
+    ) throws -> [DockingResult] {
+        typealias Failure = AppViewModel.DockingPostProcessingError
+        guard !isRunning else { throw Failure.busy }
+        guard let gaParamsBuffer, let ligandAtomBuffer, !results.isEmpty else { throw Failure.staleEngineState }
+
+        let prepared = prepareLigandGeometry(ligand)
+        let atomCount = prepared.gpuAtoms.count
+        let currentGA = gaParamsBuffer.contents().bindMemory(to: GAParams.self, capacity: 1).pointee
+        guard Int(currentGA.numLigandAtoms) == atomCount,
+              ligandAtomBuffer.length >= atomCount * MemoryLayout<DockLigandAtom>.stride else {
+            throw Failure.staleEngineState
+        }
+        let loaded = ligandAtomBuffer.contents().bindMemory(to: DockLigandAtom.self, capacity: atomCount)
+        for i in 0..<atomCount where simd_distance(loaded[i].position, prepared.gpuAtoms[i].position) > 1e-3 {
+            throw Failure.staleEngineState
+        }
+
+        var poses = results.map(makeDockPose)
+        var rescoreGA = currentGA
+        rescoreGA.populationSize = UInt32(poses.count)
+        guard let poseBuffer = device.makeBuffer(bytes: &poses, length: poses.count * MemoryLayout<DockPose>.stride,
+                                                 options: .storageModeShared),
+              let rescoreGABuffer = device.makeBuffer(bytes: &rescoreGA, length: MemoryLayout<GAParams>.stride,
+                                                      options: .storageModeShared) else {
+            throw Failure.scorerUnavailable(method)
+        }
+
+        isRunning = true
+        defer { isRunning = false }
+        let perPose = MTLSize(width: poses.count, height: 1, depth: 1)
+        let single = MTLSize(width: 1, height: 1, depth: 1)
+        switch method {
+        case .druseAffinity:
+            guard druseAFWeights != nil, druseAFEncodePipeline != nil,
+                  prepareDruseAFBuffers(ligandAtoms: prepared.heavyAtoms, ligandBonds: prepared.heavyBonds,
+                                        gpuLigAtoms: prepared.gpuAtoms, pocket: pocket, popSize: poses.count) else {
+                throw Failure.scorerUnavailable(method)
+            }
+            scoreDruseAF(buffer: poseBuffer, gaParamsBuffer: rescoreGABuffer, tg: perPose, tgs: single)
+        case .pignet2:
+            guard pignet2Weights != nil, pignet2EncodePipeline != nil, pignet2ScorePipeline != nil,
+                  preparePIGNet2Buffers(ligandAtoms: prepared.heavyAtoms, ligandBonds: prepared.heavyBonds,
+                                        gpuLigAtoms: prepared.gpuAtoms, pocket: pocket, popSize: poses.count) else {
+                throw Failure.scorerUnavailable(method)
+            }
+            scorePIGNet2(buffer: poseBuffer, gaParamsBuffer: rescoreGABuffer, tg: perPose, tgs: single)
+        case .vina, .drusina:
+            throw Failure.unsupportedRescoring(method)
+        }
+        // A GPU command-buffer error clears isRunning.
+        guard isRunning else { throw Failure.scorerUnavailable(method) }
+
+        let scored = poseBuffer.contents().bindMemory(to: DockPose.self, capacity: poses.count)
+        return results.enumerated().map { i, result in
+            var updated = result
+            updated.energy = scored[i].energy
+            updated.stericEnergy = scored[i].stericEnergy
+            updated.hydrophobicEnergy = scored[i].hydrophobicEnergy
+            updated.hbondEnergy = scored[i].hbondEnergy
+            updated.torsionPenalty = scored[i].torsionPenalty
+            updated.drusinaCorrection = 0
+            return updated
         }
     }
 }

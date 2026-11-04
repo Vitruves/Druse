@@ -45,7 +45,7 @@ struct ConstraintConfigSheet: View {
             .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
             .keyboardShortcut(.defaultAction)
         }
-        .frame(minWidth: 400, idealWidth: 420, minHeight: 420, idealHeight: 540)
+        .frame(minWidth: 420, idealWidth: 460, minHeight: 560, idealHeight: 680)
         .onAppear { setDefaults() }
     }
 
@@ -54,14 +54,21 @@ struct ConstraintConfigSheet: View {
     private var targetSection: some View {
         Section {
             LabeledContent {
-                DSTag(context.sourceType == .receptor ? "Receptor" : "Ligand",
-                      tone: context.sourceType == .receptor ? .protein : .ligand)
+                HStack(spacing: DS.Space.xs) {
+                    Circle()
+                        .fill(context.sourceType == .receptor ? DS.Color.protein : DS.Color.ligand)
+                        .frame(width: 8, height: 8)
+                    Text(context.sourceType == .receptor ? "Receptor" : "Ligand")
+                        .foregroundStyle(.secondary)
+                }
             } label: {
-                HStack(spacing: DS.Space.s) {
+                HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
                     Text(targetTitle)
-                        .font(context.residueName == nil ? DS.Font.body.weight(.medium) : DS.Font.mono.weight(.medium))
+                        .font(DS.Font.body.weight(.medium))
                     if let chain = context.chainID, !chain.isEmpty {
-                        DSTag("Chain \(chain)", monospaced: true)
+                        Text("Chain \(chain)")
+                            .font(DS.Font.secondary)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -82,7 +89,7 @@ struct ConstraintConfigSheet: View {
 
     private var targetTitle: String {
         if let atomName = context.atomName, let resName = context.residueName {
-            return "\(atomName) @ \(resName)"
+            return "\(atomName) · \(resName)"
         }
         return context.residueName ?? "Selection"
     }
@@ -197,7 +204,7 @@ struct ConstraintConfigSheet: View {
             ? .hard
             : .soft(kcalPerAngstromSq: softStrength)
 
-        var constraint = PharmacophoreConstraintDef(
+        viewModel.addPharmacophoreConstraint(PharmacophoreConstraintDef(
             targetScope: targetScope,
             interactionType: interactionType,
             strength: strength,
@@ -209,20 +216,7 @@ struct ConstraintConfigSheet: View {
             chainID: context.chainID,
             residueName: context.residueName,
             atomName: context.atomName
-        )
-
-        // Resolve target positions immediately
-        if context.sourceType == .receptor, let protein = viewModel.molecules.protein {
-            constraint.targetPositions = ConstraintAtomResolver.resolveTargetPositions(
-                constraint: constraint, atoms: protein.atoms, residues: protein.residues
-            )
-        }
-
-        // Assign group ID
-        constraint.groupID = viewModel.docking.pharmacophoreConstraints.count
-
-        viewModel.docking.pharmacophoreConstraints.append(constraint)
-        viewModel.pushToRenderer()
+        ))
     }
 }
 

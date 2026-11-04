@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Johan H.G. Natter
+# SPDX-License-Identifier: Apache-2.0
+#
+# druse — run DruseScript headless: `druse script.druse [--var name=value]…`, `druse <command> [args…]`,
+# `druse -c "cmd; cmd"` (`-i` then stays at the prompt), or `druse` alone for an interactive prompt with line editing and Tab completion.
+# All arguments go to `Druse --headless` (see `druse --help`; `druse --completions fish|zsh|bash` prints a
+# shell completion script). Druse.app is looked up in $DRUSE_APP, /Applications, ~/Applications, then the
+# newest Debug or Release build under this checkout's build/ (`xcodebuild -derivedDataPath build`),
+# ~/Library/Developer/Xcode/DerivedData, or the extra derived-data folders listed (':'-separated) in
+# $DRUSE_DERIVED_DATA.
+#
+# This copy is for source checkouts: make it executable once (`chmod +x Tools/druse`) and symlink it into
+# your PATH. An installed Druse.app does not need it: Settings ▸ Command Line writes an executable `druse`
+# wrapper for that app into ~/.local/bin or /usr/local/bin.
+set -euo pipefail
+
+is_app() { [[ -x "$1/Contents/MacOS/Druse" ]]; }
+
+find_app() {
+    if [[ -n "${DRUSE_APP:-}" ]]; then
+        if is_app "$DRUSE_APP"; then
+            printf '%s\n' "$DRUSE_APP"
+            return 0
+        fi
+        echo "druse: DRUSE_APP=$DRUSE_APP is not a Druse.app bundle" >&2
+        return 1
+    fi
+
+    local candidate
+    for candidate in "/Applications/Druse.app" "$HOME/Applications/Druse.app"; do
+        if is_app "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    local newest="" newest_time=0 time
+    # The checkout this script lives in (resolving a PATH symlink), whose build/ holds -derivedDataPath builds.
+    local checkout_build
+    checkout_build="$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")/build"
+    local search_roots=("$checkout_build" "$HOME/Library/Developer/Xcode/DerivedData")
+    local extra_roots=()
+    if [[ -n "${DRUSE_DERIVED_DATA:-}" ]]; then
+        IFS=':' read -r -a extra_roots <<< "$DRUSE_DERIVED_DATA"
+        search_roots+=("${extra_roots[@]}")
+    fi
+    while IFS= read -r -d '' candidate; do
+        is_app "$candidate" || continue
+        time=$(stat -f '%m' "$candidate/Contents/MacOS/Druse")
+        if (( time > newest_time )); then
+            newest="$candidate"
+            newest_time=$time
+        fi
+    done < <(find "${search_roots[@]}" -maxdepth 5 \
+                 -type d -path '*/Build/Products/*/Druse.app' -print0 -prune 2>/dev/null)
+
+    if [[ -n "$newest" ]]; then
+        printf '%s\n' "$newest"
+        return 0
+    fi
+    echo "druse: Druse.app not found; install it in /Applications or set DRUSE_APP=/path/to/Druse.app" >&2
+    return 1
+}
+
+app=$(find_app) || exit 2
+exec "$app/Contents/MacOS/Druse" --headless "$@"

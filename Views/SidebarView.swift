@@ -24,7 +24,7 @@ enum SidebarTab: String, CaseIterable {
         case .dock:             "arrow.down.right.and.arrow.up.left"
         case .results:          "chart.bar.doc.horizontal"
         case .leadOptimization: "arrow.triangle.branch"
-        case .sequence:         "textformat.abc"
+        case .sequence:         "list.bullet.indent"
         }
     }
 
@@ -255,8 +255,9 @@ struct NavigatorColumn: View {
 private enum StepBarDensity: CaseIterable { case full, compact, iconOnly }
 
 /// The single step switcher: pipeline steps 1…7, a divider, then the Sequence tool, in one
-/// capsule. Each button carries its status badge and the `pipeline_<Step>` accessibility ID.
-/// Shows number + icon + label when `availableWidth` allows, then number + icon, then icons.
+/// capsule. Each step's number disc carries its status colour (`DSStepMark`); every button has
+/// the `pipeline_<Step>` accessibility ID. Shows number + icon + label when `availableWidth`
+/// allows, then number + icon (with the label kept on the selected step), then icons.
 /// Every density is measured off-screen (hidden, inaccessible) so the bar always takes its
 /// natural width — toolbar items must not be wider than their content — and the width used
 /// is reported back so the shell can hand the rest of the toolbar to the activity capsule.
@@ -294,8 +295,8 @@ struct PipelineStepBar: View {
         HStack(spacing: density == .iconOnly ? DS.Space.xxs : DS.Space.xs) {
             ForEach(SidebarTab.allCases.filter(\.isPipelineStep), id: \.self) { button(for: $0, density) }
             Divider()
-                .frame(height: DS.Size.stepBarButton - DS.Space.m)
-                .padding(.horizontal, DS.Space.xs)
+                .frame(height: DS.Size.stepBarButton - DS.Space.l)
+                .padding(.horizontal, DS.Space.s)
             ForEach(SidebarTab.allCases.filter { !$0.isPipelineStep }, id: \.self) { button(for: $0, density) }
         }
         .padding(DS.Space.xxs + 1)
@@ -320,8 +321,10 @@ private struct PipelineStepButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: DS.Space.xs + 1) {
-                if density != .iconOnly { leadingMark }
+            HStack(spacing: DS.Space.s) {
+                if density != .iconOnly, let number = tab.stepNumber {
+                    DSStepMark(number: number, status: status, isSelected: isSelected)
+                }
                 Image(systemName: tab.icon)
                     .font(DS.Font.body.weight(isSelected ? .semibold : .regular))
                     .symbolRenderingMode(.hierarchical)
@@ -329,7 +332,7 @@ private struct PipelineStepButton: View {
                     .overlay(alignment: .bottomTrailing) {
                         if density == .iconOnly { badge.offset(x: 4, y: 3) }
                     }
-                if density == .full {
+                if showsTitle {
                     Text(tab.shortTitle)
                         .font(DS.Font.label.weight(isSelected ? .semibold : .medium))
                         .lineLimit(1)
@@ -340,6 +343,9 @@ private struct PipelineStepButton: View {
             .padding(.horizontal, density == .iconOnly ? DS.Space.s : DS.Space.m)
             .frame(minWidth: DS.Size.stepBarButton, minHeight: DS.Size.stepBarButton)
             .background(Capsule().fill(fill))
+            .overlay {
+                if isSelected { Capsule().strokeBorder(DS.Color.accent.opacity(0.35), lineWidth: 0.5) }
+            }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -351,35 +357,36 @@ private struct PipelineStepButton: View {
         .accessibilityIdentifier(AccessibilityID.pipelineTab(tab.rawValue))
     }
 
-    /// Step number in a small disc (status badge on its corner); tools get the badge alone.
-    @ViewBuilder
-    private var leadingMark: some View {
-        if let number = tab.stepNumber {
-            Text("\(number)")
-                .font(DS.Font.caption.weight(.bold))
-                .monospacedDigit()
-                .frame(width: 17, height: 17)
-                .background(Circle().fill(isSelected ? AnyShapeStyle(DS.Color.accentOnFill.opacity(0.22)) : AnyShapeStyle(DS.Color.controlFill)))
-                .overlay(alignment: .bottomTrailing) { badge.offset(x: 4, y: 3) }
+    /// Full density labels every step; compact keeps the label on the selected step only, so the
+    /// current step is always named. The Sequence tool is never labelled below full density.
+    private var showsTitle: Bool {
+        switch density {
+        case .full:     true
+        case .compact:  isSelected && tab.isPipelineStep
+        case .iconOnly: false
         }
     }
 
+    /// Icon-only density has no number disc, so status falls back to a corner badge there.
     @ViewBuilder
     private var badge: some View {
-        if let status, status != .ready || !isSelected {
+        if let status, status != .ready {
             DSStatusBadge(status, size: 6)
                 .padding(1)
                 .background(Circle().fill(.background))
         }
     }
 
+    /// Selected: accent on a soft accent fill (the same "selected" idiom as choice tiles and canvas
+    /// tools). Tools such as Sequence sit at secondary weight next to the seven major steps.
     private var foreground: AnyShapeStyle {
-        if isSelected { return AnyShapeStyle(DS.Color.accentOnFill) }
-        return status == .blocked ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary)
+        if isSelected { return AnyShapeStyle(DS.Color.accent) }
+        if !tab.isPipelineStep || status == .blocked { return AnyShapeStyle(.secondary) }
+        return AnyShapeStyle(.primary)
     }
 
     private var fill: AnyShapeStyle {
-        if isSelected { return AnyShapeStyle(DS.Color.accent) }
+        if isSelected { return AnyShapeStyle(DS.Color.accentSoft) }
         return isHovering ? AnyShapeStyle(DS.Color.controlFill) : AnyShapeStyle(.clear)
     }
 

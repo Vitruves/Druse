@@ -16,37 +16,66 @@ extension LogLevel {
     }
 }
 
-/// Bottom debug area of the main window: a 24 pt bar (console toggle, next-step hint,
-/// warning/error counters, console tools) above a resizable log console.
-/// Live status, progress and stop live in the toolbar's `ActivityView`.
+/// The two surfaces of the bottom panel. The terminal shows only the DruseScript session; the
+/// logs show only `ActivityLog` entries.
+enum BottomPanel: String, CaseIterable, Sendable {
+    case terminal
+    case logs
+
+    /// `@AppStorage` key of the surface last shown (the panel's visibility is `ui.consoleOpen`).
+    static let storageKey = "ui.bottomPanel"
+
+    var title: String {
+        switch self {
+        case .terminal: "Terminal"
+        case .logs: "Logs"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .terminal: "terminal"
+        case .logs: "list.bullet.rectangle"
+        }
+    }
+
+    /// Menu shortcut, as shown in help tags (View ▸ Show Terminal / Show Logs).
+    var shortcut: String {
+        switch self {
+        case .terminal: "⌃`"
+        case .logs: "⇧⌘Y"
+        }
+    }
+}
+
+/// Bottom debug area of the main window: a 24 pt bar (Terminal / Logs tabs, next-step hint,
+/// warning/error counters, terminal tools) above a resizable panel showing either the
+/// DruseScript terminal or the activity log (whose filters get their own header row, so the bar
+/// never runs out of width). Live status, progress and stop live in the toolbar's `ActivityView`.
 struct StatusStripView: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Binding var showConsole: Bool
-    @Binding var consoleHeight: CGFloat
+    @Binding var showPanel: Bool
+    @Binding var panel: BottomPanel
+    @Binding var panelHeight: CGFloat
     /// Step shown in the navigator; the hint never points at the step the user is already on.
     let currentStep: SidebarTab
     private let log = ActivityLog.shared
 
-    @State private var filterLevel: LogLevel? = nil
-    @GestureState private var dragStartHeight: CGFloat = 0
+    /// Created once for the window so scrollback, history, draft and a running command survive
+    /// hiding the panel, switching to the logs and changing workflow step.
+    @State private var session: ConsoleSession?
+    @State private var logState = LogPanelState()
+    @State private var dragStartHeight: CGFloat?
+    @State private var isHoveringResize = false
 
-    // Console selection state
-    @State private var selectedEntryIDs: Set<UUID> = []
-    @State private var lastClickedID: UUID? = nil
-
-    // Error handling: the console opens by itself for one error only; after that
-    // (until the user opens the console again) new errors just pulse the badge.
+    // Error handling: the Logs panel opens by itself for one error only; after that
+    // (until the user opens the panel again) new errors just pulse the badge.
     @State private var autoOpenArmed = true
     @State private var isAutoOpening = false
     @State private var errorPulse = 0
 
-    private static let consoleHeightRange: ClosedRange<CGFloat> = 80...500
-
-    private var filteredEntries: [LogEntry] {
-        guard let level = filterLevel else { return log.entries }
-        return log.entries.filter { $0.level == level }
-    }
+    private static let panelHeightRange: ClosedRange<CGFloat> = 80...500
 
     private var nextStep: SidebarTab? { currentStep.suggestedNextStep(in: viewModel) }
 
@@ -54,22 +83,35 @@ struct StatusStripView: View {
         VStack(spacing: 0) {
             Divider()
             bar
-            if showConsole {
+            if showPanel, let session {
                 Divider()
-                console
+                if panel == .logs {
+                    logToolbar
+                    Divider()
+                }
+                Group {
+                    switch panel {
+                    case .terminal: ConsoleView(session: session)
+                    case .logs: LogPanelView(state: logState, threshold: session.logLevel)
+                    }
+                }
+                .frame(height: min(Self.panelHeightRange.upperBound, max(Self.panelHeightRange.lowerBound, panelHeight)))
             }
+        }
+        .onAppear {
+            if session == nil { session = ConsoleSession(viewModel: viewModel) }
         }
         .onChange(of: log.entries.count) { _, _ in
             guard let last = log.entries.last, last.level == .error else { return }
-            if !showConsole && autoOpenArmed {
+            if !showPanel && autoOpenArmed {
                 autoOpenArmed = false
                 isAutoOpening = true
-                withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = true }
-            } else if !showConsole {
+                show(.logs)
+            } else if !showPanel || panel != .logs {
                 errorPulse &+= 1
             }
         }
-        .onChange(of: showConsole) { _, isOpen in
+        .onChange(of: showPanel) { _, isOpen in
             // A user-driven open re-arms the one-shot auto-open.
             if isAutoOpening {
                 isAutoOpening = false
@@ -83,52 +125,90 @@ struct StatusStripView: View {
 
     private var bar: some View {
         HStack(spacing: DS.Space.m) {
-            Button(action: toggleConsole) {
-                HStack(spacing: DS.Space.xs) {
-                    Image(systemName: showConsole ? "chevron.down" : "chevron.up")
-                        .font(DS.Font.caption.weight(.semibold))
-                    Text("Console")
-                        .font(DS.Font.secondary)
+            HStack(spacing: DS.Space.xxs) {
+                ForEach(BottomPanel.allCases, id: \.self) { tab in
+                    tabButton(tab)
                 }
-                .foregroundStyle(showConsole ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
-            .help(showConsole ? "Hide Console ⇧⌘Y" : "Show Console ⇧⌘Y")
-            .accessibilityIdentifier(AccessibilityID.statusToggleConsole)
+            .fixedSize()
+
+            if session?.isRunning == true {
+                ProgressView().controlSize(.mini)
+                    .help("A terminal command is running")
+            }
 
             if let next = nextStep {
-                Divider().frame(height: 12)
-                Button { next.request(in: viewModel) } label: {
-                    Label {
-                        Text("Up next: \(next.rawValue) — \(next.subtitle)").lineLimit(1)
-                    } icon: {
-                        Image(systemName: "lightbulb")
-                    }
-                    .font(DS.Font.secondary)
-                    .foregroundStyle(.secondary)
-                    .labelStyle(.titleAndIcon)
-                    .contentShape(Rectangle())
+                // Full hint, then the step name alone, then nothing: never a truncated "Prep…".
+                ViewThatFits(in: .horizontal) {
+                    upNextButton(next, text: "Up next: \(next.rawValue) — \(next.subtitle)")
+                    upNextButton(next, text: "Up next: \(next.rawValue)")
+                    Color.clear.frame(width: 0, height: 0)
                 }
-                .buttonStyle(.plain)
-                .help("Go to step \(next.shortcutNumber): \(next.rawValue) (⌘\(next.shortcutNumber))")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Spacer(minLength: DS.Space.m)
             }
-
-            Spacer(minLength: DS.Space.m)
 
             counters
 
-            if showConsole {
+            if showPanel, panel == .terminal, let session {
                 Divider().frame(height: 12)
-                consoleTools
+                terminalTools(session)
             }
         }
         .padding(.horizontal, DS.Space.l)
         .frame(height: DS.Size.debugBar)
         .background(.bar)
         .overlay(alignment: .top) {
-            if showConsole { resizeHandle }
+            if showPanel { resizeHandle }
         }
+    }
+
+    private func upNextButton(_ next: SidebarTab, text: String) -> some View {
+        Button { next.request(in: viewModel) } label: {
+            HStack(spacing: DS.Space.m) {
+                Divider().frame(height: 12)
+                Label(text, systemImage: "lightbulb")
+                    .labelStyle(.titleAndIcon)
+                    .lineLimit(1)
+            }
+            .font(DS.Font.secondary)
+            .foregroundStyle(.secondary)
+            .fixedSize()
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Go to step \(next.shortcutNumber): \(next.rawValue) (⌘\(next.shortcutNumber))")
+    }
+
+    /// Terminal / Logs tab: selects that surface, or hides the panel when it is already shown.
+    private func tabButton(_ tab: BottomPanel) -> some View {
+        let isActive = showPanel && panel == tab
+        return Button {
+            if isActive {
+                withAnimation(DS.Motion.respecting(reduceMotion)) { showPanel = false }
+            } else {
+                show(tab)
+            }
+        } label: {
+            Label(tab.title, systemImage: tab.systemImage)
+                .labelStyle(.titleAndIcon)
+                .lineLimit(1)
+                .fixedSize()
+                .font(DS.Font.secondary)
+                .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .padding(.horizontal, DS.Space.s)
+                .padding(.vertical, DS.Space.xxs)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+                        .fill(isActive ? DS.Color.controlFill : .clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isActive ? "Hide \(tab.title) \(tab.shortcut)" : "Show \(tab.title) \(tab.shortcut)")
+        .accessibilityAddTraits(isActive ? .isSelected : [])
+        .accessibilityIdentifier(tab == .terminal ? AccessibilityID.statusToggleConsole : "status_toggleLogs")
     }
 
     @ViewBuilder
@@ -146,18 +226,62 @@ struct StatusStripView: View {
 
     private func counterButton(count: Int, level: LogLevel, tone: DSTone) -> some View {
         Button {
-            filterLevel = level
-            if !showConsole { toggleConsole() }
+            logState.levelFilter = level
+            show(.logs)
         } label: {
             DSTag("\(count)", tone: tone, systemImage: level.icon)
         }
         .buttonStyle(.plain)
-        .help("Show \(count) \(level.rawValue.lowercased()) message\(count == 1 ? "" : "s")")
+        .help("\(count) \(level.rawValue.lowercased())\(count == 1 ? "" : "s") — click to show \(count == 1 ? "it" : "them") in Logs")
+        .accessibilityLabel("\(count) \(level.rawValue.lowercased())\(count == 1 ? "" : "s")")
+        .accessibilityHint("Shows them in the logs")
+    }
+
+    // MARK: - Terminal tools
+
+    @ViewBuilder
+    private func terminalTools(_ session: ConsoleSession) -> some View {
+        toolButton("Run Script…", systemImage: "play.rectangle", help: "Run a DruseScript file (.druse)",
+                   id: "console.runScript", action: session.chooseAndRunScript)
+            .disabled(session.isRunning)
+
+        if session.isRunning {
+            toolButton("Stop", systemImage: "stop.fill", help: "Cancel the running command ⌃C",
+                       id: "console.stop", action: session.interrupt)
+                .foregroundStyle(DS.Color.danger)
+        }
+
+        toolButton("Copy All", systemImage: "doc.on.clipboard", help: "Copy the whole terminal scrollback",
+                   id: AccessibilityID.statusCopyAll) { copyToPasteboard(session.plainTranscript) }
+
+        toolButton("Clear", systemImage: "clear", help: "Clear the terminal scrollback ⌘K",
+                   id: "console.clear", action: session.clearScrollback)
+    }
+
+    // MARK: - Log tools
+
+    /// Header row of the Logs surface: search, level and category filters, then the log actions.
+    private var logToolbar: some View {
+        HStack(spacing: DS.Space.m) {
+            logTools
+        }
+        .padding(.horizontal, DS.Space.l)
+        .frame(height: DS.Size.debugBar + DS.Space.s)
+        .background(.bar)
     }
 
     @ViewBuilder
-    private var consoleTools: some View {
-        Picker("Filter", selection: $filterLevel) {
+    private var logTools: some View {
+        @Bindable var logState = logState
+
+        TextField("Search logs", text: $logState.searchText)
+            .textFieldStyle(.roundedBorder)
+            .controlSize(.small)
+            .frame(minWidth: 120, idealWidth: 220, maxWidth: 260)
+            .help("Show only entries whose message or category contains this text")
+            .accessibilityIdentifier("logs.search")
+
+        Picker("Filter", selection: $logState.levelFilter) {
             Text("All").tag(nil as LogLevel?)
             ForEach(LogLevel.allCases, id: \.self) { level in
                 Image(systemName: level.icon)
@@ -169,32 +293,53 @@ struct StatusStripView: View {
         .labelsHidden()
         .controlSize(.small)
         .fixedSize()
-        .help("Filter console by log level")
+        .help("Filter log entries by level")
 
-        if !selectedEntryIDs.isEmpty {
-            Button(action: copySelected) {
-                Label("\(selectedEntryIDs.count)", systemImage: "doc.on.doc")
+        Picker("Category", selection: $logState.categoryFilter) {
+            Text("All Categories").tag(nil as LogCategory?)
+            Divider()
+            ForEach(LogCategory.allCases, id: \.self) { category in
+                Text(category.rawValue).tag(category as LogCategory?)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .controlSize(.small)
+        .fixedSize()
+        .help("Filter log entries by category")
+
+        Spacer(minLength: DS.Space.m)
+
+        if !logState.selectedIDs.isEmpty {
+            Button { copyToPasteboard(logState.copyText(of: visibleLogEntries)) } label: {
+                Label("\(logState.selectedIDs.count)", systemImage: "doc.on.doc")
                     .monospacedDigit()
             }
             .buttonStyle(.borderless)
-            .help("Copy selected lines ⌘C")
+            .help("Copy selected entries ⌘C")
             .accessibilityIdentifier(AccessibilityID.statusCopySelected)
         }
 
-        toolButton("Copy All", systemImage: "doc.on.clipboard", help: "Copy all console output",
-                   id: AccessibilityID.statusCopyAll, action: copyAll)
+        toolButton("Copy All", systemImage: "doc.on.clipboard", help: "Copy every entry shown",
+                   id: "logs.copyAll") {
+            logState.clearSelection()
+            copyToPasteboard(logState.copyText(of: visibleLogEntries))
+        }
 
-        toolButton("Clear", systemImage: "trash", help: "Clear all log entries",
+        toolButton("Clear", systemImage: "trash", help: "Clear the activity log (the log file is kept)",
                    id: AccessibilityID.statusClearLog) {
+            logState.clearSelection()
             log.clear()
-            selectedEntryIDs.removeAll()
-            lastClickedID = nil
         }
 
         if log.currentLogFileURL != nil {
             toolButton("Reveal Log", systemImage: "doc.text.magnifyingglass", help: "Reveal log file in Finder",
                        id: AccessibilityID.statusRevealLog) { log.revealLogInFinder() }
         }
+    }
+
+    private var visibleLogEntries: [LogEntry] {
+        logState.visibleEntries(log.entries, threshold: session?.logLevel ?? .debug)
     }
 
     private func toolButton(_ title: String, systemImage: String, help: String, id: String,
@@ -208,137 +353,42 @@ struct StatusStripView: View {
         .accessibilityIdentifier(id)
     }
 
+    /// Drag strip along the bar's top edge. It stays inside the bar (the Metal view above would
+    /// swallow events) and measures in window coordinates, because the bar itself moves while the
+    /// panel grows. A highlighted hairline shows it on hover and while dragging.
     private var resizeHandle: some View {
         Color.clear
-            .frame(height: 5)
+            .frame(height: DS.Space.s)
             .contentShape(Rectangle())
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(DS.Color.accent)
+                    .frame(height: 2)
+                    .opacity(isHoveringResize || dragStartHeight != nil ? 0.8 : 0)
+                    .animation(DS.Motion.snappy, value: isHoveringResize)
+            }
             .pointerStyle(.rowResize)
+            .onHover { isHoveringResize = $0 }
             .gesture(
-                DragGesture(minimumDistance: 1)
-                    .updating($dragStartHeight) { _, state, _ in
-                        if state == 0 { state = consoleHeight }
-                    }
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { value in
-                        let initial = dragStartHeight != 0 ? dragStartHeight : consoleHeight
-                        let range = Self.consoleHeightRange
-                        consoleHeight = min(range.upperBound, max(range.lowerBound, initial - value.translation.height))
+                        let initial = dragStartHeight ?? panelHeight
+                        dragStartHeight = initial
+                        let range = Self.panelHeightRange
+                        panelHeight = min(range.upperBound, max(range.lowerBound, initial - value.translation.height))
                     }
+                    .onEnded { _ in dragStartHeight = nil }
             )
-            .offset(y: -2)
+            .help("Drag to resize the panel")
             .accessibilityHidden(true)
-    }
-
-    // MARK: - Console
-
-    private var console: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(filteredEntries) { entry in
-                        logEntryRow(entry)
-                            .id(entry.id)
-                    }
-                }
-                .padding(.horizontal, DS.Space.m)
-                .padding(.vertical, DS.Space.xs)
-            }
-            .onChange(of: log.entries.count) { _, _ in
-                if let last = filteredEntries.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-            }
-            .onChange(of: filterLevel) { _, _ in scrollToLatest(proxy) }
-            .onAppear { scrollToLatest(proxy) }
-            .onKeyPress(.escape) {
-                selectedEntryIDs.removeAll()
-                lastClickedID = nil
-                return .handled
-            }
-        }
-        .frame(height: min(Self.consoleHeightRange.upperBound, max(Self.consoleHeightRange.lowerBound, consoleHeight)))
-        .background(Color(nsColor: .textBackgroundColor))
-        .copyable(formatEntries(selectedEntryIDs.isEmpty ? filteredEntries : selectedEntries))
-    }
-
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        guard let last = filteredEntries.last else { return }
-        DispatchQueue.main.async {
-            proxy.scrollTo(last.id, anchor: .bottom)
-        }
-    }
-
-    @ViewBuilder
-    private func logEntryRow(_ entry: LogEntry) -> some View {
-        let isSelected = selectedEntryIDs.contains(entry.id)
-        HStack(alignment: .firstTextBaseline, spacing: DS.Space.m) {
-            Text(entry.formattedTime)
-                .foregroundStyle(.secondary)
-                .frame(width: 84, alignment: .leading)
-            Image(systemName: entry.level.icon)
-                .foregroundStyle(entry.level.dsColor)
-                .frame(width: 14)
-            Text(entry.category.rawValue)
-                .foregroundStyle(.secondary)
-                .frame(width: 72, alignment: .leading)
-                .lineLimit(1)
-            Text(entry.message)
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-                .textSelection(.enabled)
-            Spacer(minLength: 0)
-        }
-        .font(DS.Font.monoSmall)
-        .padding(.vertical, DS.Space.xxs + 1)
-        .padding(.horizontal, DS.Space.xs)
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
-                .fill(isSelected ? DS.Color.accentSoft : .clear)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            handleEntryClick(entry, shiftKey: NSEvent.modifierFlags.contains(.shift))
-        }
     }
 
     // MARK: - Actions
 
-    private func toggleConsole() {
-        withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole.toggle() }
-    }
-
-    private var selectedEntries: [LogEntry] {
-        filteredEntries.filter { selectedEntryIDs.contains($0.id) }
-    }
-
-    private func handleEntryClick(_ entry: LogEntry, shiftKey: Bool) {
-        let entries = filteredEntries
-        if shiftKey, let anchorID = lastClickedID,
-           let anchorIdx = entries.firstIndex(where: { $0.id == anchorID }),
-           let clickIdx = entries.firstIndex(where: { $0.id == entry.id }) {
-            let range = min(anchorIdx, clickIdx)...max(anchorIdx, clickIdx)
-            selectedEntryIDs = Set(entries[range].map(\.id))
-        } else if selectedEntryIDs.contains(entry.id) && selectedEntryIDs.count == 1 {
-            selectedEntryIDs.removeAll()
-            lastClickedID = nil
-        } else {
-            selectedEntryIDs = [entry.id]
-            lastClickedID = entry.id
-        }
-    }
-
-    private func formatEntries(_ entries: [LogEntry]) -> [String] {
-        let text = entries.map { entry in
-            "\(entry.formattedTime)  [\(entry.level.rawValue)]  [\(entry.category.rawValue)]  \(entry.message)"
-        }.joined(separator: "\n")
-        return [text]
-    }
-
-    private func copySelected() {
-        copyToPasteboard(formatEntries(selectedEntries).first ?? "")
-    }
-
-    private func copyAll() {
-        copyToPasteboard(formatEntries(filteredEntries).first ?? "")
+    private func show(_ surface: BottomPanel) {
+        panel = surface
+        guard !showPanel else { return }
+        withAnimation(DS.Motion.respecting(reduceMotion)) { showPanel = true }
     }
 
     private func copyToPasteboard(_ text: String) {

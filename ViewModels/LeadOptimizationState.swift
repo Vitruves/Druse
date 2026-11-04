@@ -62,6 +62,26 @@ struct LeadOptimizationState {
     var selectedAnalogIndex: Int?
     var showComparison: Bool = false
 
+    // MARK: Parameter defaults
+
+    /// Restores the generation parameters, property directions and ADMET filters to their
+    /// defaults, keeping the reference and the generated analogs (`leadopt defaults`).
+    mutating func resetParameters() {
+        let defaults = LeadOptimizationState()
+        analogCount = defaults.analogCount
+        similarityThreshold = defaults.similarityThreshold
+        keepScaffold = defaults.keepScaffold
+        polarityDirection = defaults.polarityDirection
+        rigidityDirection = defaults.rigidityDirection
+        lipophilicityDirection = defaults.lipophilicityDirection
+        sizeDirection = defaults.sizeDirection
+        filterLipinski = defaults.filterLipinski
+        filterVeber = defaults.filterVeber
+        filterHERG = defaults.filterHERG
+        filterCYP = defaults.filterCYP
+        maxLogP = defaults.maxLogP
+    }
+
     // MARK: Computed
 
     var hasReference: Bool { !referenceSMILES.isEmpty }

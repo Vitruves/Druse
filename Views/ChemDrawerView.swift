@@ -242,7 +242,12 @@ struct ChemDrawerSheet: View {
                     .lineLimit(1)
                 Spacer(minLength: DS.Space.l)
 
-                if !currentSmiles.isEmpty {
+                if currentSmiles.isEmpty {
+                    Text("Draw a structure — its SMILES appears here as you edit.")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
                     Text(currentSmiles)
                         .font(DS.Font.monoSmall)
                         .foregroundStyle(.secondary)

@@ -1,0 +1,31 @@
+# Redock the crystal ligand of PDBbind 1add into its own pocket and export the result.
+# Run: druse Examples/dock_one_ligand.druse
+# Writes poses, the score table and the best complex to $out (/tmp; edit the "set out" line to write elsewhere).
+set onerror=stop
+set data = ../Benchmark/data/refined-set/1add
+set out = /tmp
+
+load $data/1add_protein.pdb
+load $data/1add_ligand.sdf
+
+# One-shot receptor preparation (cleanup, repair, protonation at pH 7.4, charges)
+prep waters=remove
+
+# Docking box around the crystal ligand, 6 Å padding
+pocket box fit around=ligand padding=6
+pocket box show
+
+# Vina scoring with the standard budget; show what will run first
+dock set scoring=vina
+dock config budget
+dock preset=standard
+
+results top=5
+results clusters
+interactions pose=1
+rmsd reference top=5
+validity top=5
+
+export poses $out/1add_poses.sdf top=5
+export results $out/1add_results.csv
+export complex 1 $out/1add_complex.pdb

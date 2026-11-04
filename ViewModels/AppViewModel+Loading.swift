@@ -30,7 +30,10 @@ extension AppViewModel {
 
     // MARK: - PDB Loading
 
-    func loadFromPDB(id: String) {
+    /// Fetches and loads a PDB entry. The returned task completes when loading has finished
+    /// and yields whether the entry was loaded.
+    @discardableResult
+    func loadFromPDB(id: String) -> Task<Bool, Never> {
         workspace.isLoading = true
         let upper = id.uppercased()
         let cached = PDBService.isCached(id: id)
@@ -40,10 +43,12 @@ extension AppViewModel {
                  : "Fetching PDB \(upper) from RCSB...",
                  category: .network)
 
-        Task {
+        return Task {
+            var loaded = false
             do {
                 let content = try await PDBService.shared.fetchPDBFile(id: id)
                 molecules.rawPDBContent = content
+                resetPreparationHistory()
                 workspace.loadingMessage = "Parsing..."
 
                 let result = await Task.detached { PDBParser.parse(content) }.value
@@ -65,14 +70,14 @@ extension AppViewModel {
                                           bonds: firstLig.bonds, title: firstLig.title)
                     setLigandForDocking(ligMol)
 
+                    // Crystal ligands carry no hydrogens or charges: keep them unprepared (still
+                    // dockable as-is for redocking) until the user runs ligand preparation.
                     for ligData in result.ligands {
                         let entry = LigandEntry(
                             name: ligData.name,
                             smiles: ligData.smiles ?? "",
                             atoms: ligData.atoms,
-                            bonds: ligData.bonds,
-                            isPrepared: true,
-                            conformerCount: 1
+                            bonds: ligData.bonds
                         )
                         ligandDB.add(entry)
                     }
@@ -107,6 +112,7 @@ extension AppViewModel {
                 }
 
                 workspace.statusMessage = "\(id.uppercased()) loaded"
+                loaded = true
             } catch {
                 log.error("Failed to load \(id): \(error.localizedDescription)", category: .pdb)
                 workspace.statusMessage = "Failed to load \(id)"
@@ -114,15 +120,19 @@ extension AppViewModel {
 
             workspace.isLoading = false
             workspace.loadingMessage = ""
+            return loaded
         }
     }
 
     // MARK: - File Loading
 
-    func loadFromFile(url: URL) {
+    /// Loads a structure or ligand file. Returns nil for an unsupported format; otherwise the
+    /// returned task completes when loading has finished and yields whether the file was read.
+    @discardableResult
+    func loadFromFile(url: URL) -> Task<Bool, Never>? {
         guard let format = FileImportHandler.detectFormat(url: url) else {
             log.error("[Loading] Unsupported file format: \(url.pathExtension) (\(url.lastPathComponent))", category: .system)
-            return
+            return nil
         }
 
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
@@ -137,7 +147,8 @@ extension AppViewModel {
         workspace.isLoading = true
         workspace.loadingMessage = "Loading \(url.lastPathComponent)..."
 
-        Task {
+        return Task {
+            var loaded = false
             do {
                 switch format {
                 case .pdb:
@@ -146,6 +157,7 @@ extension AppViewModel {
                         return (content, PDBParser.parse(content))
                     }.value
                     molecules.rawPDBContent = content
+                    resetPreparationHistory()
 
                     if let protData = result.protein {
                         let mol = Molecule(name: protData.name, atoms: protData.atoms,
@@ -210,6 +222,7 @@ extension AppViewModel {
                     let content = try await Task.detached {
                         try String(contentsOf: url, encoding: .utf8)
                     }.value
+                    resetPreparationHistory()
                     do {
                         let mmcifResult = try await Task.detached { try MMCIFParser.parse(content: content) }.value
                         let mol = Molecule(name: mmcifResult.name, atoms: mmcifResult.atoms,
@@ -243,6 +256,7 @@ extension AppViewModel {
                 pushToRenderer()
                 renderer?.fitToContent()
                 workspace.statusMessage = "\(url.lastPathComponent) loaded"
+                loaded = true
             } catch {
                 log.error("Failed to load file: \(error.localizedDescription)", category: .system)
                 workspace.statusMessage = "Failed to load file"
@@ -250,6 +264,7 @@ extension AppViewModel {
 
             workspace.isLoading = false
             workspace.loadingMessage = ""
+            return loaded
         }
     }
 

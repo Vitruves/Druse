@@ -19,6 +19,8 @@ enum DS {
         static let s: CGFloat = 6         // buttons, fields, canvas tool buttons
         static let m: CGFloat = 10        // cards, embedded lists, popovers
         static let floating: CGFloat = 14 // glass clusters, HUD, legends
+        /// Buttons nested in a floating cluster (floating radius minus the cluster's `xs` inset), so corners stay concentric.
+        static let floatingInner: CGFloat = floating - Space.xs
         static let l: CGFloat = 20        // welcome cards / hero
     }
 
@@ -26,12 +28,19 @@ enum DS {
     enum Size {
         static let toolButton: CGFloat = 28, toolIcon: CGFloat = 14
         static let stepBarButton: CGFloat = 30
+        /// Step-number disc in the toolbar step bar.
+        static let stepNumber: CGFloat = 18
+        /// Removal / clear buttons on rows and chips: never smaller than this hit target.
+        static let removeButton: CGFloat = 16
         static let rowHeight: CGFloat = 22, buttonHeight: CGFloat = 26, primaryButtonHeight: CGFloat = 30
         static let labelColumn: CGFloat = 96, valueColumn: CGFloat = 60, numberField: CGFloat = 72
         static let navigatorMin: CGFloat = 300, navigatorIdeal: CGFloat = 340, navigatorMax: CGFloat = 440
         static let inspectorMin: CGFloat = 240, inspectorIdeal: CGFloat = 280, inspectorMax: CGFloat = 380
         static let debugBar: CGFloat = 24
+        /// Minimum window frame, toolbar included.
         static let windowMin = CGSize(width: 1180, height: 720)
+        /// Height of the unified toolbar above the window content.
+        static let toolbarHeight: CGFloat = 52
         static let windowDefault = CGSize(width: 1440, height: 900)
     }
 
@@ -51,6 +60,12 @@ enum DS {
         static let canvasLabel  = SwiftUI.Font.system(size: 9, weight: .medium)           // ONLY inside zoomable canvases
     }
 
+    // MARK: Opacity
+    enum Opacity {
+        /// Disabled controls drawn by hand (plain-style canvas buttons, choice tiles).
+        static let disabled: Double = 0.32
+    }
+
     // MARK: Motion
     enum Motion {
         static let snappy = Animation.snappy(duration: 0.22)
@@ -62,8 +77,27 @@ enum DS {
     // MARK: Colors (all dynamic light/dark)
     enum Color {
         static let accent                 = SwiftUI.Color.accentColor
-        static let accentOnFill           = dynamic(light: 0xFFFFFF, dark: 0x04262B)
-        static let accentSoft             = dynamic(light: 0x0A7C8C, dark: 0x3CC8D6, lightAlpha: 0.12, darkAlpha: 0.18)
+        /// Text/icons on a solid accent fill: white, or near-black when the effective accent is light
+        /// (the app's teal in Dark mode). Follows the user's system accent colour.
+        static let accentOnFill           = SwiftUI.Color(nsColor: NSColor(name: nil) { appearance in
+            var luminance: CGFloat = 0
+            appearance.performAsCurrentDrawingAppearance {
+                let accent = NSColor.controlAccentColor.usingColorSpace(.sRGB) ?? .systemBlue
+                luminance = 0.2126 * accent.redComponent + 0.7152 * accent.greenComponent + 0.0722 * accent.blueComponent
+            }
+            return luminance > 0.6 ? srgb(0x04262B, alpha: 1) : .white
+        })
+        /// Tinted background for selected tiles and toggled tools; always derived from the effective
+        /// accent so it never disagrees with `accent` when the user picks a system accent colour.
+        static let accentSoft             = SwiftUI.Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            var color = NSColor.controlAccentColor
+            appearance.performAsCurrentDrawingAppearance {
+                color = (NSColor.controlAccentColor.usingColorSpace(.sRGB) ?? .systemBlue)
+                    .withAlphaComponent(isDark ? 0.22 : 0.13)
+            }
+            return color
+        })
         static let cardFill               = dynamic(light: 0x000000, dark: 0xFFFFFF, lightAlpha: 0.035, darkAlpha: 0.05)
         static let hairline               = dynamic(light: 0x000000, dark: 0xFFFFFF, lightAlpha: 0.08, darkAlpha: 0.10)
         static let controlFill            = dynamic(light: 0x000000, dark: 0xFFFFFF, lightAlpha: 0.05, darkAlpha: 0.08)
@@ -255,11 +289,15 @@ struct DSStepHeader<Accessory: View>: View {
             Text(tab.subtitle)
                 .font(DS.Font.secondary)
                 .foregroundStyle(.secondary)
+            // Live data, so it gets readable contrast (not `.tertiary`) and may wrap instead of clipping.
             if let summary {
                 Text(summary)
-                    .font(DS.Font.secondary)
+                    .font(DS.Font.secondary.weight(.medium))
                     .monospacedDigit()
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, DS.Space.xxs)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -306,6 +344,8 @@ struct DSStepScaffold<Content: View, Footer: View>: View {
                 .padding(.vertical, DS.Space.m)
         }
         .scrollIndicators(.automatic)
+        // Content scrolling under the pinned footer fades out instead of reading as clipped.
+        .scrollEdgeEffectStyle(.soft, for: .vertical)
     }
 }
 
@@ -560,15 +600,25 @@ struct DSMetricGrid<Content: View>: View {
 
 // MARK: - Floating (Liquid Glass) surfaces
 
+/// How `dsFloating` surfaces are drawn. Liquid Glass refracts what is behind its edges, which
+/// smears atoms under wide surfaces such as legends; `.solid` draws an opaque material card instead.
+enum DSFloatingStyle: Sendable { case glass, solid }
+
+extension EnvironmentValues {
+    @Entry var dsFloatingStyle: DSFloatingStyle = .glass
+}
+
 private struct DSFloatingModifier<S: Shape>: ViewModifier {
     let shape: S
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.dsFloatingStyle) private var style
 
     func body(content: Content) -> some View {
-        if reduceTransparency {
+        if reduceTransparency || style == .solid {
             content
-                .background(.thickMaterial, in: shape)
+                .background(reduceTransparency ? AnyShapeStyle(.thickMaterial) : AnyShapeStyle(.regularMaterial), in: shape)
                 .overlay(shape.stroke(DS.Color.hairline, lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
         } else {
             content.glassEffect(.regular, in: shape)
         }
@@ -582,6 +632,11 @@ extension View {
 
     func dsFloatingCapsule() -> some View {
         modifier(DSFloatingModifier(shape: Capsule()))
+    }
+
+    /// Sets how the `dsFloating` surfaces inside this view are drawn (glass by default).
+    func dsFloatingStyle(_ style: DSFloatingStyle) -> some View {
+        environment(\.dsFloatingStyle, style)
     }
 
     /// Card chrome (cardFill + hairline, radius `m`) for custom containers.
@@ -638,6 +693,8 @@ struct DSMoleculeChip: View {
                     Image(systemName: "xmark.circle.fill")
                         .font(DS.Font.secondary)
                         .foregroundStyle(.secondary)
+                        .frame(width: DS.Size.removeButton, height: DS.Size.removeButton)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .help("Remove \(name)")
@@ -658,6 +715,7 @@ struct DSCanvasToolButton: View {
     let help: String
     let action: () -> Void
     @State private var isHovering = false
+    @Environment(\.isEnabled) private var isEnabled
 
     init(_ title: String, systemImage: String, isOn: Bool = false, help: String, action: @escaping () -> Void) {
         self.title = title
@@ -668,20 +726,37 @@ struct DSCanvasToolButton: View {
     }
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
         Button(action: action) {
             Image(systemName: systemImage)
                 .font(.system(size: DS.Size.toolIcon, weight: .medium))
-                .foregroundStyle(isOn ? AnyShapeStyle(DS.Color.accent) : AnyShapeStyle(Color.primary.opacity(0.85)))
-                .frame(width: DS.Size.toolButton, height: DS.Size.toolButton)
-                .background(shape.fill(isOn ? DS.Color.accentSoft : (isHovering ? DS.Color.controlFill : Color.clear)))
-                .contentShape(shape)
+                .dsCanvasToolChrome(isOn: isOn, isHovering: isHovering, isEnabled: isEnabled)
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
         .help(help)
         .accessibilityLabel(title)
         .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+}
+
+extension View {
+    /// Shared look of canvas tool buttons (symbol or text glyph): concentric with the cluster,
+    /// accent when on, hover fill, clearly dimmed when disabled.
+    func dsCanvasToolChrome(isOn: Bool, isHovering: Bool, isEnabled: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.floatingInner, style: .continuous)
+        return self
+            .foregroundStyle(isOn ? AnyShapeStyle(DS.Color.accent) : AnyShapeStyle(Color.primary.opacity(0.85)))
+            .frame(width: DS.Size.toolButton, height: DS.Size.toolButton)
+            .background(shape.fill(isOn ? DS.Color.accentSoft : (isHovering && isEnabled ? DS.Color.controlFill : Color.clear)))
+            .opacity(isEnabled ? 1 : DS.Opacity.disabled)
+            .contentShape(shape)
+    }
+}
+
+/// Hairline between groups of a horizontal `DSCanvasToolCluster`.
+struct DSCanvasToolDivider: View {
+    var body: some View {
+        Divider().frame(height: DS.Size.toolButton - DS.Space.m).padding(.horizontal, DS.Space.xxs)
     }
 }
 
@@ -702,6 +777,61 @@ struct DSCanvasToolCluster<Content: View>: View {
             layout { content }
                 .padding(DS.Space.xs)
                 .dsFloating()
+        }
+    }
+}
+
+// MARK: - Step mark
+
+/// Step number in a disc whose colour carries the step's status, so status reads without a
+/// separate dot: done = success, attention = warning, running = accent ring, ready = neutral,
+/// blocked = outlined and dimmed. Used by the toolbar step bar.
+struct DSStepMark: View {
+    let number: Int
+    let status: DSStepStatus?
+    let isSelected: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Text("\(number)")
+            .font(DS.Font.caption.weight(.bold))
+            .monospacedDigit()
+            .foregroundStyle(numberStyle)
+            .frame(width: DS.Size.stepNumber, height: DS.Size.stepNumber)
+            .background(Circle().fill(fill))
+            .overlay {
+                switch status {
+                case .blocked:
+                    Circle().strokeBorder(DS.Color.hairline, lineWidth: 1)
+                case .running:
+                    Circle()
+                        .strokeBorder(DS.Color.accent, lineWidth: 1.5)
+                        .phaseAnimator(reduceMotion ? [1.0] : [1.0, 0.3]) { ring, phase in ring.opacity(phase) }
+                            animation: { _ in .easeInOut(duration: 0.8) }
+                default:
+                    EmptyView()
+                }
+            }
+            .accessibilityHidden(true)
+    }
+
+    private var numberStyle: AnyShapeStyle {
+        switch status {
+        case .done:      AnyShapeStyle(DS.Color.success)
+        case .attention: AnyShapeStyle(DS.Color.warning)
+        case .running:   AnyShapeStyle(DS.Color.accent)
+        case .blocked:   AnyShapeStyle(.tertiary)
+        case .ready, nil: isSelected ? AnyShapeStyle(DS.Color.accent) : AnyShapeStyle(.primary)
+        }
+    }
+
+    private var fill: AnyShapeStyle {
+        switch status {
+        case .done:      AnyShapeStyle(DS.Color.success.opacity(0.16))
+        case .attention: AnyShapeStyle(DS.Color.warning.opacity(0.18))
+        case .running:   AnyShapeStyle(DS.Color.accentSoft)
+        case .blocked:   AnyShapeStyle(.clear)
+        case .ready, nil: AnyShapeStyle(DS.Color.controlFill)
         }
     }
 }

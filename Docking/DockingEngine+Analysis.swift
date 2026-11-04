@@ -322,7 +322,7 @@ extension DockingEngine {
         if candidates.count >= 2048 {
             flags.withUnsafeMutableBufferPointer { buf in
                 nonisolated(unsafe) let out = buf
-                DispatchQueue.concurrentPerform(iterations: candidates.count) { c in
+                CPUBudget.concurrentPerform(iterations: candidates.count) { c in
                     out[c] = isWithinRMSD(leader, positions[candidates[c]], maxSumSq: maxSumSq)
                 }
             }

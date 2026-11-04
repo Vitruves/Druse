@@ -141,6 +141,11 @@ final class LigandDatabase {
     private var saveTask: Task<Void, Never>?
     private let saveDebounceInterval: Duration = .milliseconds(500)
 
+    /// The preparation pipeline (enumerate / dominant / basic) that writes into this database.
+    /// Shared by the Ligand Database window and the console so both see one run, one progress
+    /// and one set of session defaults.
+    @ObservationIgnored private(set) lazy var preparation = LigandPreparationService(database: self)
+
     /// Auto-save is only allowed while the in-memory entries are the authoritative copy of the
     /// default database file: the file did not exist at launch, or it was loaded/saved explicitly.
     /// Otherwise the first edit of a fresh session (or a project load) would overwrite the user's
@@ -198,19 +203,6 @@ final class LigandDatabase {
         entries.append(entry)
     }
 
-    /// Add a molecule from SMILES and immediately run full preparation (3D + minimize + charges).
-    /// Returns the entry UUID so caller can track progress.
-    @discardableResult
-    func addAndAutoPrepare(_ smiles: String, name: String) -> UUID {
-        var entry = LigandEntry(name: name, smiles: smiles)
-        if let desc = RDKitBridge.computeDescriptors(smiles: smiles) {
-            entry.descriptors = desc
-        }
-        let id = entry.id
-        entries.append(entry)
-        return id
-    }
-
     // MARK: - Remove
 
     func remove(at offsets: IndexSet) {
@@ -234,37 +226,6 @@ final class LigandDatabase {
     func update(_ entry: LigandEntry) {
         if let idx = entries.firstIndex(where: { $0.id == entry.id }) {
             entries[idx] = entry
-        }
-    }
-
-    // MARK: - Prepare Single
-
-    func prepareEntry(at index: Int, addH: Bool = true, minimize: Bool = true, charges: Bool = true) {
-        guard index < entries.count else { return }
-        let id = entries[index].id
-        let smiles = entries[index].smiles
-        let name = entries[index].name
-
-        Task {
-            let (mol, desc, canonSMILES, error) = await Task.detached {
-                RDKitBridge.prepareLigand(smiles: smiles, name: name,
-                                          addHydrogens: addH, minimize: minimize, computeCharges: charges)
-            }.value
-
-            guard let currentIndex = entries.firstIndex(where: { $0.id == id }) else { return }
-
-            if let mol {
-                entries[currentIndex].atoms = mol.atoms
-                entries[currentIndex].bonds = mol.bonds
-                entries[currentIndex].descriptors = desc
-                entries[currentIndex].isPrepared = true
-                entries[currentIndex].preparationDate = Date()
-                entries[currentIndex].conformerCount = 1
-                if let canonSMILES { entries[currentIndex].originalSMILES = canonSMILES }
-            }
-            if let error {
-                ActivityLog.shared.error("Failed to prepare \(name): \(error)", category: .prep)
-            }
         }
     }
 
@@ -325,8 +286,13 @@ final class LigandDatabase {
 
     func importSMIFile(url: URL, prepare: Bool = true) throws {
         let content = try String(contentsOf: url, encoding: .utf8)
-        let baseIndex = entries.count
-        let lines = content.components(separatedBy: .newlines)
+        importSMILES(Self.smiLines(content, baseIndex: entries.count), prepare: prepare)
+    }
+
+    /// Parses a SMILES list: one molecule per line as `SMILES name` (tab or space separated,
+    /// either column order), `#` comments ignored; unnamed molecules get `Mol_<n>`.
+    nonisolated static func smiLines(_ content: String, baseIndex: Int) -> [(smiles: String, name: String)] {
+        content.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
             .enumerated()
@@ -337,28 +303,19 @@ final class LigandDatabase {
                 if tabParts.count > 1 {
                     parts = tabParts
                 } else {
-                    let spaceParts = line.split(separator: " ", maxSplits: 1).map(String.init)
-                    parts = spaceParts
+                    parts = line.split(separator: " ", maxSplits: 1).map(String.init)
                 }
                 if parts.isEmpty { return nil }
 
                 if parts.count > 1 {
-                    // Two columns: figure out which is SMILES
-                    let col0IsSMILES = Self.looksLikeSMILES(parts[0])
-                    let col1IsSMILES = Self.looksLikeSMILES(parts[1])
-                    if col0IsSMILES {
-                        return (parts[0], parts[1])
-                    } else if col1IsSMILES {
+                    // Two columns: figure out which is SMILES; default to column 0
+                    if !looksLikeSMILES(parts[0]) && looksLikeSMILES(parts[1]) {
                         return (parts[1], parts[0])
                     }
-                    // Default: assume column 0 is SMILES
                     return (parts[0], parts[1])
-                } else {
-                    return (parts[0], "Mol_\(baseIndex + offset + 1)")
                 }
+                return (parts[0], "Mol_\(baseIndex + offset + 1)")
             }
-
-        importSMILES(lines, prepare: prepare)
     }
 
     // MARK: - Import from CSV
@@ -490,7 +447,7 @@ final class LigandDatabase {
     }
 
     /// Heuristic: does this string look like a SMILES notation?
-    static func looksLikeSMILES(_ s: String) -> Bool {
+    nonisolated static func looksLikeSMILES(_ s: String) -> Bool {
         guard s.count >= 2 else { return false }
         // SMILES have organic atoms and structural chars; scores/names don't
         let smilesChars = CharacterSet(charactersIn: "CNOSPFIBrcnospfi[]()=#@+-/\\%0123456789")
@@ -517,34 +474,43 @@ final class LigandDatabase {
 
     // MARK: - Persistence
 
-    private static var defaultURL: URL {
+    /// ~/Library/Application Support/Druse/ligand_database.json (Save / Load Database).
+    static var defaultURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let druseDir = appSupport.appendingPathComponent("Druse", isDirectory: true)
         try? FileManager.default.createDirectory(at: druseDir, withIntermediateDirectories: true)
         return druseDir.appendingPathComponent("ligand_database.json")
     }
 
-    /// Save the database to ~/Library/Application Support/Druse/ligand_database.json
-    func save() {
+    /// Save the database to ~/Library/Application Support/Druse/ligand_database.json.
+    /// Returns false (after logging the error) when the file could not be written.
+    @discardableResult
+    func save() -> Bool {
         do {
             let data = try Self.encode(entries)
             try data.write(to: Self.defaultURL, options: .atomic)
             autoSaveEnabled = true
+            return true
         } catch {
             ActivityLog.shared.error("Failed to save ligand database: \(error.localizedDescription)", category: .system)
+            return false
         }
     }
 
     /// Load the database from disk (File > Load Ligand Database).
-    func load() {
-        guard FileManager.default.fileExists(atPath: Self.defaultURL.path) else { return }
+    /// Returns false when there is no saved database or it could not be read (the error is logged).
+    @discardableResult
+    func load() -> Bool {
+        guard FileManager.default.fileExists(atPath: Self.defaultURL.path) else { return false }
         do {
             let data = try Data(contentsOf: Self.defaultURL)
             entries = try Self.decodeEntries(from: data)
             autoSaveEnabled = true
             ActivityLog.shared.info("Loaded \(entries.count) ligands from database", category: .system)
+            return true
         } catch {
             ActivityLog.shared.error("Failed to load ligand database: \(error.localizedDescription)", category: .system)
+            return false
         }
     }
 
@@ -575,9 +541,9 @@ final class LigandDatabase {
         }
     }
 
-    /// Encode the entire database to Data (for project save).
-    func encodeToData() throws -> Data {
-        try Self.encode(entries)
+    /// Encode the database (or `subset` of it) in the on-disk JSON format (project save, JSON export).
+    func encodeToData(_ subset: [LigandEntry]? = nil) throws -> Data {
+        try Self.encode(subset ?? entries)
     }
 
     /// Replace the current entries with ones decoded from a project's ligand file.
@@ -743,16 +709,6 @@ final class LigandDatabase {
             bonds.append(Bond(id: bonds.count, atomIndex1: bd[i], atomIndex2: bd[i+1], order: order))
         }
         return bonds
-    }
-
-    /// Encode conformers for an entry. Returns parallel arrays of flat positions and energies.
-    private static func encodeConformers(_ conformers: [LigandConformer]) -> (positions: [[Float]]?, energies: [Double]?) {
-        guard !conformers.isEmpty else { return (nil, nil) }
-        let positions = conformers.map { conf in
-            conf.atoms.flatMap { [$0.position.x, $0.position.y, $0.position.z] }
-        }
-        let energies = conformers.map(\.energy)
-        return (positions, energies)
     }
 
     /// Decode conformers from serialized flat position arrays and energies.
@@ -977,5 +933,210 @@ final class LigandDatabase {
             heavyAtomCount: s.heavyAtomCount ?? 0, fractionCSP3: s.fractionCSP3 ?? 0,
             lipinski: s.lipinski ?? false, veber: s.veber ?? false
         )
+    }
+}
+
+// MARK: - Dockable entries
+
+extension LigandDatabase {
+    /// Entries that are one docking job each: prepared, and not a source molecule whose
+    /// enumerated forms are in the database (those forms are docked instead).
+    var dockableEntries: [LigandEntry] {
+        let parentsWithForms = Set(entries.compactMap(\.parentName))
+        return entries.filter { $0.isPrepared && !($0.parentName == nil && parentsWithForms.contains($0.name)) }
+    }
+}
+
+// MARK: - Reading ligand files (console imports)
+
+/// A ligand file that could not be read, with a message naming the problem.
+struct LigandImportError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// How to read a delimited ligand table (CSV/TSV). Column specs are a header name
+/// (case-insensitive) or a 1-based column number; nil means auto-detect.
+struct LigandTableImportOptions: Sendable {
+    var smilesColumn: String?
+    var nameColumn: String?
+    var kiColumn: String?
+    var pKiColumn: String?
+    var ic50Column: String?
+    /// nil: tab if the first line contains one, else comma.
+    var delimiter: Character?
+    /// nil: a header is assumed when the first row names a SMILES/name/affinity column.
+    var hasHeader: Bool?
+    /// Keep unmapped columns as user properties (table columns in the Ligand Database window).
+    var keepExtraColumns = true
+}
+
+extension LigandDatabase {
+
+    /// userProperties keys the Ligand Database window shows affinity data under.
+    nonisolated static let kiPropertyKey = "Ki (nM)"
+    nonisolated static let pKiPropertyKey = "pKi"
+    nonisolated static let ic50PropertyKey = "IC50 (nM)"
+
+    /// Stores affinity values on the entry and mirrors them into its user properties, as the
+    /// window's mapped imports do, so the table shows them as columns.
+    nonisolated static func setAffinity(_ entry: inout LigandEntry, ki: Float?, pKi: Float?, ic50: Float?) {
+        if let ki {
+            entry.ki = ki
+            entry.userProperties[kiPropertyKey] = String(format: "%g", ki)
+        }
+        if let pKi {
+            entry.pKi = pKi
+            entry.userProperties[pKiPropertyKey] = String(format: "%g", pKi)
+        }
+        if let ic50 {
+            entry.ic50 = ic50
+            entry.userProperties[ic50PropertyKey] = String(format: "%g", ic50)
+        }
+    }
+
+    /// Reads a SMILES list into unprepared entries with descriptors.
+    nonisolated static func readSMIFile(_ url: URL, baseIndex: Int) throws -> [LigandEntry] {
+        let content = try String(contentsOf: url, encoding: .utf8)
+        return smiLines(content, baseIndex: baseIndex).map { line in
+            LigandEntry(name: line.name, smiles: line.smiles,
+                        descriptors: RDKitBridge.computeDescriptors(smiles: line.smiles))
+        }
+    }
+
+    /// Reads a CSV/TSV table into unprepared entries with descriptors, affinity data and
+    /// (optionally) every other column as user properties.
+    nonisolated static func readTableFile(_ url: URL, options: LigandTableImportOptions,
+                                          baseIndex: Int) throws -> [LigandEntry] {
+        let content = try String(contentsOf: url, encoding: .utf8)
+        let rows = parseDelimitedRows(content, separator: options.delimiter ?? tableDelimiter(in: content))
+        guard let first = rows.first else { return [] }
+        let normalized = first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        let looksLikeHeader = normalized.contains {
+            $0.contains("smiles") || $0.contains("name") || $0.contains("molecule")
+                || ["ki", "pki", "ic50", "id", "title"].contains($0)
+        } || !first.contains(where: looksLikeSMILES)
+        let hasHeader = options.hasHeader ?? looksLikeHeader
+        let headers = hasHeader ? first.map { $0.trimmingCharacters(in: .whitespaces) } : []
+        let dataRows = hasHeader ? Array(rows.dropFirst()) : rows
+        let columnCount = rows.map(\.count).max() ?? 0
+
+        func resolve(_ spec: String?, role: String, auto: () -> Int?) throws -> Int? {
+            guard let spec else { return auto() }
+            if let number = Int(spec) {
+                guard (1...max(columnCount, 1)).contains(number) else {
+                    throw LigandImportError(message: "\(role) column \(number) is out of range (the table has \(columnCount) columns)")
+                }
+                return number - 1
+            }
+            guard hasHeader else {
+                throw LigandImportError(message: "\(role) column '\(spec)' given by name, but the table has no header row — use a column number")
+            }
+            guard let index = headers.firstIndex(where: { $0.lowercased() == spec.lowercased() }) else {
+                throw LigandImportError(message: "no column named '\(spec)' for \(role); columns: \(headers.joined(separator: ", "))")
+            }
+            return index
+        }
+        func header(matching names: [String]) -> Int? {
+            normalized.indices.first { hasHeader && names.contains(normalized[$0]) }
+        }
+
+        let smilesIndex = try resolve(options.smilesColumn, role: "SMILES") {
+            if hasHeader, let index = normalized.firstIndex(where: {
+                $0.contains("smiles") || $0.contains("molecule") || $0.contains("structure")
+            }) { return index }
+            return dataRows.first?.firstIndex(where: looksLikeSMILES)
+        }
+        guard let smilesIndex else {
+            throw LigandImportError(message: "could not find a SMILES column — name it with smiles-col=")
+        }
+        let nameIndex = try resolve(options.nameColumn, role: "name") {
+            guard hasHeader else { return smilesIndex == 0 && columnCount > 1 ? 1 : (smilesIndex > 0 ? 0 : nil) }
+            return normalized.indices.first { $0 != smilesIndex
+                && (normalized[$0].contains("name") || normalized[$0] == "id" || normalized[$0].contains("title")) }
+        }
+        let kiIndex = try resolve(options.kiColumn, role: "Ki") { header(matching: ["ki", "ki_nm", "ki (nm)"]) }
+        let pKiIndex = try resolve(options.pKiColumn, role: "pKi") { header(matching: ["pki", "p_ki", "pki_value"]) }
+        let ic50Index = try resolve(options.ic50Column, role: "IC50") {
+            header(matching: ["ic50", "ic50_nm", "ic50 (nm)", "ic50_value"])
+        }
+        let mapped = Set([smilesIndex, nameIndex, kiIndex, pKiIndex, ic50Index].compactMap { $0 })
+
+        return dataRows.enumerated().compactMap { offset, cells -> LigandEntry? in
+            func cell(_ index: Int?) -> String? {
+                guard let index, index < cells.count, !cells[index].isEmpty else { return nil }
+                return cells[index]
+            }
+            guard let smiles = cell(smilesIndex) else { return nil }
+            var entry = LigandEntry(name: cell(nameIndex) ?? "Mol_\(baseIndex + offset + 1)", smiles: smiles,
+                                    descriptors: RDKitBridge.computeDescriptors(smiles: smiles))
+            setAffinity(&entry, ki: cell(kiIndex).flatMap(Float.init), pKi: cell(pKiIndex).flatMap(Float.init),
+                        ic50: cell(ic50Index).flatMap(Float.init))
+            if options.keepExtraColumns && hasHeader {
+                for (index, key) in headers.enumerated() where !mapped.contains(index) && !key.isEmpty {
+                    if let value = cell(index) { entry.userProperties[key] = value }
+                }
+            }
+            return entry
+        }
+    }
+
+    /// The most frequent of tab, semicolon and comma on the first line (comma when none occurs).
+    nonisolated private static func tableDelimiter(in content: String) -> Character {
+        let firstLine = content.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).first ?? ""
+        let counts: [(Character, Int)] = ["\t", ";", ","].map { delimiter in
+            (delimiter, firstLine.filter { $0 == delimiter }.count)
+        }
+        return counts.max { $0.1 < $1.1 }.flatMap { $0.1 > 0 ? $0.0 : nil } ?? ","
+    }
+
+    /// SD fields Druse writes on export that are recomputed on import rather than kept as properties.
+    nonisolated private static let derivedSDFields: Set<String> = [
+        "prepared", "mw", "logp", "tpsa", "hbd", "hba", "rotbonds", "lipinski", "parent", "formkind",
+        "population", "relativeenergy", "conformer", "mmff_energy"
+    ]
+
+    /// Reads SDF/MOL/MOL2 molecules with their file coordinates. SD data fields named like
+    /// Ki/pKi/IC50 become affinity data, the rest user properties. Entries are marked prepared
+    /// when `coordinatesArePrepared` (the file's 3D structures are used for docking as they are).
+    nonisolated static func readStructureFile(_ url: URL, coordinatesArePrepared: Bool) throws -> [LigandEntry] {
+        let molecules: [MoleculeData]
+        switch url.pathExtension.lowercased() {
+        case "mol2":
+            molecules = try MOL2Parser.parse(url: url).map {
+                MoleculeData(name: $0.name, title: $0.title, atoms: $0.atoms, bonds: $0.bonds)
+            }
+        default:
+            molecules = try SDFParser.parse(url: url)
+        }
+        return molecules.map { molecule in
+            var ki: Float?, pKi: Float?, ic50: Float?
+            var smiles = molecule.smiles ?? ""
+            var properties: [String: String] = [:]
+            for (key, raw) in molecule.properties {
+                let value = raw.trimmingCharacters(in: .whitespaces)
+                switch key.lowercased() {
+                case "ki", "ki_nm", "ki (nm)": ki = Float(value)
+                case "pki", "p_ki", "pki_value": pKi = Float(value)
+                case "ic50", "ic50_nm", "ic50 (nm)", "ic50_value": ic50 = Float(value)
+                case "smiles" where smiles.isEmpty: smiles = value
+                case let name where derivedSDFields.contains(name) || name == "smiles": break
+                default: if !value.isEmpty { properties[key] = value }
+                }
+            }
+            if smiles.isEmpty {
+                smiles = molecule.molBlock.flatMap(RDKitBridge.smilesFromMolBlock)
+                    ?? RDKitBridge.atomsBondsToSMILES(atoms: molecule.atoms, bonds: molecule.bonds) ?? ""
+            }
+            var entry = LigandEntry(
+                name: molecule.name.isEmpty ? url.deletingPathExtension().lastPathComponent : molecule.name,
+                smiles: smiles, atoms: molecule.atoms, bonds: molecule.bonds,
+                descriptors: smiles.isEmpty ? nil : RDKitBridge.computeDescriptors(smiles: smiles),
+                isPrepared: coordinatesArePrepared, conformerCount: coordinatesArePrepared ? 1 : 0
+            )
+            entry.userProperties = properties
+            setAffinity(&entry, ki: ki, pKi: pKi, ic50: ic50)
+            return entry
+        }
     }
 }

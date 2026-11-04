@@ -6,6 +6,9 @@
 // Structure IO, PDB/molblock utilities, and Vina typing.
 
 #include <GraphMol/FileParsers/FileParsers.h>
+#include <GraphMol/Substruct/SubstructMatch.h>
+#include <ForceField/ForceField.h>
+#include <ForceField/PositionConstraint.h>
 
 DruseMoleculeResult* druse_add_hydrogens_pdb(const char *pdbContent) {
     if (!pdbContent || !pdbContent[0]) return make_error("Empty PDB content");
@@ -63,6 +66,113 @@ DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock) {
     }
 }
 
+namespace {
+
+/// Heavy-atom graph of `mol` with elements and connectivity only (no charges, bond orders
+/// or hydrogens), for matching structures whose bond orders or protonation differ.
+/// `heavyIndices` receives the source index of each skeleton atom.
+std::unique_ptr<RWMol> heavy_skeleton(const ROMol &mol, std::vector<unsigned> &heavyIndices) {
+    auto skeleton = std::make_unique<RWMol>();
+    std::vector<int> toSkeleton(mol.getNumAtoms(), -1);
+    heavyIndices.clear();
+    for (const auto *atom : mol.atoms()) {
+        if (atom->getAtomicNum() <= 1) continue;
+        Atom bare(atom->getAtomicNum());
+        bare.setNoImplicit(true);
+        toSkeleton[atom->getIdx()] = (int)skeleton->addAtom(&bare, true, false);
+        heavyIndices.push_back(atom->getIdx());
+    }
+    for (const auto *bond : mol.bonds()) {
+        int a = toSkeleton[bond->getBeginAtomIdx()], b = toSkeleton[bond->getEndAtomIdx()];
+        if (a >= 0 && b >= 0 && !skeleton->getBondBetweenAtoms(a, b)) skeleton->addBond(a, b, Bond::SINGLE);
+    }
+    MolOps::fastFindRings(*skeleton);
+    return skeleton;
+}
+
+} // namespace
+
+DruseMoleculeResult* druse_prepare_on_template(
+    const char *templateMolBlock, const char *targetMolBlock, const char *name,
+    bool minimize, bool computeCharges, double *outEnergy
+) {
+    if (outEnergy) *outEnergy = NAN;
+    if (!templateMolBlock || !templateMolBlock[0] || !targetMolBlock || !targetMolBlock[0])
+        return make_error("Empty mol block");
+    try {
+        std::unique_ptr<RWMol> tmpl(MolBlockToMol(std::string(templateMolBlock), false, false, false));
+        std::unique_ptr<RWMol> target(MolBlockToMol(std::string(targetMolBlock), true, false, false));
+        if (!tmpl || !target || tmpl->getNumConformers() == 0 || target->getNumConformers() == 0)
+            return make_error("Failed to parse mol block");
+
+        std::vector<unsigned> tmplHeavy, targetHeavy;
+        auto tmplSkeleton = heavy_skeleton(*tmpl, tmplHeavy);
+        auto targetSkeleton = heavy_skeleton(*target, targetHeavy);
+        if (tmplHeavy.size() != targetHeavy.size() ||
+            tmplSkeleton->getNumBonds() != targetSkeleton->getNumBonds())
+            return make_error("Heavy atoms differ from the experimental structure");
+        SubstructMatchParameters params;
+        params.maxMatches = 1;
+        params.uniquify = false;
+        auto matches = SubstructMatch(*tmplSkeleton, *targetSkeleton, params);
+        if (matches.empty()) return make_error("Heavy atoms differ from the experimental structure");
+
+        // Target heavy atoms on the experimental coordinates.
+        auto &conf = target->getConformer();
+        const auto &tmplConf = tmpl->getConformer();
+        for (const auto &[targetSkelIdx, tmplSkelIdx] : matches.front()) {
+            conf.setAtomPos(targetHeavy[targetSkelIdx], tmplConf.getAtomPos(tmplHeavy[tmplSkelIdx]));
+        }
+
+        // Hydrogens: RDKit places them on the heavy-atom geometry of a hydrogen-free copy
+        // (heavy atoms keep their relative order there), and each heavy atom's new
+        // hydrogens are copied onto its own hydrogens in the target (which may carry
+        // fewer, e.g. polar hydrogens only).
+        RWMol placed(*target);
+        MolOps::removeAllHs(placed);
+        MolOps::addHs(placed, false, true);
+        const auto &placedConf = placed.getConformer();
+        for (unsigned k = 0; k < targetHeavy.size(); ++k) {
+            std::vector<unsigned> own, fresh;
+            for (const auto *nbr : target->atomNeighbors(target->getAtomWithIdx(targetHeavy[k])))
+                if (nbr->getAtomicNum() == 1) own.push_back(nbr->getIdx());
+            for (const auto *nbr : placed.atomNeighbors(placed.getAtomWithIdx(k)))
+                if (nbr->getAtomicNum() == 1) fresh.push_back(nbr->getIdx());
+            if (own.size() > fresh.size()) return make_error("Hydrogen placement failed");
+            for (size_t h = 0; h < own.size(); ++h) conf.setAtomPos(own[h], placedConf.getAtomPos(fresh[h]));
+        }
+
+        MMFF::MMFFMolProperties mmffProps(*target);
+        if (mmffProps.isValid()) {
+            if (minimize) {
+                std::unique_ptr<ForceFields::ForceField> ff(MMFF::constructForceField(*target, &mmffProps));
+                if (ff) {
+                    for (unsigned idx : targetHeavy) {
+                        ff->contribs().emplace_back(new ForceFields::PositionConstraintContrib(ff.get(), idx, 0.3, 100.0));
+                    }
+                    ff->initialize();
+                    ff->minimize(2000);
+                }
+            }
+            std::unique_ptr<ForceFields::ForceField> energyFF(MMFF::constructForceField(*target, &mmffProps));
+            if (energyFF && outEnergy) {
+                energyFF->initialize();
+                *outEnergy = energyFF->calcEnergy();
+            }
+        }
+
+        if (computeCharges) {
+            try { computeGasteigerCharges(*target); } catch (...) {}
+        }
+        try { MolOps::assignStereochemistryFrom3D(*target); } catch (...) {}
+        return mol_to_result(*target, name ? name : "ligand");
+    } catch (const std::exception &e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("Unknown error preparing ligand on template");
+    }
+}
+
 const char* druse_molblock_to_smiles(const char *molBlock) {
     if (!molBlock || !molBlock[0]) return nullptr;
     try {
@@ -106,7 +216,7 @@ DruseMoleculeResult* druse_atoms_bonds_to_smiles(
         for (int32_t i = 0; i < atomCount; i++) {
             Atom atom(atoms[i].atomicNum);
             atom.setFormalCharge(atoms[i].formalCharge);
-            mol->addAtom(&atom, true, true);
+            mol->addAtom(&atom, true, false);
         }
 
         for (int32_t i = 0; i < bondCount && bonds; i++) {

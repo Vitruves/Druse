@@ -3,6 +3,10 @@
 
 #include "druse_core_internal.h"
 #include <GraphMol/MolStandardize/Charge.h>
+#include <tbb/global_control.h>
+#ifdef DRUSE_HAS_OPENMM
+#include <openmm/Platform.h>
+#endif
 
 #include <cstring>
 #include <cmath>
@@ -11,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -86,6 +91,31 @@ const MolChemicalFeatureFactory *vina_feature_factory() {
     return factory.get();
 }
 
+// AutoDock Vina XS heteroatom typing, self-contained (no fdef dependency).
+// O: always an acceptor, donor when it carries an H.
+// N: donor when it carries an H; acceptor per AD4 "NA" (as Meeko assigns it):
+// no H, not cationic, not 4-connected, not an aromatic N with 3 connections,
+// and not a trivalent N conjugated to an aromatic ring or bonded to an
+// amide/sulfonamide-like C or S carrying a double bond to N/O/S.
+static bool is_ad4_nitrogen_acceptor(const ROMol &mol, const Atom &atom) {
+    if (atom.getTotalNumHs(true) > 0 || atom.getFormalCharge() > 0) return false;
+    const unsigned int degree = atom.getTotalDegree();
+    if (degree >= 4) return false;
+    if (degree < 3) return true;
+    if (atom.getIsAromatic()) return false;
+
+    for (const auto *nbr : mol.atomNeighbors(&atom)) {
+        if (nbr->getIsAromatic()) return false;
+        if (nbr->getAtomicNum() != 6 && nbr->getAtomicNum() != 16) continue;
+        for (const auto *bond : mol.atomBonds(nbr)) {
+            if (bond->getBondType() != Bond::DOUBLE) continue;
+            const unsigned int other = bond->getOtherAtom(nbr)->getAtomicNum();
+            if (other == 7 || other == 8 || other == 16) return false;
+        }
+    }
+    return true;
+}
+
 void compute_donor_acceptor_flags(
     const ROMol &mol,
     std::vector<bool> &donorFlags,
@@ -94,35 +124,19 @@ void compute_donor_acceptor_flags(
     donorFlags.assign(mol.getNumAtoms(), false);
     acceptorFlags.assign(mol.getNumAtoms(), false);
 
-    if (const auto *factory = vina_feature_factory()) {
-        auto features = factory->getFeaturesForMol(mol);
-        for (const auto &feature : features) {
-            if (!feature) {
-                continue;
-            }
-
-            const std::string &family = feature->getFamily();
-            const bool isDonor = family == "Donor";
-            const bool isAcceptor = family == "Acceptor";
-            if (!isDonor && !isAcceptor) {
-                continue;
-            }
-
-            for (const auto *atom : feature->getAtoms()) {
-                if (!atom) {
-                    continue;
-                }
-                const unsigned int idx = atom->getIdx();
-                if (idx >= donorFlags.size()) {
-                    continue;
-                }
-                if (isDonor) {
-                    donorFlags[idx] = true;
-                }
-                if (isAcceptor) {
-                    acceptorFlags[idx] = true;
-                }
-            }
+    for (const auto *atom : mol.atoms()) {
+        const unsigned int idx = atom->getIdx();
+        switch (atom->getAtomicNum()) {
+            case 7:
+                donorFlags[idx] = atom->getTotalNumHs(true) > 0;
+                acceptorFlags[idx] = is_ad4_nitrogen_acceptor(mol, *atom);
+                break;
+            case 8:
+                donorFlags[idx] = atom->getTotalNumHs(true) > 0;
+                acceptorFlags[idx] = true;
+                break;
+            default:
+                break;
         }
     }
 }
@@ -777,4 +791,48 @@ void druse_free_batch_results(DruseMoleculeResult **results, int32_t count) {
 const char* druse_rdkit_version(void) {
     static std::string ver = RDKit::rdkitVersion;
     return ver.c_str();
+}
+
+// ============================================================================
+// MARK: - CPU Thread Limit
+// ============================================================================
+
+namespace {
+/// TBB applies a limit only while its `global_control` object is alive, so the active one is
+/// kept here for the life of the process and swapped when the limit changes.
+std::mutex threadLimitMutex;
+std::unique_ptr<tbb::global_control> threadLimitControl;
+}
+
+int32_t druse_set_max_threads(int32_t maxThreads) {
+    std::lock_guard<std::mutex> lock(threadLimitMutex);
+    // Several live global_control objects resolve to their minimum: release the old one first.
+    threadLimitControl.reset();
+    if (maxThreads > 0) {
+        threadLimitControl = std::make_unique<tbb::global_control>(
+            tbb::global_control::max_allowed_parallelism, static_cast<size_t>(maxThreads));
+    }
+
+    // OpenMM's CPU platform runs its own thread pool, sized from OPENMM_CPU_THREADS when the
+    // plugin registers and from the platform's "Threads" default for each new Context.
+    if (maxThreads > 0) {
+        setenv("OPENMM_CPU_THREADS", std::to_string(maxThreads).c_str(), 1);
+    } else {
+        unsetenv("OPENMM_CPU_THREADS");
+    }
+#ifdef DRUSE_HAS_OPENMM
+    try {
+        OpenMM::Platform &cpu = OpenMM::Platform::getPlatformByName("CPU");
+        const int32_t threads = maxThreads > 0 ? maxThreads : druse_max_threads();
+        cpu.setPropertyDefaultValue("Threads", std::to_string(threads));
+    } catch (...) {
+        // Plugin not loaded yet: it will read OPENMM_CPU_THREADS when it registers.
+    }
+#endif
+    return druse_max_threads();
+}
+
+int32_t druse_max_threads(void) {
+    return static_cast<int32_t>(
+        tbb::global_control::active_value(tbb::global_control::max_allowed_parallelism));
 }

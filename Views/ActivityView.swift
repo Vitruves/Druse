@@ -4,15 +4,17 @@
 import SwiftUI
 
 /// Xcode-style activity capsule on the trailing side of the toolbar (just before the
-/// Console / Inspector toggles): what is loaded, what is running, how far along it is,
-/// and a stop button. The single home for live progress outside the canvas HUD. Click to
-/// see the most recent log lines. The shell hands it a `width` budget; when that is narrow the
-/// text drops away first (document name, then the operation), leaving the state dot, progress and stop.
+/// Terminal / Inspector toggles): what is running, how far along it is, and a stop button. The
+/// single home for live progress outside the canvas HUD. What is loaded lives in the canvas chips,
+/// so the capsule shows only the live status; the full text is in the tooltip. Click to see the
+/// most recent log lines. The shell hands it a `width` budget; text never truncates mid-word: it
+/// falls back to a shorter form of the message, then to the state dot, progress and stop alone.
 struct ActivityView: View {
     let width: CGFloat
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("ui.consoleOpen") private var showConsole = false
+    @AppStorage(BottomPanel.storageKey) private var bottomPanel = BottomPanel.terminal
     @State private var showRecentLog = false
     private let log = ActivityLog.shared
 
@@ -22,12 +24,8 @@ struct ActivityView: View {
                 HStack(spacing: DS.Space.s) {
                     stateDot
                     ViewThatFits(in: .horizontal) {
-                        HStack(spacing: DS.Space.s) {
-                            documentText
-                            Text("·").foregroundStyle(.tertiary)
-                            operationLabel
-                        }
-                        operationLabel
+                        statusLabel(operationText)
+                        statusLabel(Self.compact(operationText))
                         Color.clear.frame(width: 0)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -35,7 +33,7 @@ struct ActivityView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("\(documentTitle) — \(operationText)\nClick for recent activity")
+            .help("\(operationText)\n\(documentTitle)\nClick for recent activity")
             .popover(isPresented: $showRecentLog, arrowEdge: .bottom) { recentLogPopover }
 
             if isBusy {
@@ -67,22 +65,22 @@ struct ActivityView: View {
         .accessibilityLabel("Activity")
     }
 
-    private var documentText: some View {
-        Text(documentTitle)
-            .font(DS.Font.label.weight(.medium))
+    /// One status line at its natural width, so `ViewThatFits` picks a form that fits whole.
+    private func statusLabel(_ text: String) -> some View {
+        Text(text)
+            .font(DS.Font.label.weight(isBusy ? .medium : .regular))
+            .monospacedDigit()
+            .foregroundStyle(isBusy ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
             .lineLimit(1)
             .fixedSize()
     }
 
-    private var operationLabel: some View {
-        Text(operationText)
-            .font(DS.Font.label)
-            .monospacedDigit()
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            // A small ideal width lets ViewThatFits keep the text (truncated) rather than drop it.
-            .frame(minWidth: 60, idealWidth: 60, maxWidth: .infinity, alignment: .leading)
+    /// The head of a status message: up to the first separator or parenthesis
+    /// ("6o0m_protein.pdb loaded (2370 atoms)" → "6o0m_protein.pdb loaded").
+    private static func compact(_ message: String) -> String {
+        let separators = [" (", " — ", " · ", ": ", " – ", ", "]
+        let cut = separators.compactMap { message.range(of: $0)?.lowerBound }.min()
+        return cut.map { String(message[..<$0]) } ?? message
     }
 
     // MARK: - State
@@ -130,8 +128,9 @@ struct ActivityView: View {
         }
         if viewModel.workspace.isSearching { return "Searching RCSB" }
         let message = viewModel.workspace.statusMessage
-        if message != "Ready" { return message }
-        return log.entries.last?.message ?? "Ready"
+        if !message.isEmpty, message != "Ready" { return message }
+        if let last = log.entries.last?.message, !last.isEmpty { return last }
+        return "Ready"
     }
 
     /// Determinate progress when the running operation reports it, else nil (spinner).
@@ -175,7 +174,8 @@ struct ActivityView: View {
                 Text("Recent Activity")
                     .font(DS.Font.sectionTitle)
                 Spacer()
-                Button("Show Console") {
+                Button("Show Logs") {
+                    bottomPanel = .logs
                     showConsole = true
                     showRecentLog = false
                 }

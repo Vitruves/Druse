@@ -9,15 +9,18 @@ extension AppViewModel {
 
     // MARK: - Reference Selection
 
-    /// Set a docking result as the reference for lead optimization.
-    /// Called from the Results tab "Optimize" button.
-    func selectReferenceForOptimization(result: DockingResult, ligand: Molecule) {
+    /// Set a ligand (and optionally one of its docked poses) as the reference for lead
+    /// optimization. Called from the Results tab "Optimize" button and by the console's
+    /// `leadopt reference`; without a pose the reference has no score to compare analogs with.
+    /// Returns whether the reference was set; on failure the reason is logged and shown.
+    @discardableResult
+    func selectReferenceForOptimization(result: DockingResult?, ligand: Molecule) -> Bool {
         guard let smiles = Self.referenceSMILES(for: ligand),
               let descriptors = RDKitBridge.computeDescriptors(smiles: smiles) else {
-            let msg = "Cannot optimize \(ligand.name): RDKit could not derive a valid SMILES from its structure"
+            let msg = Self.referenceFailureMessage(for: ligand.name)
             log.error(msg, category: .molecule)
             workspace.statusMessage = msg
-            return
+            return false
         }
         leadOpt.referenceResult = result
         leadOpt.referenceMolecule = ligand
@@ -29,12 +32,26 @@ extension AppViewModel {
         workspace.requestedTabToken &+= 1
         workspace.statusMessage = "Reference set: \(ligand.name) — opened Lead Opt"
         log.info("Reference for lead optimization: \(ligand.name) (\(smiles))", category: .molecule)
+        return true
     }
 
-    /// SMILES of a docked ligand. SDF / PDB ligands carry no SMILES (their title is a record
-    /// name such as "6o0m_ligand"), so fall back to the heavy-atom graph, which RDKit turns
-    /// into canonical SMILES with implicit hydrogens. Explicit H atoms are dropped first —
-    /// left in, they would surface as "[H]" atoms that break substituent edits.
+    /// Why `selectReferenceForOptimization` refused a ligand, with what the user can do about it.
+    static func referenceFailureMessage(for name: String) -> String {
+        "Cannot optimize \(name): RDKit could not build a valid molecule from its structure "
+            + "(usually an aromatic ring that cannot be kekulized because hydrogens or bond orders are missing, "
+            + "even after trying to add a missing aromatic N–H) — load the ligand from SMILES or from a "
+            + "MOL2/SDF file with explicit hydrogens and Kekulé bond orders"
+    }
+
+    /// SMILES of a docked ligand, in order of preference:
+    /// 1. the SMILES recorded with the ligand (SMILES input, ligand database, SDF property);
+    /// 2. the heavy-atom graph, which RDKit turns into canonical SMILES with implicit hydrogens.
+    ///    Explicit H atoms are dropped — left in, they would surface as "[H]" atoms that break
+    ///    substituent edits;
+    /// 3. when (2) cannot be kekulized, the graph again with aromatic N–H restored: first the
+    ///    explicit hydrogens the structure carries on aromatic nitrogens, then one synthetic H on
+    ///    each pyrrole-type nitrogen candidate in turn. Crystal ligands (e.g. PDBbind 6o0m, an
+    ///    azaindole) often lack that H, and without it RDKit cannot place the ring's double bonds.
     private static func referenceSMILES(for ligand: Molecule) -> String? {
         if let recorded = ligand.smiles?.trimmingCharacters(in: .whitespacesAndNewlines),
            !recorded.isEmpty, RDKitBridge.computeDescriptors(smiles: recorded) != nil {
@@ -50,7 +67,99 @@ extension AppViewModel {
             guard let a = heavyIndex[bond.atomIndex1], let b = heavyIndex[bond.atomIndex2] else { return nil }
             return Bond(id: bond.id, atomIndex1: a, atomIndex2: b, order: bond.order)
         }
-        return RDKitBridge.atomsBondsToSMILES(atoms: heavyAtoms, bonds: heavyBonds)
+        if let smiles = RDKitBridge.atomsBondsToSMILES(atoms: heavyAtoms, bonds: heavyBonds),
+           RDKitBridge.computeDescriptors(smiles: smiles) != nil {
+            return smiles
+        }
+        return aromaticNHRepairedSMILES(ligand: ligand, heavyIndex: heavyIndex, heavyAtoms: heavyAtoms, heavyBonds: heavyBonds)
+    }
+
+    /// Step 3 of `referenceSMILES`: valid SMILES of the heavy-atom graph with hydrogens put back
+    /// on aromatic nitrogens, or nil when no such repair makes the molecule kekulizable.
+    private static func aromaticNHRepairedSMILES(
+        ligand: Molecule, heavyIndex: [Int: Int], heavyAtoms: [Atom], heavyBonds: [Bond]
+    ) -> String? {
+        var heavyNeighbors = Array(repeating: [Int](), count: heavyAtoms.count)
+        var aromaticDegree = Array(repeating: 0, count: heavyAtoms.count)
+        for bond in heavyBonds {
+            heavyNeighbors[bond.atomIndex1].append(bond.atomIndex2)
+            heavyNeighbors[bond.atomIndex2].append(bond.atomIndex1)
+            if bond.order == .aromatic {
+                aromaticDegree[bond.atomIndex1] += 1
+                aromaticDegree[bond.atomIndex2] += 1
+            }
+        }
+        var carriesHydrogen = Set<Int>()
+        for bond in ligand.bonds {
+            let pair = [bond.atomIndex1, bond.atomIndex2]
+            guard pair.allSatisfy(ligand.atoms.indices.contains) else { continue }
+            if ligand.atoms[pair[0]].element == .H, let heavy = heavyIndex[pair[1]] { carriesHydrogen.insert(heavy) }
+            if ligand.atoms[pair[1]].element == .H, let heavy = heavyIndex[pair[0]] { carriesHydrogen.insert(heavy) }
+        }
+        let aromaticNitrogens = heavyAtoms.indices.filter {
+            heavyAtoms[$0].element == .N && heavyAtoms[$0].formalCharge == 0
+                && heavyNeighbors[$0].count == 2 && aromaticDegree[$0] == 2
+        }
+        let kept = aromaticNitrogens.filter(carriesHydrogen.contains)
+        // Pyrrole-type N–H sits in five-membered rings; trying those first picks the usual
+        // tautomer (1H-azaindole, not 7H) when several placements would kekulize.
+        let candidates = aromaticNitrogens.filter { !carriesHydrogen.contains($0) }
+            .map { (atom: $0, ring: smallestRingSize(through: $0, neighbors: heavyNeighbors)) }
+            .sorted { ($0.ring == 5 ? 0 : 1, $0.ring) < ($1.ring == 5 ? 0 : 1, $1.ring) }
+            .map(\.atom)
+
+        /// SMILES with one explicit H on each nitrogen in `nitrogens`, folded to `[nH]`.
+        func smiles(protonating nitrogens: [Int]) -> String? {
+            var atoms = heavyAtoms
+            var bonds = heavyBonds
+            for n in nitrogens {
+                let neighborCenter = heavyNeighbors[n].reduce(SIMD3<Float>.zero) { $0 + heavyAtoms[$1].position }
+                    / Float(heavyNeighbors[n].count)
+                let outward = simd_normalize(heavyAtoms[n].position - neighborCenter)
+                atoms.append(Atom(id: atoms.count, element: .H, position: heavyAtoms[n].position + 1.01 * outward,
+                                  name: "H", residueName: heavyAtoms[n].residueName, residueSeq: heavyAtoms[n].residueSeq,
+                                  chainID: heavyAtoms[n].chainID))
+                bonds.append(Bond(id: bonds.count, atomIndex1: n, atomIndex2: atoms.count - 1, order: .single))
+            }
+            guard let raw = RDKitBridge.atomsBondsToSMILES(atoms: atoms, bonds: bonds),
+                  let folded = SMILESAtomGraph(raw)?.foldingAromaticNH(),
+                  RDKitBridge.computeDescriptors(smiles: folded) != nil else { return nil }
+            return folded
+        }
+
+        if !kept.isEmpty, let repaired = smiles(protonating: kept) { return repaired }
+        for candidate in candidates {
+            if let repaired = smiles(protonating: kept + [candidate]) {
+                let atomName = heavyAtoms[candidate].name.trimmingCharacters(in: .whitespaces)
+                ActivityLog.shared.warn(
+                    "\(ligand.name): aromatic ring could not be kekulized — added the missing H on aromatic N "
+                        + (atomName.isEmpty ? "#\(candidate + 1)" : atomName),
+                    category: .molecule
+                )
+                return repaired
+            }
+        }
+        return nil
+    }
+
+    /// Atoms in the smallest ring through `atom` (which has two neighbours), or `Int.max` when
+    /// it is in no ring: the shortest path between its neighbours that avoids it, plus `atom`.
+    private static func smallestRingSize(through atom: Int, neighbors: [[Int]]) -> Int {
+        guard neighbors[atom].count == 2 else { return .max }
+        let (start, goal) = (neighbors[atom][0], neighbors[atom][1])
+        var distance = [start: 0]
+        var queue = [start]
+        var head = 0
+        while head < queue.count {
+            let current = queue[head]
+            head += 1
+            if current == goal { return distance[current, default: 0] + 2 }
+            for next in neighbors[current] where next != atom && distance[next] == nil {
+                distance[next] = distance[current, default: 0] + 1
+                queue.append(next)
+            }
+        }
+        return .max
     }
 
     /// Set a screening hit as the reference.
@@ -128,15 +237,17 @@ extension AppViewModel {
     }
 
     /// Generate property-directed analogs with similarity, scaffold and ADMET filtering.
-    func generateOptimizedAnalogs() {
-        guard leadOpt.hasReference else { return }
+    /// Returns nil when generation cannot start; otherwise `leadOpt.generationTask`.
+    @discardableResult
+    func generateOptimizedAnalogs() -> Task<Void, Never>? {
+        guard leadOpt.hasReference else { return nil }
         let smiles = leadOpt.referenceSMILES
         let name = leadOpt.referenceName
         guard let graph = SMILESAtomGraph(smiles) else {
             let msg = "Cannot generate analogs: the reference SMILES of \(name) could not be tokenized"
             log.error(msg, category: .molecule)
             workspace.statusMessage = msg
-            return
+            return nil
         }
 
         leadOpt.isGenerating = true
@@ -276,6 +387,7 @@ extension AppViewModel {
                 self.workspace.statusMessage = "All \(totalGenerated) analogs filtered — loosen filters"
             }
         }
+        return leadOpt.generationTask
     }
 
     private func computeDeltaProperties(for analog: inout LeadOptAnalog, reference: LigandDescriptors?) {
@@ -364,23 +476,25 @@ extension AppViewModel {
 
     /// Dock all generated analogs into the reference pocket with the reference's scoring
     /// method and docking settings (reduced search budget), so scores compare 1:1.
-    func dockAnalogs() {
+    /// Returns nil when mini-docking cannot start; otherwise `leadOpt.dockingTask`.
+    @discardableResult
+    func dockAnalogs() -> Task<Void, Never>? {
         let activeAnalogs = leadOpt.analogs.enumerated().filter { $0.element.status == .generated }
         guard !activeAnalogs.isEmpty else {
             workspace.statusMessage = "No generated analogs to dock"
-            return
+            return nil
         }
         guard let engine = docking.dockingEngine, let pocket = docking.selectedPocket else {
             let msg = "Run docking on the reference ligand first — analog mini-docking reuses its receptor and pocket"
             log.warn(msg, category: .dock)
             workspace.statusMessage = msg
-            return
+            return nil
         }
         guard !engine.isRunning else {
             let msg = "The docking engine is busy — wait for the current run to finish before docking analogs"
             log.warn(msg, category: .dock)
             workspace.statusMessage = msg
-            return
+            return nil
         }
 
         let scoringMethod = leadOpt.scoringMethod
@@ -389,6 +503,14 @@ extension AppViewModel {
         analogConfig.numRuns = 1
         analogConfig.generationsPerRun = min(analogConfig.generationsPerRun, 150)
         analogConfig.liveUpdateFrequency = analogConfig.numGenerations + 1 // no live viewport updates for batch
+
+        // The engine's live callbacks belong to the reference docking run: they draw poses with the
+        // reference ligand's atoms and bonds, so an analog pose (different atoms) would be rendered
+        // as a scrambled molecule. Detach them for the analog runs (as VirtualScreening does).
+        let savedPoseUpdate = engine.onPoseUpdate
+        let savedGenerationComplete = engine.onGenerationComplete
+        engine.onPoseUpdate = nil
+        engine.onGenerationComplete = nil
 
         leadOpt.isDocking = true
         leadOpt.dockingProgress = (0, activeAnalogs.count)
@@ -400,6 +522,8 @@ extension AppViewModel {
 
         leadOpt.dockingTask = Task {
             defer {
+                engine.onPoseUpdate = savedPoseUpdate
+                engine.onGenerationComplete = savedGenerationComplete
                 self.leadOpt.isDocking = false
                 self.workspace.statusMessage = "Analog docking complete"
             }
@@ -461,6 +585,29 @@ extension AppViewModel {
             let dockedCount = self.leadOpt.analogs.filter { $0.status == .docked }.count
             self.log.success("Docked \(dockedCount)/\(activeAnalogs.count) analogs", category: .dock)
         }
+        return leadOpt.dockingTask
+    }
+
+    // MARK: - Clearing and ADMET
+
+    /// Removes every generated analog (the Lead Opt "Clear" action); the reference is kept.
+    func clearLeadOptimizationAnalogs() {
+        leadOpt.analogs.removeAll()
+        leadOpt.selectedAnalogIndex = nil
+        log.info("Cleared lead-optimization analogs", category: .molecule)
+    }
+
+    /// ADMET predictions of analog `index`, computed on first request and kept on the analog
+    /// (generation only predicts ADMET when the hERG or CYP filter is on). Nil when the index
+    /// is out of range or the list changed while predicting.
+    func analogADMET(at index: Int) async -> ADMETPredictor.ADMETResult? {
+        guard leadOpt.analogs.indices.contains(index) else { return nil }
+        let analog = leadOpt.analogs[index]
+        if let admet = analog.admet { return admet }
+        let admet = await admetPredictor.predict(smiles: analog.smiles)
+        guard let current = leadOpt.analogs.firstIndex(where: { $0.id == analog.id }) else { return nil }
+        leadOpt.analogs[current].admet = admet
+        return admet
     }
 
     // MARK: - Cancellation
@@ -653,6 +800,33 @@ private struct SMILESAtomGraph {
                 inRing[b] = true
             }
         }
+    }
+
+    /// The SMILES with every explicit `[H]` bonded to a plain aromatic `n` folded into `[nH]`.
+    /// RDKit writes hydrogens that are graph atoms as `[H]`; the reference-SMILES repair adds such
+    /// atoms only to tell RDKit which nitrogen is pyrrole-type, so they are folded back to keep
+    /// the reference free of `[H]` tokens.
+    func foldingAromaticNH() -> String {
+        var edits: [(range: Range<String.Index>, text: String)] = []
+        for (h, token) in atoms.enumerated() where token.isBracket && smiles[token.range] == "[H]" {
+            guard neighbors[h].count == 1 else { continue }
+            let n = neighbors[h][0].atom
+            guard !atoms[n].isBracket, atoms[n].symbol == "n" else { continue }
+            var removal = token.range
+            if removal.lowerBound > smiles.startIndex, removal.upperBound < smiles.endIndex,
+               smiles[smiles.index(before: removal.lowerBound)] == "(", smiles[removal.upperBound] == ")" {
+                removal = smiles.index(before: removal.lowerBound)..<smiles.index(after: removal.upperBound)
+            } else if removal.lowerBound > smiles.startIndex, smiles[smiles.index(before: removal.lowerBound)] == "-" {
+                removal = smiles.index(before: removal.lowerBound)..<removal.upperBound
+            }
+            edits.append((removal, ""))
+            edits.append((atoms[n].range, "[nH]"))
+        }
+        var result = smiles
+        for edit in edits.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            result.replaceSubrange(edit.range, with: edit.text)
+        }
+        return result
     }
 
     /// Every site where `edit` applies, as (first edited atom, edited SMILES).

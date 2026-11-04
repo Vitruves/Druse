@@ -314,7 +314,7 @@ struct PharmacophoreEditorView: View {
     private var sourceCard: some View {
         let (title, icon): (String, String) = {
             switch sourceMode {
-            case .singleLigand:   return ("Ligand", "list.bullet")
+            case .singleLigand:   return ("Ligand", "hexagon")
             case .commonScaffold: return ("Common Scaffold", "square.on.square.intersection.dashed")
             case .smiles:         return ("SMILES", "character.cursor.ibeam")
             case .draw:           return (drawValidated ? "Drawn Structure" : "Draw Scaffold", "pencil.and.outline")

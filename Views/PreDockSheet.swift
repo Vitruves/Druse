@@ -170,6 +170,9 @@ struct PreDockSheet: View {
             value("Method", config.searchMethod.shortLabel)
             value("Population size", "\(config.populationSize)")
             value("Generations", "\(config.numGenerations)")
+            if config.numRuns > 1 {
+                value("Independent runs", "\(config.numRuns) × \(config.generationsPerRun) generations")
+            }
             value("Grid spacing", String(format: "%.3f Å", config.gridSpacing))
             value("Mutation rate", String(format: "%.3f", config.mutationRate))
             value("Crossover rate", String(format: "%.1f", config.crossoverRate))

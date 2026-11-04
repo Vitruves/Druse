@@ -49,9 +49,10 @@ struct MultiPoseAnalysisSheet: View {
             }
         } footer: {
             Button("Done") { dismiss() }
+                .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
                 .keyboardShortcut(.defaultAction)
         }
-        .frame(minWidth: 560, idealWidth: 680, minHeight: 480, idealHeight: 620)
+        .frame(minWidth: 560, idealWidth: 680, minHeight: 480, idealHeight: 580)
     }
 
     private var subtitle: String {
@@ -133,7 +134,8 @@ private struct RMSDMatrixView: View {
 
     private var matrixGrid: some View {
         let n = indices.count
-        let cellSize: CGFloat = 38
+        // Grow cells for small selections so the matrix fills the card instead of a corner of it.
+        let cellSize: CGFloat = min(64, max(38, 480 / CGFloat(max(n, 1))))
         let labelWidth: CGFloat = 38
         return ScrollView([.horizontal, .vertical]) {
             VStack(alignment: .leading, spacing: 0) {
@@ -334,6 +336,8 @@ private struct InteractionFingerprintView: View {
     @State private var residueKeys: [String] = []
     @State private var residueLabels: [String: String] = [:]
     @State private var fingerprints: [[String: Set<MolecularInteraction.InteractionType>]] = []
+    /// Measured width of the heatmap card's content, which the columns share.
+    @State private var heatmapWidth: CGFloat = 520
 
     var body: some View {
         ScrollView {
@@ -377,12 +381,15 @@ private struct InteractionFingerprintView: View {
     }
 
     private var heatmap: some View {
-        let cellWidth: CGFloat = 24
-        let cellHeight: CGFloat = 28
-        let headerHeight: CGFloat = 96
+        let cellHeight: CGFloat = 32
+        let headerHeight: CGFloat = 84
         let leftLabelWidth: CGFloat = 64
         // Labels rotated -55° from the bottom-left of the last column reach this far past it.
         let headerOverhang = headerHeight / tan(55 * .pi / 180)
+        // Columns share the card's measured width (few residues → wide cells); below 20 pt per
+        // column the heatmap keeps 20 pt cells and scrolls sideways.
+        let columnsWidth = heatmapWidth - leftLabelWidth - headerOverhang - 4
+        let cellWidth: CGFloat = min(44, max(20, (columnsWidth / CGFloat(max(residueKeys.count, 1))).rounded(.down)))
         return ScrollView([.horizontal, .vertical]) {
             VStack(alignment: .leading, spacing: 0) {
                 // Column header: residues, rotated -55° around the bottom of
@@ -415,7 +422,26 @@ private struct InteractionFingerprintView: View {
                         ForEach(residueKeys, id: \.self) { key in
                             cell(types: fingerprints[row][key] ?? [])
                                 .frame(width: cellWidth, height: cellHeight)
+                                .overlay(Rectangle().strokeBorder(DS.Color.hairline, lineWidth: 0.5))
                         }
+                    }
+                }
+
+                // Footer: how many of the selected poses contact each residue.
+                HStack(spacing: 0) {
+                    Text("Poses")
+                        .font(DS.Font.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, DS.Space.xs)
+                        .frame(width: leftLabelWidth, height: cellHeight - 8, alignment: .leading)
+                    ForEach(residueKeys, id: \.self) { key in
+                        let count = fingerprints.reduce(0) { $0 + (($1[key]?.isEmpty == false) ? 1 : 0) }
+                        Text("\(count)")
+                            .font(DS.Font.monoSmall.weight(count == indices.count ? .semibold : .regular))
+                            .monospacedDigit()
+                            .foregroundStyle(count == indices.count ? AnyShapeStyle(DS.Color.success) : AnyShapeStyle(.secondary))
+                            .frame(width: cellWidth, height: cellHeight - 8)
+                            .help("\(residueLabels[key] ?? key): contacted in \(count) of \(indices.count) poses")
                     }
                 }
             }
@@ -423,6 +449,7 @@ private struct InteractionFingerprintView: View {
             .padding(.trailing, headerOverhang)
         }
         .frame(maxHeight: 360)
+        .onGeometryChange(for: CGFloat.self, of: \.size.width) { _, width in heatmapWidth = width }
         .dsCard(padding: DS.Space.s)
     }
 

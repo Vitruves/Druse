@@ -53,10 +53,7 @@ struct InteractionDiagramView: View {
             } else if scene != nil {
                 diagramCanvas
             } else {
-                DSEmptyState("Could Not Generate 2D Layout",
-                             systemImage: "atom",
-                             description: "A SMILES string is required for the 2D depiction of this ligand.")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                contactListFallback
             }
             if showLegend {
                 legend
@@ -223,6 +220,91 @@ struct InteractionDiagramView: View {
         }
         .padding(DS.Space.m)
         .dsFloating(cornerRadius: DS.Radius.m)
+    }
+
+    // MARK: - Contact list (no 2D layout)
+
+    /// Contacts grouped by residue, closest first: what the diagram would have shown.
+    private var residueContacts: [(key: ResidueKey, types: [MolecularInteraction.InteractionType], closest: Float)] {
+        var byResidue: [ResidueKey: [MolecularInteraction]] = [:]
+        for ixn in interactions where proteinAtoms.indices.contains(ixn.proteinAtomIndex) {
+            let atom = proteinAtoms[ixn.proteinAtomIndex]
+            byResidue[ResidueKey(name: atom.residueName, seq: atom.residueSeq, chain: atom.chainID), default: []].append(ixn)
+        }
+        return byResidue.map { key, contacts in
+            let present = Set(contacts.map(\.type))
+            return (key: key,
+                    types: MolecularInteraction.InteractionType.allCases.filter { present.contains($0) },
+                    closest: contacts.map(\.distance).min() ?? 0)
+        }
+        .sorted { $0.closest < $1.closest }
+    }
+
+    /// Shown when RDKit cannot lay the ligand out in 2D: a compact notice and the
+    /// contacts as a residue table, so the window still answers "what touches what".
+    private var contactListFallback: some View {
+        let rows = residueContacts
+        return VStack(alignment: .leading, spacing: DS.Space.l) {
+            HStack(alignment: .top, spacing: DS.Space.m) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(DS.Font.body)
+                    .foregroundStyle(DS.Color.warning)
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text("No 2D layout for this ligand")
+                        .font(DS.Font.sectionTitle)
+                    Text("RDKit could not derive a 2D depiction from its atoms. Load the ligand from SMILES or an SDF with bond orders to get the diagram; its contacts are listed below.")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if rows.isEmpty {
+                Text("This pose makes no contacts with the protein.")
+                    .font(DS.Font.label)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        HStack(spacing: DS.Space.m) {
+                            Text("Residue").frame(width: 110, alignment: .leading)
+                            Text("Interactions").frame(maxWidth: .infinity, alignment: .leading)
+                            Text("Closest").frame(width: 64, alignment: .trailing)
+                        }
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, DS.Space.l)
+                        .frame(height: DS.Size.rowHeight + DS.Space.xs)
+                        Divider()
+                        ForEach(Array(rows.enumerated()), id: \.element.key) { position, row in
+                            if position > 0 { Divider().padding(.leading, DS.Space.l) }
+                            HStack(spacing: DS.Space.m) {
+                                Text(verbatim: "\(row.key.name) \(row.key.seq)\(row.key.chain.isEmpty ? "" : " · \(row.key.chain)")")
+                                    .font(DS.Font.mono)
+                                    .frame(width: 110, alignment: .leading)
+                                FlowLayout(spacing: DS.Space.xs, lineSpacing: DS.Space.xs) {
+                                    ForEach(row.types, id: \.rawValue) { type in
+                                        DSTag(type.label, tint: type.themeColor)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(String(format: "%.1f Å", row.closest))
+                                    .font(DS.Font.monoSmall)
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 64, alignment: .trailing)
+                            }
+                            .padding(.horizontal, DS.Space.l)
+                            .padding(.vertical, DS.Space.s)
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
+                    .dsCard(padding: 0)
+                }
+            }
+        }
+        .padding(DS.Space.xxl)
+        .frame(maxWidth: 720, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     // MARK: - Legend

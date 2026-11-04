@@ -6,6 +6,7 @@
 // Torsion tree, spatial indices, alignment, energies, and ESP.
 
 #include <GraphMol/RingInfo.h>
+#include <GraphMol/Substruct/SubstructMatch.h>
 #include <queue>
 #include <unordered_set>
 #include <nanoflann.hpp>
@@ -223,6 +224,200 @@ void druse_free_torsion_tree(DruseTorsionTree *tree) {
     delete[] tree->edges;
     delete[] tree->movingAtomIndices;
     delete tree;
+}
+
+// MARK: - Ring conformation variants
+
+namespace {
+
+/// A ring dihedral: four full-molecule atom indices, endocyclic or with one exocyclic
+/// heavy substituent (which separates axial from equatorial placements).
+struct RingQuad {
+    int a, b, c, d;
+    bool endocyclic;
+};
+
+constexpr double kRingPlanarDeg = 15.0;
+constexpr double kRingDihedralToleranceDeg = 30.0;
+
+double dihedral_deg(const float *xyz, const RingQuad &q) {
+    auto p = [xyz](int i) { return Eigen::Vector3d(xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]); };
+    const Eigen::Vector3d b1 = p(q.b) - p(q.a), b2 = p(q.c) - p(q.b), b3 = p(q.d) - p(q.c);
+    const Eigen::Vector3d n1 = b1.cross(b2), n2 = b2.cross(b3);
+    const double x = n1.dot(n2);
+    const double y = n1.cross(n2).dot(b2.normalized());
+    return std::atan2(y, x) * 180.0 / M_PI;
+}
+
+int planarity_class(double phi) {
+    if (std::fabs(phi) < kRingPlanarDeg) return 0;
+    return phi > 0 ? 1 : -1;
+}
+
+/// True when conformers `x` and `y` have the same ring conformation under some automorphism.
+bool same_ring_conformation(const float *x, const float *y, const std::vector<RingQuad> &quads,
+                            const std::vector<std::vector<int>> &automorphisms) {
+    for (const auto &perm : automorphisms) {
+        bool match = true;
+        for (const auto &q : quads) {
+            const RingQuad mapped{perm[q.a], perm[q.b], perm[q.c], perm[q.d], q.endocyclic};
+            const double px = dihedral_deg(x, q), py = dihedral_deg(y, mapped);
+            double diff = std::fabs(px - py);
+            if (diff > 180.0) diff = 360.0 - diff;
+            if (diff > kRingDihedralToleranceDeg
+                || (q.endocyclic && planarity_class(px) != planarity_class(py))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+DruseRingVariantSet* druse_ring_conformation_variants(
+    const char *molBlock, const float *positions, int32_t numConformers, int32_t numAtoms,
+    int32_t maxVariants, int32_t addMirror
+) {
+    if (!molBlock || !molBlock[0] || !positions || numConformers <= 0 || numAtoms <= 0 || maxVariants <= 0) {
+        return nullptr;
+    }
+    try {
+        std::unique_ptr<RWMol> mol(MolBlockToMol(std::string(molBlock), true, false, false));
+        if (!mol || (int)mol->getNumAtoms() != numAtoms) return nullptr;
+        MolOps::findSSSR(*mol);
+
+        std::vector<RingQuad> quads;
+        for (const auto &ring : mol->getRingInfo()->atomRings()) {
+            const int k = (int)ring.size();
+            if (k < 5) continue;
+            if (std::all_of(ring.begin(), ring.end(),
+                            [&](int i) { return mol->getAtomWithIdx(i)->getIsAromatic(); })) continue;
+            const std::unordered_set<int> inRing(ring.begin(), ring.end());
+            for (int i = 0; i < k; i++) {
+                const int r0 = ring[i], r1 = ring[(i + 1) % k], r2 = ring[(i + 2) % k];
+                quads.push_back({r0, r1, r2, ring[(i + 3) % k], true});
+                for (const auto *nbr : mol->atomNeighbors(mol->getAtomWithIdx(r0))) {
+                    const int s = (int)nbr->getIdx();
+                    if (nbr->getAtomicNum() != 1 && !inRing.count(s)) quads.push_back({s, r0, r1, r2, false});
+                }
+            }
+        }
+
+        const size_t stride = (size_t)numAtoms * 3;
+        auto conformer = [&](int i) { return positions + stride * (size_t)i; };
+        bool nonPlanar = false;
+        for (int i = 0; i < numConformers && !nonPlanar; i++) {
+            for (const auto &q : quads) {
+                if (q.endocyclic && planarity_class(dihedral_deg(conformer(i), q)) != 0) { nonPlanar = true; break; }
+            }
+        }
+
+        std::vector<int> sourceIndex;
+        std::vector<int> mirrored;
+        std::vector<std::vector<float>> coords;
+        auto addVariant = [&](int source, bool mirror, std::vector<float> xyz) {
+            sourceIndex.push_back(source);
+            mirrored.push_back(mirror ? 1 : 0);
+            coords.push_back(std::move(xyz));
+        };
+
+        if (!nonPlanar) {
+            addVariant(0, false, std::vector<float>(conformer(0), conformer(0) + stride));
+        } else {
+            // Graph automorphisms on heavy atoms, lifted to full-molecule indices
+            // (hydrogens never appear in a ring quad).
+            std::vector<int> heavyToFull;
+            for (const auto *atom : mol->atoms()) {
+                if (atom->getAtomicNum() != 1) heavyToFull.push_back((int)atom->getIdx());
+            }
+            std::unique_ptr<ROMol> heavy(MolOps::removeAllHs(static_cast<const ROMol &>(*mol), false));
+            std::vector<std::vector<int>> automorphisms;
+            if (heavy && heavy->getNumAtoms() == heavyToFull.size()) {
+                SubstructMatchParameters params;
+                params.uniquify = false;
+                params.maxMatches = 1000;
+                for (const auto &match : SubstructMatch(*heavy, *heavy, params)) {
+                    std::vector<int> perm(numAtoms);
+                    for (int i = 0; i < numAtoms; i++) perm[i] = i;
+                    for (const auto &[queryIdx, molIdx] : match) perm[heavyToFull[queryIdx]] = heavyToFull[molIdx];
+                    automorphisms.push_back(std::move(perm));
+                }
+            }
+            if (automorphisms.empty()) {
+                std::vector<int> identity(numAtoms);
+                for (int i = 0; i < numAtoms; i++) identity[i] = i;
+                automorphisms.push_back(std::move(identity));
+            }
+
+            // The mirror image is the same molecule only without tetrahedral stereocentres.
+            bool mirrorAllowed = addMirror != 0;
+            if (mirrorAllowed) {
+                auto &conf = mol->getConformer();
+                for (int i = 0; i < numAtoms; i++) {
+                    const float *p = conformer(0) + 3 * i;
+                    conf.setAtomPos(i, RDGeom::Point3D(p[0], p[1], p[2]));
+                }
+                conf.set3D(true);
+                MolOps::assignStereochemistryFrom3D(*mol);
+                for (const auto *atom : mol->atoms()) {
+                    const auto tag = atom->getChiralTag();
+                    if (tag == Atom::CHI_TETRAHEDRAL_CW || tag == Atom::CHI_TETRAHEDRAL_CCW) {
+                        mirrorAllowed = false;
+                        break;
+                    }
+                }
+            }
+
+            auto isNew = [&](const std::vector<float> &xyz) {
+                for (const auto &kept : coords) {
+                    if (same_ring_conformation(kept.data(), xyz.data(), quads, automorphisms)) return false;
+                }
+                return true;
+            };
+            for (int i = 0; i < numConformers && (int)coords.size() < maxVariants; i++) {
+                std::vector<float> xyz(conformer(i), conformer(i) + stride);
+                if (!isNew(xyz)) continue;
+                std::vector<float> mirror;
+                if (mirrorAllowed) {
+                    double cx = 0;
+                    for (int a = 0; a < numAtoms; a++) cx += xyz[3 * a];
+                    cx /= numAtoms;
+                    mirror = xyz;
+                    for (int a = 0; a < numAtoms; a++) mirror[3 * a] = (float)(2 * cx - xyz[3 * a]);
+                }
+                addVariant(i, false, std::move(xyz));
+                if (!mirror.empty() && (int)coords.size() < maxVariants && isNew(mirror)) {
+                    addVariant(i, true, std::move(mirror));
+                }
+            }
+        }
+
+        auto *set = new DruseRingVariantSet();
+        set->count = (int32_t)coords.size();
+        set->numAtoms = numAtoms;
+        set->sourceIndex = new int32_t[coords.size()];
+        set->mirrored = new int32_t[coords.size()];
+        set->positions = new float[coords.size() * stride];
+        for (size_t v = 0; v < coords.size(); v++) {
+            set->sourceIndex[v] = sourceIndex[v];
+            set->mirrored[v] = mirrored[v];
+            std::copy(coords[v].begin(), coords[v].end(), set->positions + v * stride);
+        }
+        return set;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void druse_free_ring_variant_set(DruseRingVariantSet *set) {
+    if (!set) return;
+    delete[] set->sourceIndex;
+    delete[] set->mirrored;
+    delete[] set->positions;
+    delete set;
 }
 
 namespace {

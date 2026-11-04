@@ -9,7 +9,8 @@ import simd
 enum PDBWriter {
 
     /// Build a PDB string containing the protein atoms followed by the ligand pose
-    /// (HETATM records) using the supplied transformed positions.
+    /// (HETATM records) using the supplied transformed positions. `proteinHydrogens: false`
+    /// leaves the receptor's hydrogens out (for tools that re-protonate on import).
     @MainActor
     static func combinedPose(
         protein: Molecule?,
@@ -18,7 +19,8 @@ enum PDBWriter {
         ligandResidueName: String = "LIG",
         ligandChainID: String = "X",
         ligandResidueSeq: Int = 1,
-        title: String? = nil
+        title: String? = nil,
+        proteinHydrogens: Bool = true
     ) -> String {
         var lines: [String] = []
 
@@ -30,7 +32,8 @@ enum PDBWriter {
 
         var serial = 1
         if let protein {
-            appendProteinRecords(protein.atoms, to: &lines, serial: &serial)
+            let atoms = proteinHydrogens ? protein.atoms : protein.atoms.filter { $0.element != .H }
+            appendProteinRecords(atoms, to: &lines, serial: &serial)
         }
 
         // Ligand HETATM records — use the heavy-atom template combined with the
@@ -130,6 +133,38 @@ enum PDBWriter {
             }
         }
 
+        lines.append("END")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Ligand poses only, one MODEL/ENDMDL block per pose (heavy atoms as HETATM, a REMARK
+    /// with each pose's score line). Viewers such as PyMOL and ChimeraX load the models as
+    /// states, so poses can be stepped through like a trajectory.
+    @MainActor
+    static func multiModelPoses(
+        ligandTemplate: Molecule,
+        poses: [(rank: Int, positions: [SIMD3<Float>], scoreLine: String)],
+        ligandResidueName: String = "LIG",
+        ligandChainID: String = "X",
+        title: String? = nil
+    ) -> String {
+        var lines: [String] = title.map(titleChunks) ?? []
+        let heavyAtoms = ligandTemplate.atoms.filter { $0.element != .H }
+        for (model, pose) in poses.enumerated() {
+            lines.append(String(format: "MODEL     %4d", model + 1))
+            lines.append("REMARK   2 \(pose.scoreLine)")
+            for i in 0..<min(heavyAtoms.count, pose.positions.count) {
+                let template = heavyAtoms[i]
+                let atom = Atom(
+                    id: i + 1, element: template.element, position: pose.positions[i],
+                    name: ligandAtomName(template: template, index: i),
+                    residueName: ligandResidueName, residueSeq: pose.rank, chainID: ligandChainID,
+                    charge: template.charge, formalCharge: template.formalCharge, isHetAtom: true
+                )
+                lines.append(atomRecord(record: "HETATM", serial: i + 1, atom: atom, position: pose.positions[i]))
+            }
+            lines.append("ENDMDL")
+        }
         lines.append("END")
         return lines.joined(separator: "\n") + "\n"
     }

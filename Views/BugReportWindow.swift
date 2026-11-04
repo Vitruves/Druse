@@ -48,9 +48,13 @@ struct BugReportWindow: View {
             systemImage: "ladybug"
         ) {
             Form {
-                Section("Summary") {
+                // Hidden labels: a labelled grouped-form field right-aligns its text,
+                // so the section header names the field and the text starts on the left.
+                Section("Title") {
                     TextField("Title", text: $title,
                               prompt: Text("e.g. Crash when loading PDB 1ABC"))
+                        .labelsHidden()
+                        .multilineTextAlignment(.leading)
                 }
 
                 Section {
@@ -67,7 +71,7 @@ struct BugReportWindow: View {
                         TextEditor(text: $steps)
                             .font(DS.Font.mono)
                             .scrollContentBackground(.hidden)
-                            .frame(minHeight: 120)
+                            .frame(minHeight: 110)
                             .accessibilityLabel("Description")
                     }
                 } header: {
@@ -79,8 +83,10 @@ struct BugReportWindow: View {
                 Section {
                     TextField("Reply-to", text: $reporterEmail, prompt: Text("your@email.com"))
                         .textContentType(.emailAddress)
+                        .labelsHidden()
+                        .multilineTextAlignment(.leading)
                 } header: {
-                    Text("Contact")
+                    Text("Reply-to Address")
                 } footer: {
                     Text("Optional — lets the developer reply to you.")
                 }
@@ -148,7 +154,7 @@ struct BugReportWindow: View {
             .keyboardShortcut(.defaultAction)
             .disabled(!canSend)
         }
-        .frame(minWidth: 540, idealWidth: 600, maxWidth: 720, minHeight: 600, idealHeight: 700)
+        .frame(minWidth: 540, idealWidth: 600, maxWidth: 720, minHeight: 640, idealHeight: 780)
         // The scaffold header already says "Report a Bug"; a second title in the
         // window's title bar only repeats it.
         .toolbar(removing: .title)
@@ -165,7 +171,11 @@ struct BugReportWindow: View {
     private var statusView: some View {
         switch status {
         case .idle:
-            EmptyView()
+            if !canSend {
+                Text("Add a title and a description to send.")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.tertiary)
+            }
         case .sending:
             Label("Sending…", systemImage: "paperplane")
                 .font(DS.Font.secondary)

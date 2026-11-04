@@ -5,8 +5,11 @@ import SwiftUI
 
 struct PreparationTabView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var pkaReferenceExpanded = false
+    /// Remembered across launches; expanded by default so every manual tool stays one click away.
+    @AppStorage("prep.manualStepsExpanded") private var manualStepsExpanded = true
 
     var body: some View {
         if let prot = viewModel.molecules.protein {
@@ -27,12 +30,10 @@ struct PreparationTabView: View {
                 DSEmptyState(
                     "No Protein Loaded",
                     systemImage: "wrench.and.screwdriver",
-                    description: "Load a structure in step 1."
+                    description: "Load or fetch a protein in step 1, then come back to clean, repair and protonate it."
                 ) {
-                    Button("Go to Search") {
-                        viewModel.workspace.requestedTab = .search
-                        viewModel.workspace.requestedTabToken &+= 1
-                    }
+                    Button("Go to Search") { SidebarTab.search.request(in: viewModel) }
+                        .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
                 }
                 .padding(.top, DS.Space.xxl)
             }
@@ -43,35 +44,67 @@ struct PreparationTabView: View {
 
     private var phText: String { String(format: "%.1f", viewModel.molecules.protonationPH) }
 
+    private var prepareTitle: String {
+        viewModel.molecules.isMinimizing ? "Preparing…"
+            : viewModel.molecules.proteinPrepared ? "Prepare Again" : "Prepare for Docking"
+    }
+
+    private var prepareHelp: String {
+        "Keeps the preferred alternate conformation, removes non-standard residues, builds short missing loops, caps chain breaks, rebuilds missing atoms, adds hydrogens at pH \(phText) and assigns partial charges. Waters are kept — use Cleanup below to remove them."
+    }
+
+    /// Before preparation the one-click pipeline is the step's primary action. Once the
+    /// structure is prepared, moving on is what users want: re-running drops to a
+    /// secondary button beside the next-step link.
     @ViewBuilder
     private var footer: some View {
-        Text("Cleanup · repair · hydrogens at pH \(phText) · charges")
-            .font(DS.Font.caption)
-            .monospacedDigit()
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        if viewModel.molecules.proteinPrepared && !viewModel.molecules.isMinimizing {
+            let rerun = Button { viewModel.runEnergyMinimization() } label: {
+                Label(prepareTitle, systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
+            .fixedSize()
+            .help(prepareHelp)
+            .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
+            let next = DSNextStepButton(SidebarTab.preparation.suggestedNextStep(in: viewModel) ?? .ligands)
+                .fixedSize()
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: DS.Space.m) {
+                    rerun
+                    Spacer(minLength: DS.Space.s)
+                    next
+                }
+                VStack(alignment: .leading, spacing: DS.Space.s) {
+                    rerun
+                    HStack {
+                        Spacer(minLength: 0)
+                        next
+                    }
+                }
+            }
+        } else {
+            Text("Cleanup · repair · hydrogens at pH \(phText) · charges")
+                .font(DS.Font.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-        PanelRunButton(
-            title: viewModel.molecules.isMinimizing ? "Preparing…"
-                : viewModel.molecules.proteinPrepared ? "Prepare Again" : "Prepare for Docking",
-            icon: "wand.and.stars",
-            isDisabled: viewModel.molecules.isMinimizing
-        ) {
-            viewModel.runEnergyMinimization()
-        }
-        .help("Keeps the preferred alternate conformation, removes non-standard residues, builds short missing loops, caps chain breaks, rebuilds missing atoms, adds hydrogens at pH \(phText) and assigns partial charges. Waters are kept — use Cleanup below to remove them.")
-        .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
+            PanelRunButton(
+                title: prepareTitle,
+                icon: "wand.and.stars",
+                isDisabled: viewModel.molecules.isMinimizing
+            ) {
+                viewModel.runEnergyMinimization()
+            }
+            .help(prepareHelp)
+            .accessibilityIdentifier(AccessibilityID.prepStructureCleanup)
 
-        if viewModel.molecules.isMinimizing {
-            ProgressView()
-                .progressViewStyle(.linear)
-                .controlSize(.small)
-        } else if viewModel.molecules.proteinPrepared {
-            HStack {
-                DSTag("Prepared", tone: .success, systemImage: "checkmark")
-                Spacer(minLength: 0)
-                DSNextStepButton(SidebarTab.preparation.suggestedNextStep(in: viewModel) ?? .ligands)
-                    .fixedSize()
+            if viewModel.molecules.isMinimizing {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    .accessibilityLabel("Preparing the protein")
             }
         }
     }
@@ -246,7 +279,7 @@ struct PreparationTabView: View {
                     }
                 }
                 PanelHint(
-                    text: "Structure Repair below rebuilds missing loops and atoms; “Prepare for Docking” runs it too.",
+                    text: "“Prepare for Docking” repairs these; Manual Steps ▸ Structure Repair fixes them one at a time.",
                     icon: "lightbulb"
                 )
             }
@@ -305,16 +338,42 @@ struct PreparationTabView: View {
     // MARK: - Manual steps card
 
     private var manualStepsCard: some View {
-        PanelCard("Manual Steps", icon: "slider.horizontal.3") {
-            VStack(alignment: .leading, spacing: DS.Space.m) {
-                PanelLabeledDivider(title: "Cleanup", icon: "paintbrush")
-                cleanupSection
-                PanelLabeledDivider(title: "Structure Repair", icon: "bandage")
-                structureRepairSection
-                PanelLabeledDivider(title: "Hydrogens & Protonation", icon: "atom")
-                hydrogensSection
-                PanelLabeledDivider(title: "Charges", icon: "bolt")
-                chargesSection
+        PanelCard(
+            "Manual Steps",
+            icon: "slider.horizontal.3",
+            accessory: {
+                Button {
+                    withAnimation(DS.Motion.respecting(reduceMotion, DS.Motion.snappy)) { manualStepsExpanded.toggle() }
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(manualStepsExpanded ? 90 : 0))
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help(manualStepsExpanded ? "Hide the manual preparation tools" : "Show the manual preparation tools")
+                .accessibilityLabel("Manual steps")
+                .accessibilityValue(manualStepsExpanded ? "Expanded" : "Collapsed")
+            }
+        ) {
+            if manualStepsExpanded {
+                VStack(alignment: .leading, spacing: DS.Space.m) {
+                    PanelLabeledDivider(title: "Cleanup", icon: "paintbrush")
+                    cleanupSection
+                    PanelLabeledDivider(title: "Structure Repair", icon: "bandage")
+                    structureRepairSection
+                    PanelLabeledDivider(title: "Hydrogens & Protonation", icon: "atom")
+                    hydrogensSection
+                    PanelLabeledDivider(title: "Charges", icon: "bolt")
+                    chargesSection
+                }
+            } else {
+                Text("Cleanup, structure repair, hydrogens and charges, one tool at a time.")
+                    .font(DS.Font.secondary)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

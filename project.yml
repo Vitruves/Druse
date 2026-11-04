@@ -38,6 +38,7 @@ targets:
       - path: ML
       - path: Services
       - path: Utils
+      - path: Console
       - path: Resources/Assets.xcassets
       - path: Resources/dun2010bbdep.bin
         buildPhase: resources

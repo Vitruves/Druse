@@ -1,0 +1,37 @@
+# Protein preparation, stage by stage, on PDBbind 1add (adenosine deaminase).
+# Run: druse Examples/protein_preparation.druse   (relative paths resolve against this script's folder)
+# Writes the prepared receptor to $out (/tmp; edit the "set out" line to write elsewhere).
+set onerror=stop
+set data = ../Benchmark/data/refined-set/1add
+set out = /tmp
+
+load $data/1add_protein.pdb
+protein info
+chain list
+chain sequence A
+
+# What is missing or odd in the deposited structure
+prep missing
+residue list het
+
+# Cleanup: preferred altlocs, drop non-standard residues and every water
+prep altlocs
+prep nonstandard
+prep waters remove
+
+# PDBbind ships the receptor protonated: strip hydrogens so FASPR can work on the heavy-atom model,
+# rebuild missing heavy atoms and repack the incomplete side chains
+prep hydrogens remove
+prep repair atoms
+prep pack residues=incomplete
+
+# pKa-aware protonation at pH 7.4, H-bond network, charges, restrained minimisation
+prep protonate ph=7.4
+prep states type=his
+prep hbonds
+prep charges method=gasteiger
+prep minimize steps=50
+prep report
+
+export protein $out/1add_prepared.pdb hydrogens=on
+status

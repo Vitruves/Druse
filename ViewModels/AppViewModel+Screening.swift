@@ -24,15 +24,18 @@ extension AppViewModel {
         workspace.statusMessage = "\(prepared.count) ligands queued — run from Docking tab"
     }
 
-    func dockEntries(_ entries: [LigandEntry]) {
+    /// Docks each prepared entry into the selected pocket. Returns nil when nothing can be
+    /// docked; otherwise the batch task (also stored in `docking.batchDockingTask`).
+    @discardableResult
+    func dockEntries(_ entries: [LigandEntry]) -> Task<Void, Never>? {
         let prepared = entries.filter { !$0.atoms.isEmpty }
         guard !prepared.isEmpty else {
             log.warn("No prepared ligands in selection — prepare them first", category: .dock)
-            return
+            return nil
         }
         guard let pocket = docking.selectedPocket, let prot = molecules.protein else {
             log.error("Need protein and pocket for batch docking", category: .dock)
-            return
+            return nil
         }
 
         docking.isBatchDocking = true
@@ -44,7 +47,7 @@ extension AppViewModel {
         workspace.statusMessage = "Batch docking 0/\(prepared.count)..."
 
         docking.batchDockingTask = Task {
-            if docking.dockingEngine == nil, let device = renderer?.device {
+            if docking.dockingEngine == nil, let device = computeDevice {
                 docking.dockingEngine = DockingEngine(device: device)
             }
             guard let engine = docking.dockingEngine else {
@@ -58,7 +61,7 @@ extension AppViewModel {
             let chargeMethod = docking.chargeMethod
             let (scoringProtein, _) = await preparedProteinForDocking(protein: prot, pH: dockingPH, chargeMethod: chargeMethod)
 
-            engine.computeGridMaps(protein: scoringProtein, pocket: pocket, spacing: docking.dockingConfig.gridSpacing)
+            attachReceptor(scoringProtein, to: engine)
 
             // Bind pharmacophore buffers (required by all scoring kernels, even if empty)
             engine.prepareConstraintBuffers(
@@ -66,7 +69,6 @@ extension AppViewModel {
                 atoms: scoringProtein.atoms,
                 residues: scoringProtein.residues
             )
-            log.success("[Batch] Grid maps computed", category: .dock)
 
             for (i, entry) in prepared.enumerated() {
                 guard !Task.isCancelled, docking.isBatchDocking else {
@@ -200,6 +202,7 @@ extension AppViewModel {
             log.success("Batch complete: \(docking.batchResults.count) ligands, best: \(docking.batchResults.first?.ligandName ?? "?") (\(String(format: "%.1f", bestScore)) \(sm.unitLabel))", category: .dock)
             workspace.statusMessage = "Batch complete — \(docking.batchResults.count) ligands ranked"
         }
+        return docking.batchDockingTask
     }
 
     func cancelBatchDocking() {
@@ -213,13 +216,21 @@ extension AppViewModel {
 
     // MARK: - Virtual Screening
 
-    func startScreening(library: [(name: String, smiles: String)]) {
+    /// Screens a SMILES library against the selected pocket with `config` (pipeline defaults
+    /// when omitted). Returns nil without protein or pocket; otherwise the screening task
+    /// (also stored in `docking.screeningTask`).
+    @discardableResult
+    func startScreening(
+        library: [(name: String, smiles: String)],
+        config: VirtualScreeningPipeline.ScreeningConfig = .init()
+    ) -> Task<Void, Never>? {
         guard let pocket = docking.selectedPocket, let prot = molecules.protein else {
             log.error("Need protein and pocket for virtual screening", category: .dock)
-            return
+            return nil
         }
 
         let pipeline = docking.screeningPipeline ?? VirtualScreeningPipeline()
+        pipeline.config = config
         docking.screeningPipeline = pipeline
         docking.screeningState = .preparing(current: 0, total: library.count)
         docking.screeningProgress = 0
@@ -238,7 +249,7 @@ extension AppViewModel {
         }
 
         docking.screeningTask = Task {
-            if docking.dockingEngine == nil, let device = renderer?.device {
+            if docking.dockingEngine == nil, let device = computeDevice {
                 docking.dockingEngine = DockingEngine(device: device)
             }
             guard let engine = docking.dockingEngine else {
@@ -268,6 +279,7 @@ extension AppViewModel {
                 workspace.statusMessage = "Screening: \(hits) hits"
             }
         }
+        return docking.screeningTask
     }
 
     func cancelScreening() {
@@ -281,16 +293,52 @@ extension AppViewModel {
 
     // MARK: - Export
 
+    enum DockingExportError: LocalizedError {
+        case noResults
+        case noLigand
+        case noStructure
+        case poseOutOfRange(Int)
+        case missingCoordinates(Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .noResults: "No docking results to export"
+            case .noLigand: "No docked ligand loaded"
+            case .noStructure: "No protein or ligand loaded"
+            case .poseOutOfRange(let index): "No pose #\(index + 1)"
+            case .missingCoordinates(let index): "Pose #\(index + 1) has no transformed coordinates"
+            }
+        }
+    }
+
+    /// Maximum number of poses written by `writeDockingResultsSDF`.
+    static let exportedPoseLimit = 50
+
     func exportDockingResultsSDF() {
-        guard !docking.dockingResults.isEmpty, let lig = molecules.ligand else { return }
+        guard !docking.dockingResults.isEmpty, molecules.ligand != nil else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.init(filenameExtension: "sdf")].compactMap { $0 }
         panel.nameFieldStringValue = "docking_poses.sdf"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
+        do {
+            let count = try writeDockingResultsSDF(to: url)
+            log.success("Exported \(count) poses to SDF", category: .dock)
+        } catch {
+            log.error("SDF export failed: \(error.localizedDescription)", category: .dock)
+        }
+    }
+
+    /// Writes the top-ranked docking poses (at most `exportedPoseLimit`) as SDF; returns the pose count.
+    @discardableResult
+    func writeDockingResultsSDF(to url: URL) throws -> Int {
+        guard !docking.dockingResults.isEmpty else { throw DockingExportError.noResults }
+        guard let lig = molecules.ligand else { throw DockingExportError.noLigand }
+
+        let poses = docking.dockingResults.prefix(Self.exportedPoseLimit)
         var molBlocks: [String] = []
-        molBlocks.reserveCapacity(min(docking.dockingResults.count, 50))
-        for (i, result) in docking.dockingResults.prefix(50).enumerated() {
+        molBlocks.reserveCapacity(poses.count)
+        for (i, result) in poses.enumerated() {
             let heavyAtoms = lig.atoms.filter { $0.element != .H }
             var poseAtoms: [Atom] = []
             var idMap: [Int: Int] = [:]
@@ -323,14 +371,8 @@ extension AppViewModel {
             molBlocks.append(SDFWriter.molBlock(name: "\(lig.name)_pose\(i + 1)", atoms: poseAtoms,
                                        bonds: poseBonds, properties: props))
         }
-        let sdf = molBlocks.joined()
-
-        do {
-            try SDFWriter.save(sdf, to: url)
-            log.success("Exported \(min(docking.dockingResults.count, 50)) poses to SDF", category: .dock)
-        } catch {
-            log.error("SDF export failed: \(error.localizedDescription)", category: .dock)
-        }
+        try SDFWriter.save(molBlocks.joined(), to: url)
+        return poses.count
     }
 
     /// Export a single docked pose (protein + transformed ligand) as a combined PDB file.
@@ -355,6 +397,22 @@ extension AppViewModel {
         panel.nameFieldStringValue = "\(ligName)_pose\(index + 1).pdb"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
+        do {
+            try writeDockingPosePDB(at: index, to: url)
+            log.success("Exported pose #\(index + 1) to \(url.lastPathComponent)", category: .dock)
+        } catch {
+            log.error("PDB export failed: \(error.localizedDescription)", category: .dock)
+        }
+    }
+
+    /// Writes pose `index` (0-based) with the protein as one PDB file.
+    func writeDockingPosePDB(at index: Int, to url: URL) throws {
+        guard docking.dockingResults.indices.contains(index) else { throw DockingExportError.poseOutOfRange(index) }
+        let result = docking.dockingResults[index]
+        let ligand = docking.originalDockingLigand ?? molecules.ligand
+        guard !result.transformedAtomPositions.isEmpty else { throw DockingExportError.missingCoordinates(index) }
+        guard ligand != nil || molecules.protein != nil else { throw DockingExportError.noStructure }
+
         let title = String(
             format: "Druse pose %d  score=%.2f %@",
             index + 1,
@@ -367,13 +425,7 @@ extension AppViewModel {
             ligandPositions: result.transformedAtomPositions,
             title: title
         )
-
-        do {
-            try PDBWriter.save(pdb, to: url)
-            log.success("Exported pose #\(index + 1) to \(url.lastPathComponent)", category: .dock)
-        } catch {
-            log.error("PDB export failed: \(error.localizedDescription)", category: .dock)
-        }
+        try PDBWriter.save(pdb, to: url)
     }
 
     func exportDockingResultsCSV() {
@@ -383,13 +435,18 @@ extension AppViewModel {
         panel.nameFieldStringValue = "docking_results.csv"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        let csv = exportResultsCSV()
         do {
-            try csv.write(to: url, atomically: true, encoding: .utf8)
+            try writeDockingResultsCSV(to: url)
             log.success("Exported docking results to CSV", category: .dock)
         } catch {
             log.error("CSV export failed: \(error.localizedDescription)", category: .dock)
         }
+    }
+
+    /// Writes the docking results table (`exportResultsCSV()`) to `url`.
+    func writeDockingResultsCSV(to url: URL) throws {
+        guard !docking.dockingResults.isEmpty else { throw DockingExportError.noResults }
+        try exportResultsCSV().write(to: url, atomically: true, encoding: .utf8)
     }
 
     func exportScreeningHits() {

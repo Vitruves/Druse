@@ -317,6 +317,23 @@ A built-in molecular database for organizing your compounds.
 
 <br>
 
+## Console & Scripting
+
+Everything Druse does in the GUI is also a DruseScript command: loading, protein and ligand preparation, pockets, docking, analysis, export, lead optimization, view control and settings. Type commands in the built-in terminal (⌃\`, with Tab completion, autosuggestions, history and ⌃R search), save them as `.druse` scripts, or run them from macOS Terminal without opening a window:
+
+```bash
+druse Examples/dock_one_ligand.druse
+druse --eval "fetch 1hsg; prep; pocket detect; dock preset=fast; results top=5"
+```
+
+Install the `druse` command and fish/zsh/bash completions from **Settings ▸ Command Line** and **Settings ▸ Shell Completions** (or `cli install` and `cli completions install` in the terminal). The full language and command reference is in [Docs/DruseScript.md](Docs/DruseScript.md); runnable example scripts are in [Examples/](Examples).
+
+<br>
+
+---
+
+<br>
+
 ## Guided Demo
 
 New to molecular docking? Druse includes a fully interactive guided walkthrough that docks Nafamostat into Trypsin (PDB: 3PTB) — from protein fetch to scored poses — with step-by-step narration. Just click **Demo** on the welcome screen.

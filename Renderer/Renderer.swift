@@ -144,6 +144,12 @@ final class Renderer: NSObject {
     // All molecule atom positions for camera fitting (independent of render mode filtering)
     private var allMoleculePositions: [SIMD3<Float>] = []
 
+    /// Attachment formats and MSAA sample count the pipelines were built for. Offscreen
+    /// snapshots render into textures of exactly these formats so the same pipelines apply.
+    private let colorPixelFormat: MTLPixelFormat
+    private let depthPixelFormat: MTLPixelFormat
+    private let sampleCount: Int
+
     init?(mtkView: MTKView) {
         guard let device = mtkView.device ?? MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
@@ -154,6 +160,9 @@ final class Renderer: NSObject {
         self.device = device
         self.commandQueue = queue
         self.library = lib
+        self.colorPixelFormat = mtkView.colorPixelFormat
+        self.depthPixelFormat = mtkView.depthStencilPixelFormat
+        self.sampleCount = mtkView.sampleCount
 
         super.init()
 
@@ -935,12 +944,37 @@ final class Renderer: NSObject {
             semaphore.signal()
         }
 
+        // MSAA: storeAndMultisampleResolve
+        descriptor.colorAttachments[0].storeAction = view.sampleCount > 1 ? .storeAndMultisampleResolve : .store
+        let viewportSize = SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height))
+        guard encodeScene(into: commandBuffer, descriptor: descriptor, viewportSize: viewportSize) else {
+            // Commit the empty buffer so its completion handler returns the frame slot;
+            // otherwise three consecutive failures would deadlock the main thread on wait().
+            commandBuffer.commit()
+            return
+        }
+
+        if let drawable = view.currentDrawable {
+            commandBuffer.present(drawable)
+        }
+        commandBuffer.commit()
+
+        // Keep requesting frames while camera is smoothly animating
+        if camera.isAnimating {
+            setNeedsRedraw()
+        }
+    }
+
+    /// Encodes one frame of the scene into `descriptor`'s attachments (on screen or offscreen).
+    /// The caller owns the frame slot and commits `commandBuffer`; returns false when no encoder
+    /// could be created.
+    private func encodeScene(into commandBuffer: MTLCommandBuffer,
+                             descriptor: MTLRenderPassDescriptor,
+                             viewportSize: SIMD2<Float>) -> Bool {
         // Rotate uniform buffer index
         currentUniformBufferIndex = (currentUniformBufferIndex + 1) % Self.maxFramesInFlight
         let uniformBuffer = uniformBuffers[currentUniformBufferIndex]
 
-        // MSAA: storeAndMultisampleResolve
-        descriptor.colorAttachments[0].storeAction = view.sampleCount > 1 ? .storeAndMultisampleResolve : .store
         descriptor.colorAttachments[0].loadAction = .clear
         let clearColor: MTLClearColor
         if backgroundOpacity <= 0.01 {
@@ -955,13 +989,10 @@ final class Renderer: NSObject {
         descriptor.colorAttachments[0].clearColor = clearColor
 
         // Update uniforms into the current ring buffer slot
-        updateUniforms(into: uniformBuffer, viewportSize: SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height)))
+        updateUniforms(into: uniformBuffer, viewportSize: viewportSize)
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
-            // Commit the empty buffer so its completion handler returns the frame slot;
-            // otherwise three consecutive failures would deadlock the main thread on wait().
-            commandBuffer.commit()
-            return
+            return false
         }
 
         // 1. Background gradient
@@ -1079,16 +1110,100 @@ final class Renderer: NSObject {
         }
 
         encoder.endEncoding()
+        return true
+    }
 
-        if let drawable = view.currentDrawable {
-            commandBuffer.present(drawable)
+    // MARK: - Offscreen Snapshot
+
+    /// Largest snapshot edge in pixels (Metal's 2D texture limit on Apple silicon).
+    static let maxSnapshotSide = 16384
+
+    /// Renders the current scene, from the current camera, offscreen at `width`×`height` pixels
+    /// (same MSAA and shading as the viewport) and returns it as an sRGB image. Used by the
+    /// console's `view snapshot`; works without a window. Nil when the size is out of range or
+    /// the GPU resources cannot be created.
+    func snapshot(width: Int, height: Int) -> CGImage? {
+        let sides = 1...Self.maxSnapshotSide
+        guard sides.contains(width), sides.contains(height) else { return nil }
+
+        let resolveDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: colorPixelFormat, width: width, height: height, mipmapped: false)
+        resolveDescriptor.usage = .renderTarget
+        resolveDescriptor.storageMode = .shared
+        guard let resolved = device.makeTexture(descriptor: resolveDescriptor) else { return nil }
+
+        let depthDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: depthPixelFormat, width: width, height: height, mipmapped: false)
+        depthDescriptor.usage = .renderTarget
+        depthDescriptor.storageMode = .private
+        depthDescriptor.textureType = sampleCount > 1 ? .type2DMultisample : .type2D
+        depthDescriptor.sampleCount = sampleCount
+        guard let depth = device.makeTexture(descriptor: depthDescriptor) else { return nil }
+
+        let pass = MTLRenderPassDescriptor()
+        if sampleCount > 1 {
+            let msaaDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: colorPixelFormat, width: width, height: height, mipmapped: false)
+            msaaDescriptor.usage = .renderTarget
+            msaaDescriptor.storageMode = .private
+            msaaDescriptor.textureType = .type2DMultisample
+            msaaDescriptor.sampleCount = sampleCount
+            guard let msaa = device.makeTexture(descriptor: msaaDescriptor) else { return nil }
+            pass.colorAttachments[0].texture = msaa
+            pass.colorAttachments[0].resolveTexture = resolved
+            pass.colorAttachments[0].storeAction = .multisampleResolve
+        } else {
+            pass.colorAttachments[0].texture = resolved
+            pass.colorAttachments[0].storeAction = .store
         }
+        pass.depthAttachment.texture = depth
+        pass.depthAttachment.loadAction = .clear
+        pass.depthAttachment.clearDepth = 1.0
+        pass.depthAttachment.storeAction = .dontCare
+
+        frameSemaphore.wait()
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            frameSemaphore.signal()
+            return nil
+        }
+        commandBuffer.addCompletedHandler { [semaphore = frameSemaphore] _ in
+            semaphore.signal()
+        }
+        // The snapshot's aspect ratio applies to this frame only; the viewport keeps its own.
+        let viewportAspect = camera.aspectRatio
+        let encoded = encodeScene(into: commandBuffer, descriptor: pass,
+                                  viewportSize: SIMD2<Float>(Float(width), Float(height)))
+        camera.aspectRatio = viewportAspect
         commandBuffer.commit()
+        guard encoded else { return nil }
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else { return nil }
 
-        // Keep requesting frames while camera is smoothly animating
-        if camera.isAnimating {
-            setNeedsRedraw()
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        pixels.withUnsafeMutableBytes { buffer in
+            resolved.getBytes(buffer.baseAddress!, bytesPerRow: bytesPerRow,
+                              from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
         }
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        return CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        )
+    }
+
+    /// A renderer that is not attached to any window, configured like the viewport
+    /// (BGRA8, 32-bit depth, 4× MSAA). Headless runs use it for `view snapshot`.
+    static func makeWindowless() -> Renderer? {
+        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+        let view = MTKView(frame: CGRect(x: 0, y: 0, width: 800, height: 600), device: device)
+        view.colorPixelFormat = .bgra8Unorm
+        view.depthStencilPixelFormat = .depth32Float
+        view.sampleCount = 4
+        return Renderer(mtkView: view)
     }
 
     private func updateUniforms(into buffer: MTLBuffer, viewportSize: SIMD2<Float>) {

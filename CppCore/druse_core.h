@@ -324,6 +324,25 @@ DruseMoleculeResult* druse_compute_charges_pdb(const char *pdbContent);
 /// Preserves atom ordering so charges can be merged back onto an existing ligand.
 DruseMoleculeResult* druse_compute_charges_molblock(const char *molBlock);
 
+/// Puts a prepared ligand on experimental heavy-atom coordinates (crystal redocking input).
+/// `targetMolBlock` is the prepared structure (bond orders, formal charges, hydrogens) and
+/// `templateMolBlock` the experimental ligand; only the template's heavy-atom elements,
+/// connectivity and coordinates are used. Each target heavy atom takes the coordinates of
+/// its graph match in the template, hydrogens are re-placed on that geometry, and with
+/// `minimize` the structure is MMFF94-relaxed under harmonic heavy-atom position
+/// restraints (100 kcal/mol/A^2 beyond 0.3 A), so hydrogens move and heavy atoms stay.
+/// The result keeps the target's atom order. `outEnergy` (optional) receives the
+/// unrestrained MMFF94 energy of the final geometry (NaN without MMFF parameters).
+/// Fails when the two heavy-atom graphs differ.
+DruseMoleculeResult* druse_prepare_on_template(
+    const char *templateMolBlock,
+    const char *targetMolBlock,
+    const char *name,
+    bool minimize,
+    bool computeCharges,
+    double *outEnergy
+);
+
 /// Convert an MDL mol block to canonical SMILES.
 /// Uses RDKit's native MolBlockToMol parser, which handles both 2D and 3D coordinates correctly.
 /// Returns a result with the SMILES string populated (atoms/bonds are NOT populated).
@@ -401,6 +420,20 @@ void druse_free_batch_results(DruseMoleculeResult **results, int32_t count);
 const char* druse_rdkit_version(void);
 
 // ============================================================================
+// MARK: - CPU Thread Limit
+// ============================================================================
+
+/// Caps the CPU worker threads used by the C++ core: every TBB parallel loop (ligand
+/// variants, protonation, analysis, GFN2-xTB) and the OpenMM CPU platform. The limit counts
+/// the calling thread. `maxThreads <= 0` restores the hardware default. Safe to call again
+/// at any time; OpenMM picks up the new value for contexts created afterwards.
+/// Returns the limit now in effect.
+int32_t druse_set_max_threads(int32_t maxThreads);
+
+/// The CPU thread limit currently in effect for TBB work (the hardware count when uncapped).
+int32_t druse_max_threads(void);
+
+// ============================================================================
 // MARK: - Torsion Tree
 // ============================================================================
 
@@ -428,6 +461,31 @@ DruseTorsionTree* druse_build_torsion_tree(const char *smiles);
 DruseTorsionTree* druse_build_torsion_tree_molblock(const char *molBlock);
 
 void druse_free_torsion_tree(DruseTorsionTree *tree);
+
+typedef struct {
+    int32_t count;           // number of distinct ring conformations
+    int32_t numAtoms;
+    int32_t *sourceIndex;    // input conformer each variant comes from
+    int32_t *mirrored;       // 1 when the variant is that conformer's mirror image
+    float *positions;        // count * numAtoms * 3 coordinates, input atom order
+} DruseRingVariantSet;
+
+/// Distinct ring conformations among `numConformers` coordinate sets of the molecule in
+/// `molBlock` (same atom order; `positions` holds numConformers * numAtoms * 3 floats,
+/// best first). Torsion trees keep rings rigid, so each distinct pucker of a non-aromatic
+/// ring of size >= 5 is a separate docking start. Conformers match when, under some graph
+/// automorphism, every endocyclic dihedral has the same sign class (0 below 15 deg) and every
+/// endo/exocyclic ring dihedral differs by at most 30 deg; the first of each class is kept.
+/// With `addMirror` and no tetrahedral stereocentre, each kept conformer's mirror image
+/// (reflection keeps E/Z) is added when it is a new ring conformation. A molecule without a
+/// non-planar ring yields exactly conformer 0. Returns at most `maxVariants`, or NULL on
+/// failure. Free with druse_free_ring_variant_set().
+DruseRingVariantSet* druse_ring_conformation_variants(
+    const char *molBlock, const float *positions, int32_t numConformers, int32_t numAtoms,
+    int32_t maxVariants, int32_t addMirror
+);
+
+void druse_free_ring_variant_set(DruseRingVariantSet *set);
 
 // ============================================================================
 // MARK: - Spatial Queries (nanoflann KD-tree)

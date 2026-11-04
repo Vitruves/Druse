@@ -127,7 +127,7 @@ struct SequenceView: View {
             } else {
                 DSEmptyState(
                     "No Protein Loaded",
-                    systemImage: "textformat.abc",
+                    systemImage: "list.bullet.indent",
                     description: "Load a structure to view its sequence."
                 )
                 .padding(.top, DS.Space.xxl)
@@ -661,11 +661,13 @@ struct SequenceView: View {
                             .foregroundStyle(.secondary)
                     }
                 } else {
-                    Text(condenseRanges(sortedSelected, prot: prot))
+                    let ranges = condenseRanges(sortedSelected, prot: prot)
+                    Text(ranges)
                         .font(DS.Font.monoSmall)
                         .foregroundStyle(.secondary)
-                        .lineLimit(3)
+                        .lineLimit(4)
                         .textSelection(.enabled)
+                        .help(ranges)
                 }
                 Text("\(totalAtoms) atoms")
                     .font(DS.Font.secondary)
@@ -696,7 +698,8 @@ struct SequenceView: View {
     private func rangeString(_ start: Int, _ end: Int, prot: Molecule) -> String {
         let startSeq = start < prot.residues.count ? prot.residues[start].sequenceNumber : start
         let endSeq = end < prot.residues.count ? prot.residues[end].sequenceNumber : end
-        return startSeq == endSeq ? "\(startSeq)" : "\(startSeq)–\(endSeq)"
+        // Word joiners keep "123–135" on one line: ranges wrap only after their commas.
+        return startSeq == endSeq ? "\(startSeq)" : "\(startSeq)\u{2060}–\u{2060}\(endSeq)"
     }
 
     // MARK: - Rename Sheet
@@ -774,6 +777,8 @@ private struct SequenceCanvas<MenuContent: View>: View {
     private let numberH: CGFloat = 11
     private let gapW: CGFloat = 40
     private let spacing: CGFloat = 1
+    /// Extra space between wrapped rows, so a row's residue numbers clear the row above.
+    private let rowSpacing: CGFloat = 4
 
     // Precomputed layout: (cellIndex, origin) pairs
     @State private var cellRects: [CGRect] = []
@@ -855,7 +860,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
 
             if x + w > width && x > 0 {
                 x = 0
-                y += rowH + spacing
+                y += rowH + rowSpacing
             }
             rects.append(CGRect(x: x, y: y, width: w, height: rowH))
             x += w + spacing
@@ -869,7 +874,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
 
     private func hitTest(_ point: CGPoint) -> Int? {
         guard !cellRects.isEmpty else { return nil }
-        let rowH = cellH + numberH + spacing
+        let rowH = cellH + numberH + rowSpacing
         // Find which row the point is in
         let rowIdx = Int(point.y / rowH)
         let rowMinY = CGFloat(rowIdx) * rowH
@@ -900,7 +905,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
             let rowH = cellH + numberH
             for cell in cells {
                 let w: CGFloat = (cell.isResidue ? cellW : gapW)
-                if x + w > containerWidth && x > 0 { x = 0; y += rowH + spacing }
+                if x + w > containerWidth && x > 0 { x = 0; y += rowH + rowSpacing }
                 computed.append(CGRect(x: x, y: y, width: w, height: rowH))
                 x += w + spacing
             }
@@ -910,7 +915,7 @@ private struct SequenceCanvas<MenuContent: View>: View {
         let residueFont = DS.Font.monoSmall.weight(.medium)
         let residueFontBold = DS.Font.monoSmall.weight(.bold)
         let numberFont = DS.Font.canvasLabel.monospacedDigit()
-        let gapFont = DS.Font.monoSmall.weight(.medium)
+        let gapFont = DS.Font.canvasLabel.monospacedDigit()
 
         for (i, cell) in cells.enumerated() {
             guard i < rects.count else { break }
@@ -954,25 +959,22 @@ private struct SequenceCanvas<MenuContent: View>: View {
                              anchor: .center)
 
             case .gap(_, let count, _, _):
+                // A quiet dashed break in the sequence (the chain header already flags gaps): the
+                // number of missing residues between two dashed segments.
                 let gapRect = CGRect(x: rect.minX, y: rect.minY + numberH, width: gapW, height: cellH)
-                let gapPath = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous).path(in: gapRect)
-                // Gap background
-                context.fill(
-                    gapPath,
-                    with: .color(DS.Color.warning.opacity(0.12))
-                )
-                context.stroke(
-                    gapPath,
-                    with: .color(DS.Color.warning.opacity(0.4)),
-                    lineWidth: 0.5
-                )
-                // Gap label
-                let gapText = Text("···\(count)···")
+                let gapText = Text("\(count)")
                     .font(gapFont)
-                    .foregroundColor(DS.Color.warning)
-                context.draw(context.resolve(gapText),
-                             at: CGPoint(x: gapRect.midX, y: gapRect.midY),
-                             anchor: .center)
+                    .foregroundColor(.secondary)
+                let resolved = context.resolve(gapText)
+                let labelHalf = resolved.measure(in: gapRect.size).width / 2 + 3
+                var dash = Path()
+                dash.move(to: CGPoint(x: gapRect.minX + 2, y: gapRect.midY))
+                dash.addLine(to: CGPoint(x: gapRect.midX - labelHalf, y: gapRect.midY))
+                dash.move(to: CGPoint(x: gapRect.midX + labelHalf, y: gapRect.midY))
+                dash.addLine(to: CGPoint(x: gapRect.maxX - 2, y: gapRect.midY))
+                context.stroke(dash, with: .color(.secondary.opacity(0.6)),
+                               style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                context.draw(resolved, at: CGPoint(x: gapRect.midX, y: gapRect.midY), anchor: .center)
             }
         }
     }

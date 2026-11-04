@@ -1,0 +1,31 @@
+# Build and prepare a small ligand library: protomers × tautomers × conformers at pH 7.4.
+# Run: druse Examples/prepare_ligand_library.druse
+# Writes the prepared library to $out (/tmp; edit the "set out" line to write elsewhere).
+set onerror=stop
+set data = ../Benchmark/data/refined-set/1add
+set out = /tmp
+
+# Session preparation defaults, used by every 'ligand prep' below
+ligand prep set mode=enumerate ph=7.4 pka=gnn pka-threshold=2 max-tautomers=4 max-protomers=4 energy-window=8 conformers=5 min-population=1
+ligand prep config
+
+# Entries from SMILES (added unprepared) and from the crystal SDF
+ligand smiles "Nc1ncnc2c1ncn2C1OC(CO)C(O)C1O" name=adenosine prep=off
+ligand smiles "CC(=O)Oc1ccccc1C(=O)O" name=aspirin prep=off
+ligand smiles "OC(=O)c1ccccc1" name=benzoic_acid prep=off
+ligand load $data/1add_ligand.sdf
+ligand affinity adenosine ki=20000
+ligand list unprepared
+
+# Prepare everything that is not prepared yet
+ligand prep unprepared
+ligand list forms
+ligand forms adenosine
+ligand conformers adenosine
+ligand pka adenosine method=both
+ligand descriptors all
+ligand admet prepared
+ligand db stats
+
+export ligands $out/1add_library.sdf subset=dockable conformers=best
+ligand db export $out/1add_library.csv

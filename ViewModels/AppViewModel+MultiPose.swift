@@ -55,6 +55,88 @@ extension AppViewModel {
         return matrix
     }
 
+    // MARK: - Ligand placements and interactions
+
+    /// Heavy-atom geometry of a ligand placed in the receptor: a docked pose or the loaded
+    /// ligand as it stands (e.g. the co-crystallised ligand). Input of interaction, contact
+    /// and validity analysis.
+    struct LigandPlacement {
+        /// "pose 3" or the ligand's name.
+        let label: String
+        let atoms: [Atom]
+        /// Bonds re-indexed onto `atoms`.
+        let bonds: [Bond]
+        let positions: [SIMD3<Float>]
+    }
+
+    /// Placement of docking pose `index` (0-based into `docking.dockingResults`), or of the
+    /// loaded ligand when `index` is nil. Nil when the pose or ligand does not exist or the
+    /// pose carries no coordinates.
+    func ligandPlacement(pose index: Int?) -> LigandPlacement? {
+        if let index {
+            guard docking.dockingResults.indices.contains(index),
+                  let ligand = docking.originalDockingLigand ?? molecules.ligand else { return nil }
+            let positions = docking.dockingResults[index].transformedAtomPositions
+            let heavy = ligand.atoms.filter { $0.element != .H }
+            guard !positions.isEmpty, positions.count == heavy.count else { return nil }
+            return LigandPlacement(label: "pose \(index + 1)", atoms: heavy,
+                                   bonds: buildHeavyBonds(from: ligand), positions: positions)
+        }
+        guard let ligand = molecules.ligand else { return nil }
+        let heavy = ligand.atoms.filter { $0.element != .H }
+        return LigandPlacement(label: ligand.name, atoms: heavy,
+                               bonds: buildHeavyBonds(from: ligand), positions: heavy.map(\.position))
+    }
+
+    /// Protein–ligand interactions of a placement, each with the protein heavy atom it
+    /// involves. By default only the interaction types the active scoring function accounts
+    /// for are reported (as in the 3D view); `allTypes` reports every type the detector knows.
+    func interactions(of placement: LigandPlacement, allTypes: Bool = false)
+        -> [(interaction: MolecularInteraction, proteinAtom: Atom)] {
+        guard let prot = molecules.protein else { return [] }
+        let heavyProtAtoms = prot.atoms.filter { $0.element != .H }
+        // Drusina accounts for every interaction type, so it serves as the "all types" filter.
+        let found = InteractionDetector.detect(
+            ligandAtoms: placement.atoms,
+            ligandPositions: placement.positions,
+            proteinAtoms: heavyProtAtoms,
+            ligandBonds: placement.bonds,
+            scoringMethod: allTypes ? .drusina : docking.scoringMethod
+        )
+        return found.compactMap { inter in
+            guard heavyProtAtoms.indices.contains(inter.proteinAtomIndex) else { return nil }
+            return (inter, heavyProtAtoms[inter.proteinAtomIndex])
+        }
+    }
+
+    /// Heavy-atom positions of the docked ligand's input coordinates when they are a placement in
+    /// the docking box (a co-crystallised or previously posed ligand). Nil when there is no input
+    /// ligand or its centroid lies outside the box (2 Å margin): SMILES-built and prepared conformers
+    /// sit at the origin, and an "RMSD to the input pose" of 40 Å would only mislead.
+    var inputPoseReference: [SIMD3<Float>]? {
+        guard let ligand = docking.originalDockingLigand else { return nil }
+        let reference = ligand.atoms.filter { $0.element != .H }.map(\.position)
+        guard !reference.isEmpty else { return nil }
+        if let pocket = docking.selectedPocket {
+            let centroid = reference.reduce(SIMD3<Float>.zero, +) / Float(reference.count)
+            let offset = abs(centroid - pocket.center) - pocket.size
+            guard offset.max() <= 2 else { return nil }
+        }
+        return reference
+    }
+
+    /// Heavy-atom RMSD (Å) of docking pose `index` against the input coordinates of the docked
+    /// ligand — the redocking RMSD when the input was a co-crystallised ligand. Nil when the
+    /// pose has no coordinates, the atom counts differ or the input is not placed in the box.
+    func rmsdToInputLigand(pose index: Int) -> Float? {
+        guard docking.dockingResults.indices.contains(index),
+              let reference = inputPoseReference else { return nil }
+        let pose = docking.dockingResults[index].transformedAtomPositions
+        guard !reference.isEmpty, pose.count == reference.count else { return nil }
+        let sumSq = zip(reference, pose).reduce(Float(0)) { $0 + simd_distance_squared($1.0, $1.1) }
+        return sqrt(sumSq / Float(reference.count))
+    }
+
     // MARK: - Interaction fingerprints
 
     /// Per-residue interaction fingerprint for each pose in `indices`.
@@ -64,40 +146,21 @@ extension AppViewModel {
         indices: [Int]
     ) -> (residueKeys: [String], residueLabels: [String: String],
           fingerprints: [[String: Set<MolecularInteraction.InteractionType>]]) {
-        guard let origLig = docking.originalDockingLigand ?? molecules.ligand,
-              let prot = molecules.protein else {
+        guard docking.originalDockingLigand ?? molecules.ligand != nil, molecules.protein != nil else {
             return ([], [:], [])
         }
-
-        let heavyLigAtoms = origLig.atoms.filter { $0.element != .H }
-        let heavyBonds = buildHeavyBonds(from: origLig)
-        let heavyProtAtoms = prot.atoms.filter { $0.element != .H }
 
         var allKeys = Set<String>()
         var labelByKey: [String: String] = [:]
         var perPose: [[String: Set<MolecularInteraction.InteractionType>]] = []
 
         for idx in indices {
-            guard idx >= 0, idx < docking.dockingResults.count else {
+            guard let placement = ligandPlacement(pose: idx) else {
                 perPose.append([:])
                 continue
             }
-            let pose = docking.dockingResults[idx]
-            guard !pose.transformedAtomPositions.isEmpty else {
-                perPose.append([:])
-                continue
-            }
-            let interactions = InteractionDetector.detect(
-                ligandAtoms: heavyLigAtoms,
-                ligandPositions: pose.transformedAtomPositions,
-                proteinAtoms: heavyProtAtoms,
-                ligandBonds: heavyBonds,
-                scoringMethod: docking.scoringMethod
-            )
             var poseMap: [String: Set<MolecularInteraction.InteractionType>] = [:]
-            for inter in interactions {
-                guard inter.proteinAtomIndex >= 0, inter.proteinAtomIndex < heavyProtAtoms.count else { continue }
-                let a = heavyProtAtoms[inter.proteinAtomIndex]
+            for (inter, a) in interactions(of: placement) {
                 let key = "\(a.chainID)_\(a.residueSeq)_\(a.residueName)"
                 allKeys.insert(key)
                 labelByKey[key] = "\(a.residueName)\(a.residueSeq)\(a.chainID.isEmpty ? "" : "/\(a.chainID)")"

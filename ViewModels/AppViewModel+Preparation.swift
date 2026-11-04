@@ -8,6 +8,96 @@ import Metal
 
 extension AppViewModel {
 
+    // MARK: - Options
+
+    /// What happens to crystallographic waters during cleanup.
+    enum WaterHandling: Sendable, Equatable {
+        /// Leave every water in place.
+        case keep
+        /// Delete every water.
+        case remove
+        /// Delete bulk water but keep waters within `radius` Å of the selected pocket centre
+        /// (they then act as rigid receptor atoms during docking).
+        case pocket(radius: Float)
+    }
+
+    /// Which hydrogens the preparation pipeline places.
+    enum HydrogenMode: String, Sendable {
+        /// Polar and non-polar hydrogens from residue templates (the GUI default).
+        case all
+        /// Polar hydrogens only (united-atom style receptor).
+        case polar
+        /// No hydrogens: heavy-atom model with rebuilt and repacked side chains.
+        case none
+    }
+
+    /// Stage switches of the one-click "Prepare for Docking" pipeline. The defaults are the
+    /// GUI's pipeline; the console exposes each switch as a `prep` option.
+    struct ProteinPreparationOptions: Sendable {
+        /// Model short missing loops (≤ 15 residues) before chain breaks are capped.
+        var buildLoops = true
+        /// Delete ligands, ions other than structural metals, and other non-standard residues.
+        var removeNonStandard = true
+        var waters: WaterHandling = .keep
+        /// Cap the termini of remaining chain breaks with ACE/NME.
+        var capChainBreaks = true
+        var hydrogens: HydrogenMode = .all
+        /// Assign partial charges with `docking.chargeMethod` (plus the electrostatic fallback).
+        var assignCharges = true
+    }
+
+    /// How freshly built loop atoms are relaxed after the loop builder places them.
+    enum LoopRefinement: String, Sendable {
+        /// Restrained Metal GPU minimisation (the GUI default).
+        case gpu
+        /// OpenMM minimisation with backbone angle and trans-peptide restraints.
+        case openmm
+        /// Keep the raw loop-builder geometry.
+        case none
+    }
+
+    /// Result of a loop-building pass.
+    struct LoopBuildOutcome: Sendable {
+        var atoms: [Atom]
+        var bonds: [Bond]
+        var gapsBuilt = 0
+        var residuesAdded = 0
+        /// Gaps longer than the size limit, left as chain breaks.
+        var gapsTooLong = 0
+        /// Whether the residue identities came from SEQRES (otherwise polyalanine).
+        var usedSEQRES = false
+        /// Refinement that actually ran (`.none` when the requested one was unavailable).
+        var refinement: LoopRefinement = .none
+    }
+
+    /// Residues whose side chains `packSidechains` repacks.
+    enum SidechainPackingScope: Sendable {
+        /// Rebuild missing side-chain heavy atoms from templates, then repack only those residues.
+        case incomplete
+        /// Repack every rotameric residue.
+        case all
+        /// Repack the residues with these `FASPRSidechainPacker.residueKey` keys.
+        case residues(Set<String>)
+    }
+
+    /// Largest gap (in residues) the loop builder models.
+    static let maxBuildableLoopLength = 15
+
+    // MARK: - Preparation history
+
+    /// Logs a completed preparation step and keeps it for `prep report`.
+    func recordPreparation(_ step: String, _ detail: String) {
+        preparationLog.append(PreparationLogEntry(step: step, detail: detail, pH: molecules.protonationPH))
+        log.success(detail, category: .prep)
+    }
+
+    /// Water residue keys ("chain_seq") present in `atoms`, the set that pocket-water
+    /// retention marks as rigid receptor waters.
+    private func waterResidueKeys(in atoms: [Atom]) -> Set<String> {
+        let waterNames: Set<String> = ["HOH", "WAT", "DOD", "H2O"]
+        return Set(atoms.filter { waterNames.contains($0.residueName) }.map { "\($0.chainID)_\($0.residueSeq)" })
+    }
+
     // MARK: - Protein Preparation
 
     func removeWaters() {
@@ -28,7 +118,7 @@ extension AppViewModel {
         pushToRenderer()
         renderer?.fitToContent()
         molecules.proteinPrepared = true
-        log.success("Removed \(result.removedCount) water molecules", category: .prep)
+        recordPreparation("Remove waters", "Removed \(result.removedCount) water molecules")
         workspace.statusMessage = "\(result.removedCount) waters removed"
 
         molecules.preparationReport = ProteinPreparation.analyze(
@@ -54,10 +144,7 @@ extension AppViewModel {
             keepingNearby: [pocket.center], within: radius
         )
 
-        // Count how many waters we kept
-        let waterNames: Set<String> = ["HOH", "WAT", "DOD", "H2O"]
-        let keptWaterAtoms = result.atoms.filter { waterNames.contains($0.residueName) }
-        let keptWaterResidues = Set(keptWaterAtoms.map { "\($0.chainID)_\($0.residueSeq)" })
+        let keptWaterResidues = waterResidueKeys(in: result.atoms)
         molecules.keptWaterKeys = keptWaterResidues
 
         if result.removedCount == 0 && keptWaterResidues.isEmpty {
@@ -72,10 +159,10 @@ extension AppViewModel {
         pushToRenderer()
         molecules.proteinPrepared = true
 
-        log.success(
+        recordPreparation(
+            "Keep pocket waters",
             "Kept \(keptWaterResidues.count) bridging water(s) within \(String(format: "%.1f", radius)) Å of pocket, " +
-            "removed \(result.removedCount) bulk water(s)",
-            category: .prep
+            "removed \(result.removedCount) bulk water(s)"
         )
         workspace.statusMessage = "\(keptWaterResidues.count) waters kept, \(result.removedCount) removed"
 
@@ -109,9 +196,9 @@ extension AppViewModel {
         molecules.proteinPrepared = true
         pushToRenderer()
         renderer?.fitToContent()
-        log.success(
-            "Removed \(result.removedResidueCount) non-standard residue(s) (\(result.removedAtomCount) atoms)",
-            category: .prep
+        recordPreparation(
+            "Remove non-standard residues",
+            "Removed \(result.removedResidueCount) non-standard residue(s) (\(result.removedAtomCount) atoms)"
         )
         workspace.statusMessage = "\(result.removedResidueCount) non-standard residue(s) removed"
         molecules.preparationReport = ProteinPreparation.analyze(atoms: result.atoms, bonds: result.bonds)
@@ -133,16 +220,53 @@ extension AppViewModel {
         molecules.protein = updated
         molecules.proteinPrepared = true
         pushToRenderer()
-        log.success("Removed \(resolved.removedAtomCount) alternate conformation atoms", category: .prep)
+        recordPreparation("Resolve alternate locations", "Removed \(resolved.removedAtomCount) alternate conformation atoms")
         workspace.statusMessage = "\(resolved.removedAtomCount) alt confs removed"
 
         molecules.preparationReport = ProteinPreparation.analyze(atoms: resolved.atoms, bonds: resolved.bonds)
     }
 
-    func assignProtonation() {
+    /// Caps the termini of uncapped chain breaks with ACE/NME so a missing segment does not
+    /// leave charged artificial termini in the receptor. Like every cleanup pass it also keeps
+    /// only the preferred alternate conformation. Returns the number of cap residues added.
+    @discardableResult
+    func capChainBreaks() -> Int {
+        guard let prot = molecules.protein else {
+            log.info("[Prep] capChainBreaks skipped: no protein loaded", category: .prep)
+            return 0
+        }
+        let options = ProteinPreparation.CleanupOptions(
+            removeNonStandardResidues: false, waterPolicy: .keepAll,
+            capChainBreaks: true, keepExistingCaps: true
+        )
+        let cleaned = ProteinPreparation.cleanupStructure(atoms: prot.atoms, bonds: prot.bonds, options: options)
+        let added = cleaned.report.addedCappingResidues
+        guard added > 0 || cleaned.report.removedAltConformerAtoms > 0 else {
+            log.info("No uncapped chain breaks found", category: .prep)
+            workspace.statusMessage = "No chain breaks to cap"
+            return 0
+        }
+        let updated = Molecule(name: prot.name, atoms: cleaned.atoms, bonds: cleaned.bonds, title: prot.title)
+        updated.secondaryStructureAssignments = prot.secondaryStructureAssignments
+        molecules.protein = updated
+        molecules.proteinPrepared = true
+        pushToRenderer()
+        let remaining = cleaned.report.chainBreaks.filter { !$0.isCapped }.count
+        recordPreparation(
+            "Cap chain breaks",
+            "Added \(added) ACE/NME cap residue(s); \(cleaned.report.chainBreaks.count) chain break(s), \(remaining) uncapped"
+        )
+        workspace.statusMessage = "\(added) cap residue(s) added"
+        molecules.preparationReport = ProteinPreparation.analyze(atoms: cleaned.atoms, bonds: cleaned.bonds)
+        return added
+    }
+
+    /// Returns nil without a protein; otherwise a task that completes once hydrogens are placed.
+    @discardableResult
+    func assignProtonation() -> Task<Void, Never>? {
         guard let prot = molecules.protein else {
             log.info("[Prep] assignProtonation skipped: no protein loaded", category: .prep)
-            return
+            return nil
         }
         let pH = molecules.protonationPH
         molecules.isMinimizing = true
@@ -155,7 +279,7 @@ extension AppViewModel {
         let title = prot.title
         let secondaryStructure = prot.secondaryStructureAssignments
 
-        Task.detached(priority: .userInitiated) {
+        return Task.detached(priority: .userInitiated) {
             let completed = ProteinPreparation.completePhase23(
                 atoms: atoms, bonds: bonds, pH: pH, polarOnly: true
             )
@@ -167,6 +291,7 @@ extension AppViewModel {
                 let mol = Molecule(name: name, atoms: completed.atoms, bonds: completed.bonds, title: title)
                 mol.secondaryStructureAssignments = secondaryStructure
                 self.molecules.protein = mol
+                self.protonationStates = completed.protonation
                 self.molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
                 self.pushToRenderer()
 
@@ -178,9 +303,9 @@ extension AppViewModel {
                 if let nr = completed.report.networkReport, nr.moveableGroups > 0 {
                     parts.append("\(nr.flipsAccepted) flips, \(nr.rotationsOptimized) rotations optimized")
                 }
-                self.log.success(
-                    "Polar hydrogens at pH \(String(format: "%.1f", pH)): \(parts.joined(separator: ", "))",
-                    category: .prep
+                self.recordPreparation(
+                    "Protonate",
+                    "Polar hydrogens at pH \(String(format: "%.1f", pH)): \(parts.joined(separator: ", "))"
                 )
                 self.workspace.statusMessage = "Polar H at pH \(String(format: "%.1f", pH))"
                 self.molecules.isMinimizing = false
@@ -188,13 +313,48 @@ extension AppViewModel {
         }
     }
 
-    // MARK: - Energy Minimization
+    // MARK: - Preparation Pipeline
 
-    func runEnergyMinimization() {
+    /// The one-click "Prepare for Docking" pipeline with the GUI's stage settings.
+    /// Returns nil without a protein; otherwise a task that completes once the prepared
+    /// protein is in place.
+    @discardableResult
+    func runEnergyMinimization() -> Task<Void, Never>? {
+        runPreparationPipeline(ProteinPreparationOptions())
+    }
+
+    /// The full preparation pipeline: short-loop modelling, cleanup (alternate locations,
+    /// non-standard residues, waters, chain-break caps), heavy-atom completion with FASPR
+    /// repacking of rebuilt side chains, restrained minimisation, protonation at
+    /// `molecules.protonationPH`, template hydrogens, H-bond network optimisation and partial
+    /// charges — each stage switchable through `options`. Returns nil without a protein, or
+    /// when pocket-water retention is requested without a selected pocket.
+    @discardableResult
+    func runPreparationPipeline(_ options: ProteinPreparationOptions) -> Task<Void, Never>? {
         guard let prot = molecules.protein else {
-            log.info("[Prep] runEnergyMinimization skipped: no protein loaded", category: .prep)
-            return
+            log.info("[Prep] runPreparationPipeline skipped: no protein loaded", category: .prep)
+            return nil
         }
+
+        let waterPolicy: ProteinPreparation.WaterPolicy
+        switch options.waters {
+        case .keep:
+            waterPolicy = .keepAll
+        case .remove:
+            waterPolicy = .removeAll
+        case .pocket(let radius):
+            guard let pocket = docking.selectedPocket else {
+                log.warn("Select a pocket first to define which waters to retain", category: .prep)
+                return nil
+            }
+            waterPolicy = .keepNearby(centers: [pocket.center], radius: radius)
+        }
+        let cleanupOptions = ProteinPreparation.CleanupOptions(
+            removeNonStandardResidues: options.removeNonStandard,
+            waterPolicy: waterPolicy,
+            capChainBreaks: options.capChainBreaks,
+            keepExistingCaps: true
+        )
 
         molecules.isMinimizing = true
         log.info("Running protein structure cleanup (loops + protonation + charges)...", category: .prep)
@@ -208,58 +368,87 @@ extension AppViewModel {
         let rawPDBContent = molecules.rawPDBContent
         let pH = molecules.protonationPH
         let chargeMethod = docking.chargeMethod
-        let metalDevice = renderer?.device
+        let metalDevice = computeDevice
 
-        Task {
-            // Phase 0: Build short missing loops (≤15 residues) before NME/ACE
-            // capping runs in prepareForDocking — otherwise the gap gets capped
-            // off and the loop builder can no longer bridge the anchors.
-            let loopOutcome = await Self.buildShortMissingLoops(
-                atoms: initialAtoms,
-                bonds: initialBonds,
-                rawPDBContent: rawPDBContent,
-                metalDevice: metalDevice
-            )
+        return Task {
+            // Short loops are built before capping — otherwise the gap gets capped off and
+            // the loop builder can no longer bridge the anchors.
+            let loopOutcome = options.buildLoops
+                ? await Self.buildShortMissingLoops(
+                    atoms: initialAtoms, bonds: initialBonds,
+                    rawPDBContent: rawPDBContent, metalDevice: metalDevice)
+                : LoopBuildOutcome(atoms: initialAtoms, bonds: initialBonds)
 
-            let prepared = await Task.detached(priority: .userInitiated) {
-                ProteinPreparation.prepareForDocking(
-                    atoms: loopOutcome.atoms,
-                    bonds: loopOutcome.bonds,
-                    rawPDBContent: rawPDBContent,
-                    pH: pH,
-                    chargeMethod: chargeMethod,
-                    device: MTLCreateSystemDefaultDevice()
-                )
+            let staged = await Task.detached(priority: .userInitiated) {
+                let cleanup = ProteinPreparation.cleanupStructure(
+                    atoms: loopOutcome.atoms, bonds: loopOutcome.bonds, options: cleanupOptions)
+                switch options.hydrogens {
+                case .all, .polar:
+                    let completed = ProteinPreparation.completePhase23(
+                        atoms: cleanup.atoms, bonds: cleanup.bonds, pH: pH,
+                        polarOnly: options.hydrogens == .polar,
+                        device: MTLCreateSystemDefaultDevice()
+                    )
+                    return (cleanup: cleanup.report, atoms: completed.atoms, bonds: completed.bonds,
+                            heavyAtomsAdded: completed.report.heavyAtomsAdded,
+                            hydrogensAdded: completed.report.hydrogensAdded,
+                            protonation: completed.protonation)
+                case .none:
+                    let rebuilt = Self.reconstructAndRepack(
+                        atoms: cleanup.atoms, bonds: cleanup.bonds, device: MTLCreateSystemDefaultDevice())
+                    return (cleanup: cleanup.report, atoms: rebuilt.atoms, bonds: rebuilt.bonds,
+                            heavyAtomsAdded: rebuilt.heavyAtomsAdded, hydrogensAdded: 0,
+                            protonation: [Protonation.ResiduePrediction]())
+                }
             }.value
 
-            let mol = Molecule(name: name, atoms: prepared.atoms, bonds: prepared.bonds, title: title)
+            var finalAtoms = staged.atoms
+            if options.assignCharges {
+                let charged = await Self.computeProteinCharges(
+                    atoms: staged.atoms, bonds: staged.bonds,
+                    method: chargeMethod, rawPDBContent: rawPDBContent)
+                finalAtoms = ProteinPreparation.applyElectrostaticFallback(to: charged.atoms)
+            }
+
+            let mol = Molecule(name: name, atoms: finalAtoms, bonds: staged.bonds, title: title)
             mol.secondaryStructureAssignments = secondaryStructure
             molecules.protein = mol
+            protonationStates = staged.protonation
+            switch options.waters {
+            case .keep: break
+            case .remove: molecules.keptWaterKeys.removeAll()
+            case .pocket: molecules.keptWaterKeys = waterResidueKeys(in: finalAtoms)
+            }
             pushToRenderer()
             renderer?.fitToContent()
-            molecules.preparationReport = ProteinPreparation.analyze(atoms: prepared.atoms, bonds: prepared.bonds)
+            molecules.preparationReport = ProteinPreparation.analyze(atoms: finalAtoms, bonds: staged.bonds)
 
+            let cleanup = staged.cleanup
+            let protonationUpdates = staged.protonation.reduce(0) { $0 + $1.atomFormalCharges.count }
+            let chargedAtoms = finalAtoms.filter { abs($0.charge) > 0.001 }.count
             let loopSummary: String? = loopOutcome.gapsBuilt > 0
                 ? "\(loopOutcome.gapsBuilt) loop\(loopOutcome.gapsBuilt == 1 ? "" : "s") built (\(loopOutcome.residuesAdded) residues)"
                 : nil
             let summary = [
                 loopSummary,
-                prepared.report.altConformerAtomsRemoved > 0 ? "\(prepared.report.altConformerAtomsRemoved) altloc atoms removed" : nil,
-                prepared.report.heterogenResiduesRemoved > 0 ? "\(prepared.report.heterogenResiduesRemoved) non-standard residues removed" : nil,
-                prepared.report.cappingResiduesAdded > 0 ? "\(prepared.report.cappingResiduesAdded) cap residues added" : nil,
-                prepared.report.missingHeavyAtomsAdded > 0 ? "\(prepared.report.missingHeavyAtomsAdded) heavy atoms rebuilt" : nil,
-                prepared.report.hydrogensAdded > 0 ? "\(prepared.report.hydrogensAdded) hydrogens added" : nil,
-                prepared.report.protonationUpdates > 0 ? "\(prepared.report.protonationUpdates) ionization sites updated" : nil
+                cleanup.removedAltConformerAtoms > 0 ? "\(cleanup.removedAltConformerAtoms) altloc atoms removed" : nil,
+                cleanup.removedHeterogenResidues > 0 ? "\(cleanup.removedHeterogenResidues) non-standard residues removed" : nil,
+                cleanup.removedWaterResidues > 0 ? "\(cleanup.removedWaterResidues) waters removed" : nil,
+                cleanup.addedCappingResidues > 0 ? "\(cleanup.addedCappingResidues) cap residues added" : nil,
+                staged.heavyAtomsAdded > 0 ? "\(staged.heavyAtomsAdded) heavy atoms rebuilt" : nil,
+                staged.hydrogensAdded > 0 ? "\(staged.hydrogensAdded) hydrogens added" : nil,
+                protonationUpdates > 0 ? "\(protonationUpdates) ionization sites updated" : nil
             ].compactMap { $0 }.joined(separator: ", ")
+            let chargeSummary = options.assignCharges ? "charges on \(chargedAtoms) atoms" : "no charges assigned"
 
-            log.success(
+            recordPreparation(
+                "Prepare for docking",
                 "Structure cleanup complete (\(summary.isEmpty ? "no structural edits" : summary), " +
-                "pH \(String(format: "%.1f", molecules.protonationPH)), charges on \(prepared.report.nonZeroChargeAtoms) atoms)",
-                category: .prep
+                "pH \(String(format: "%.1f", molecules.protonationPH)), \(chargeSummary))"
             )
             if loopOutcome.gapsTooLong > 0 {
                 log.warn(
-                    "\(loopOutcome.gapsTooLong) gap\(loopOutcome.gapsTooLong == 1 ? "" : "s") longer than 15 residues left as chain breaks (capped) — use ML structure prediction (ESM-Fold/AlphaFold) for missing domains",
+                    "\(loopOutcome.gapsTooLong) gap\(loopOutcome.gapsTooLong == 1 ? "" : "s") longer than \(Self.maxBuildableLoopLength) residues left as chain breaks (capped) — use ML structure prediction (ESM-Fold/AlphaFold) for missing domains",
                     category: .prep
                 )
             }
@@ -269,75 +458,147 @@ extension AppViewModel {
         }
     }
 
-    // MARK: - Shared loop-building helper
+    /// Rebuilds missing heavy atoms from residue templates and repacks the rebuilt side chains
+    /// with FASPR (when the rotamer library is available): the heavy-atom part of preparation,
+    /// used where hydrogens are not wanted.
+    nonisolated static func reconstructAndRepack(
+        atoms: [Atom], bonds: [Bond], device: MTLDevice?
+    ) -> (atoms: [Atom], bonds: [Bond], heavyAtomsAdded: Int, residuesPacked: Int) {
+        let rebuilt = ProteinPreparation.reconstructMissingHeavyAtoms(atoms: atoms, bonds: bonds)
+        guard DunbrackRotamerLibrary.shared.isLoaded, !rebuilt.sidechainRebuiltResidueKeys.isEmpty else {
+            return (rebuilt.atoms, rebuilt.bonds, rebuilt.addedAtomCount, 0)
+        }
+        let packed = FASPRSidechainPacker.packSidechains(
+            atoms: rebuilt.atoms, bonds: rebuilt.bonds, device: device,
+            onlyIncomplete: true, reconstructedResidueKeys: rebuilt.sidechainRebuiltResidueKeys
+        )
+        return (packed.atoms, packed.bonds, rebuilt.addedAtomCount, packed.report.residuesPacked)
+    }
 
-    /// Detect short residue-numbering gaps (≤15 res) and run the loop builder
-    /// (with optional GPU refinement) so the chain is bridged before downstream
-    /// chain-break capping. Returns the loop-built atom/bond arrays plus stats.
-    /// Long gaps (> 15 res) are reported but not built — those need full
-    /// homology / ML structure prediction.
+    /// Partial charges for a protein with the rules of the docking preparation: Gasteiger
+    /// charges come from RDKit on the original PDB text (≤ 6000 atoms) merged by atom
+    /// identity; EEM, QEq and xTB run on the atoms directly. `assigned` is false when the
+    /// method could not run; the atoms are then returned unchanged. The electrostatic
+    /// fallback is left to the caller.
+    nonisolated static func computeProteinCharges(
+        atoms: [Atom], bonds: [Bond], method: ChargeMethod, rawPDBContent: String?
+    ) async -> (atoms: [Atom], assigned: Bool) {
+        switch method {
+        case .gasteiger:
+            let maxAtomsForRDKitCharges = 6000
+            guard let pdbContent = rawPDBContent, atoms.count <= maxAtomsForRDKitCharges else {
+                return (atoms, false)
+            }
+            let chargeData = await Task.detached { RDKitBridge.computeChargesPDB(pdbContent: pdbContent) }.value
+            guard let chargeData else { return (atoms, false) }
+            let merged = ProteinPreparation.mergeProteinAtoms(
+                currentAtoms: atoms, sourceAtoms: chargeData.atoms
+            ) { current, source in current.charge = source.charge }
+            return (merged.atoms, true)
+        case .eem, .qeq, .xtb:
+            let calculator: ChargeCalculator = switch method {
+            case .eem: EEMChargeCalculator(device: nil)
+            case .qeq: QEqChargeCalculator(device: nil)
+            default: XTBChargeCalculator()
+            }
+            guard let charges = try? await calculator.computeCharges(atoms: atoms, bonds: bonds, totalCharge: 0) else {
+                return (atoms, false)
+            }
+            var charged = atoms
+            for i in 0..<min(charges.count, charged.count) {
+                charged[i].charge = charges[i]
+            }
+            return (charged, true)
+        }
+    }
+
+    // MARK: - Loop Building
+
+    /// Detects residue-numbering gaps of at most `maxBuildableLoopLength` residues and models
+    /// them with GPU refinement, so the chain is bridged before downstream chain-break
+    /// capping. Longer gaps are only counted — they need homology or ML structure prediction.
     fileprivate static func buildShortMissingLoops(
         atoms: [Atom],
         bonds: [Bond],
         rawPDBContent: String?,
         metalDevice: MTLDevice?
-    ) async -> (atoms: [Atom], bonds: [Bond], gapsBuilt: Int, residuesAdded: Int, gapsTooLong: Int) {
+    ) async -> LoopBuildOutcome {
         let gaps = ProteinPreparation.detectMissingResidues(in: atoms)
-        let buildable = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
-        let tooLong = gaps.count - buildable.count
-        guard !buildable.isEmpty else {
-            return (atoms, bonds, 0, 0, tooLong)
-        }
+        return await buildLoops(atoms: atoms, bonds: bonds, gaps: gaps, maxLength: maxBuildableLoopLength,
+                                rawPDBContent: rawPDBContent, refinement: .gpu, metalDevice: metalDevice)
+    }
+
+    /// Builds the gaps no longer than `maxLength` with the loop builder (residue identities
+    /// from SEQRES when the original file is available, else polyalanine) and relaxes only the
+    /// new loop atoms with the requested refinement.
+    nonisolated static func buildLoops(
+        atoms: [Atom],
+        bonds: [Bond],
+        gaps: [(chainID: String, gapStart: Int, gapEnd: Int)],
+        maxLength: Int,
+        rawPDBContent: String?,
+        refinement: LoopRefinement,
+        metalDevice: MTLDevice?
+    ) async -> LoopBuildOutcome {
+        let buildable = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= maxLength }
+        let unbuilt = LoopBuildOutcome(atoms: atoms, bonds: bonds, gapsTooLong: gaps.count - buildable.count)
+        guard !buildable.isEmpty else { return unbuilt }
 
         return await Task.detached(priority: .userInitiated) {
+            var outcome = unbuilt
             var chainSequences: [GemmiBridge.ChainSequence] = []
             if let content = rawPDBContent {
                 chainSequences = (try? GemmiBridge.entitySequences(content: content)) ?? []
             }
-
             let result = LoopBuilder.buildMissingLoops(
-                atoms: atoms, bonds: bonds,
-                gaps: buildable, chainSequences: chainSequences
+                atoms: atoms, bonds: bonds, gaps: buildable, chainSequences: chainSequences
             )
-            guard result.gapsBuilt > 0 else {
-                return (atoms, bonds, 0, 0, tooLong)
-            }
+            guard result.gapsBuilt > 0 else { return outcome }
 
-            // GPU-refine the newly built loop atoms only (same as the manual
-            // "Fix Missing Residues" flow) so the geometry isn't a raw spline.
-            var finalAtoms = result.atoms
-            if let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) {
+            outcome.atoms = result.atoms
+            outcome.bonds = result.bonds
+            outcome.gapsBuilt = result.gapsBuilt
+            outcome.residuesAdded = result.residuesAdded
+            outcome.usedSEQRES = !chainSequences.isEmpty
+
+            switch refinement {
+            case .none:
+                break
+            case .openmm:
+                guard druse_openmm_available() else { break }
+                outcome.atoms = refineLoopsWithOpenMM(
+                    atoms: result.atoms, bonds: result.bonds, originalAtomCount: atoms.count)
+                outcome.refinement = .openmm
+            case .gpu:
+                guard let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) else { break }
                 var isLoopAtom = [Bool](repeating: false, count: result.atoms.count)
                 for i in atoms.count..<result.atoms.count { isLoopAtom[i] = true }
-                let loopAngles = AppViewModel.extractLoopBackboneAngles(
+                let loopAngles = extractLoopBackboneAngles(
                     atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom)
-                let loopTorsions = AppViewModel.extractLoopOmegaTorsions(
+                let loopTorsions = extractLoopOmegaTorsions(
                     atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom)
                 let refineInput = LoopMetalAccelerator.LoopRefineInput(
                     atoms: result.atoms, bonds: result.bonds,
                     isLoopAtom: isLoopAtom, angles: loopAngles, torsions: loopTorsions)
                 let output = accelerator.refine(input: refineInput, maxIterations: 500, tolerance: 0.05)
                 for i in 0..<result.atoms.count where isLoopAtom[i] {
-                    finalAtoms[i] = Atom(
-                        id: finalAtoms[i].id, element: finalAtoms[i].element,
-                        position: output.positions[i], name: finalAtoms[i].name,
-                        residueName: finalAtoms[i].residueName, residueSeq: finalAtoms[i].residueSeq,
-                        chainID: finalAtoms[i].chainID, charge: finalAtoms[i].charge,
-                        formalCharge: finalAtoms[i].formalCharge, isHetAtom: finalAtoms[i].isHetAtom,
-                        occupancy: finalAtoms[i].occupancy, tempFactor: finalAtoms[i].tempFactor)
+                    outcome.atoms[i].position = output.positions[i]
                 }
+                outcome.refinement = .gpu
             }
-            return (finalAtoms, result.bonds, result.gapsBuilt, result.residuesAdded, tooLong)
+            return outcome
         }.value
     }
 
     // MARK: - Fix Missing Residues (Detection + Loop Building + Atom Reconstruction)
 
     /// Combined action: detect gaps, build missing loops, and reconstruct missing atoms.
-    func detectAndFixMissingResidues() {
+    /// Returns nil without a protein; otherwise a task that completes once the repair is applied.
+    @discardableResult
+    func detectAndFixMissingResidues() -> Task<Void, Never>? {
         guard let prot = molecules.protein else {
             log.info("[Prep] fixMissingResidues skipped: no protein loaded", category: .prep)
-            return
+            return nil
         }
 
         let gaps = ProteinPreparation.detectMissingResidues(in: prot.atoms)
@@ -364,342 +625,142 @@ extension AppViewModel {
         let title = prot.title
         let secondaryStructure = prot.secondaryStructureAssignments
         let rawContent = molecules.rawPDBContent
-        let buildableGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
         let hadHydrogens = atoms.contains { $0.element == .H }
         let capturedPH = molecules.protonationPH
         let capturedChargeMethod = docking.chargeMethod
+        let metalDevice = computeDevice
 
-        Task.detached(priority: .userInitiated) {
-            var workAtoms = atoms
-            var workBonds = bonds
-            var loopsBuilt = 0
-            var residuesAdded = 0
-
+        return Task {
             // Phase 1: Build missing loop residues (if gaps exist)
-            if !buildableGaps.isEmpty {
-                var chainSequences: [GemmiBridge.ChainSequence] = []
-                if let content = rawContent {
-                    do {
-                        chainSequences = try GemmiBridge.entitySequences(content: content)
-                    } catch { /* fall back to polyalanine */ }
-                }
+            let loops = await Self.buildLoops(
+                atoms: atoms, bonds: bonds, gaps: gaps, maxLength: Self.maxBuildableLoopLength,
+                rawPDBContent: rawContent, refinement: .gpu, metalDevice: metalDevice)
 
-                let loopResult = LoopBuilder.buildMissingLoops(
-                    atoms: workAtoms, bonds: workBonds,
-                    gaps: buildableGaps, chainSequences: chainSequences
+            let repaired = await Task.detached(priority: .userInitiated) {
+                // Phase 2: Reconstruct missing heavy atoms in existing residues (no hydrogen addition)
+                let reconstructed = ProteinPreparation.reconstructMissingHeavyAtoms(
+                    atoms: loops.atoms, bonds: loops.bonds
                 )
-                if loopResult.gapsBuilt > 0 {
-                    // GPU refine loop regions
-                    let metalDevice = await MainActor.run { self.renderer?.device }
-                    var finalAtoms = loopResult.atoms
-                    if let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) {
-                        var isLoopAtom = [Bool](repeating: false, count: loopResult.atoms.count)
-                        for i in workAtoms.count..<loopResult.atoms.count { isLoopAtom[i] = true }
-                        let loopAngles = AppViewModel.extractLoopBackboneAngles(
-                            atoms: loopResult.atoms, bonds: loopResult.bonds, isLoopAtom: isLoopAtom)
-                        let loopTorsions = AppViewModel.extractLoopOmegaTorsions(
-                            atoms: loopResult.atoms, bonds: loopResult.bonds, isLoopAtom: isLoopAtom)
-                        let refineInput = LoopMetalAccelerator.LoopRefineInput(
-                            atoms: loopResult.atoms, bonds: loopResult.bonds,
-                            isLoopAtom: isLoopAtom, angles: loopAngles, torsions: loopTorsions)
-                        let output = accelerator.refine(input: refineInput, maxIterations: 500, tolerance: 0.05)
-                        for i in 0..<loopResult.atoms.count where isLoopAtom[i] {
-                            finalAtoms[i] = Atom(
-                                id: finalAtoms[i].id, element: finalAtoms[i].element,
-                                position: output.positions[i], name: finalAtoms[i].name,
-                                residueName: finalAtoms[i].residueName, residueSeq: finalAtoms[i].residueSeq,
-                                chainID: finalAtoms[i].chainID, charge: finalAtoms[i].charge,
-                                formalCharge: finalAtoms[i].formalCharge, isHetAtom: finalAtoms[i].isHetAtom,
-                                occupancy: finalAtoms[i].occupancy, tempFactor: finalAtoms[i].tempFactor)
-                        }
-                    }
-                    workAtoms = finalAtoms
-                    workBonds = loopResult.bonds
-                    loopsBuilt = loopResult.gapsBuilt
-                    residuesAdded = loopResult.residuesAdded
+                guard hadHydrogens else {
+                    return (atoms: reconstructed.atoms, bonds: reconstructed.bonds,
+                            atomsRebuilt: reconstructed.addedAtomCount, hydrogensAdded: 0,
+                            protonation: [Protonation.ResiduePrediction]())
                 }
-            }
-
-            // Phase 2: Reconstruct missing heavy atoms in existing residues (no hydrogen addition)
-            let reconstructed = ProteinPreparation.reconstructMissingHeavyAtoms(
-                atoms: workAtoms, bonds: workBonds
-            )
-            let atomsRebuilt = reconstructed.addedAtomCount
-            let capturedLoopsBuilt = loopsBuilt
-            let capturedResiduesAdded = residuesAdded
-
-            var finalAtoms = reconstructed.atoms
-            var finalBonds = reconstructed.bonds
-
-            // Phase 3: If the protein was already prepared (had hydrogens), re-run
-            // protonation + hydrogen addition + charge assignment so that newly built
-            // residues are fully integrated with the prior preparation state.
-            var hAdded = 0
-            if hadHydrogens {
-                // Strip existing hydrogens — completePhase23 will re-add them consistently
-                let heavyAtoms = finalAtoms.filter { $0.element != .H }
-                let heavyIndices = finalAtoms.indices.filter { finalAtoms[$0].element != .H }
-                let indexMap = Dictionary(uniqueKeysWithValues: heavyIndices.enumerated().map { ($0.element, $0.offset) })
-                let heavyBonds = finalBonds.compactMap { bond -> Bond? in
-                    guard let i1 = indexMap[bond.atomIndex1], let i2 = indexMap[bond.atomIndex2] else { return nil }
-                    return Bond(id: i1 * 100000 + i2, atomIndex1: i1, atomIndex2: i2, order: bond.order)
-                }
-
-                let metalDevice = await MainActor.run { self.renderer?.device }
+                // Phase 3: the protein was already prepared (had hydrogens) — strip them and
+                // re-run protonation + hydrogen addition so newly built residues are fully
+                // integrated with the prior preparation state.
+                let heavyIndices = reconstructed.atoms.indices.filter { reconstructed.atoms[$0].element != .H }
+                let heavy = ProteinPreparation.remapSubstructure(
+                    atoms: reconstructed.atoms, bonds: reconstructed.bonds, selectedIndices: heavyIndices)
                 let phase23 = ProteinPreparation.completePhase23(
-                    atoms: heavyAtoms, bonds: heavyBonds, pH: capturedPH, device: metalDevice
+                    atoms: heavy.atoms, bonds: heavy.bonds, pH: capturedPH, device: metalDevice
                 )
-                finalAtoms = phase23.atoms
-                finalBonds = phase23.bonds
-                hAdded = phase23.report.hydrogensAdded
+                return (atoms: phase23.atoms, bonds: phase23.bonds,
+                        atomsRebuilt: reconstructed.addedAtomCount,
+                        hydrogensAdded: phase23.report.hydrogensAdded,
+                        protonation: phase23.protonation)
+            }.value
 
-                // Re-apply charges
-                switch capturedChargeMethod {
-                case .gasteiger:
-                    if let pdbContent = rawContent, finalAtoms.count <= 6000,
-                       let chargeData = RDKitBridge.computeChargesPDB(pdbContent: pdbContent) {
-                        let merged = ProteinPreparation.mergeProteinAtoms(
-                            currentAtoms: finalAtoms, sourceAtoms: chargeData.atoms
-                        ) { current, source in current.charge = source.charge }
-                        finalAtoms = merged.atoms
-                    }
-                case .eem, .qeq, .xtb:
-                    let calculator: ChargeCalculator = {
-                        switch capturedChargeMethod {
-                        case .eem: return EEMChargeCalculator(device: nil)
-                        case .qeq: return QEqChargeCalculator(device: nil)
-                        case .xtb: return XTBChargeCalculator()
-                        default:   return GasteigerChargeCalculator()
-                        }
-                    }()
-                    if let charges = try? await calculator.computeCharges(
-                        atoms: finalAtoms, bonds: finalBonds, totalCharge: 0
-                    ) {
-                        for i in 0..<min(charges.count, finalAtoms.count) {
-                            finalAtoms[i].charge = charges[i]
-                        }
-                    }
-                }
-                finalAtoms = ProteinPreparation.applyElectrostaticFallback(to: finalAtoms)
+            var finalAtoms = repaired.atoms
+            if hadHydrogens {
+                let charged = await Self.computeProteinCharges(
+                    atoms: repaired.atoms, bonds: repaired.bonds,
+                    method: capturedChargeMethod, rawPDBContent: rawContent)
+                finalAtoms = ProteinPreparation.applyElectrostaticFallback(to: charged.atoms)
+                protonationStates = repaired.protonation
             }
 
-            let capturedFinalAtoms = finalAtoms
-            let capturedFinalBonds = finalBonds
-            let capturedHAdded = hAdded
+            let mol = Molecule(name: name, atoms: finalAtoms, bonds: repaired.bonds, title: title)
+            mol.secondaryStructureAssignments = secondaryStructure
+            molecules.protein = mol
+            molecules.preparationReport = ProteinPreparation.analyze(atoms: finalAtoms, bonds: repaired.bonds)
+            pushToRenderer()
+            renderer?.fitToContent()
 
-            await MainActor.run {
-                let mol = Molecule(name: name, atoms: capturedFinalAtoms, bonds: capturedFinalBonds, title: title)
-                mol.secondaryStructureAssignments = secondaryStructure
-                self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: capturedFinalAtoms, bonds: capturedFinalBonds)
-                self.pushToRenderer()
-                self.renderer?.fitToContent()
-
-                var messages: [String] = []
-                if capturedLoopsBuilt > 0 { messages.append("\(capturedLoopsBuilt) loop(s) built (\(capturedResiduesAdded) residues)") }
-                if atomsRebuilt > 0 { messages.append("\(atomsRebuilt) heavy atoms rebuilt") }
-                if capturedHAdded > 0 { messages.append("re-protonated (\(capturedHAdded) H)") }
-                if messages.isEmpty {
-                    self.log.success("Protein structure is complete — no missing residues or atoms", category: .prep)
-                    self.workspace.statusMessage = "Structure complete"
-                } else {
-                    self.log.success("Fixed: \(messages.joined(separator: ", "))", category: .prep)
-                    self.workspace.statusMessage = messages.joined(separator: ", ")
-                }
-                self.molecules.isMinimizing = false
-                self.molecules.proteinPrepared = true
+            var messages: [String] = []
+            if loops.gapsBuilt > 0 { messages.append("\(loops.gapsBuilt) loop(s) built (\(loops.residuesAdded) residues)") }
+            if repaired.atomsRebuilt > 0 { messages.append("\(repaired.atomsRebuilt) heavy atoms rebuilt") }
+            if repaired.hydrogensAdded > 0 { messages.append("re-protonated (\(repaired.hydrogensAdded) H)") }
+            if messages.isEmpty {
+                log.success("Protein structure is complete — no missing residues or atoms", category: .prep)
+                workspace.statusMessage = "Structure complete"
+            } else {
+                recordPreparation("Repair structure", "Fixed: \(messages.joined(separator: ", "))")
+                workspace.statusMessage = messages.joined(separator: ", ")
             }
-        }
-    }
-
-    func detectAndReportMissingResidues() {
-        guard let prot = molecules.protein else {
-            log.info("[Prep] detectMissingResidues skipped: no protein loaded", category: .prep)
-            return
-        }
-
-        let gaps = ProteinPreparation.detectMissingResidues(in: prot.atoms)
-        if gaps.isEmpty {
-            log.success("No missing residues detected -- sequence is contiguous", category: .prep)
-            workspace.statusMessage = "No gaps found"
-        } else {
-            log.warn("Detected \(gaps.count) gap(s) in residue numbering:", category: .prep)
-            for gap in gaps {
-                let count = gap.gapEnd - gap.gapStart + 1
-                log.warn("  Chain \(gap.chainID): residues \(gap.gapStart)-\(gap.gapEnd) missing (\(count) residue\(count == 1 ? "" : "s"))", category: .prep)
-            }
-            let buildableGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) <= 15 }
-            if !buildableGaps.isEmpty {
-                let totalResidues = buildableGaps.reduce(0) { $0 + ($1.gapEnd - $1.gapStart + 1) }
-                log.info("Use 'Build Missing Loops' to model \(buildableGaps.count) gap(s) (\(totalResidues) residues, max 15 per loop)", category: .prep)
-            }
-            let longGaps = gaps.filter { ($0.gapEnd - $0.gapStart + 1) > 15 }
-            for gap in longGaps {
-                let count = gap.gapEnd - gap.gapStart + 1
-                log.warn("  Chain \(gap.chainID): gap of \(count) residues too long for ab initio loop building (max 15)", category: .prep)
-            }
-            workspace.statusMessage = "\(gaps.count) gap(s) detected"
-        }
-
-        if molecules.preparationReport != nil {
-            molecules.preparationReport?.missingResidues = gaps
-        }
-
-        // Reconstruct missing heavy atoms from residue templates
-        molecules.isMinimizing = true
-        log.info("Reconstructing missing heavy atoms from templates...", category: .prep)
-
-        let atoms = prot.atoms
-        let bonds = prot.bonds
-        let name = prot.name
-        let title = prot.title
-        let secondaryStructure = prot.secondaryStructureAssignments
-
-        Task.detached(priority: .userInitiated) {
-            let reconstructed = ProteinPreparation.reconstructMissingHeavyAtoms(
-                atoms: atoms, bonds: bonds
-            )
-
-            await MainActor.run {
-                let mol = Molecule(name: name, atoms: reconstructed.atoms, bonds: reconstructed.bonds, title: title)
-                mol.secondaryStructureAssignments = secondaryStructure
-                self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: reconstructed.atoms, bonds: reconstructed.bonds)
-                self.pushToRenderer()
-                if reconstructed.addedAtomCount > 0 {
-                    self.log.success("Rebuilt \(reconstructed.addedAtomCount) missing heavy atoms from residue templates", category: .prep)
-                    self.workspace.statusMessage = "\(reconstructed.addedAtomCount) atoms rebuilt"
-                } else {
-                    self.log.info("No missing heavy atoms found to rebuild", category: .prep)
-                }
-                self.molecules.isMinimizing = false
-            }
+            molecules.isMinimizing = false
+            molecules.proteinPrepared = true
         }
     }
 
     // MARK: - Build Missing Loops
 
-    func buildMissingLoops() {
+    /// Models missing loops of at most `maxLength` residues and relaxes them with
+    /// `refinement`, without touching the rest of the structure. Returns nil without a
+    /// protein; otherwise a task yielding the outcome (nil when there was no gap to build).
+    @discardableResult
+    func buildMissingLoops(maxLength: Int = maxBuildableLoopLength, refinement: LoopRefinement = .gpu) -> Task<LoopBuildOutcome?, Never>? {
         guard let prot = molecules.protein else {
             log.info("[Prep] buildMissingLoops skipped: no protein loaded", category: .prep)
-            return
+            return nil
         }
 
         let gaps = ProteinPreparation.detectMissingResidues(in: prot.atoms)
         guard !gaps.isEmpty else {
             log.success("No missing residues detected -- nothing to build", category: .prep)
             workspace.statusMessage = "No gaps to build"
-            return
+            return Task { nil }
         }
 
         molecules.isMinimizing = true
         log.info("Building missing residue loops...", category: .prep)
         workspace.statusMessage = "Building loops..."
 
-        let atoms = prot.atoms
-        let bonds = prot.bonds
-        let name = prot.name
-        let title = prot.title
-        let secondaryStructure = prot.secondaryStructureAssignments
         let rawContent = molecules.rawPDBContent
+        let metalDevice = computeDevice
 
-        Task.detached(priority: .userInitiated) {
-            // 1. Extract SEQRES sequences
-            var chainSequences: [GemmiBridge.ChainSequence] = []
-            if let content = rawContent {
-                do {
-                    chainSequences = try GemmiBridge.entitySequences(content: content)
-                } catch {
-                    // Fall back to polyalanine
-                }
+        return Task {
+            let outcome = await Self.buildLoops(
+                atoms: prot.atoms, bonds: prot.bonds, gaps: gaps, maxLength: maxLength,
+                rawPDBContent: rawContent, refinement: refinement, metalDevice: metalDevice)
+            defer { molecules.isMinimizing = false }
+
+            guard outcome.gapsBuilt > 0 else {
+                log.warn("No gaps could be built (anchors missing or gaps longer than \(maxLength) residues)", category: .prep)
+                workspace.statusMessage = "No loops built"
+                return outcome
             }
 
-            // 2. Build loops (backbone + sidechains)
-            let result = LoopBuilder.buildMissingLoops(
-                atoms: atoms,
-                bonds: bonds,
-                gaps: gaps,
-                chainSequences: chainSequences
+            let mol = Molecule(name: prot.name, atoms: outcome.atoms, bonds: outcome.bonds, title: prot.title)
+            mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+            molecules.protein = mol
+            molecules.preparationReport = ProteinPreparation.analyze(atoms: outcome.atoms, bonds: outcome.bonds)
+            pushToRenderer()
+            renderer?.fitToContent()
+
+            let refined = switch outcome.refinement {
+            case .gpu: ", Metal GPU-refined"
+            case .openmm: ", OpenMM-refined"
+            case .none: ""
+            }
+            recordPreparation(
+                "Build loops",
+                "Built \(outcome.gapsBuilt) loop(s) with \(outcome.residuesAdded) residues " +
+                "(from \(outcome.usedSEQRES ? "SEQRES" : "polyalanine")\(refined))"
             )
-
-            guard result.gapsBuilt > 0 else {
-                await MainActor.run {
-                    self.log.warn("No gaps could be built (anchors missing or gaps too long)", category: .prep)
-                    self.workspace.statusMessage = "No loops built"
-                    self.molecules.isMinimizing = false
-                }
-                return
+            if outcome.gapsTooLong > 0 {
+                log.warn("\(outcome.gapsTooLong) gap(s) longer than \(maxLength) residues left unbuilt", category: .prep)
             }
-
-            // 3. Metal GPU refinement of loop regions
-            let metalDevice = await MainActor.run { self.renderer?.device }
-            var finalAtoms = result.atoms
-            var wasRefined = false
-            if let dev = metalDevice, let accelerator = LoopMetalAccelerator(device: dev) {
-                var isLoopAtom = [Bool](repeating: false, count: result.atoms.count)
-                for i in atoms.count..<result.atoms.count { isLoopAtom[i] = true }
-
-                let loopAngles = AppViewModel.extractLoopBackboneAngles(
-                    atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom
-                )
-                let loopTorsions = AppViewModel.extractLoopOmegaTorsions(
-                    atoms: result.atoms, bonds: result.bonds, isLoopAtom: isLoopAtom
-                )
-
-                let refineInput = LoopMetalAccelerator.LoopRefineInput(
-                    atoms: result.atoms,
-                    bonds: result.bonds,
-                    isLoopAtom: isLoopAtom,
-                    angles: loopAngles,
-                    torsions: loopTorsions
-                )
-                let output = accelerator.refine(input: refineInput, maxIterations: 500, tolerance: 0.05)
-                for i in 0..<result.atoms.count where isLoopAtom[i] {
-                    finalAtoms[i] = Atom(
-                        id: finalAtoms[i].id,
-                        element: finalAtoms[i].element,
-                        position: output.positions[i],
-                        name: finalAtoms[i].name,
-                        residueName: finalAtoms[i].residueName,
-                        residueSeq: finalAtoms[i].residueSeq,
-                        chainID: finalAtoms[i].chainID,
-                        charge: finalAtoms[i].charge,
-                        formalCharge: finalAtoms[i].formalCharge,
-                        isHetAtom: finalAtoms[i].isHetAtom,
-                        occupancy: finalAtoms[i].occupancy,
-                        tempFactor: finalAtoms[i].tempFactor
-                    )
-                }
-                wasRefined = true
-            }
-
-            let capturedAtoms = finalAtoms
-            let capturedChainSequences = chainSequences
-            let capturedWasRefined = wasRefined
-            await MainActor.run {
-                let mol = Molecule(name: name, atoms: capturedAtoms, bonds: result.bonds, title: title)
-                mol.secondaryStructureAssignments = secondaryStructure
-                self.molecules.protein = mol
-                self.molecules.preparationReport = ProteinPreparation.analyze(atoms: capturedAtoms, bonds: result.bonds)
-                self.pushToRenderer()
-                self.renderer?.fitToContent()
-
-                let seqSource = capturedChainSequences.isEmpty ? "polyalanine" : "SEQRES"
-                let refinedStr = capturedWasRefined ? ", Metal GPU-refined" : ""
-                self.log.success(
-                    "Built \(result.gapsBuilt) loop(s) with \(result.residuesAdded) residues " +
-                    "(from \(seqSource)\(refinedStr))",
-                    category: .prep
-                )
-                self.workspace.statusMessage = "\(result.residuesAdded) loop residues built"
-                self.molecules.isMinimizing = false
-                self.molecules.proteinPrepared = true
-            }
+            workspace.statusMessage = "\(outcome.residuesAdded) loop residues built"
+            molecules.proteinPrepared = true
+            return outcome
         }
     }
 
     // MARK: - OpenMM Loop Refinement
 
+    /// Relaxes the loop atoms appended after `originalAtomCount` with OpenMM while the rest of
+    /// the structure stays restrained; returns the input unchanged when OpenMM fails.
     nonisolated static func refineLoopsWithOpenMM(
         atoms: [Atom],
         bonds: [Bond],
@@ -967,15 +1028,8 @@ extension AppViewModel {
         pushToRenderer()
         renderer?.fitToContent()
 
-        log.success("Rebuilt \(rebuilt.addedAtomCount) missing heavy atom(s) from residue templates", category: .prep)
+        recordPreparation("Rebuild missing atoms", "Rebuilt \(rebuilt.addedAtomCount) missing heavy atom(s) from residue templates")
         workspace.statusMessage = "\(rebuilt.addedAtomCount) heavy atom(s) rebuilt"
-    }
-
-    // MARK: - Solvation Shell
-
-    func addSolvationShell() {
-        // Redirect to pocket waters — the solvation shell button now calls this
-        keepPocketWaters()
     }
 
     func removeHydrogens() {
@@ -990,6 +1044,7 @@ extension AppViewModel {
         let mol = Molecule(name: prot.name, atoms: result.atoms, bonds: result.bonds, title: prot.title)
         mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
         molecules.protein = mol
+        protonationStates = []
 
         if let lig = molecules.ligand, lig.atoms.contains(where: { $0.element == .H }) {
             let ligKept = lig.atoms.indices.filter { lig.atoms[$0].element != .H }
@@ -1004,22 +1059,24 @@ extension AppViewModel {
         renderer?.fitToContent()
         molecules.preparationReport = ProteinPreparation.analyze(atoms: result.atoms, bonds: result.bonds)
         let removed = prot.atoms.count - result.atoms.count
-        log.success("Removed \(removed) hydrogen atoms", category: .prep)
+        recordPreparation("Remove hydrogens", "Removed \(removed) hydrogen atoms")
         workspace.statusMessage = "\(removed) H removed"
     }
 
     // MARK: - C++ Protein Preparation
 
-    func addHydrogens() {
+    /// Returns nil without a protein; otherwise a task that completes once hydrogens are added.
+    @discardableResult
+    func addHydrogens() -> Task<Void, Never>? {
         guard let prot = molecules.protein else {
             log.info("[Prep] addHydrogens skipped: no protein loaded", category: .prep)
-            return
+            return nil
         }
 
         log.info("Adding all hydrogens (polar + nonpolar) from residue templates...", category: .prep)
         workspace.statusMessage = "Adding hydrogens..."
 
-        Task {
+        return Task {
             let completed = ProteinPreparation.completePhase23(
                 atoms: prot.atoms,
                 bonds: prot.bonds,
@@ -1029,6 +1086,7 @@ extension AppViewModel {
             let mol = Molecule(name: prot.name, atoms: completed.atoms, bonds: completed.bonds, title: prot.title)
             mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
             molecules.protein = mol
+            protonationStates = completed.protonation
             pushToRenderer()
             renderer?.fitToContent()
 
@@ -1045,30 +1103,198 @@ extension AppViewModel {
                 log.success("Structure already complete — no missing atoms or hydrogens", category: .prep)
                 workspace.statusMessage = "No hydrogens added"
             } else {
-                log.success(parts.joined(separator: ", "), category: .prep)
+                recordPreparation("Add hydrogens", parts.joined(separator: ", "))
                 workspace.statusMessage = added > 0 ? "\(added) H added" : "No hydrogens added"
             }
             molecules.preparationReport = ProteinPreparation.analyze(atoms: completed.atoms, bonds: completed.bonds)
         }
     }
 
-    func assignCharges() {
+    // MARK: - H-bond Network, Side-chain Packing, Minimization
+
+    /// Re-optimises the hydrogen-bond network of an already protonated protein: OH/SH/NH3⁺
+    /// rotors, Asn/Gln amide flips and His tautomer/flip states, scored as one network.
+    /// Uses the protonation states of the last protonation (or predicts them at the current
+    /// pH). Returns nil without a protonated protein; otherwise a task yielding the report.
+    @discardableResult
+    func optimizeHydrogenBondNetwork() -> Task<HBondNetworkOptimizer.NetworkReport, Never>? {
+        guard let prot = molecules.protein, prot.atoms.contains(where: { $0.element == .H }) else {
+            log.warn("[Prep] H-bond optimization needs a protonated protein — add hydrogens first", category: .prep)
+            return nil
+        }
+        molecules.isMinimizing = true
+        workspace.statusMessage = "Optimizing H-bond network..."
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let pH = molecules.protonationPH
+        let known = protonationStates
+        let device = computeDevice
+
+        return Task {
+            let network = await Task.detached(priority: .userInitiated) {
+                let predictions = known.isEmpty
+                    ? Protonation.predictResidueStates(atoms: atoms, bonds: bonds, pH: pH)
+                    : known
+                return HBondNetworkOptimizer.optimizeNetwork(
+                    atoms: atoms, bonds: bonds, predictions: predictions, device: device)
+            }.value
+
+            let mol = Molecule(name: prot.name, atoms: network.atoms, bonds: network.bonds, title: prot.title)
+            mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+            molecules.protein = mol
+            protonationStates = network.predictions
+            pushToRenderer()
+            let report = network.report
+            recordPreparation(
+                "Optimize H-bond network",
+                "H-bond network: \(report.moveableGroups) movable groups in \(report.cliques) cliques, " +
+                "\(report.flipsAccepted) flips, \(report.rotationsOptimized) rotations, " +
+                String(format: "%.1f", report.totalEnergyImprovement) + " improvement"
+            )
+            workspace.statusMessage = "H-bond network optimized"
+            molecules.isMinimizing = false
+            return report
+        }
+    }
+
+    /// Repacks side chains with FASPR (Dunbrack rotamers, DEE + tree decomposition).
+    /// Works on heavy-atom models only — hydrogens would no longer match repacked side chains.
+    /// Returns nil without a protein, with hydrogens present, or without the rotamer library;
+    /// otherwise a task yielding the packing report.
+    @discardableResult
+    func packSidechains(_ scope: SidechainPackingScope) -> Task<FASPRSidechainPacker.PackingReport, Never>? {
+        guard let prot = molecules.protein else {
+            log.info("[Prep] packSidechains skipped: no protein loaded", category: .prep)
+            return nil
+        }
+        guard !prot.atoms.contains(where: { $0.element == .H }) else {
+            log.warn("[Prep] Side-chain packing needs a heavy-atom model — remove hydrogens first", category: .prep)
+            return nil
+        }
+        guard DunbrackRotamerLibrary.shared.isLoaded else {
+            log.error("[Prep] Dunbrack rotamer library is not available", category: .prep)
+            return nil
+        }
+        molecules.isMinimizing = true
+        workspace.statusMessage = "Packing side chains..."
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+        let device = computeDevice
+
+        return Task {
+            let packed = await Task.detached(priority: .userInitiated) {
+                switch scope {
+                case .incomplete:
+                    let rebuilt = ProteinPreparation.reconstructMissingHeavyAtoms(atoms: atoms, bonds: bonds)
+                    guard !rebuilt.sidechainRebuiltResidueKeys.isEmpty else {
+                        return (atoms: rebuilt.atoms, bonds: rebuilt.bonds, report: FASPRSidechainPacker.PackingReport())
+                    }
+                    return FASPRSidechainPacker.packSidechains(
+                        atoms: rebuilt.atoms, bonds: rebuilt.bonds, device: device,
+                        onlyIncomplete: true, reconstructedResidueKeys: rebuilt.sidechainRebuiltResidueKeys)
+                case .all:
+                    return FASPRSidechainPacker.packSidechains(
+                        atoms: atoms, bonds: bonds, device: device, onlyIncomplete: false)
+                case .residues(let keys):
+                    return FASPRSidechainPacker.packSidechains(
+                        atoms: atoms, bonds: bonds, device: device,
+                        onlyIncomplete: true, reconstructedResidueKeys: keys)
+                }
+            }.value
+
+            let mol = Molecule(name: prot.name, atoms: packed.atoms, bonds: packed.bonds, title: prot.title)
+            mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+            molecules.protein = mol
+            molecules.preparationReport = ProteinPreparation.analyze(atoms: packed.atoms, bonds: packed.bonds)
+            pushToRenderer()
+            if packed.report.residuesPacked > 0 {
+                recordPreparation(
+                    "Pack side chains",
+                    "FASPR repacked \(packed.report.residuesPacked) side chain(s) " +
+                    "(\(packed.report.totalRotamersEvaluated) rotamers, \(String(format: "%.0f", packed.report.elapsedMs)) ms)"
+                )
+                workspace.statusMessage = "\(packed.report.residuesPacked) side chains packed"
+            } else {
+                log.info("No side chains needed packing", category: .prep)
+                workspace.statusMessage = "No side chains packed"
+            }
+            molecules.isMinimizing = false
+            return packed.report
+        }
+    }
+
+    /// Restrained energy minimisation of the whole protein on the GPU (L-BFGS on VDW + bond
+    /// terms): backbone atoms strongly restrained, side chains moderately, hydrogens free —
+    /// the relaxation the preparation pipeline runs after repacking. Returns nil without a
+    /// protein or Metal device; otherwise a task yielding the minimiser output.
+    @discardableResult
+    func minimizeProtein(maxIterations: Int) -> Task<PreparationMinimizer.MinimizationOutput, Never>? {
+        guard let prot = molecules.protein else {
+            log.info("[Prep] minimizeProtein skipped: no protein loaded", category: .prep)
+            return nil
+        }
+        guard let device = computeDevice, let minimizer = PreparationMinimizer(device: device) else {
+            log.error("[Prep] Restrained minimization needs a Metal device", category: .prep)
+            return nil
+        }
+        molecules.isMinimizing = true
+        workspace.statusMessage = "Minimizing protein..."
+        let atoms = prot.atoms
+        let bonds = prot.bonds
+
+        return Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                let regions: [PreparationMinimizer.AtomRegion] = atoms.map { atom in
+                    if atom.element == .H { return .hydrogen }
+                    let name = ProteinResidueTemplateStore.normalizeAtomName(atom.name)
+                    return ["N", "CA", "C", "O"].contains(name) ? .backbone : .existingSidechain
+                }
+                return minimizer.minimize(
+                    input: PreparationMinimizer.MinimizationInput(atoms: atoms, bonds: bonds, atomRegions: regions),
+                    maxIterations: maxIterations
+                )
+            }.value
+
+            var minimized = atoms
+            for i in 0..<min(result.positions.count, minimized.count) {
+                minimized[i].position = result.positions[i]
+            }
+            let mol = Molecule(name: prot.name, atoms: minimized, bonds: bonds, title: prot.title)
+            mol.secondaryStructureAssignments = prot.secondaryStructureAssignments
+            molecules.protein = mol
+            pushToRenderer()
+            recordPreparation(
+                "Minimize",
+                "Restrained minimization: E = \(String(format: "%.1f", result.finalEnergy)) kcal/mol after " +
+                "\(result.iterations) iteration(s)\(result.converged ? ", converged" : ", not converged")"
+            )
+            workspace.statusMessage = "Protein minimized"
+            molecules.isMinimizing = false
+            return result
+        }
+    }
+
+    // MARK: - Charges
+
+    /// Assigns partial charges with `docking.chargeMethod`. Returns nil when charges cannot be
+    /// computed at all; otherwise a task yielding whether the charges were assigned.
+    @discardableResult
+    func assignCharges() -> Task<Bool, Never>? {
         let method = docking.chargeMethod
         if method == .gasteiger {
-            assignGasteigerCharges()
-            return
+            return assignGasteigerCharges()
         }
 
         guard let prot = molecules.protein else {
             log.info("[Prep] assignCharges skipped: no protein loaded", category: .prep)
-            return
+            return nil
         }
         log.info("Computing \(method.rawValue) charges...", category: .prep)
         workspace.statusMessage = "Computing \(method.rawValue) charges..."
 
-        Task {
+        return Task {
             do {
-                let calculator = ChargeCalculatorFactory.calculator(for: method, device: renderer?.device)
+                let calculator = ChargeCalculatorFactory.calculator(for: method, device: computeDevice)
                 let charges = try await calculator.computeCharges(
                     atoms: prot.atoms, bonds: prot.bonds, totalCharge: 0
                 )
@@ -1084,33 +1310,36 @@ extension AppViewModel {
                 pushToRenderer()
 
                 let nonZero = charges.filter { abs($0) > 0.001 }.count
-                log.success("\(method.rawValue) charges assigned: \(nonZero)/\(charges.count) non-zero", category: .prep)
+                recordPreparation("Assign charges", "\(method.rawValue) charges assigned: \(nonZero)/\(charges.count) non-zero")
                 workspace.statusMessage = "\(method.rawValue) charges assigned"
 
                 molecules.preparationReport = ProteinPreparation.analyze(
                     atoms: updatedAtoms, bonds: prot.bonds
                 )
+                return true
             } catch {
                 log.warn("Charge calculation failed: \(error.localizedDescription)", category: .prep)
                 workspace.statusMessage = "Charge calculation failed"
+                return false
             }
         }
     }
 
-    func assignGasteigerCharges() {
+    @discardableResult
+    func assignGasteigerCharges() -> Task<Bool, Never>? {
         guard let prot = molecules.protein else {
             log.info("[Prep] assignGasteigerCharges skipped: no protein loaded", category: .prep)
-            return
+            return nil
         }
         log.info("Computing Gasteiger charges via RDKit...", category: .prep)
         workspace.statusMessage = "Computing charges..."
 
         guard let pdbContent = molecules.rawPDBContent else {
             log.warn("[Prep] No raw PDB content available for Gasteiger charges", category: .prep)
-            return
+            return nil
         }
 
-        Task {
+        return Task {
             let result = await Task.detached {
                 RDKitBridge.computeChargesPDB(pdbContent: pdbContent)
             }.value
@@ -1124,7 +1353,7 @@ extension AppViewModel {
                 molecules.protein?.secondaryStructureAssignments = prot.secondaryStructureAssignments
                 pushToRenderer()
                 let charged = updated.filter { abs($0.charge) > 0.001 }.count
-                log.success("Gasteiger charges assigned: \(charged)/\(updated.count) atoms with non-zero charge (\(merged.matchedCount) matched)", category: .prep)
+                recordPreparation("Assign charges", "Gasteiger charges assigned: \(charged)/\(updated.count) atoms with non-zero charge (\(merged.matchedCount) matched)")
                 workspace.statusMessage = "\(charged) atoms charged"
             } else {
                 log.error("RDKit charge computation returned nil", category: .prep)
@@ -1135,6 +1364,7 @@ extension AppViewModel {
                 atoms: molecules.protein?.atoms ?? prot.atoms,
                 bonds: molecules.protein?.bonds ?? prot.bonds
             )
+            return result != nil
         }
     }
 }

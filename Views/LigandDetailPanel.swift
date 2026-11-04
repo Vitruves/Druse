@@ -59,12 +59,19 @@ extension LigandDatabaseWindow {
                 if let error = entry.preparationError {
                     PanelHint(text: error, icon: "xmark.octagon.fill", color: DS.Color.danger)
                 }
-
-                detailActions(entry)
             }
             .padding(DS.Space.l)
         }
         .scrollIndicators(.automatic)
+        // Actions stay pinned and fully visible, like the step panels' footers.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                detailActions(entry)
+                    .padding(DS.Space.l)
+            }
+            .background(.bar)
+        }
     }
 
     @ViewBuilder
@@ -78,7 +85,8 @@ extension LigandDatabaseWindow {
                     .textSelection(.enabled)
                 Spacer(minLength: DS.Space.xs)
                 if isActive {
-                    DSTag("Active", tone: .ligand, systemImage: "hexagon.fill")
+                    DSTag("Docking", tone: .ligand, systemImage: "scope")
+                        .help("This compound is the active docking ligand")
                 }
             }
 
@@ -135,9 +143,12 @@ extension LigandDatabaseWindow {
                 atoms: entry.atoms,
                 bonds: entry.bonds,
                 conformers: conformers,
-                selectedConformerIndex: $selectedConformerIndex
+                selectedConformerIndex: $selectedConformerIndex,
+                isPreparing: isProcessing,
+                onPrepare: entry.smiles.isEmpty ? nil : { prepareSingleEntry(entry) }
             )
-            .frame(height: 240)
+            // The empty state needs far less room than the live viewport.
+            .frame(height: entry.atoms.isEmpty ? 132 : 240)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
@@ -216,36 +227,63 @@ extension LigandDatabaseWindow {
         }
     }
 
+    /// One primary action for the entry's state: Prepare while it has no 3D
+    /// structure, Use for Docking once it has one. Parents with enumerated forms
+    /// point at their forms instead.
     @ViewBuilder
     private func detailActions(_ entry: LigandEntry) -> some View {
         let isParentWithForms = db.hasEnumeratedChildren(entry)
+        let canDock = !entry.atoms.isEmpty && !isParentWithForms
+        let isActive = viewModel.activeLigandEntryID == entry.id
         VStack(spacing: DS.Space.s) {
-            Button {
-                useEntryForDocking(entry)
-            } label: {
-                Label("Use for Docking", systemImage: "arrow.right.circle.fill")
-            }
-            .buttonStyle(.dsPrimary)
-            .disabled(entry.atoms.isEmpty || isParentWithForms)
-            .help(entry.atoms.isEmpty ? "Prepare this compound first"
-                  : isParentWithForms ? "Dock one of the enumerated forms instead"
-                  : "Make this the active docking ligand")
-
-            HStack(spacing: DS.Space.s) {
+            if canDock && isActive {
+                Label("Active Docking Ligand", systemImage: "scope")
+                    .font(DS.Font.label.weight(.medium))
+                    .foregroundStyle(DS.Color.ligand)
+                    .frame(maxWidth: .infinity, minHeight: DS.Size.primaryButtonHeight)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                            .fill(DS.Color.ligand.opacity(0.12))
+                    )
+            } else if canDock {
+                Button {
+                    useEntryForDocking(entry)
+                } label: {
+                    Label("Use for Docking", systemImage: "arrow.right.circle.fill")
+                }
+                .buttonStyle(.dsPrimary)
+                .help("Make this the active docking ligand")
+            } else if isParentWithForms {
+                PanelHint(text: "Dock one of the enumerated forms of this compound.",
+                          icon: "arrow.turn.down.right", color: .secondary)
+            } else {
                 Button {
                     prepareSingleEntry(entry)
                 } label: {
-                    Label(entry.isPrepared ? "Re-prepare" : "Prepare", systemImage: "wand.and.stars")
+                    Label("Prepare", systemImage: "wand.and.stars")
                 }
-                .buttonStyle(.dsSecondary)
+                .buttonStyle(.dsPrimary)
                 .disabled(entry.smiles.isEmpty || isProcessing)
                 .help("Prepare the dominant form: add H → protonate at pH → minimize → charges → conformers")
+            }
+
+            HStack(spacing: DS.Space.s) {
+                if canDock || isParentWithForms {
+                    Button {
+                        prepareSingleEntry(entry)
+                    } label: {
+                        Label("Re-prepare", systemImage: "wand.and.stars")
+                    }
+                    .buttonStyle(.dsSecondary)
+                    .disabled(entry.smiles.isEmpty || isProcessing)
+                    .help("Prepare the dominant form again: add H → protonate at pH → minimize → charges → conformers")
+                }
 
                 Button {
                     editingEntryID = entry.id
                     showChemDrawer = true
                 } label: {
-                    Label("Edit…", systemImage: "pencil.and.outline")
+                    Label("Edit Structure…", systemImage: "pencil.and.outline")
                 }
                 .buttonStyle(.dsSecondary)
                 .disabled(entry.smiles.isEmpty)

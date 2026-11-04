@@ -610,6 +610,16 @@ enum ProteinPreparation {
         }
         logT("Phase 5 charges (\(chargeMethod), \(workingAtoms.count) atoms)", t)
 
+        // RDKit Gasteiger (and occasionally an iterative solver) returns inf/NaN for atoms it cannot
+        // parameterise; one such charge poisons every electrostatic sum downstream (OpenMM refinement
+        // diverged on every pose), so it is cleared here and replaced by the fallback below.
+        let nonFiniteCharges = workingAtoms.indices.filter { !workingAtoms[$0].charge.isFinite }
+        for index in nonFiniteCharges { workingAtoms[index].charge = 0 }
+        if !nonFiniteCharges.isEmpty {
+            let count = nonFiniteCharges.count
+            Task { @MainActor in ActivityLog.shared.info("[Prep] \(count) receptor atom(s) had a non-finite \(chargeMethod) charge; using the fallback charge instead", category: .prep) }
+        }
+
         let beforeFallback = workingAtoms
         workingAtoms = applyElectrostaticFallback(to: workingAtoms)
         report.fallbackChargeAtoms = zip(beforeFallback, workingAtoms).filter {

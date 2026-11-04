@@ -1,0 +1,29 @@
+# Lead optimization from the docked crystal ligand of 1add: generate analogs, dock them, hand off the best.
+# Run: druse Examples/lead_optimization.druse
+# Writes the analog table to $out (/tmp; edit the "set out" line to write elsewhere).
+set onerror=stop
+set data = ../Benchmark/data/refined-set/1add
+set out = /tmp
+
+load $data/1add_protein.pdb
+load $data/1add_ligand.sdf
+prep waters=remove
+pocket box fit around=ligand padding=6
+dock preset=fast
+results top=3
+
+# Reference = best pose of the run; generation options, then generate
+leadopt reference pose=1
+leadopt set count=8 similarity=0.6
+leadopt config
+leadopt generate
+leadopt list top=8
+leadopt show 1
+
+# Dock every analog against the same pocket and compare
+leadopt dock
+leadopt list top=8
+
+export analogs $out/1add_analogs.csv
+leadopt send database
+ligand list

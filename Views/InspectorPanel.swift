@@ -66,6 +66,20 @@ private struct Swatch: View {
     }
 }
 
+/// The colour button of a chain or ligand row: a round dot with a darker ring, so a grey colour
+/// never reads as an unchecked checkbox next to the row's switch.
+private struct ColorDot<Fill: View>: View {
+    @ViewBuilder let fill: () -> Fill
+
+    var body: some View {
+        fill()
+            .frame(width: 14, height: 14)
+            .clipShape(Circle())
+            .overlay(Circle().strokeBorder(Color.primary.opacity(0.25), lineWidth: 1))
+            .frame(width: 18, height: 18)
+    }
+}
+
 /// 4×4 grid of preset swatches used by both color popovers.
 private struct SwatchGrid: View {
     let isSelected: (Color) -> Bool
@@ -98,8 +112,7 @@ private struct ChainColorPicker: View {
 
     var body: some View {
         Button(action: { showPopover.toggle() }) {
-            swatchIcon
-                .frame(width: 18, height: 18)
+            ColorDot { swatchIcon }
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -155,22 +168,18 @@ private struct ChainColorPicker: View {
 
     @ViewBuilder
     private var swatchIcon: some View {
-        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
         switch mode {
         case .cpk:
             // Multi-color CPK indicator (C gray, N blue, O red)
             ZStack {
                 Color(red: 0.5, green: 0.5, blue: 0.5)
-                Circle().fill(Color(red: 0.0, green: 0.4, blue: 1.0)).frame(width: 8, height: 8).offset(x: -3, y: -3)
+                Circle().fill(Color(red: 0.0, green: 0.4, blue: 1.0)).frame(width: 7, height: 7).offset(x: -3, y: -3)
                 Circle().fill(Color(red: 1.0, green: 0.2, blue: 0.2)).frame(width: 6, height: 6).offset(x: 3, y: 3)
             }
-            .frame(width: 16, height: 16)
-            .clipShape(shape)
-            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
         case .chainDefault:
-            Swatch(color: swatchColor(paletteColor))
+            swatchColor(paletteColor)
         case .custom:
-            Swatch(color: swatchColor(customColor ?? paletteColor))
+            swatchColor(customColor ?? paletteColor)
         }
     }
 
@@ -211,7 +220,6 @@ private struct ChainColorPicker: View {
 private struct InlineColorPicker: View {
     @Binding var color: Color
     var label: String = ""
-    var size: CGFloat = 16
     var carbonsOnly: Binding<Bool>? = nil
     var onReset: (() -> Void)? = nil
 
@@ -219,8 +227,7 @@ private struct InlineColorPicker: View {
 
     var body: some View {
         Button(action: { showPopover.toggle() }) {
-            Swatch(color: color, size: size)
-                .frame(width: 18, height: 18)
+            ColorDot { color }
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -268,7 +275,6 @@ private struct InlineColorPicker: View {
 
 struct InspectorPanel: View {
     @Environment(AppViewModel.self) private var viewModel
-    @Binding var showInspector: Bool
 
     private var selectionMode: WorkspaceState.SelectionMode {
         viewModel.workspace.selectionMode
@@ -321,27 +327,19 @@ struct InspectorPanel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// Title row of the pane. It has no close button: the toolbar's Inspector toggle (⌥⌘0)
+    /// shows and hides it, as for the navigator, so the pane reads as part of the window.
     private var header: some View {
         HStack(spacing: DS.Space.s) {
             Text("Inspector")
                 .font(DS.Font.sectionTitle)
             Spacer(minLength: DS.Space.xs)
-            Button {
-                showInspector = false
-            } label: {
-                Image(systemName: "xmark")
-                    .font(DS.Font.secondary.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20, height: 20)
-                    .contentShape(Rectangle())
+            if hasMolecule {
+                SelectionShortcutsButton()
             }
-            .buttonStyle(.borderless)
-            .help("Hide Inspector (⌥⌘0)")
-            .accessibilityLabel("Hide Inspector")
-            .accessibilityIdentifier(AccessibilityID.inspectorClose)
         }
         .padding(.horizontal, DS.Space.l)
-        .padding(.vertical, DS.Space.m)
+        .frame(height: 36)
     }
 
     // MARK: - Selection card
@@ -377,50 +375,20 @@ struct InspectorPanel: View {
 
     // MARK: - Empty selection placeholder
 
+    /// One line pointing at the canvas; the full mouse/keyboard list is in the header's (?) popover.
     private var emptySelectionContent: some View {
-        VStack(alignment: .leading, spacing: DS.Space.s) {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
             Text("No selection")
                 .font(DS.Font.label.weight(.medium))
                 .foregroundStyle(.secondary)
-            Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.xs) {
-                shortcutHint(keys: ["Click"], description: "select an item")
-                shortcutHint(keys: ["⌥", "Click"], description: "add to selection")
-                shortcutHint(keys: ["⌥", "Drag"], description: "box-select")
-                shortcutHint(keys: ["Double-click"], description: "select chain")
-            }
+            Text(selectionMode == .atom
+                 ? "Click an atom in the viewport; ⌥-drag to box-select."
+                 : "Click a residue in the viewport or the Sequence tool; ⌥-drag to box-select.")
+                .font(DS.Font.secondary)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// Keys rendered as separate keycaps joined by "+", then the description.
-    private func shortcutHint(keys: [String], description: String) -> some View {
-        GridRow {
-            HStack(spacing: DS.Space.xxs) {
-                ForEach(Array(keys.enumerated()), id: \.offset) { idx, key in
-                    if idx > 0 {
-                        Text("+")
-                            .font(DS.Font.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                    keyChip(key)
-                }
-            }
-            Text(description)
-                .font(DS.Font.secondary)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func keyChip(_ text: String) -> some View {
-        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
-        return Text(text)
-            .font(DS.Font.monoSmall.weight(.semibold))
-            .foregroundStyle(.primary)
-            .padding(.horizontal, DS.Space.xs)
-            .padding(.vertical, 1)
-            .background(shape.fill(DS.Color.controlFill))
-            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
-            .fixedSize()
     }
 
     // MARK: - Atom Selection Content
@@ -948,26 +916,22 @@ struct InspectorPanel: View {
             icon: "square.stack.3d.up",
             accessory: {
                 Button(action: { viewModel.createSubsetFromSelection() }) {
-                    Image(systemName: "plus")
+                    Label("New Subset", systemImage: "plus")
+                        .labelStyle(.iconOnly)
                         .font(DS.Font.secondary.weight(.semibold))
-                        .foregroundStyle(DS.Color.accent)
-                        .frame(width: 22, height: 22)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
-                                .fill(DS.Color.accentSoft)
-                        )
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 .disabled(viewModel.workspace.selectedResidueIndices.isEmpty)
-                .opacity(viewModel.workspace.selectedResidueIndices.isEmpty ? 0.4 : 1)
-                .help("Create subset from selected residues")
+                .help(viewModel.workspace.selectedResidueIndices.isEmpty
+                      ? "Select residues first, then save them as a subset"
+                      : "Create subset from selected residues")
                 .accessibilityLabel("Create subset from selected residues")
             }
         ) {
             VStack(alignment: .leading, spacing: DS.Space.s) {
                 if viewModel.workspace.residueSubsets.isEmpty {
-                    Text("Select residues, then click + to save them as a named subset.")
+                    Text("Select residues, then press + to save them as a named subset.")
                         .font(DS.Font.secondary)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1183,6 +1147,69 @@ struct InspectorPanel: View {
         let allIDs = Set(proteinChains.map(\.id))
         viewModel.workspace.hiddenChainIDs = allIDs.subtracting([chainID])
         viewModel.pushToRenderer()
+    }
+}
+
+// MARK: - Selection shortcuts
+
+/// (?) button in the Inspector header: a popover listing the viewport's selection gestures.
+private struct SelectionShortcutsButton: View {
+    @State private var isShown = false
+
+    private static let hints: [(keys: [String], description: String)] = [
+        (["Click"], "select an item"),
+        (["⌥", "Click"], "add to selection"),
+        (["⌥", "Drag"], "box-select"),
+        (["Double-click"], "select chain"),
+        (["Esc"], "clear the selection"),
+    ]
+
+    var body: some View {
+        Button { isShown.toggle() } label: {
+            Label("Selection Shortcuts", systemImage: "questionmark.circle")
+                .labelStyle(.iconOnly)
+                .font(DS.Font.body)
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help("Selection shortcuts")
+        .popover(isPresented: $isShown, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: DS.Space.m) {
+                Text("Selecting in the viewport")
+                    .font(DS.Font.sectionTitle)
+                Grid(alignment: .leading, horizontalSpacing: DS.Space.m, verticalSpacing: DS.Space.s) {
+                    ForEach(Self.hints, id: \.description) { hint in
+                        GridRow {
+                            HStack(spacing: DS.Space.xxs) {
+                                ForEach(Array(hint.keys.enumerated()), id: \.offset) { index, key in
+                                    if index > 0 {
+                                        Text("+").font(DS.Font.caption).foregroundStyle(.tertiary)
+                                    }
+                                    keycap(key)
+                                }
+                            }
+                            Text(hint.description)
+                                .font(DS.Font.secondary)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(DS.Space.l)
+        }
+    }
+
+    private func keycap(_ text: String) -> some View {
+        let shape = RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
+        return Text(text)
+            .font(DS.Font.monoSmall.weight(.semibold))
+            .padding(.horizontal, DS.Space.xs)
+            .padding(.vertical, 1)
+            .background(shape.fill(DS.Color.controlFill))
+            .overlay(shape.strokeBorder(DS.Color.hairline, lineWidth: 0.5))
+            .fixedSize()
     }
 }
 

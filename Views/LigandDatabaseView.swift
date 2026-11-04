@@ -10,6 +10,9 @@ struct LigandDatabaseView: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.openWindow) private var openWindow
     @State private var smilesInput: String = ""
+    @State private var nameInput: String = ""
+    /// Descriptors of the SMILES being typed: nil while unchecked, `.some(nil)` when RDKit rejects it.
+    @State private var inputCheck: LigandDescriptors?? = nil
     @State private var lastAddedName: String?
     @State private var libraryFilter: String = ""
 
@@ -62,6 +65,8 @@ struct LigandDatabaseView: View {
                             Image(systemName: "xmark.circle.fill")
                                 .font(DS.Font.body)
                                 .foregroundStyle(.secondary)
+                                .frame(width: 20, height: 20)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.borderless)
                         .help("Remove ligand from view and database")
@@ -73,13 +78,29 @@ struct LigandDatabaseView: View {
                         LigandDepictionView(smiles: smiles)
                             .frame(height: 120)
 
-                        Text(smiles)
-                            .font(DS.Font.mono)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .truncationMode(.middle)
-                            .textSelection(.enabled)
-                            .help(smiles)
+                        HStack(alignment: .top, spacing: DS.Space.s) {
+                            Text(smiles)
+                                .font(DS.Font.mono)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
+                                .help(smiles)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(smiles, forType: .string)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                                    .font(DS.Font.secondary)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 20, height: 20)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Copy SMILES")
+                            .accessibilityLabel("Copy SMILES")
+                        }
                     }
 
                     FlowLayout(spacing: DS.Space.xs, lineSpacing: DS.Space.xs) {
@@ -127,15 +148,22 @@ struct LigandDatabaseView: View {
                         font: .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular),
                         onSubmit: { if !trimmedInput.isEmpty { addFromSMILES() } }
                     )
+                    .accessibilityLabel("SMILES")
                     .accessibilityIdentifier(AccessibilityID.ligSmilesField)
 
                     Button(action: addFromSMILES) {
                         Label("Add", systemImage: "plus")
                     }
                     .buttonStyle(DSSecondaryButtonStyle(fullWidth: false))
+                    .fixedSize()
                     .disabled(trimmedInput.isEmpty)
-                    .help("Add SMILES to the ligand library")
+                    .help("Add this SMILES to the ligand library (↩ in the field)")
                     .accessibilityIdentifier(AccessibilityID.ligAddSmiles)
+                }
+
+                if !trimmedInput.isEmpty {
+                    smilesPreview
+                        .transition(.opacity)
                 }
 
                 // One hint slot whose content swaps in place. Two views
@@ -155,8 +183,56 @@ struct LigandDatabaseView: View {
                 guard !Task.isCancelled else { return }
                 lastAddedName = nil
             }
+            .task(id: trimmedInput) {
+                inputCheck = nil
+                let smiles = trimmedInput
+                guard !smiles.isEmpty else { return }
+                // Debounced: typing restarts the task, a paste is checked once.
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                let descriptors = await Task.detached(priority: .userInitiated) {
+                    RDKitBridge.computeDescriptors(smiles: smiles)
+                }.value
+                guard !Task.isCancelled else { return }
+                inputCheck = .some(descriptors)
+            }
         }
     }
+
+    /// Live 2D depiction, parse check and an optional name for the SMILES being entered.
+    @ViewBuilder
+    private var smilesPreview: some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            if case .some(.none) = inputCheck {
+                PanelHint(
+                    text: "RDKit could not parse this SMILES. Check brackets, ring closures and charges.",
+                    icon: "exclamationmark.triangle.fill",
+                    color: DS.Color.warning
+                )
+            } else {
+                LigandDepictionView(smiles: trimmedInput)
+                    .frame(height: 96)
+                if case .some(.some(let d)) = inputCheck {
+                    FlowLayout(spacing: DS.Space.xs, lineSpacing: DS.Space.xs) {
+                        DSTag(String(format: "MW %.0f", d.molecularWeight))
+                        DSTag("\(d.heavyAtomCount) heavy atoms")
+                        DSTag(d.lipinski ? "Ro5 pass" : "Ro5 fail",
+                              tone: d.lipinski ? .success : .warning,
+                              systemImage: d.lipinski ? "checkmark" : "exclamationmark.triangle")
+                    }
+                }
+            }
+            TextField("Name (optional, default \(defaultName))", text: $nameInput)
+                .textFieldStyle(.roundedBorder)
+                .font(DS.Font.label)
+                .onSubmit { addFromSMILES() }
+                .accessibilityLabel("Ligand name")
+                .help("Library name for this compound; leave empty to use \(defaultName)")
+        }
+    }
+
+    /// Name given to a compound added without an explicit name.
+    private var defaultName: String { "Ligand_\(db.count + 1)" }
 
     private var trimmedInput: String {
         smilesInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -291,17 +367,26 @@ struct LigandDatabaseView: View {
             || (viewModel.activeLigandEntryID == nil && viewModel.molecules.ligand?.name == entry.name)
         let canUse = !entry.atoms.isEmpty
 
-        HStack(spacing: DS.Space.s) {
-            Circle()
-                .fill(isActive ? DS.Color.ligand : Color.clear)
-                .overlay(Circle().strokeBorder(DS.Color.ligand.opacity(isActive ? 1 : 0.6), lineWidth: 1))
-                .frame(width: 8, height: 8)
+        HStack(spacing: DS.Space.m) {
+            // Mini depiction so compounds are recognisable by shape, not only by name.
+            thumbnail(entry)
+                .frame(width: 40, height: 40)
+                .overlay(alignment: .topLeading) {
+                    if isActive {
+                        Circle()
+                            .fill(DS.Color.ligand)
+                            .frame(width: 8, height: 8)
+                            .offset(x: -3, y: -3)
+                            .accessibilityHidden(true)
+                    }
+                }
 
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(entry.name)
                     .font(DS.Font.label.weight(isActive ? .semibold : .regular))
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(entry.smiles)
                 if let d = entry.descriptors {
                     Text(String(format: "%.0f Da", d.molecularWeight))
                         .font(DS.Font.caption)
@@ -333,11 +418,30 @@ struct LigandDatabaseView: View {
         }
         .padding(.horizontal, DS.Space.s)
         .padding(.vertical, DS.Space.xs)
+        // Neutral fill for the active row; the ligand dot and "Active" label carry the meaning.
         .background(
             RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
-                .fill(isActive ? DS.Color.ligand.opacity(0.10) : Color.clear)
+                .fill(isActive ? DS.Color.controlFill : Color.clear)
         )
         .contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(isActive ? "\(entry.name), active ligand" : entry.name)
+    }
+
+    @ViewBuilder
+    private func thumbnail(_ entry: LigandEntry) -> some View {
+        if entry.smiles.isEmpty {
+            RoundedRectangle(cornerRadius: DS.Radius.s, style: .continuous)
+                .fill(DS.Color.controlFill)
+                .overlay {
+                    Image(systemName: "hexagon")
+                        .font(DS.Font.label)
+                        .foregroundStyle(.tertiary)
+                }
+                .accessibilityHidden(true)
+        } else {
+            LigandDepictionView(smiles: entry.smiles)
+        }
     }
 
     @ViewBuilder
@@ -383,9 +487,11 @@ struct LigandDatabaseView: View {
     private func addFromSMILES() {
         let smiles = trimmedInput
         guard !smiles.isEmpty else { return }
-        let name = "Ligand_\(db.count + 1)"
+        let typedName = nameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = typedName.isEmpty ? defaultName : typedName
         db.addFromSMILES(smiles, name: name)
         smilesInput = ""
+        nameInput = ""
         lastAddedName = name
     }
 

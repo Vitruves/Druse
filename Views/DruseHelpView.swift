@@ -101,7 +101,7 @@ private let workflowItems: [HelpItem] = {
                           "Workflow ▸ Next Step and Previous Step walk through the pipeline in order. Each step's footer also ends with a “Continue to …” link once the step is done.",
                           shortcut: "⌘] / ⌘[", icon: "arrow.right"))
     items.append(HelpItem("Status Badges",
-                          "Each step button carries a small badge: a green checkmark when the step is done, a filled accent dot when it is ready, a hollow dot while it waits on an earlier step, an orange exclamation mark when it needs attention, and a spinner while it runs.",
+                          "Each step button's number shows its status: green when the step is done, orange when it needs attention, a pulsing accent ring while it runs, neutral when it is ready, and dimmed while it waits on an earlier step.",
                           icon: "checkmark.circle"))
     return items
 }()
@@ -119,7 +119,7 @@ private let helpSections: [HelpSection] = [
         group: .basics,
         items: [
             HelpItem("The Main Window",
-                     "The step buttons sit in the centre of the toolbar; click one (or press ⌘1–⌘8) to switch steps. The navigator on the left (⌃⌘S) shows the current step with its header, cards and a pinned footer for the main action. The 3D viewport fills the centre, the Inspector sits on the right (⌥⌘0), and the console opens from the bar under the viewport (⇧⌘Y). Drag the inner edge of the navigator or the Inspector to resize it. On the right of the toolbar, just before the Console and Inspector buttons, the activity indicator shows what is loaded and any running operation, with a stop button."),
+                     "The step buttons sit in the centre of the toolbar; click one (or press ⌘1–⌘8) to switch steps. The navigator on the left (⌃⌘S) shows the current step with its header, cards and a pinned footer for the main action. The 3D viewport fills the centre, the Inspector sits on the right (⌥⌘0), and the bar under the viewport opens the DruseScript terminal (⌃`) or the activity log (⇧⌘Y). Drag the inner edge of the navigator or the Inspector to resize it. On the right of the toolbar, just before the Terminal and Inspector buttons, the activity indicator shows the live status or the running operation's progress, with a stop button; hover it for the full message and the loaded molecules."),
             HelpItem("Quick Start: Redocking",
                      "1) Open a PDB file containing a co-crystallised ligand (⌘O). 2) In Preparation, click Prepare for Docking. 3) In Ligands, the co-crystallised ligand is already in the library — prepare it. 4) In Binding Site, choose From Ligand to place the pocket and grid box. 5) In Docking, review the run summary and click Run. 6) Poses appear in Results."),
             HelpItem("Quick Start: Virtual Screening",
@@ -544,7 +544,7 @@ private let helpSections: [HelpSection] = [
 
     // ── Tools & viewport ────────────────────────────────────────────────
     HelpSection(
-        icon: "textformat.abc",
+        icon: "list.bullet.indent",
         title: "Sequence Tool",
         summary: "Browse chains residue by residue and edit chain topology.",
         tint: DS.Color.protein,
@@ -658,10 +658,12 @@ private let helpSections: [HelpSection] = [
                      "Atom, residue and chain counts for the loaded protein. This is the one place protein statistics are shown."),
             HelpItem.subtitle("Toolbar"),
             HelpItem("Activity Indicator",
-                     "The capsule on the right of the toolbar, next to the Console and Inspector buttons, names the loaded protein and ligand and shows the current operation with its progress. Its stop button cancels the running operation; click the capsule to see the most recent log lines."),
-            HelpItem.subtitle("Console"),
-            HelpItem("Console",
-                     "The bar at the bottom of the window shows a hint for the next step and counts warnings and errors. Click Console to open the log: filter by level, copy selected or all lines, clear it, or reveal the log file in Finder. Drag its top edge to resize it.", shortcut: "⇧⌘Y"),
+                     "The capsule on the right of the toolbar, next to the Terminal and Inspector buttons, names the loaded protein and ligand and shows the current operation with its progress. Its stop button cancels the running operation; click the capsule to see the most recent log lines."),
+            HelpItem.subtitle("Terminal and Logs"),
+            HelpItem("Terminal",
+                     "The bar at the bottom of the window shows a hint for the next step, counts warnings and errors, and has two tabs. Terminal opens the DruseScript terminal: type a command after the prompt and press Return. Tab completes, → accepts the grey suggestion, ↑ and ↓ walk the history, ⌃R searches it, ⇧Return continues on a new line (pasted lines also run together as one script), ⌃C cancels the running command, ⌘K or ⌃L clears the screen. Long commands show a live progress line. The terminal shows only commands and their output. Drag the bar's top edge to resize the panel.", shortcut: "⌃`"),
+            HelpItem("Logs",
+                     "The Logs tab shows the activity log: search it, filter by level or category, copy selected or all entries, clear it, or reveal the log file in Finder. It opens by itself on the first error.", shortcut: "⇧⌘Y"),
             HelpItem.subtitle("Settings"),
             HelpItem("General",
                      "Appearance: Automatic (follows the system), Light or Dark."),
@@ -671,9 +673,49 @@ private let helpSections: [HelpSection] = [
                      "“Confirm before docking” shows the Review & Run sheet before every run (on by default)."),
             HelpItem("Logging",
                      "Enable file logging, choose the log directory, set the retention period (default 7 days), and manually archive or clear logs."),
+            HelpItem("Performance",
+                     "Maximum CPU cores Druse uses at once (C++ core, ligand preparation, OpenMM); applied immediately. The headless --cores flag overrides it for one run."),
+            HelpItem("Console, Command Line, Shell Completions",
+                     "Console: history length and autosuggestions. Command Line: install the 'druse' terminal command. Shell Completions: install Tab completion for fish, zsh or bash. See Console & DruseScript."),
             HelpItem.subtitle("Feedback"),
             HelpItem("Report a Bug",
                      "Help ▸ Report Bug… sends a description, optional reply-to address, system details and, if you allow it, the recent activity log directly to the developer."),
+        ]
+    ),
+
+    HelpSection(
+        icon: "terminal",
+        title: "Console & DruseScript",
+        summary: "Drive every step from the terminal panel, a script or the macOS command line.",
+        tint: DS.Color.accent,
+        group: .tools,
+        items: [
+            HelpItem.subtitle("The Language"),
+            HelpItem("One Command per Line",
+                     "DruseScript is a console language, not a programming language: each line is verb [subcommand] [arguments…] [key=value…], for example 'prep ph=7.4 waters=remove' or 'dock preset=thorough scoring=drusina'. ';' separates several commands on one line, a trailing \\ continues a line, # starts a comment and \"double quotes\" keep spaces (SMILES, paths)."),
+            HelpItem("Variables and Session Settings",
+                     "'set name = value' defines $name (or ${name}); 'vars' lists them. 'set onerror=continue' keeps a script running after a failed command (default stop). 'log level debug|info|warn|error|none' filters log output."),
+            HelpItem("Batch Work",
+                     "There are no loops: batch commands do the work, such as 'ligand prep all', 'dock batch ligands=prepared', 'screen library.smi' or 'leadopt dock'. 'run file.druse' runs another script; relative paths resolve against the script's folder."),
+            HelpItem("Help in the Console",
+                     "'help' lists every command by category; 'help dock' shows each form with its arguments, types, ranges, defaults and examples; 'apropos tautomer' searches all descriptions. A misspelt command or option gets a did-you-mean suggestion."),
+            HelpItem.subtitle("Terminal Keys"),
+            HelpItem("Tab", "Completes the command, subcommand, option, value, ligand or residue name, or file path under the caret. With several candidates a list opens: ↑ ↓ or ⇧Tab move, Tab or Return accept, Esc closes."),
+            HelpItem("→ / ⌥→", "Accepts the grey autosuggestion (taken from history and the command registry), all of it or one word. Settings ▸ Console turns suggestions off."),
+            HelpItem("↑ / ↓", "Walk the command history (kept between sessions; length in Settings ▸ Console)."),
+            HelpItem("⌃R", "Reverse history search: type to filter, ⌃R again for the next older match, Return runs it, ⌃G cancels."),
+            HelpItem("⇧Return", "Continues on a new line; the whole input then runs as one script. Pasted multi-line text runs the same way."),
+            HelpItem("⌃C", "Cancels the running command (docking, preparation, screening…) and prints ^C; with nothing running it abandons the line being typed."),
+            HelpItem("⌘K / ⌃L", "Clears the screen; history and the line being edited are kept."),
+            HelpItem.subtitle("Command Line"),
+            HelpItem("Install 'druse'",
+                     "Settings ▸ Command Line (or 'cli install') writes a 'druse' command into ~/.local/bin, or /usr/local/bin with an administrator prompt. It runs this Druse.app without a window."),
+            HelpItem("Run Scripts Headless",
+                     "'druse script.druse', 'druse --eval \"load 1abc.pdb; prep\"', 'druse dock preset=fast' (one command as shell words) or 'druse' alone for an interactive prompt. Flags: --var name=value, --cores N, --log-level level, --echo. Exit codes: 0 success, 1 a command failed, 2 usage or syntax error, 130 interrupted."),
+            HelpItem("Shell Completions",
+                     "Settings ▸ Shell Completions (or 'cli completions install shell=all') installs Tab completion for fish, zsh and bash, generated from the same command registry as the in-app terminal."),
+            HelpItem("Full Reference",
+                     "Docs/DruseScript.md in the Druse repository documents every command, option and default; Examples/ holds runnable scripts for protein preparation, ligand libraries, docking, batch docking and lead optimization."),
         ]
     ),
 
@@ -704,7 +746,8 @@ private let helpSections: [HelpSection] = [
             HelpItem("⌘0", "Fit to view"),
             HelpItem("⌃⌘S", "Show / hide the navigator"),
             HelpItem("⌥⌘0", "Show / hide the Inspector"),
-            HelpItem("⇧⌘Y", "Show / hide the console"),
+            HelpItem("⌃`", "Show / hide the terminal"),
+            HelpItem("⇧⌘Y", "Show / hide the logs"),
             HelpItem.subtitle("Windows"),
             HelpItem("⌘L", "Open the Ligand Database window"),
             HelpItem("⇧⌘R", "Open the Results Database window"),
@@ -884,16 +927,24 @@ private struct SectionDetailView: View {
                                 .foregroundStyle(.secondary)
                                 .padding(.leading, DS.Space.xs)
                         }
-                        VStack(alignment: .leading, spacing: 0) {
-                            ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
-                                if index > 0 { Divider().padding(.leading, DS.Space.l) }
-                                switch section.layout {
-                                case .article: HelpArticleRow(item: item)
-                                case .shortcuts: HelpShortcutRow(item: item)
+                        switch section.layout {
+                        case .article:
+                            // One card per topic: long paragraphs read better apart than ruled together.
+                            VStack(alignment: .leading, spacing: DS.Space.m) {
+                                ForEach(group.items) { item in
+                                    HelpArticleRow(item: item)
+                                        .dsCard(padding: 0)
                                 }
                             }
+                        case .shortcuts:
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
+                                    if index > 0 { Divider().padding(.leading, DS.Space.l) }
+                                    HelpShortcutRow(item: item)
+                                }
+                            }
+                            .dsCard(padding: 0)
                         }
-                        .dsCard(padding: 0)
                     }
                 }
             }
@@ -964,7 +1015,7 @@ private struct HelpArticleRow: View {
                 Text(item.title)
                     .font(DS.Font.sectionTitle)
                 if !item.description.isEmpty {
-                    Text(item.description)
+                    Text(Self.keycapStyled(item.description))
                         .font(DS.Font.label)
                         .lineSpacing(2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -979,6 +1030,26 @@ private struct HelpArticleRow: View {
         }
         .padding(.horizontal, DS.Space.l)
         .padding(.vertical, DS.Space.m + DS.Space.xxs)
+    }
+
+    /// Modifier-key shortcuts inside running text (⌘O, ⇧⌘Y, ⌃`, ⌃⌘S…).
+    private static let shortcutPattern = #/[⌃⌥⇧⌘]+(?:Return|Tab|Space|Delete|[A-Z0-9`\[\]?,])/#
+
+    /// Body text with every inline shortcut set as a small keycap (tinted run padded by thin spaces).
+    static func keycapStyled(_ text: String) -> AttributedString {
+        var result = AttributedString()
+        var cursor = text.startIndex
+        for match in text.matches(of: shortcutPattern) {
+            result += AttributedString(text[cursor..<match.range.lowerBound])
+            var cap = AttributedString("\u{2009}\(text[match.range])\u{2009}")
+            cap.font = DS.Font.secondary.weight(.semibold)
+            cap.foregroundColor = .primary
+            cap.backgroundColor = DS.Color.controlFill
+            result += cap
+            cursor = match.range.upperBound
+        }
+        result += AttributedString(text[cursor...])
+        return result
     }
 }
 

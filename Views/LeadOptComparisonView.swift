@@ -30,7 +30,7 @@ struct LeadOptComparisonView: View {
             }
         } footer: {
             Button("Done") { viewModel.leadOpt.showComparison = false }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(DSPrimaryButtonStyle(fullWidth: false))
                 .keyboardShortcut(.defaultAction)
         }
     }
@@ -69,7 +69,10 @@ struct LeadOptComparisonView: View {
     private func deltaTag(_ score: Float, reference ref: Float) -> some View {
         let delta = score - ref
         let tone: DSTone = abs(delta) <= 0.05 ? .neutral : method.ranks(score, before: ref) ? .success : .warning
-        DSTag("Δ \(String(format: "%+.2f", delta)) \(method.unitLabel)", tone: tone, monospaced: true)
+        DSTag("Δ \(String(format: "%+.2f", delta)) \(method.unitLabel)", tone: tone)
+            .help(tone == .success ? "The analog scores better than the reference"
+                  : tone == .neutral ? "No meaningful change versus the reference"
+                  : "The analog scores worse than the reference")
     }
 
     @ViewBuilder
@@ -123,7 +126,8 @@ struct LeadOptComparisonView: View {
             if let ref = reference.referenceDescriptors, let ana = analog.descriptors {
                 HStack(alignment: .center, spacing: DS.Space.xl) {
                     radarChart(ref: ref, ana: ana)
-                        .frame(width: 220, height: 200)
+                        .frame(width: 240, height: 210)
+                        .padding(.horizontal, DS.Space.xs)
                     propertyDeltaTable(ref: ref, ana: ana)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -160,7 +164,7 @@ struct LeadOptComparisonView: View {
 
         Canvas { context, size in
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            let radius = min(size.width, size.height) / 2 - 22
+            let radius = min(size.width, size.height) / 2 - 28
             let n = axes.count
             let guide = Color.secondary.opacity(0.25)
 
@@ -188,7 +192,7 @@ struct LeadOptComparisonView: View {
                 context.stroke(spoke, with: .color(guide), lineWidth: 0.5)
                 context.draw(
                     Text(axes[i].label).font(DS.Font.caption).foregroundStyle(.secondary),
-                    at: point(i, radius + 12)
+                    at: point(i, radius + 14)
                 )
             }
 
