@@ -6,6 +6,7 @@ import MetalKit
 
 /// Launched from App/main.swift, which routes `--headless` invocations to HeadlessRunner instead.
 struct DruseApp: App {
+    @NSApplicationDelegateAdaptor(DruseAppDelegate.self) private var appDelegate
     @State private var viewModel = AppViewModel()
     @AppStorage("appTheme") private var appTheme: String = AppTheme.auto.rawValue
 
@@ -24,6 +25,7 @@ struct DruseApp: App {
                 .environment(viewModel)
                 .preferredColorScheme(selectedColorScheme)
                 .onAppear {
+                    appDelegate.viewModel = viewModel
                     initializeRenderer()
                     // Speed up tooltip display (default macOS delay is ~1.5 seconds)
                     UserDefaults.standard.set(300, forKey: "NSInitialToolTipDelay")
@@ -279,5 +281,26 @@ private struct DruseCommands: Commands {
                 showConsole = true
             }
         }
+    }
+}
+
+/// Receives files opened from Finder or `open -a Druse …`: `.druse` scripts are queued for the
+/// terminal. Files can arrive before the main window exists, so they wait for the view model.
+@MainActor
+final class DruseAppDelegate: NSObject, NSApplicationDelegate {
+    weak var viewModel: AppViewModel? {
+        didSet { flushPendingScripts() }
+    }
+    private var pendingScripts: [URL] = []
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        pendingScripts += urls.filter { $0.pathExtension.lowercased() == "druse" }
+        flushPendingScripts()
+    }
+
+    private func flushPendingScripts() {
+        guard let viewModel, !pendingScripts.isEmpty else { return }
+        viewModel.workspace.pendingScripts += pendingScripts
+        pendingScripts.removeAll()
     }
 }

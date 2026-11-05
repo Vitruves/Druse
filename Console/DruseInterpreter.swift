@@ -269,6 +269,9 @@ final class DruseInterpreter {
         output?.emit(kind, text)
     }
 
+    /// Decoration and wrapping for formatted text such as help (see `ConsoleOutput.textStyle`).
+    var textStyle: ConsoleTextStyle { output?.textStyle ?? .plain }
+
     /// Sets or (nil) clears the live status line of the running command (see `ConsoleOutput.progress`).
     func progress(_ text: String?) {
         output?.progress(text)

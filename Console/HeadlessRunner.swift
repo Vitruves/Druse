@@ -46,32 +46,73 @@ enum HeadlessCLI {
              summary: "Show this help")
     ]
 
-    static var usage: String {
-        let rows = flags.map { flag -> (String, String) in
+    /// The `--help` text: invocation forms, the two modes, every command by category, the flags,
+    /// examples and exit codes.
+    @MainActor
+    static func usage(style: ConsoleTextStyle) -> String {
+        var lines = [style.command("druse") + " — run Druse from the terminal: DruseScript commands, no window",
+                     style.dim("('druse' is 'Druse.app/Contents/MacOS/Druse --headless')")]
+
+        lines += ["", style.heading("Usage")]
+        lines += style.columns([
+            ("druse <command> [args…] [key=value…]", "Run one command, then exit"),
+            ("druse <script.druse>", "Run a script file, then exit"),
+            ("druse -c \"command; command\"", "Run inline statements, then exit"),
+            ("druse", "Open the interactive prompt (REPL)"),
+            ("druse -i <script | -c \"…\" | command>", "Run first, then open the prompt with everything it loaded"),
+            ("… | druse   or   druse -", "Run the statements read from stdin, then exit")
+        ], label: style.command)
+
+        lines += ["", style.heading("Modes")]
+        lines += style.columns([
+            ("One-shot", "A command, script, -c or piped stdin. Each run starts from an empty session and exits "
+             + "when done, so load, prepare and dock in the same script or -c. Results go to stdout; errors, "
+             + "warnings and progress to stderr, so output can be piped or redirected."),
+            ("Interactive", "'druse' alone on a terminal, or -i. A 'druse›' prompt keeps the session between "
+             + "statements, with line editing, history (~/.druse/console_history) and Tab completion. "
+             + "Ctrl-C cancels the running command; Ctrl-D or 'exit' leaves.")
+        ], label: style.heading)
+        lines.append("")
+        lines += style.paragraph("The first word is a script when it ends in .druse, contains a '/', or names an "
+                                 + "existing file that is not a command; otherwise it is a command and the "
+                                 + "remaining words form one statement.", indent: 2)
+
+        lines += ["", style.heading("Commands") + style.dim("   'druse help <command>' for details")]
+        lines += ConsoleHelp.commandList(DruseInterpreter.registry(), style: style, indent: 2)
+
+        lines += ["", style.heading("Options")]
+        lines += style.columns(flags.map { flag in
             let names = flag.names.joined(separator: ", ")
             return (flag.valueName.map { "\(names) <\($0)>" } ?? names, flag.summary)
+        }, label: style.command)
+
+        lines += ["", style.heading("Examples")]
+        let examples = [
+            ("druse help dock", "Every docking option, with types, defaults and examples"),
+            ("""
+             druse -c 'fetch 1HSG; prep; pocket detect
+                       ligand smiles "CC(=O)Oc1ccccc1C(=O)O" name=aspirin
+                       dock; export results results.csv'
+             """, "Full pipeline in one run: fetch, prepare, find the pocket, dock aspirin, write the ranking"),
+            ("druse screen.druse --var library=hits.smi --cores 8", "A script with $library predefined, on 8 cores"),
+            ("druse -i -c 'fetch 1HSG; prep'", "Prepare a protein, then explore it at the prompt"),
+            ("druse --completions fish > ~/.config/fish/completions/druse.fish",
+             "Install Tab completion for fish (also zsh and bash)")
+        ]
+        for (example, note) in examples {
+            lines += example.split(separator: "\n").map { "  " + style.command(String($0)) }
+            lines += style.paragraph(note, indent: 6)
         }
-        let width = rows.map(\.0.count).max() ?? 0
-        let options = rows.map { "  " + $0.0.padding(toLength: width + 3, withPad: " ", startingAt: 0) + $0.1 }
-        return """
-        Usage: druse [options] [script.druse | -]
-               druse [options] <command> [args…] [key=value…]
-               druse [options] -c "command; command"
-               druse -i [options] [script.druse | -c "…" | <command> …]
 
-        Runs DruseScript without opening a window ('druse' is 'Druse --headless'). The first word is a
-        script when it ends in .druse, contains a '/', or names an existing file that is not a command
-        verb; otherwise it is a command and the remaining words form one statement. With no script
-        (or '-'), statements are read from stdin: on a terminal with a 'druse› ' prompt, line editing,
-        history and Tab completion; as one script otherwise. With -i, the prompt opens after the
-        script, -c or command has run (whether it succeeded or not), with the loaded state kept.
-
-        Options:
-        \(options.joined(separator: "\n"))
-
-        Exit codes: 0 success, 1 a command failed, 2 usage or syntax error, 130 interrupted
-        (with -i, the exit code of the interactive session, normally 0). Ctrl-C cancels the running command; a second Ctrl-C exits. Type 'help' for the commands.
-        """
+        lines += ["", style.heading("Exit codes")]
+        lines += style.columns([
+            ("0", "success"),
+            ("1", "a command failed"),
+            ("2", "usage or syntax error (nothing ran)"),
+            ("130", "interrupted with Ctrl-C")
+        ], label: style.command)
+        lines += style.paragraph("With -i, the exit code is that of the interactive session (normally 0).", indent: 2)
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -127,13 +168,14 @@ final class HeadlessRunner: ConsoleOutput {
     static func start(arguments: [String]) -> Never {
         switch parse(arguments) {
         case .help:
-            writeLine(HeadlessCLI.usage, to: .standardOutput)
+            writeLine(HeadlessCLI.usage(style: .terminal(STDOUT_FILENO)), to: .standardOutput)
             exit(ExitCode.success)
         case .completions(let shell):
             write(ShellCompletions(viewModel: AppViewModel()).script(for: shell), to: .standardOutput)
             exit(ExitCode.success)
         case .usageError(let message):
-            writeLine("error: \(message)\n\n\(HeadlessCLI.usage)", to: .standardError)
+            let style = ConsoleTextStyle.terminal(STDERR_FILENO)
+            writeLine(style.error("error:") + " \(message)\n" + style.dim("Run 'druse -h' for usage."), to: .standardError)
             exit(ExitCode.usage)
         case .run(let options):
             // Line-buffer C stdio so `print` from engine code interleaves in order with our
@@ -166,17 +208,25 @@ final class HeadlessRunner: ConsoleOutput {
 
     // MARK: - ConsoleOutput
 
+    /// Help and other formatted text go to stdout: coloured and wrapped when it is a terminal.
+    var textStyle: ConsoleTextStyle { .terminal(STDOUT_FILENO) }
+
+    /// Decoration of the prompt, errors, warnings and echoed statements, which go to stderr.
+    private var stderrStyle: ConsoleTextStyle { .terminal(STDERR_FILENO) }
+
     func emit(_ kind: ConsoleOutputKind, _ text: String) {
         clearProgressLine()
         switch kind {
         case .input:
-            if options.echo { Self.writeLine("druse› \(text)", to: .standardError) }
-        case .output, .success:
+            if options.echo { Self.writeLine(stderrStyle.dim("druse› \(text)"), to: .standardError) }
+        case .output:
             Self.writeLine(text, to: .standardOutput)
+        case .success:
+            Self.writeLine(textStyle.success(text), to: .standardOutput)
         case .warning:
-            Self.writeLine("warning: \(text)", to: .standardError)
+            Self.writeLine(stderrStyle.warning("warning:") + " " + text, to: .standardError)
         case .error:
-            Self.writeLine("error: \(text)", to: .standardError)
+            Self.writeLine(stderrStyle.error("error:") + " " + text, to: .standardError)
         }
     }
 
@@ -189,7 +239,7 @@ final class HeadlessRunner: ConsoleOutput {
             clearProgressLine()
             return
         }
-        let width = Self.terminalColumns(of: STDERR_FILENO)
+        let width = ConsoleTextStyle.columns(of: STDERR_FILENO)
         let line = text.count >= width ? String(text.prefix(max(width - 2, 1))) + "…" : text
         Self.write("\r\u{1B}[2K" + line, to: .standardError)
         progressShown = true
@@ -204,12 +254,6 @@ final class HeadlessRunner: ConsoleOutput {
 
     private nonisolated static let stderrIsTerminal = isatty(STDERR_FILENO) != 0
 
-    /// Columns of the terminal behind `descriptor` (80 when it does not report a size).
-    private nonisolated static func terminalColumns(of descriptor: Int32) -> Int {
-        var size = winsize()
-        guard ioctl(descriptor, TIOCGWINSZ, &size) == 0, size.ws_col > 0 else { return 80 }
-        return Int(size.ws_col)
-    }
 
     // MARK: - Execution
 
@@ -308,6 +352,7 @@ final class HeadlessRunner: ConsoleOutput {
     /// Interactive prompt on a terminal, with readline editing, persisted history and Tab completion.
     private func runREPL() async -> Int32 {
         guard let interpreter else { return ExitCode.failure }
+        writeBanner()
         lineEditor = TerminalLineEditor.make(
             historyFile: AppSettings.shellHome.appendingPathComponent(".druse/console_history"),
             historyLength: AppSettings.shared.consoleHistoryLength
@@ -329,6 +374,20 @@ final class HeadlessRunner: ConsoleOutput {
         }
         Self.writeLine("", to: .standardError)
         return ExitCode.success
+    }
+
+    /// Greeting of the interactive prompt (on stderr, so stdout carries only command output).
+    /// The prompt itself stays uncoloured: macOS's libedit prints every escape sequence of a
+    /// prompt before its text, so colours would not land where they belong.
+    private func writeBanner() {
+        let style = stderrStyle
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        Self.writeLine(style.heading("Druse" + (version.map { " " + $0 } ?? "")) + style.dim(" — interactive DruseScript"),
+                       to: .standardError)
+        Self.writeLine(style.dim("Type ") + style.command("help") + style.dim(" for commands, ")
+                       + style.command("help <command>") + style.dim(" for details, ")
+                       + style.command("apropos <word>") + style.dim(" to search. Tab completes; Ctrl-D or ")
+                       + style.command("exit") + style.dim(" quits."), to: .standardError)
     }
 
     /// One logical statement from the terminal: lines ending in `\` continue on the next line.

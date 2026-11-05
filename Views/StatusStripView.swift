@@ -68,6 +68,8 @@ struct StatusStripView: View {
     @State private var logState = LogPanelState()
     @State private var dragStartHeight: CGFloat?
     @State private var isHoveringResize = false
+    /// True while the queue of externally opened scripts is being drained.
+    @State private var isRunningPendingScripts = false
 
     // Error handling: the Logs panel opens by itself for one error only; after that
     // (until the user opens the panel again) new errors just pulse the badge.
@@ -100,7 +102,9 @@ struct StatusStripView: View {
         }
         .onAppear {
             if session == nil { session = ConsoleSession(viewModel: viewModel) }
+            runPendingScripts()
         }
+        .onChange(of: viewModel.workspace.pendingScripts) { _, _ in runPendingScripts() }
         .onChange(of: log.entries.count) { _, _ in
             guard let last = log.entries.last, last.level == .error else { return }
             if !showPanel && autoOpenArmed {
@@ -384,6 +388,20 @@ struct StatusStripView: View {
     }
 
     // MARK: - Actions
+
+    /// Runs the scripts opened from outside the app one after another in the terminal.
+    private func runPendingScripts() {
+        guard let session, !isRunningPendingScripts, !viewModel.workspace.pendingScripts.isEmpty else { return }
+        isRunningPendingScripts = true
+        show(.terminal)
+        Task {
+            while !viewModel.workspace.pendingScripts.isEmpty {
+                let url = viewModel.workspace.pendingScripts.removeFirst()
+                await session.runScript(at: url)
+            }
+            isRunningPendingScripts = false
+        }
+    }
 
     private func show(_ surface: BottomPanel) {
         panel = surface

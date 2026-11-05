@@ -28,7 +28,7 @@ extension DruseInterpreter {
                                                          isOptional: true, isVariadic: true)]) { inv in
                     let commands = inv.interpreter.commands
                     guard let topic = inv.string("topic") else {
-                        inv.emit(.output, ConsoleHelp.overview(commands))
+                        inv.emit(.output, ConsoleHelp.overview(commands, style: inv.interpreter.textStyle))
                         return
                     }
                     let words = topic.split(separator: " ").map { $0.lowercased() }
@@ -50,7 +50,7 @@ extension DruseInterpreter {
                         }
                         throw ConsoleError(message)
                     }
-                    inv.emit(.output, ConsoleHelp.detail(command, path: path))
+                    inv.emit(.output, ConsoleHelp.detail(command, path: path, style: inv.interpreter.textStyle))
                 }
             ],
             examples: ["help", "help dock", "help ligand db", "help set"]
@@ -69,7 +69,7 @@ extension DruseInterpreter {
                                                          summary: "Text to look for (case-insensitive; several words are searched as one phrase)",
                                                          isVariadic: true)]) { inv in
                     let word = inv.requiredString("word")
-                    guard let matches = ConsoleHelp.apropos(word, in: inv.interpreter.commands) else {
+                    guard let matches = ConsoleHelp.apropos(word, in: inv.interpreter.commands, style: inv.interpreter.textStyle) else {
                         inv.emit(.output, "Nothing mentions '\(word)' — 'help' lists every command")
                         return
                     }

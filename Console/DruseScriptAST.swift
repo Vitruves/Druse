@@ -76,11 +76,15 @@ protocol ConsoleOutput: AnyObject {
     /// nil removes it. The line is transient: it never enters the transcript, and the next
     /// `emit` replaces it (so a command's result line takes the place of its progress line).
     func progress(_ text: String?)
+    /// How help and other formatted text should be decorated for this output.
+    var textStyle: ConsoleTextStyle { get }
 }
 
 extension ConsoleOutput {
     /// Outputs without a live status line (files, discarding sinks) ignore progress.
     func progress(_ text: String?) {}
+    /// Outputs other than a terminal get plain, unwrapped text.
+    var textStyle: ConsoleTextStyle { .plain }
 }
 
 // MARK: - Live progress

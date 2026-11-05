@@ -610,6 +610,22 @@ extension DruseInterpreter {
                     "view fit pocket; view rotate y=90",
                     "view snapshot figures/pose1.png width=2400 height=1600"
                 ]
+            ),
+            ConsoleCommand(
+                name: "step",
+                summary: "Show a pipeline step in the navigator (GUI only)",
+                category: .view,
+                forms: [
+                    ConsoleForm(path: [], summary: "Switch the navigator to a pipeline step",
+                                arguments: [ConsoleParameter(name: "name", type: .choice(ViewNames.names(ViewNames.steps)),
+                                                             summary: "Pipeline step")],
+                                isGUIOnly: true) { inv in
+                        guard let tab = ViewNames.lookup(inv.string("name"), in: ViewNames.steps) else { return }
+                        inv.viewModel.workspace.requestedTab = tab
+                        inv.viewModel.workspace.requestedTabToken &+= 1
+                    }
+                ],
+                examples: ["step docking", "dock preset=fast; step results"]
             )
         ]
     }
@@ -1045,6 +1061,10 @@ private enum ViewNames {
     ]
     static let surfaceColors: [(String, SurfaceColorMode)] = [
         ("uniform", .uniform), ("esp", .esp), ("hydrophobicity", .hydrophobicity), ("pharmacophore", .pharmacophore)
+    ]
+    static let steps: [(String, SidebarTab)] = [
+        ("search", .search), ("preparation", .preparation), ("ligands", .ligands), ("site", .bindingSite),
+        ("docking", .dock), ("results", .results), ("leadopt", .leadOptimization), ("sequence", .sequence)
     ]
 
     static func names<T>(_ table: [(String, T)]) -> [String] { table.map(\.0) }

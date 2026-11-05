@@ -160,6 +160,10 @@ struct WorkspaceState {
     var requestedTab: SidebarTab? = nil
     var requestedTabToken: Int = 0
 
+    /// `.druse` scripts opened from outside the app (`open -a Druse script.druse`), waiting for
+    /// the terminal to run them in order.
+    var pendingScripts: [URL] = []
+
     // Loading state
     var isLoading: Bool = false
     var loadingMessage: String = ""

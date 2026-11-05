@@ -460,52 +460,73 @@ enum ConsoleHelp {
         return parts.joined(separator: " ")
     }
 
-    /// `help` with no argument: commands grouped by category with their one-line summaries.
-    static func overview(_ commands: [ConsoleCommand]) -> String {
+    /// `help` with no argument: commands grouped by category with their one-line summaries,
+    /// followed by a reminder of the statement syntax.
+    static func overview(_ commands: [ConsoleCommand], style: ConsoleTextStyle) -> String {
+        var lines = [style.heading("DruseScript commands")
+                     + style.dim(" — 'help <command>' for details, 'apropos <word>' to search")]
+        lines += commandList(commands, style: style)
+        lines.append("")
+        lines.append(style.heading("Syntax"))
+        lines += style.columns([
+            ("verb [subcommand] [args…] [key=value…]", "one statement per line, or several separated by ';'"),
+            ("# comment", "ignored to the end of the line"),
+            ("\"quoted text\"", "one word containing spaces"),
+            ("\\", "at the end of a line, continues the statement on the next one"),
+            ("set name = value", "defines a variable, used later as $name or ${name}"),
+            ("set onerror=continue", "keeps going after a failed statement (default: stop)"),
+            ("log level <level>", "filters the activity-log output")
+        ], label: style.command)
+        return lines.joined(separator: "\n")
+    }
+
+    /// Every command under its category heading, names aligned on one column across categories.
+    /// Headings start `indent` columns in; commands two further.
+    static func commandList(_ commands: [ConsoleCommand], style: ConsoleTextStyle, indent: Int = 0) -> [String] {
         let width = commands.map(\.name.count).max() ?? 0
-        var lines = ["DruseScript commands — 'help <command>' for details, 'apropos <word>' to search."]
+        let margin = String(repeating: " ", count: indent)
+        var lines: [String] = []
         for category in ConsoleCategory.allCases {
             let members = commands.filter { $0.category == category }
             guard !members.isEmpty else { continue }
             lines.append("")
-            lines.append(category.rawValue + ":")
-            for command in members {
-                lines.append("  " + command.name.padding(toLength: width + 2, withPad: " ", startingAt: 0) + command.summary)
-            }
+            lines.append(margin + style.heading(category.rawValue))
+            lines += style.columns(members.map { ($0.name, $0.summary) }, indent: indent + 2, labelWidth: width,
+                                   label: style.command)
         }
-        lines.append("")
-        lines.append("Syntax: one statement per line (or ';'-separated): verb [subcommand] [args…] [key=value…]")
-        lines.append("  # comment    \"quoted text\"    \\ at line end continues    set name = value    $name or ${name}")
-        lines.append("  set onerror=continue keeps going after a failed statement; log level <level> filters log output.")
-        return lines.joined(separator: "\n")
+        return lines
     }
 
     /// `help <command> [subcommand…]`: every addressed form with its arguments and options
     /// (type, range, default), followed by the matching examples.
     /// `path` narrows the output to forms whose subcommand path starts with it.
-    static func detail(_ command: ConsoleCommand, path: [String] = []) -> String {
+    static func detail(_ command: ConsoleCommand, path: [String] = [], style: ConsoleTextStyle) -> String {
         let forms = command.forms.filter { $0.path.starts(with: path) }
         let title = ([command.name] + path).joined(separator: " ")
-        var lines = ["\(title) — \(path.isEmpty ? command.summary : forms.first { $0.path == path }?.summary ?? command.summary)"]
+        let summary = path.isEmpty ? command.summary : forms.first { $0.path == path }?.summary ?? command.summary
+        var lines = [style.command(title) + " — " + summary]
         if path.isEmpty, command.category != .general {
-            lines[0] += "  [\(command.category.rawValue)]"
+            lines[0] += style.dim("  [\(command.category.rawValue)]")
         }
         for form in forms {
             lines.append("")
-            lines.append("  " + usage(command: command.name, form: form))
-            lines.append("      " + form.summary + (form.isGUIOnly ? " (GUI only; ignored in headless mode)" : ""))
+            let verb = ([command.name] + form.path).joined(separator: " ")
+            let usageLine = usage(command: command.name, form: form)
+            lines.append("  " + (usageLine.hasPrefix(verb)
+                                 ? style.command(verb) + String(usageLine.dropFirst(verb.count))
+                                 : usageLine))
+            lines += style.paragraph(form.summary + (form.isGUIOnly ? " " + style.dim("(GUI only; ignored in headless mode)") : ""),
+                                     indent: 6)
             let parameters = form.arguments.map { ($0, "<\($0.name)>") } + form.options.map { ($0, "\($0.name)=") }
-            let width = parameters.map(\.1.count).max() ?? 0
-            for (parameter, label) in parameters {
-                lines.append("        " + label.padding(toLength: width + 2, withPad: " ", startingAt: 0)
-                             + parameter.summary + "  (" + facts(parameter) + ")")
-            }
+            lines += style.columns(parameters.map { parameter, label in
+                (label, parameter.summary + " " + style.dim("(" + facts(parameter) + ")"))
+            }, indent: 8, label: { $0 })
         }
         let prefix = title + " "
         let examples = path.isEmpty ? command.examples : command.examples.filter { $0.hasPrefix(prefix) || $0 == title }
         if !examples.isEmpty {
             lines.append("")
-            lines.append("Examples:")
+            lines.append(style.heading("Examples"))
             lines.append(contentsOf: examples.map { "  " + $0 })
         }
         return lines.joined(separator: "\n")
@@ -532,7 +553,7 @@ enum ConsoleHelp {
     /// names and summaries contain the word (case-insensitive), one per line. A command whose
     /// own summary matches but none of whose forms do is listed once, by name, so a broad
     /// command summary does not flood the result with all of its forms.
-    static func apropos(_ word: String, in commands: [ConsoleCommand]) -> String? {
+    static func apropos(_ word: String, in commands: [ConsoleCommand], style: ConsoleTextStyle) -> String? {
         let needle = word.lowercased()
         func matches(_ text: String) -> Bool { text.lowercased().contains(needle) }
         var rows: [[String]] = []
@@ -556,8 +577,7 @@ enum ConsoleHelp {
             rows += formRows
         }
         guard !rows.isEmpty else { return nil }
-        let width = rows.map { $0[0].count }.max() ?? 0
-        return rows.map { $0[0].padding(toLength: width + 2, withPad: " ", startingAt: 0) + $0[1] }.joined(separator: "\n")
+        return style.columns(rows.map { ($0[0], $0[1]) }, indent: 0, label: style.command).joined(separator: "\n")
     }
 
     /// Formats a range bound without a needless ".0".
