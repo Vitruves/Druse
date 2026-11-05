@@ -32,6 +32,11 @@ struct DockingConfig: Sendable {
     var populationSize: Int = 300
     var numRuns: Int = 3             // independent Monte Carlo trajectory batches
     var generationsPerRun: Int = 300 // Monte Carlo steps per run
+    /// Base seed for the search. 0 draws a fresh system-random seed per run, so repeated
+    /// docks of the same input differ; any non-zero value makes the whole search
+    /// reproducible, since every stochastic choice in the standard search path derives
+    /// from `GAParams.runSeed` on the GPU. Required for any meaningful A/B measurement.
+    var randomSeed: UInt32 = 0
     var gridSpacing: Float = 0.375
 
     // Search operators
@@ -434,17 +439,21 @@ struct MolecularInteraction: Identifiable, Sendable {
     var ligandPosition: SIMD3<Float>
     var proteinPosition: SIMD3<Float>
 
+    /// Every geometric criterion for these types — distance windows, angular
+    /// thresholds, offset caps — lives in `Metal/InteractionCriteria.h`, shared
+    /// by the Drusina scoring kernel, the GPU detector and the CPU detector.
+    /// Do not restate cutoffs here; they would drift.
     enum InteractionType: Int, CaseIterable, Sendable {
-        case hbond = 0        // H-bond: N/O donor ↔ acceptor, 2.2-3.5 Å
-        case hydrophobic = 1  // Hydrophobic contact: C/S ↔ C/S, 3.3-4.5 Å (filtered)
-        case saltBridge = 2   // Salt bridge: charged group pairs, < 4.0 Å
-        case piStack = 3      // π-π stacking: aromatic ring centroids, 3.3-5.5 Å
-        case piCation = 4     // π-cation: aromatic ring ↔ cation, < 6.0 Å
-        case halogen = 5      // Halogen bond: F/Cl/Br ↔ N/O, 2.5-3.5 Å
-        case metalCoord = 6   // Metal coordination: Zn/Fe/Mg ↔ N/O/S, < 2.8 Å
-        case chPi = 7         // CH-π: C-H ↔ aromatic ring, 3.5-4.5 Å
-        case amideStack = 8   // Amide-π: backbone amide ↔ aromatic ring, 3.0-5.0 Å
-        case chalcogen = 9    // Chalcogen bond: C-S...O/N σ-hole, 2.8-3.8 Å
+        case hbond = 0        // H-bond: N/O donor ↔ N/O acceptor
+        case hydrophobic = 1  // Hydrophobic contact: non-polar C / halogen pairs
+        case saltBridge = 2   // Salt bridge: oppositely charged groups
+        case piStack = 3      // π-π stacking: face-to-face or T-shaped aromatics
+        case piCation = 4     // π-cation: cation above an aromatic ring plane
+        case halogen = 5      // Halogen bond: C-X σ-hole ↔ N/O (X = Cl, Br, I)
+        case metalCoord = 6   // Metal coordination: Zn/Fe/Mg/… ↔ N/O/S
+        case chPi = 7         // CH-π: aliphatic C-H ↔ aromatic ring face
+        case amideStack = 8   // Amide-π: amide plane ↔ aromatic ring face
+        case chalcogen = 9    // Chalcogen bond: C-S σ-hole ↔ N/O
 
         var color: SIMD4<Float> {
             switch self {

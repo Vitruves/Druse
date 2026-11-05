@@ -29,6 +29,7 @@
 using namespace metal;
 
 #include "ShaderTypes.h"
+#include "SafeMath.h"
 
 // ---------------------------------------------------------------------------
 // Constants (must match trainDruseAFv4.py exactly)
@@ -50,10 +51,6 @@ constant uint POSE_POS_STRIDE = 64 * 3;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-inline float gelu_tanh(float x) {
-    return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-}
 
 inline float linear_1d(device const float* w, device const float* b,
                         thread const float* input, uint in_dim, uint out_idx) {
@@ -105,7 +102,7 @@ kernel void druseAFv4Encode(
     // Layer 0: Linear(20→128) + GELU
     float h0[H];
     for (uint d = 0; d < H; d++)
-        h0[d] = gelu_tanh(linear_1d(w0, b0, feat, FEAT, d));
+        h0[d] = safeGeluTanh(linear_1d(w0, b0, feat, FEAT, d));
 
     // Layer 1: Linear(128→128)
     float h1[H];
@@ -150,7 +147,7 @@ kernel void druseAFv4MsgTransform(
         input[d] = protHidden[tid * H + d];
 
     for (uint d = 0; d < H; d++)
-        msgTemp[tid * H + d] = gelu_tanh(linear_1d(w, b, input, H, d));
+        msgTemp[tid * H + d] = safeGeluTanh(linear_1d(w, b, input, H, d));
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +214,7 @@ kernel void druseAFv4MsgAggregate(
             float val = ab1[k];
             for (uint b = 0; b < MSG_RBF; b++)
                 val += rbf[b] * aw1[k * MSG_RBF + b];
-            h32[k] = gelu_tanh(val);
+            h32[k] = safeGeluTanh(val);
         }
         // Layer 2: Linear(32→1)
         float logit = ab2[0];
@@ -391,7 +388,7 @@ kernel void druseAFv4Score(
                 float rbf_val = rbf_b[d];
                 for (uint b = 0; b < CRS_RBF; b++)
                     rbf_val += rbf[b] * rbf_w[d * CRS_RBF + b];
-                rbf_val = gelu_tanh(rbf_val);
+                rbf_val = safeGeluTanh(rbf_val);
 
                 // Load protein pair proj
                 float pp = protPairProj[p * PD + d];
@@ -403,7 +400,7 @@ kernel void druseAFv4Score(
             // Pair energy: GELU(pair) → Linear(PD→1)
             float e = pe_b[0];
             for (uint d = 0; d < PD; d++)
-                e += gelu_tanh(pair[d]) * pe_w[d];
+                e += safeGeluTanh(pair[d]) * pe_w[d];
             energy_sum += e;
 
             // Context gate: pair → Linear(PD→1) (no GELU)
@@ -502,7 +499,7 @@ kernel void druseAFv4Score(
             float val = ah0_b[d];
             for (uint d2 = 0; d2 < H; d2++)
                 val += tg_repr[d2] * ah0_w[d * H + d2];
-            aff_h[d] = gelu_tanh(val);
+            aff_h[d] = safeGeluTanh(val);
         }
         float global_aff = ah1_b[0];
         for (uint d = 0; d < 64; d++)
@@ -521,7 +518,7 @@ kernel void druseAFv4Score(
             float val = ch0_b[d];
             for (uint d2 = 0; d2 < H; d2++)
                 val += tg_repr[d2] * ch0_w[d * H + d2];
-            conf_h[d] = gelu_tanh(val);
+            conf_h[d] = safeGeluTanh(val);
         }
         float conf_logit = ch1_b[0];
         for (uint d = 0; d < 64; d++)
@@ -641,14 +638,14 @@ kernel void druseAFv4ScoreWithGradient(
                 float rbf_val = rbf_b[d];
                 for (uint b = 0; b < CRS_RBF; b++)
                     rbf_val += rbf[b] * rbf_w[d * CRS_RBF + b];
-                rbf_val = gelu_tanh(rbf_val);
+                rbf_val = safeGeluTanh(rbf_val);
                 float pp = protPairProj[p * PD + d];
                 pair[d] = lig_p[d] * pp * rbf_val;
             }
 
             float e = pe_b[0];
             for (uint d = 0; d < PD; d++)
-                e += gelu_tanh(pair[d]) * pe_w[d];
+                e += safeGeluTanh(pair[d]) * pe_w[d];
             energy_sum += e;
 
             float g = cg_b[0];
@@ -756,7 +753,7 @@ kernel void druseAFv4ScoreWithGradient(
             float val = ah0_b[d];
             for (uint d2 = 0; d2 < H; d2++)
                 val += tg_repr[d2] * ah0_w[d * H + d2];
-            aff_h[d] = gelu_tanh(val);
+            aff_h[d] = safeGeluTanh(val);
         }
         float global_aff = ah1_b[0];
         for (uint d = 0; d < 64; d++)
@@ -774,7 +771,7 @@ kernel void druseAFv4ScoreWithGradient(
             float val = ch0_b[d];
             for (uint d2 = 0; d2 < H; d2++)
                 val += tg_repr[d2] * ch0_w[d * H + d2];
-            conf_h[d] = gelu_tanh(val);
+            conf_h[d] = safeGeluTanh(val);
         }
         float conf_logit = ch1_b[0];
         for (uint d = 0; d < 64; d++)
@@ -873,13 +870,13 @@ kernel void druseAFv4Rescore(
                 float rv = rbf_b[d];
                 for (uint b = 0; b < CRS_RBF; b++)
                     rv += rbf[b] * rbf_w[d * CRS_RBF + b];
-                rv = gelu_tanh(rv);
+                rv = safeGeluTanh(rv);
                 float pp = protPairProj[p * PD + d];
                 pair[d] = lig_p[d] * pp * rv;
             }
 
             float e = pe_b[0];
-            for (uint d = 0; d < PD; d++) e += gelu_tanh(pair[d]) * pe_w[d];
+            for (uint d = 0; d < PD; d++) e += safeGeluTanh(pair[d]) * pe_w[d];
             energy_sum += e;
 
             // Online log-sum-exp: when a new max appears, rescale running sums
@@ -950,7 +947,7 @@ kernel void druseAFv4Rescore(
         for (uint d = 0; d < 64; d++) {
             float v = ah0_b[d];
             for (uint d2 = 0; d2 < H; d2++) v += tg_repr[d2] * ah0_w[d * H + d2];
-            ah[d] = gelu_tanh(v);
+            ah[d] = safeGeluTanh(v);
         }
         float ga = ah1_b[0];
         for (uint d = 0; d < 64; d++) ga += ah[d] * ah1_w[d];
@@ -964,7 +961,7 @@ kernel void druseAFv4Rescore(
         for (uint d = 0; d < 64; d++) {
             float v = ch0_b[d];
             for (uint d2 = 0; d2 < H; d2++) v += tg_repr[d2] * ch0_w[d * H + d2];
-            ch[d] = gelu_tanh(v);
+            ch[d] = safeGeluTanh(v);
         }
         float cl = ch1_b[0];
         for (uint d = 0; d < 64; d++) cl += ch[d] * ch1_w[d];

@@ -24,6 +24,7 @@
 
 #include <metal_stdlib>
 #include "ShaderTypes.h"
+#include "SafeMath.h"
 using namespace metal;
 
 // ============================================================================
@@ -276,7 +277,7 @@ kernel void xtb_born_radii(
 
     float psi = 0.5f * rhoOffI * sum;
     float targ = psi * (obc_alpha - psi * (obc_beta - psi * obc_gamma));
-    float th = tanh(targ);
+    float th = safeTanh(targ);
     bradOut[tid] = 1.0f / (1.0f / rhoOffI - th / rhoI);
 
     // Step 2: Gaussian SASA burial approximation

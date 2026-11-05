@@ -16,6 +16,7 @@
 
 #include <metal_stdlib>
 #include "ShaderTypes.h"
+#include "SafeMath.h"
 using namespace metal;
 
 // ============================================================================
@@ -589,7 +590,7 @@ kernel void druseAFScore(
 
         float g1[DAF_HIDDEN / 2];
         linearLayer(g1, lig_state[la], gate_w0, gate_b0, GATE_HIDDEN, D);
-        for (uint i = 0; i < GATE_HIDDEN; i++) g1[i] = tanh(g1[i]);
+        for (uint i = 0; i < GATE_HIDDEN; i++) g1[i] = safeTanh(g1[i]);
         float g2 = gate_b2[0];
         for (uint i = 0; i < GATE_HIDDEN; i++) g2 += gate_w2[i] * g1[i];
 
@@ -873,7 +874,7 @@ kernel void druseAFScoreWithGradient(
         if (l >= L) continue;
         float g1[DAF_HIDDEN / 2];
         linearLayer(g1, lig_state[la], gate_w0, gate_b0, GATE_HIDDEN, D);
-        for (uint i = 0; i < GATE_HIDDEN; i++) g1[i] = tanh(g1[i]);
+        for (uint i = 0; i < GATE_HIDDEN; i++) g1[i] = safeTanh(g1[i]);
         float g2 = gate_b2[0];
         for (uint i = 0; i < GATE_HIDDEN; i++) g2 += gate_w2[i] * g1[i];
         gate_logits[la] = g2;

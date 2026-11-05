@@ -16,6 +16,7 @@
 
 #include <metal_stdlib>
 #include "ShaderTypes.h"
+#include "SafeMath.h"
 using namespace metal;
 
 // ============================================================================
@@ -272,7 +273,7 @@ inline void pigGRUCell(
     for (uint d = 0; d < D; d++) {
         float r = 1.0f / (1.0f + exp(-(ih[d] + hh[d])));
         float z = 1.0f / (1.0f + exp(-(ih[D + d] + hh[D + d])));
-        float n = tanh(ih[2 * D + d] + r * hh[2 * D + d]);
+        float n = safeTanh(ih[2 * D + d] + r * hh[2 * D + d]);
         h_out[d] = (1.0f - z) * n + z * hidden[d];
     }
 }

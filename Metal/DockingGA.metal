@@ -197,8 +197,34 @@ kernel void initializePopulation(
     poses[tid].numChiAngles = 0;
 }
 
-/// GA evolution: tournament selection + arithmetic/SLERP crossover + Gaussian mutation.
-/// Includes diversity injection every 10 generations for bottom 5% of population.
+/// Energy used for population ranking: non-finite and sentinel (1e10) energies sort last
+/// so an unscored or NaN pose can never be mistaken for an elite.
+inline float gaRankEnergy(float e) {
+    return (isfinite(e) && e < 1e9f) ? e : 1e30f;
+}
+
+/// Wrap a torsion angle into [-pi, pi].
+inline float gaWrapAngle(float a) {
+    return a - 2.0f * M_PI_F * floor((a + M_PI_F) / (2.0f * M_PI_F));
+}
+
+/// GA evolution: elitist tournament selection + arithmetic/SLERP/uniform crossover +
+/// per-gene mutation, with random immigrants replacing the worst-ranked slots.
+///
+/// Buffer layout and pose conventions are identical to `mcPerturb`
+/// (offspring[0], population[1], GAParams[2], GridParams[3]) so the generation loop can
+/// swap one proposal kernel for the other and keep the same scoring / local-search /
+/// Metropolis-acceptance stages. Energies are "lower is better".
+///
+/// Elitism: each thread computes its own energy rank in the population (O(popSize), cheap
+/// next to one scoring pass). The top `popSize/50` slots pass through unchanged, so the
+/// survivor-selection kernel sees ΔE = 0 for them and the population's best poses cannot be
+/// destroyed by a crossover generation; the periodic local search still refines them,
+/// which only lowers their energy.
+///
+/// Every pose field is written on every path: offspring is a persistent buffer and
+/// extraction reads back the energy decomposition, the chi angles and the torsion array,
+/// so inherited-but-unwritten fields would leak stale values from earlier generations.
 kernel void gaEvolve(
     device DockPose            *offspring    [[buffer(0)]],
     device const DockPose      *population   [[buffer(1)]],
@@ -208,32 +234,104 @@ kernel void gaEvolve(
 {
     if (tid >= gaParams.populationSize) return;
 
-    uint seed = tid * 31337u + gaParams.generation * 99991u + gaParams.runSeed * 777767u;
     uint popSize = gaParams.populationSize;
-
-    // Tournament selection (k=3) for two parents
-    uint a1 = uint(gpuRandom(seed, 0) * float(popSize)) % popSize;
-    uint b1 = uint(gpuRandom(seed, 1) * float(popSize)) % popSize;
-    uint c1 = uint(gpuRandom(seed, 2) * float(popSize)) % popSize;
-    uint parentA = a1;
-    if (population[b1].energy < population[parentA].energy) parentA = b1;
-    if (population[c1].energy < population[parentA].energy) parentA = c1;
-
-    uint a2 = uint(gpuRandom(seed, 3) * float(popSize)) % popSize;
-    uint b2 = uint(gpuRandom(seed, 4) * float(popSize)) % popSize;
-    uint c2 = uint(gpuRandom(seed, 5) * float(popSize)) % popSize;
-    uint parentB = a2;
-    if (population[b2].energy < population[parentB].energy) parentB = b2;
-    if (population[c2].energy < population[parentB].energy) parentB = c2;
+    uint nTor = min(gaParams.numTorsions, 32u);
+    uint seed = tid * 31337u + gaParams.generation * 99991u + gaParams.runSeed * 777767u;
 
     device DockPose &child = offspring[tid];
-    float alpha = gpuRandom(seed, 7);
 
+    // --- Energy rank of this slot (ties broken by index so ranks are a permutation) ---
+    float myE = gaRankEnergy(population[tid].energy);
+    uint rank = 0;
+    for (uint i = 0; i < popSize; i++) {
+        float e = gaRankEnergy(population[i].energy);
+        if (e < myE || (e == myE && i < tid)) rank++;
+    }
+
+    // --- Elite pass-through: the best slots survive the generation intact ---
+    uint numElite = max(popSize / 50u, 1u);
+    if (rank < numElite) {
+        child = population[tid];
+        child.generation = int(gaParams.generation) + 1;
+        child.energy = 1e10f;
+        child.stericEnergy = 0.0f;
+        child.hydrophobicEnergy = 0.0f;
+        child.hbondEnergy = 0.0f;
+        child.torsionPenalty = 0.0f;
+        child.clashPenalty = 0.0f;
+        child.drusinaCorrection = 0.0f;
+        child.constraintPenalty = 0.0f;
+        return;
+    }
+
+    float3 searchCenter = gridParams.searchCenter;
+    float3 searchHalfExtent = gridParams.searchHalfExtent;
+    float3 searchMin = searchCenter - searchHalfExtent;
+    float3 searchMax = searchCenter + searchHalfExtent;
+
+    // --- Random immigrants: every 3rd generation the worst-ranked 20% of slots draw a
+    // fresh pose instead of a child. They compete against the slot they land in, which is
+    // by construction one of the poorest poses in the population, so survivor selection
+    // gives them a real chance of taking hold. Receptor chi angles are inherited: the
+    // immigrant explores ligand placement, not sidechain packing.
+    uint immigrantCount = max(popSize / 5u, 1u);
+    bool immigrate = gaParams.generation > 0u
+        && (gaParams.generation % 3u) == 0u
+        && rank + immigrantCount >= popSize;
+    if (immigrate) {
+        child.translation = searchCenter + float3(
+            (gpuRandom(seed, 200) * 2.0f - 1.0f) * searchHalfExtent.x,
+            (gpuRandom(seed, 201) * 2.0f - 1.0f) * searchHalfExtent.y,
+            (gpuRandom(seed, 202) * 2.0f - 1.0f) * searchHalfExtent.z
+        );
+        float u1 = gpuRandom(seed, 203);
+        float u2 = gpuRandom(seed, 204) * 2.0f * M_PI_F;
+        float u3 = gpuRandom(seed, 205) * 2.0f * M_PI_F;
+        float sq1 = sqrt(1.0f - u1);
+        float sq2 = sqrt(u1);
+        child.rotation = normalize(float4(sq1 * sin(u2), sq1 * cos(u2), sq2 * sin(u3), sq2 * cos(u3)));
+        for (uint t = 0; t < 32u; t++) {
+            child.torsions[t] = (t < nTor)
+                ? gpuRandom(seed, 210 + t) * 2.0f * M_PI_F - M_PI_F
+                : population[tid].torsions[t];
+        }
+        for (uint c = 0; c < 24u; c++) child.chiAngles[c] = population[tid].chiAngles[c];
+        child.numChiAngles = population[tid].numChiAngles;
+        child.numTorsions = int(nTor);
+        child.generation = int(gaParams.generation) + 1;
+        child.energy = 1e10f;
+        child.stericEnergy = 0.0f;
+        child.hydrophobicEnergy = 0.0f;
+        child.hbondEnergy = 0.0f;
+        child.torsionPenalty = 0.0f;
+        child.clashPenalty = 0.0f;
+        child.drusinaCorrection = 0.0f;
+        child.constraintPenalty = 0.0f;
+        return;
+    }
+
+    // --- Tournament selection (k = 3) for two parents ---
+    uint a1 = min(uint(gpuRandom(seed, 0) * float(popSize)), popSize - 1u);
+    uint b1 = min(uint(gpuRandom(seed, 1) * float(popSize)), popSize - 1u);
+    uint c1 = min(uint(gpuRandom(seed, 2) * float(popSize)), popSize - 1u);
+    uint parentA = a1;
+    if (gaRankEnergy(population[b1].energy) < gaRankEnergy(population[parentA].energy)) parentA = b1;
+    if (gaRankEnergy(population[c1].energy) < gaRankEnergy(population[parentA].energy)) parentA = c1;
+
+    uint a2 = min(uint(gpuRandom(seed, 3) * float(popSize)), popSize - 1u);
+    uint b2 = min(uint(gpuRandom(seed, 4) * float(popSize)), popSize - 1u);
+    uint c2 = min(uint(gpuRandom(seed, 5) * float(popSize)), popSize - 1u);
+    uint parentB = a2;
+    if (gaRankEnergy(population[b2].energy) < gaRankEnergy(population[parentB].energy)) parentB = b2;
+    if (gaRankEnergy(population[c2].energy) < gaRankEnergy(population[parentB].energy)) parentB = c2;
+
+    // --- Crossover ---
+    float alpha = gpuRandom(seed, 7);
     if (gpuRandom(seed, 6) < gaParams.crossoverRate) {
-        // Arithmetic crossover for translation
+        // Arithmetic crossover for translation (both parents are in-box, so is the blend)
         child.translation = mix(population[parentA].translation, population[parentB].translation, alpha);
 
-        // SLERP for quaternion
+        // SLERP for the orientation quaternion
         float4 qa = population[parentA].rotation;
         float4 qb = population[parentB].rotation;
         float dotQ = dot(qa, qb);
@@ -248,88 +346,63 @@ kernel void gaEvolve(
             child.rotation = normalize(sin((1.0f - alpha) * theta) / st * qa + sin(alpha * theta) / st * qb);
         }
 
-        // Uniform crossover for torsions
-        for (uint t = 0; t < gaParams.numTorsions; t++) {
-            child.torsions[t] = (gpuRandom(seed, 10 + t) < 0.5f)
-                ? population[parentA].torsions[t] : population[parentB].torsions[t];
+        // Uniform crossover for ligand torsions and receptor chi angles. Inactive torsion
+        // slots track parent A so the tail of the array never holds stale values.
+        for (uint t = 0; t < 32u; t++) {
+            uint src = (t < nTor && gpuRandom(seed, 8 + t) < 0.5f) ? parentB : parentA;
+            child.torsions[t] = population[src].torsions[t];
+        }
+        for (uint c = 0; c < 24u; c++) {
+            uint src = (gpuRandom(seed, 40 + c) < 0.5f) ? parentB : parentA;
+            child.chiAngles[c] = population[src].chiAngles[c];
         }
     } else {
         child.translation = population[parentA].translation;
         child.rotation = population[parentA].rotation;
-        for (uint t = 0; t < gaParams.numTorsions; t++)
-            child.torsions[t] = population[parentA].torsions[t];
+        for (uint t = 0; t < 32u; t++) child.torsions[t] = population[parentA].torsions[t];
+        for (uint c = 0; c < 24u; c++) child.chiAngles[c] = population[parentA].chiAngles[c];
+    }
+    child.numChiAngles = population[parentA].numChiAngles;
+
+    // --- Mutation: translation (isotropic step, same calibration as mcPerturb) ---
+    if (gpuRandom(seed, 64) < gaParams.mutationRate) {
+        float3 delta = gaParams.translationStep * randomInsideUnitSphere(seed, 65);
+        child.translation = clamp(child.translation + delta, searchMin, searchMax);
     }
 
-    float3 searchCenter = gridParams.searchCenter;
-    float3 searchHalfExtent = gridParams.searchHalfExtent;
-    float3 searchMin = searchCenter - searchHalfExtent;
-    float3 searchMax = searchCenter + searchHalfExtent;
-
-    // Diversity injection: reinitialize bottom 20% with random poses every 3 generations.
-    bool doInject = (gaParams.generation % 3 == 0) && (gaParams.generation > 0);
-    uint injectThreshold = popSize - max(popSize / 5, 6u);  // bottom 20%
-    if (doInject && tid >= injectThreshold) {
-        child.translation = searchCenter + float3(
-            (gpuRandom(seed, 80) * 2.0f - 1.0f) * searchHalfExtent.x,
-            (gpuRandom(seed, 81) * 2.0f - 1.0f) * searchHalfExtent.y,
-            (gpuRandom(seed, 82) * 2.0f - 1.0f) * searchHalfExtent.z
-        );
-        float u1 = gpuRandom(seed, 83);
-        float u2 = gpuRandom(seed, 84) * 2.0f * M_PI_F;
-        float u3 = gpuRandom(seed, 85) * 2.0f * M_PI_F;
-        child.rotation = normalize(float4(sqrt(1-u1)*sin(u2), sqrt(1-u1)*cos(u2), sqrt(u1)*sin(u3), sqrt(u1)*cos(u3)));
-        for (uint t = 0; t < gaParams.numTorsions; t++)
-            child.torsions[t] = gpuRandom(seed, 90 + t) * 2.0f * M_PI_F - M_PI_F;
-        child.numTorsions = int(gaParams.numTorsions);
-        child.generation = int(gaParams.generation) + 1;
-        child.energy = 1e10f;
-        child.stericEnergy = 0.0f;
-        child.hydrophobicEnergy = 0.0f;
-        child.hbondEnergy = 0.0f;
-        child.torsionPenalty = 0.0f;
-        child.clashPenalty = 0.0f;
-        return;
-    }
-
-    // Mutation -- translation (occasional large jumps for exploration)
-    float mutRoll = gpuRandom(seed, 50);
-    if (mutRoll < gaParams.mutationRate) {
-        float step = gaParams.translationStep;
-        // 20% of mutations are large jumps (5x step) for wider exploration
-        if (mutRoll < gaParams.mutationRate * 0.2f) step *= 5.0f;
-        child.translation += float3(
-            (gpuRandom(seed, 51) * 2.0f - 1.0f) * step,
-            (gpuRandom(seed, 52) * 2.0f - 1.0f) * step,
-            (gpuRandom(seed, 53) * 2.0f - 1.0f) * step
-        );
-        child.translation = clamp(child.translation, searchMin, searchMax);
-    }
-
-    // Mutation -- rotation
-    if (gpuRandom(seed, 54) < gaParams.mutationRate) {
-        float angle = (gpuRandom(seed, 55) * 2.0f - 1.0f) * gaParams.rotationStep;
-        float3 axis = normalize(float3(gpuRandom(seed, 56) - 0.5f, gpuRandom(seed, 57) - 0.5f, gpuRandom(seed, 58) - 0.5f));
-        float ha = angle * 0.5f;
-        float4 dq = float4(axis * sin(ha), cos(ha));
-        float4 q = child.rotation;
-        child.rotation = normalize(float4(
-            dq.w*q.x + dq.x*q.w + dq.y*q.z - dq.z*q.y,
-            dq.w*q.y - dq.x*q.z + dq.y*q.w + dq.z*q.x,
-            dq.w*q.z + dq.x*q.y - dq.y*q.x + dq.z*q.w,
-            dq.w*q.w - dq.x*q.x - dq.y*q.y - dq.z*q.z
-        ));
-    }
-
-    // Mutation -- torsions
-    for (uint t = 0; t < gaParams.numTorsions; t++) {
-        if (gpuRandom(seed, 60 + t) < gaParams.mutationRate) {
-            child.torsions[t] += (gpuRandom(seed, 100 + t) * 2.0f - 1.0f) * gaParams.torsionStep;
-            if (child.torsions[t] > M_PI_F) child.torsions[t] -= 2.0f * M_PI_F;
-            if (child.torsions[t] < -M_PI_F) child.torsions[t] += 2.0f * M_PI_F;
+    // --- Mutation: rotation ---
+    if (gpuRandom(seed, 86) < gaParams.mutationRate) {
+        float3 rotVec = gaParams.rotationStep * randomInsideUnitSphere(seed, 87);
+        float angle = length(rotVec);
+        if (angle > 1e-6f) {
+            float3 axis = rotVec / angle;
+            float ha = angle * 0.5f;
+            float4 dq = float4(axis * sin(ha), cos(ha));
+            float4 q = child.rotation;
+            child.rotation = normalize(float4(
+                dq.w*q.x + dq.x*q.w + dq.y*q.z - dq.z*q.y,
+                dq.w*q.y - dq.x*q.z + dq.y*q.w + dq.z*q.x,
+                dq.w*q.z + dq.x*q.y - dq.y*q.x + dq.z*q.w,
+                dq.w*q.w - dq.x*q.x - dq.y*q.y - dq.z*q.z
+            ));
         }
     }
 
-    child.numTorsions = int(gaParams.numTorsions);
+    // --- Mutation: torsions. Honours the same torsion-search policy as mcPerturb, so the
+    // redocking / exploratory presets steer the GA the way they steer the MC path.
+    float resetProbability = clamp(gaParams.torsionRandomResetProbability, 0.0f, 1.0f);
+    float perturbationScale = max(gaParams.torsionPerturbationScale, 0.0f);
+    for (uint t = 0; t < nTor; t++) {
+        if (gpuRandom(seed, 108 + t) >= gaParams.mutationRate) continue;
+        if (gpuRandom(seed, 140 + t) < resetProbability) {
+            child.torsions[t] = gpuRandom(seed, 172 + t) * 2.0f * M_PI_F - M_PI_F;
+        } else {
+            float delta = (gpuRandom(seed, 172 + t) * 2.0f - 1.0f) * gaParams.torsionStep * perturbationScale;
+            child.torsions[t] = gaWrapAngle(child.torsions[t] + delta);
+        }
+    }
+
+    child.numTorsions = int(nTor);
     child.generation = int(gaParams.generation) + 1;
     child.energy = 1e10f;
     child.stericEnergy = 0.0f;
@@ -337,4 +410,6 @@ kernel void gaEvolve(
     child.hbondEnergy = 0.0f;
     child.torsionPenalty = 0.0f;
     child.clashPenalty = 0.0f;
+    child.drusinaCorrection = 0.0f;
+    child.constraintPenalty = 0.0f;
 }

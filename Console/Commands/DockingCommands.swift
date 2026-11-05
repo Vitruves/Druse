@@ -283,7 +283,7 @@ extension DruseInterpreter {
     // MARK: dock
 
     /// Settings accepted inline by `dock` and `dock batch` (any setting via `dock set`).
-    private static let inlineDockKeys = ["search", "scoring", "charges", "population", "generations", "runs"]
+    private static let inlineDockKeys = ["search", "scoring", "charges", "population", "generations", "runs", "seed"]
 
     /// `dock`: single-ligand and batch docking runs, session docking settings, run status and cancellation.
     private static func dockCommand() -> ConsoleCommand {

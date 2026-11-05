@@ -585,8 +585,8 @@ enum ProteinPreparation {
         case .eem, .qeq, .xtb:
             let calculator: ChargeCalculator
             switch chargeMethod {
-            case .eem: calculator = EEMChargeCalculator(device: nil)
-            case .qeq: calculator = QEqChargeCalculator(device: nil)
+            case .eem: calculator = EEMChargeCalculator(device: device)
+            case .qeq: calculator = QEqChargeCalculator(device: device)
             case .xtb: calculator = XTBChargeCalculator()
             default:   calculator = GasteigerChargeCalculator()
             }

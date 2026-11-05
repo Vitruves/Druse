@@ -5,6 +5,7 @@
 using namespace metal;
 
 #include "ShaderTypes.h"
+#include "InteractionCriteria.h"
 
 // ============================================================================
 // MARK: - GPU Interaction Detection
@@ -14,9 +15,17 @@ using namespace metal;
 // applies distance cutoffs and element-flag checks, and atomically appends
 // detected interactions to an output buffer.
 //
-// Handles: metal coordination, salt bridges, H-bonds, halogen bonds,
-//          hydrophobic contacts.
-// CPU handles: π-π stacking, π-cation (require ring geometry).
+// Every cutoff here comes from InteractionCriteria.h, shared with the Drusina
+// scoring kernel and the CPU detector. Do not inline numbers.
+//
+// Handles the types that need nothing but a distance and element/property
+// flags: metal coordination, salt bridges, H-bonds, hydrophobic contacts.
+//
+// Everything with a direction or a plane is detected on the CPU
+// (InteractionDetector in Docking/DockingEngine+Analysis.swift), because the
+// bonded antecedent and ring geometry it needs are not in this buffer:
+// π-π stacking, π-cation, CH-π, amide-π, halogen bonds (C-X σ-hole axis) and
+// chalcogen bonds (C-S σ-hole axis).
 // ============================================================================
 
 kernel void detectInteractions(
@@ -31,7 +40,7 @@ kernel void detectInteractions(
     uint tgSize [[threads_per_threadgroup]]
 ) {
     // Maximum interactions a single ligand atom can produce.
-    // 6 strong (metal/salt/hbond/halogen) + 2 hydrophobic = 8 typical max,
+    // 6 strong (metal/salt/hbond) + 2 hydrophobic = 8 typical max,
     // but protein atoms can have multiple contacts; 24 is a safe upper bound.
     const uint MAX_LOCAL = 24;
     GPUInteraction localInteractions[MAX_LOCAL];
@@ -44,18 +53,18 @@ kernel void detectInteractions(
         int ligCharge = ligAtom.formalCharge;
 
         uint hydroCount = 0;
-        const uint maxHydroPerAtom = 2;
+        const uint maxHydroPerAtom = uint(kICHydrophobicMaxPerAtom);
 
         for (uint pi = 0; pi < params.numProteinAtoms; pi++) {
             InteractionAtomGPU protAtom = protAtoms[pi];
             float d = distance(lp, protAtom.position);
-            if (d >= 6.0f) continue;
+            if (d >= kICMaxInteractionReach) continue;
 
             uint protFlags = protAtom.flags;
             uint type = 0xFFFFFFFF; // sentinel: no interaction
 
-            // ---- Metal coordination: < 2.8 Angstrom, metal <-> N/O/S ----
-            if (d < 2.8f) {
+            // ---- Metal coordination: metal <-> N/O/S ----
+            if (d >= kICMetalDistMin && d <= kICMetalDistMax) {
                 bool ligCoord  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O | IDET_FLAG_S)) != 0;
                 bool protMetal = (protFlags & IDET_FLAG_METAL) != 0;
                 bool ligMetal  = (ligFlags  & IDET_FLAG_METAL) != 0;
@@ -66,8 +75,8 @@ kernel void detectInteractions(
                 }
             }
 
-            // ---- Salt bridge: < 4.0 Angstrom, charged group <-> charged group ----
-            if (type == 0xFFFFFFFF && d < 4.0f) {
+            // ---- Salt bridge: charged group <-> charged group ----
+            if (type == 0xFFFFFFFF && d <= kICSaltBridgeDistMax) {
                 bool protPositive = (protFlags & IDET_FLAG_POS_RES) != 0;
                 bool protNegative = (protFlags & IDET_FLAG_NEG_RES) != 0;
                 bool ligPositive  = ligCharge > 0;
@@ -78,12 +87,14 @@ kernel void detectInteractions(
                 }
             }
 
-            // ---- H-bond: 2.2-3.5 Angstrom between donor/acceptor (N/O) ----
+            // ---- H-bond: heavy-atom donor/acceptor (N/O) ----
             // At least one side must have an attached H to donate, otherwise
             // there is no hydrogen to share. A neutral tertiary amine (N with
             // 3 bonds, no H) and a deprotonated carboxylate O (1 bond, charge
             // -1) are both pure acceptors and cannot form an H-bond together.
-            if (type == 0xFFFFFFFF && d >= 2.2f && d <= 3.5f) {
+            // Distance-only, matching Vina's own H-bond term; the Drusina
+            // directionality bonus adds the angular criteria on top.
+            if (type == 0xFFFFFFFF && d >= kICHBondDistMin && d <= kICHBondDistMax) {
                 bool ligDA  = (ligFlags  & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
                 bool protDA = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
                 bool ligDonor  = (ligFlags  & IDET_FLAG_HB_DONOR) != 0;
@@ -93,21 +104,18 @@ kernel void detectInteractions(
                 }
             }
 
-            // ---- Halogen bond: 2.5-3.5 Angstrom, halogen <-> N/O ----
-            if (type == 0xFFFFFFFF && d >= 2.5f && d <= 3.5f) {
-                bool halogen  = (ligFlags  & IDET_FLAG_HALOGEN) != 0;
-                bool acceptor = (protFlags & (IDET_FLAG_N | IDET_FLAG_O)) != 0;
-                if (halogen && acceptor) {
-                    type = 5; // halogen
-                }
-            }
-
-            // ---- Hydrophobic: 3.4-4.0 Angstrom, C/S <-> C/S ----
-            // Allow hydrophobic contacts even if this atom has a strong interaction elsewhere, max 2 per atom
+            // ---- Hydrophobic contact ----
+            // IDET_FLAG_C is set by the Swift side for atoms Vina counts as
+            // hydrophobic (xsIsHydrophobic: non-polar carbon C_H and the
+            // halogens) and for nothing else — a carbonyl carbon (C_P) and
+            // sulfur (S_P) carry no hydrophobic term in Vina, so no line.
+            // Allowed even when this atom has a strong interaction to another
+            // protein atom, capped per atom.
             if (type == 0xFFFFFFFF &&
-                d >= 3.4f && d <= 4.0f && hydroCount < maxHydroPerAtom) {
-                bool ligHydro  = (ligFlags  & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
-                bool protHydro = (protFlags & (IDET_FLAG_C | IDET_FLAG_S)) != 0;
+                d >= kICHydrophobicDistMin && d <= kICHydrophobicDistMax &&
+                hydroCount < maxHydroPerAtom) {
+                bool ligHydro  = (ligFlags  & IDET_FLAG_C) != 0;
+                bool protHydro = (protFlags & IDET_FLAG_C) != 0;
                 if (ligHydro && protHydro) {
                     type = 1; // hydrophobic
                     hydroCount++;

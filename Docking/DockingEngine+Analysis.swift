@@ -700,6 +700,255 @@ enum InteractionDetector {
         HBondClassifier.proteinHBondAcceptorFlag(atom)
     }
 
+    // MARK: - Protein Feature Geometry
+    //
+    // The planes, σ-hole axes and cation sites the directional interactions
+    // need. Built to mirror `DockingEngine.prepareDrusinaBuffers` so that the
+    // detector and the Drusina kernel see the same features.
+
+    /// A protein amide plane — a peptide link C(i)=O(i)···N(i+1), or an
+    /// Asn/Gln sidechain carboxamide — for amide-π stacking.
+    struct AmidePlane: Sendable {
+        let centroid: SIMD3<Float>
+        let normal: SIMD3<Float>
+        let atomIndex: Int      // representative atom (the amide carbon)
+    }
+
+    /// A protein sulfur σ-hole (Met SD, Cys SG) for chalcogen bonding.
+    /// One record per S–C bond: the σ-hole lies opposite the bond.
+    struct SulfurSigmaHole: Sendable {
+        let position: SIMD3<Float>
+        let bondedCDir: SIMD3<Float>   // normalize(C - S)
+        let atomIndex: Int
+    }
+
+    private static func amidePlane(
+        c: SIMD3<Float>, o: SIMD3<Float>, n: SIMD3<Float>, atomIndex: Int
+    ) -> AmidePlane? {
+        let normal = simd_cross(o - c, n - c)
+        let len = simd_length(normal)
+        guard len > 1e-6 else { return nil }
+        return AmidePlane(centroid: (c + o + n) / 3.0, normal: normal / len, atomIndex: atomIndex)
+    }
+
+    /// Amide planes of the protein: one per peptide link plus Asn/Gln sidechains.
+    static func detectAmidePlanes(atoms: [Atom]) -> [AmidePlane] {
+        struct Residue { var seq: Int; var name: String; var atoms: [(Int, Atom)] }
+        var byResidue: [String: Residue] = [:]
+        for (i, atom) in atoms.enumerated() where !atom.isHetAtom {
+            let key = "\(atom.chainID)_\(atom.residueSeq)"
+            if byResidue[key] == nil {
+                byResidue[key] = Residue(
+                    seq: atom.residueSeq,
+                    name: atom.residueName.trimmingCharacters(in: .whitespaces),
+                    atoms: [])
+            }
+            byResidue[key]?.atoms.append((i, atom))
+        }
+
+        func named(_ residue: Residue, _ name: String) -> (Int, Atom)? {
+            residue.atoms.first { $0.1.name.trimmingCharacters(in: .whitespaces) == name }
+        }
+
+        var planes: [AmidePlane] = []
+
+        // Peptide link: C and O of residue i with N of residue i+1. The N, C
+        // and O of a single residue are N–CA–C=O and are not an amide group.
+        var chains: [String: [Residue]] = [:]
+        for (key, residue) in byResidue {
+            let chain = String(key.prefix(while: { $0 != "_" }))
+            chains[chain, default: []].append(residue)
+        }
+        for (_, residues) in chains {
+            let ordered = residues.sorted { $0.seq < $1.seq }
+            for i in 0..<ordered.count where i + 1 < ordered.count {
+                guard ordered[i + 1].seq == ordered[i].seq + 1,
+                      let c = named(ordered[i], "C"),
+                      let o = named(ordered[i], "O"),
+                      let n = named(ordered[i + 1], "N") else { continue }
+                if let p = amidePlane(c: c.1.position, o: o.1.position,
+                                      n: n.1.position, atomIndex: c.0) {
+                    planes.append(p)
+                }
+            }
+        }
+
+        // Sidechain carboxamides
+        for (_, residue) in byResidue {
+            let names: (String, String, String)
+            switch residue.name {
+            case "ASN": names = ("CG", "OD1", "ND2")
+            case "GLN": names = ("CD", "OE1", "NE2")
+            default: continue
+            }
+            guard let c = named(residue, names.0), let o = named(residue, names.1),
+                  let n = named(residue, names.2) else { continue }
+            if let p = amidePlane(c: c.1.position, o: o.1.position,
+                                  n: n.1.position, atomIndex: c.0) {
+                planes.append(p)
+            }
+        }
+        return planes
+    }
+
+    /// Protein sulfur σ-holes (Met SD → CG/CE, Cys SG → CB).
+    static func detectSulfurSigmaHoles(atoms: [Atom]) -> [SulfurSigmaHole] {
+        var byResidue: [String: [Atom]] = [:]
+        for atom in atoms {
+            byResidue["\(atom.chainID)_\(atom.residueSeq)", default: []].append(atom)
+        }
+        var holes: [SulfurSigmaHole] = []
+        for (i, atom) in atoms.enumerated() {
+            let name = atom.name.trimmingCharacters(in: .whitespaces)
+            let resName = atom.residueName.trimmingCharacters(in: .whitespaces)
+            let carbonNames: [String]
+            if resName == "MET" && name == "SD" { carbonNames = ["CG", "CE"] }
+            else if resName == "CYS" && name == "SG" { carbonNames = ["CB"] }
+            else { continue }
+            let sameRes = byResidue["\(atom.chainID)_\(atom.residueSeq)"] ?? []
+            for cName in carbonNames {
+                guard let c = sameRes.first(where: {
+                    $0.name.trimmingCharacters(in: .whitespaces) == cName
+                }) else { continue }
+                let dir = c.position - atom.position
+                let len = simd_length(dir)
+                guard len > 1e-6 else { continue }
+                holes.append(SulfurSigmaHole(position: atom.position,
+                                             bondedCDir: dir / len, atomIndex: i))
+            }
+        }
+        return holes
+    }
+
+    /// Cation sites, matching `DockingEngine.prepareDrusinaBuffers`: Lys NZ,
+    /// Arg NH1/NH2, anything with a positive formal charge, and metal ions.
+    static let cationAtomNames: Set<String> = ["NZ", "NH1", "NH2"]
+    static let cationMetals: Set<Element> = [.Zn, .Fe, .Mg, .Ca, .Mn, .Cu, .Co, .Ni]
+
+    static func isCationSite(_ atom: Atom) -> Bool {
+        cationAtomNames.contains(atom.name.trimmingCharacters(in: .whitespaces))
+            || atom.formalCharge > 0
+            || cationMetals.contains(atom.element)
+    }
+
+    /// Halogen element code matching `HalogenBondInfo.elementType`
+    /// (0 = F, 1 = Cl, 2 = Br, 3 = I); nil for every other element.
+    static func halogenElementType(_ element: Element) -> Int? {
+        switch element {
+        case .F:  return 0
+        case .Cl: return 1
+        case .Br: return 2
+        case .I:  return 3
+        default:  return nil
+        }
+    }
+
+    /// Element-specific halogen bond optimum (Scholfield 2013 CSD statistics).
+    static func halogenOptimalDistance(_ elementType: Int) -> Float {
+        switch elementType {
+        case 2:  return kICHalogenDistOptBr
+        case 3:  return kICHalogenDistOptI
+        default: return kICHalogenDistOptCl
+        }
+    }
+
+    // MARK: - Spatial Index
+
+    /// Uniform-grid neighbour index. Shared by hydrophobic-carbon typing, the
+    /// CPU contact fallback and the directional interaction search, so the
+    /// protein is bucketed once per pose instead of once per interaction type.
+    struct NeighborGrid {
+        private struct Key: Hashable { let x, y, z: Int }
+        private let cellSize: Float
+        private let cells: [Key: [Int]]
+
+        init(positions: [SIMD3<Float>], cellSize: Float) {
+            self.cellSize = cellSize
+            let inv = 1.0 / cellSize
+            var cells: [Key: [Int]] = [:]
+            cells.reserveCapacity(positions.count / 3 + 1)
+            for (i, p) in positions.enumerated() {
+                let key = Key(x: Int(floor(p.x * inv)), y: Int(floor(p.y * inv)),
+                              z: Int(floor(p.z * inv)))
+                cells[key, default: []].append(i)
+            }
+            self.cells = cells
+        }
+
+        /// Indices in the 27 cells around `point`. Complete for radii <= cellSize.
+        func neighbors(of point: SIMD3<Float>) -> [Int] {
+            let inv = 1.0 / cellSize
+            let cx = Int(floor(point.x * inv)), cy = Int(floor(point.y * inv))
+            let cz = Int(floor(point.z * inv))
+            var out: [Int] = []
+            for dx in -1...1 { for dy in -1...1 { for dz in -1...1 {
+                if let bucket = cells[Key(x: cx + dx, y: cy + dy, z: cz + dz)] {
+                    out.append(contentsOf: bucket)
+                }
+            }}}
+            return out
+        }
+    }
+
+    /// Vina types a carbon bonded to N or O as C_P (polar) and every other
+    /// carbon as C_H, and only C_H carries the hydrophobic term — so only C_H
+    /// may be drawn as a hydrophobic contact. Sulfur is typed S_P and is not
+    /// hydrophobic under Vina either.
+    private static let covalentCNOCutoff: Float = 1.75
+
+    static func hydrophobicCarbonFlags(
+        atoms: [Atom], positions: [SIMD3<Float>], grid: NeighborGrid
+    ) -> [Bool] {
+        atoms.indices.map { i in
+            guard atoms[i].element == .C else { return false }
+            let p = positions[i]
+            for j in grid.neighbors(of: p) where j != i {
+                let e = atoms[j].element
+                guard e == .N || e == .O else { continue }
+                if simd_distance(p, positions[j]) < covalentCNOCutoff { return false }
+            }
+            return true
+        }
+    }
+
+    static func hydrophobicCarbonFlags(atoms: [Atom], bonds: [Bond]) -> [Bool] {
+        var polar = [Bool](repeating: false, count: atoms.count)
+        for bond in bonds {
+            let a = bond.atomIndex1, b = bond.atomIndex2
+            guard a < atoms.count, b < atoms.count else { continue }
+            if atoms[a].element == .C, atoms[b].element == .N || atoms[b].element == .O {
+                polar[a] = true
+            }
+            if atoms[b].element == .C, atoms[a].element == .N || atoms[a].element == .O {
+                polar[b] = true
+            }
+        }
+        return atoms.indices.map { atoms[$0].element == .C && !polar[$0] }
+    }
+
+    /// Carbons covalently bonded to `index`, from the bond graph when the
+    /// caller has one and by distance otherwise.
+    private static func bondedCarbons(
+        of index: Int, atoms: [Atom], bonds: [Bond], positions: [SIMD3<Float>]
+    ) -> [Int] {
+        if !bonds.isEmpty {
+            var out: [Int] = []
+            for bond in bonds {
+                let partner: Int?
+                if bond.atomIndex1 == index { partner = bond.atomIndex2 }
+                else if bond.atomIndex2 == index { partner = bond.atomIndex1 }
+                else { partner = nil }
+                if let p = partner, p < atoms.count, atoms[p].element == .C { out.append(p) }
+            }
+            return out
+        }
+        let p = positions[index]
+        return atoms.indices.filter {
+            $0 != index && atoms[$0].element == .C
+                && simd_distance(p, positions[$0]) < 2.2   // covers C-I at ~2.1 Å
+        }
+    }
+
     // MARK: - Full Interaction Detection
 
     static func detect(
@@ -711,21 +960,44 @@ enum InteractionDetector {
     ) -> [MolecularInteraction] {
         let allowedTypes = scoringMethod.accountedInteractionTypes
         if allowedTypes.isEmpty { return [] }
+        guard !ligandAtoms.isEmpty, !proteinAtoms.isEmpty,
+              ligandPositions.count >= ligandAtoms.count else { return [] }
         var result: [MolecularInteraction] = []
         var idCounter = 0
 
         let positiveResAtoms: Set<String> = ["NZ", "NH1", "NH2", "NE"]
         let negativeResAtoms: Set<String> = ["OD1", "OD2", "OE1", "OE2"]
         let metals: Set<Element> = [.Fe, .Zn, .Ca, .Mg, .Mn, .Cu]
+        let maxHydrophobicPerAtom = Int(kICHydrophobicMaxPerAtom)
 
-        // Donor flags: an atom can DONATE to an H-bond only if it has at
-        // least one attached hydrogen. For ligand atoms we derive this from
-        // the bond graph (bond order sum + formal charge → implicit H count).
-        // For protein atoms we use a residue-name lookup since explicit
-        // bonds are not always available on the Atom struct.
+        // Donor flags: an atom can DONATE to an H-bond only if it actually has
+        // a hydrogen attached. For ligand atoms we derive this from the bond
+        // graph (bond order sum + formal charge → implicit H count). For
+        // protein atoms we use a residue-name lookup, since explicit bonds are
+        // not always available on the Atom struct.
         let ligandHasH: [Bool] = computeLigandHBondDonorFlags(
             atoms: ligandAtoms, bonds: ligandBonds)
         let proteinHasH: [Bool] = proteinAtoms.map(proteinHBondDonorFlag)
+        let proteinIsAcceptor: [Bool] = proteinAtoms.map(proteinHBondAcceptorFlag)
+        let ligandIsAcceptor: [Bool] = computeLigandHBondAcceptorFlags(
+            atoms: ligandAtoms, bonds: ligandBonds)
+
+        let ligPositions = Array(ligandPositions.prefix(ligandAtoms.count))
+        let proteinPositions = proteinAtoms.map(\.position)
+        let grid = NeighborGrid(positions: proteinPositions, cellSize: kICMaxInteractionReach)
+        let proteinHydrophobicC = hydrophobicCarbonFlags(
+            atoms: proteinAtoms, positions: proteinPositions, grid: grid)
+        let ligandHydrophobicC = ligandBonds.isEmpty
+            ? hydrophobicCarbonFlags(
+                atoms: ligandAtoms, positions: ligPositions,
+                grid: NeighborGrid(positions: ligPositions, cellSize: kICMaxInteractionReach))
+            : hydrophobicCarbonFlags(atoms: ligandAtoms, bonds: ligandBonds)
+
+        /// Vina's hydrophobic term covers non-polar carbon and the halogens
+        /// (xsIsHydrophobic: C_H, F_H, Cl_H, Br_H, I_H), and nothing else.
+        func isVinaHydrophobic(_ index: Int, hydrophobicCarbon: [Bool], atoms: [Atom]) -> Bool {
+            hydrophobicCarbon[index] || halogenElementType(atoms[index].element) != nil
+        }
 
         if let gpu = InteractionDetectorGPU.shared,
            let gpuResults = gpu.detect(
@@ -734,6 +1006,12 @@ enum InteractionDetector {
                 proteinAtoms: proteinAtoms,
                 ligandHasH: ligandHasH,
                 proteinHasH: proteinHasH,
+                ligandHydrophobic: ligandAtoms.indices.map {
+                    isVinaHydrophobic($0, hydrophobicCarbon: ligandHydrophobicC, atoms: ligandAtoms)
+                },
+                proteinHydrophobic: proteinAtoms.indices.map {
+                    isVinaHydrophobic($0, hydrophobicCarbon: proteinHydrophobicC, atoms: proteinAtoms)
+                },
                 positiveResAtoms: positiveResAtoms,
                 negativeResAtoms: negativeResAtoms,
                 metals: metals
@@ -751,178 +1029,367 @@ enum InteractionDetector {
                 idCounter += 1
             }
         } else {
-            // CPU fallback with spatial grid (also used when the GPU path fails)
-            var ligandHasStrongInteraction: Set<Int> = []
-            let cellSize: Float = 6.0
-            let invCell: Float = 1.0 / cellSize
-            struct CellKey: Hashable { let x, y, z: Int }
-            var proteinGrid: [CellKey: [Int]] = [:]
-            proteinGrid.reserveCapacity(proteinAtoms.count / 3)
-            for (pi, protAtom) in proteinAtoms.enumerated() {
-                let ck = CellKey(x: Int(floor(protAtom.position.x * invCell)),
-                                 y: Int(floor(protAtom.position.y * invCell)),
-                                 z: Int(floor(protAtom.position.z * invCell)))
-                proteinGrid[ck, default: []].append(pi)
-            }
+            // CPU fallback (also used when the GPU path fails). Same criteria
+            // and same precedence as Metal/InteractionCompute.metal.
+            var hydroCount = [Int](repeating: 0, count: ligandAtoms.count)
 
             for (li, ligAtom) in ligandAtoms.enumerated() {
-                guard li < ligandPositions.count else { continue }
-                let lp = ligandPositions[li]
-                let lcx = Int(floor(lp.x * invCell))
-                let lcy = Int(floor(lp.y * invCell))
-                let lcz = Int(floor(lp.z * invCell))
+                let lp = ligPositions[li]
+                let ligCoord = ligAtom.element == .N || ligAtom.element == .O || ligAtom.element == .S
+                let ligMetal = metals.contains(ligAtom.element)
+                let ligDA = ligAtom.element == .N || ligAtom.element == .O
+                let ligHydro = isVinaHydrophobic(li, hydrophobicCarbon: ligandHydrophobicC,
+                                                 atoms: ligandAtoms)
 
-                for ndx in -1...1 { for ndy in -1...1 { for ndz in -1...1 {
-                let nkey = CellKey(x: lcx + ndx, y: lcy + ndy, z: lcz + ndz)
-                guard let cellIndices = proteinGrid[nkey] else { continue }
-                for pi in cellIndices {
+                for pi in grid.neighbors(of: lp) {
                     let protAtom = proteinAtoms[pi]
                     let d = simd_distance(lp, protAtom.position)
-                    guard d < 6.0 else { continue }
+                    guard d < kICMaxInteractionReach else { continue }
                     let protName = protAtom.name.trimmingCharacters(in: .whitespaces)
+                    var type: MolecularInteraction.InteractionType?
 
-                    if d < 2.8 {
-                        let ligCoord = ligAtom.element == .N || ligAtom.element == .O || ligAtom.element == .S
+                    if d >= kICMetalDistMin && d <= kICMetalDistMax {
                         let protMetal = metals.contains(protAtom.element)
-                        let ligMetal = metals.contains(ligAtom.element)
-                        let protCoord = protAtom.element == .N || protAtom.element == .O || protAtom.element == .S
+                        let protCoord = protAtom.element == .N || protAtom.element == .O
+                            || protAtom.element == .S
                         if (protMetal && ligCoord) || (ligMetal && protCoord) {
-                            result.append(MolecularInteraction(
-                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                                type: .metalCoord, distance: d,
-                                ligandPosition: lp, proteinPosition: protAtom.position))
-                            idCounter += 1; ligandHasStrongInteraction.insert(li); continue
+                            type = .metalCoord
                         }
                     }
-                    if d < 4.0 {
+                    if type == nil && d <= kICSaltBridgeDistMax {
                         let protPositive = positiveResAtoms.contains(protName)
                         let protNegative = negativeResAtoms.contains(protName)
-                        if (protPositive && ligAtom.formalCharge < 0) || (protNegative && ligAtom.formalCharge > 0) {
-                            result.append(MolecularInteraction(
-                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                                type: .saltBridge, distance: d,
-                                ligandPosition: lp, proteinPosition: protAtom.position))
-                            idCounter += 1; ligandHasStrongInteraction.insert(li); continue
+                        if (protPositive && ligAtom.formalCharge < 0)
+                            || (protNegative && ligAtom.formalCharge > 0) {
+                            type = .saltBridge
                         }
                     }
-                    if d >= 2.2 && d <= 3.5 {
-                        let ligDA = ligAtom.element == .N || ligAtom.element == .O
+                    if type == nil && d >= kICHBondDistMin && d <= kICHBondDistMax {
                         let proDA = protAtom.element == .N || protAtom.element == .O
-                        // At least one side must carry an explicit/implicit H
-                        // to actually donate. Two pure acceptors (e.g. neutral
-                        // tertiary amine + deprotonated carboxylate) cannot
-                        // form an H-bond.
-                        let donor = (li < ligandHasH.count && ligandHasH[li])
-                                 || (pi < proteinHasH.count && proteinHasH[pi])
-                        if ligDA && proDA && donor {
-                            result.append(MolecularInteraction(
-                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                                type: .hbond, distance: d,
-                                ligandPosition: lp, proteinPosition: protAtom.position))
-                            idCounter += 1; ligandHasStrongInteraction.insert(li); continue
+                        if ligDA && proDA && (ligandHasH[li] || proteinHasH[pi]) {
+                            type = .hbond
                         }
                     }
-                    if d >= 2.5 && d <= 3.5 {
-                        let halogen = ligAtom.element == .F || ligAtom.element == .Cl || ligAtom.element == .Br
-                        let acceptor = protAtom.element == .N || protAtom.element == .O
-                        if halogen && acceptor {
-                            result.append(MolecularInteraction(
-                                id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                                type: .halogen, distance: d,
-                                ligandPosition: lp, proteinPosition: protAtom.position))
-                            idCounter += 1; ligandHasStrongInteraction.insert(li)
-                        }
+                    if type == nil && d >= kICHydrophobicDistMin && d <= kICHydrophobicDistMax
+                        && hydroCount[li] < maxHydrophobicPerAtom
+                        && ligHydro
+                        && isVinaHydrophobic(pi, hydrophobicCarbon: proteinHydrophobicC,
+                                             atoms: proteinAtoms) {
+                        type = .hydrophobic
+                        hydroCount[li] += 1
                     }
-                }
-                }}} // spatial grid
-            }
 
-            // CPU hydrophobic contacts
-            let invCellH = invCell
-            var hydroCount: [Int: Int] = [:]
-            for (li, ligAtom) in ligandAtoms.enumerated() {
-                guard li < ligandPositions.count, !ligandHasStrongInteraction.contains(li) else { continue }
-                guard ligAtom.element == .C || ligAtom.element == .S else { continue }
-                let lp = ligandPositions[li]
-                let cx = Int(floor(lp.x * invCellH)), cy = Int(floor(lp.y * invCellH)), cz = Int(floor(lp.z * invCellH))
-                for ndx in -1...1 { for ndy in -1...1 { for ndz in -1...1 {
-                guard (hydroCount[li, default: 0]) < 2 else { continue }
-                let hk = CellKey(x: cx + ndx, y: cy + ndy, z: cz + ndz)
-                guard let hci = proteinGrid[hk] else { continue }
-                for pi in hci {
-                    let pa = proteinAtoms[pi]
-                    guard pa.element == .C || pa.element == .S else { continue }
-                    let d = simd_distance(lp, pa.position)
-                    guard d >= 3.4 && d <= 4.0, (hydroCount[li, default: 0]) < 2 else { continue }
+                    guard let t = type else { continue }
                     result.append(MolecularInteraction(
                         id: idCounter, ligandAtomIndex: li, proteinAtomIndex: pi,
-                        type: .hydrophobic, distance: d,
-                        ligandPosition: lp, proteinPosition: pa.position))
-                    idCounter += 1; hydroCount[li, default: 0] += 1
+                        type: t, distance: d,
+                        ligandPosition: lp, proteinPosition: protAtom.position))
+                    idCounter += 1
                 }
-                }}}
             }
         }
 
-        // π-π stacking (always CPU — few rings)
+        // ------------------------------------------------------------------
+        // Directional interactions — always CPU.
+        //
+        // These need a ring plane, an amide plane or a σ-hole axis, none of
+        // which the GPU detector's flat atom buffer carries. All criteria come
+        // from Metal/InteractionCriteria.h, so they are identical to the ones
+        // Metal/DockingScoring.metal rewards.
+        //
+        // Where the geometry physically admits a single partner — a σ-hole is
+        // one lobe, a ring face takes one stacking partner — only the best
+        // partner is emitted, matching the scoring kernel's per-site cap.
+        // ------------------------------------------------------------------
         let proteinRings = detectAromaticRings(atoms: proteinAtoms)
         let ligandRings = detectAromaticRings(
             atoms: ligandAtoms, positions: ligandPositions,
             bonds: ligandBonds.isEmpty ? nil : ligandBonds
         )
+        let ligandRingMembers = Set(ligandRings.flatMap(\.atomIndices))
 
+        func emit(_ type: MolecularInteraction.InteractionType,
+                  ligandAtomIndex: Int, proteinAtomIndex: Int, distance: Float,
+                  ligandPosition: SIMD3<Float>, proteinPosition: SIMD3<Float>) {
+            result.append(MolecularInteraction(
+                id: idCounter, ligandAtomIndex: ligandAtomIndex,
+                proteinAtomIndex: proteinAtomIndex, type: type, distance: distance,
+                ligandPosition: ligandPosition, proteinPosition: proteinPosition))
+            idCounter += 1
+        }
+
+        /// Lateral displacement of `other` from the axis through `origin` along
+        /// `normal` — the stacking offset (Salentin 2015). Mirrors
+        /// `drusinaLateralOffset`.
+        func lateralOffset(_ origin: SIMD3<Float>, _ normal: SIMD3<Float>,
+                           _ other: SIMD3<Float>) -> Float {
+            let delta = other - origin
+            let axial = simd_dot(delta, normal)
+            return max(simd_length_squared(delta) - axial * axial, 0).squareRoot()
+        }
+
+        /// Verdonk 2003 ramp, mirroring `drusinaRamp`. Used here only to rank
+        /// candidate partners for a site that can take just one.
+        func ramp(_ x: Float, _ inner: Float, _ outer: Float) -> Float {
+            let ax = abs(x)
+            if ax <= inner { return 1 }
+            if ax >= outer { return 0 }
+            return (outer - ax) / (outer - inner)
+        }
+
+        /// Angular gate: 0 at the criterion threshold, 1 at perfect alignment.
+        /// Linear where the kernel's `drusinaAngleGate` is cubic — it is used
+        /// only to rank candidate partners, and both are monotone in the same
+        /// variable, so they pick the same winner.
+        func angleGate(_ value: Float, _ threshold: Float, _ ideal: Float) -> Float {
+            min(max((value - threshold) / (ideal - threshold), 0), 1)
+        }
+
+        /// One slot per ring face (true = along +normal, false = along -normal).
+        struct BestPartner {
+            var score: Float = 0
+            var ligandAtomIndex = 0
+            var proteinAtomIndex = 0
+            var ligandPosition = SIMD3<Float>.zero
+            var proteinPosition = SIMD3<Float>.zero
+            var distance: Float = 0
+
+            mutating func offer(_ score: Float, ligandAtomIndex: Int, proteinAtomIndex: Int,
+                                ligandPosition: SIMD3<Float>, proteinPosition: SIMD3<Float>,
+                                distance: Float) {
+                guard score > self.score else { return }
+                self = BestPartner(score: score, ligandAtomIndex: ligandAtomIndex,
+                                   proteinAtomIndex: proteinAtomIndex,
+                                   ligandPosition: ligandPosition,
+                                   proteinPosition: proteinPosition, distance: distance)
+            }
+        }
+
+        func emitBest(_ type: MolecularInteraction.InteractionType, _ slots: [BestPartner]) {
+            for slot in slots where slot.score > 0 {
+                emit(type, ligandAtomIndex: slot.ligandAtomIndex,
+                     proteinAtomIndex: slot.proteinAtomIndex, distance: slot.distance,
+                     ligandPosition: slot.ligandPosition, proteinPosition: slot.proteinPosition)
+            }
+        }
+
+        // ---- π-π stacking: best face-to-face per ring face + best T-shaped ----
+        // Bissantz 2010, McGaughey 1998; offset cap from Salentin 2015.
         for ligRing in ligandRings {
+            var faceUp = BestPartner(), faceDown = BestPartner(), edge = BestPartner()
+            let ligAtom = ligRing.atomIndices.first ?? 0
             for protRing in proteinRings {
                 let d = simd_distance(ligRing.centroid, protRing.centroid)
-                guard d >= 3.3 && d <= 5.5 else { continue }
+                guard d >= kICPiStackDistMin, d <= kICPiStackEdgeDistMax else { continue }
                 let dotN = abs(simd_dot(ligRing.normal, protRing.normal))
-                let isFaceToFace = dotN > 0.85 && d < 4.2
-                let isEdgeToFace = dotN < 0.5 && d >= 4.0 && d <= 5.5
-                if isFaceToFace || isEdgeToFace {
-                    result.append(MolecularInteraction(
-                        id: idCounter, ligandAtomIndex: ligRing.atomIndices.first ?? 0,
-                        proteinAtomIndex: protRing.atomIndices.first ?? 0,
-                        type: .piStack, distance: d,
-                        ligandPosition: ligRing.centroid, proteinPosition: protRing.centroid))
-                    idCounter += 1
+                let protAtom = protRing.atomIndices.first ?? 0
+
+                if dotN >= kICPiStackFaceCosMin, d <= kICPiStackFaceDistMax,
+                   lateralOffset(ligRing.centroid, ligRing.normal, protRing.centroid)
+                        <= kICPiStackOffsetMax {
+                    let score = angleGate(dotN, kICPiStackFaceCosMin, 1)
+                        * ramp(d - kICPiStackFaceDistOpt,
+                               kICPiStackFaceRampInner, kICPiStackFaceRampOuter)
+                    let above = simd_dot(protRing.centroid - ligRing.centroid, ligRing.normal) >= 0
+                    if above {
+                        faceUp.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: protAtom,
+                                     ligandPosition: ligRing.centroid,
+                                     proteinPosition: protRing.centroid, distance: d)
+                    } else {
+                        faceDown.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: protAtom,
+                                       ligandPosition: ligRing.centroid,
+                                       proteinPosition: protRing.centroid, distance: d)
+                    }
+                } else if dotN <= kICPiStackEdgeCosMax {
+                    let score = angleGate(dotN, kICPiStackEdgeCosMax, 0)
+                        * ramp(d - kICPiStackEdgeDistOpt,
+                               kICPiStackEdgeRampInner, kICPiStackEdgeRampOuter)
+                    edge.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: protAtom,
+                               ligandPosition: ligRing.centroid,
+                               proteinPosition: protRing.centroid, distance: d)
                 }
+            }
+            emitBest(.piStack, [faceUp, faceDown, edge])
+        }
+
+        // ---- π-cation: ligand ring ↔ protein cation (best per ring face) ----
+        // Gallivan 1999, Bissantz 2010.
+        for ligRing in ligandRings {
+            var up = BestPartner(), down = BestPartner()
+            let ligAtom = ligRing.atomIndices.first ?? 0
+            for (pi, protAtom) in proteinAtoms.enumerated() where isCationSite(protAtom) {
+                let d = simd_distance(ligRing.centroid, protAtom.position)
+                guard d <= kICPiCationDistMax,
+                      lateralOffset(ligRing.centroid, ligRing.normal, protAtom.position)
+                        <= kICPiCationOffsetMax else { continue }
+                let cosA = abs(simd_dot(simd_normalize(protAtom.position - ligRing.centroid),
+                                        ligRing.normal))
+                guard cosA >= kICPiCationCosMin else { continue }
+                let score = angleGate(cosA, kICPiCationCosMin, 1)
+                    * ramp(d - kICPiCationDistOpt, kICPiCationRampInner, kICPiCationRampOuter)
+                let above = simd_dot(protAtom.position - ligRing.centroid, ligRing.normal) >= 0
+                if above {
+                    up.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: pi,
+                             ligandPosition: ligRing.centroid,
+                             proteinPosition: protAtom.position, distance: d)
+                } else {
+                    down.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: pi,
+                               ligandPosition: ligRing.centroid,
+                               proteinPosition: protAtom.position, distance: d)
+                }
+            }
+            emitBest(.piCation, [up, down])
+        }
+
+        // ---- π-cation: protein ring ↔ ligand cation (best per ring) ----
+        for protRing in proteinRings {
+            var best = BestPartner()
+            let protAtom = protRing.atomIndices.first ?? 0
+            for (li, ligAtom) in ligandAtoms.enumerated() where ligAtom.formalCharge > 0 {
+                let lp = ligPositions[li]
+                let d = simd_distance(protRing.centroid, lp)
+                guard d <= kICPiCationDistMax,
+                      lateralOffset(protRing.centroid, protRing.normal, lp)
+                        <= kICPiCationOffsetMax else { continue }
+                let cosA = abs(simd_dot(simd_normalize(lp - protRing.centroid), protRing.normal))
+                guard cosA >= kICPiCationCosMin else { continue }
+                let score = angleGate(cosA, kICPiCationCosMin, 1)
+                    * ramp(d - kICPiCationDistOpt, kICPiCationRampInner, kICPiCationRampOuter)
+                best.offer(score, ligandAtomIndex: li, proteinAtomIndex: protAtom,
+                           ligandPosition: lp, proteinPosition: protRing.centroid, distance: d)
+            }
+            emitBest(.piCation, [best])
+        }
+
+        // ---- CH-π: ligand aliphatic C-H ↔ protein aromatic ring ----
+        // Nishio 2011, Brandl 2001. The heavy-atom carbon stands in for the
+        // C-H vector; one CH per ring face, as in the kernel.
+        for protRing in proteinRings {
+            var up = BestPartner(), down = BestPartner()
+            let protAtom = protRing.atomIndices.first ?? 0
+            for (li, ligAtom) in ligandAtoms.enumerated() {
+                guard ligAtom.element == .C, ligandHydrophobicC[li],
+                      !ligandRingMembers.contains(li) else { continue }
+                let lp = ligPositions[li]
+                let d = simd_distance(lp, protRing.centroid)
+                guard d >= kICCHPiDistMin, d <= kICCHPiDistMax,
+                      lateralOffset(protRing.centroid, protRing.normal, lp)
+                        <= kICCHPiOffsetMax else { continue }
+                let cosA = abs(simd_dot(simd_normalize(lp - protRing.centroid), protRing.normal))
+                guard cosA >= kICCHPiCosMin else { continue }
+                let score = angleGate(cosA, kICCHPiCosMin, 1)
+                    * ramp(d - kICCHPiDistOpt, kICCHPiRampInner, kICCHPiRampOuter)
+                let above = simd_dot(lp - protRing.centroid, protRing.normal) >= 0
+                if above {
+                    up.offer(score, ligandAtomIndex: li, proteinAtomIndex: protAtom,
+                             ligandPosition: lp, proteinPosition: protRing.centroid, distance: d)
+                } else {
+                    down.offer(score, ligandAtomIndex: li, proteinAtomIndex: protAtom,
+                               ligandPosition: lp, proteinPosition: protRing.centroid, distance: d)
+                }
+            }
+            emitBest(.chPi, [up, down])
+        }
+
+        // ---- Amide-π: protein amide plane ↔ ligand aromatic ring ----
+        // Harder 2013, Bissantz 2010. Parallel stacking only; one amide per
+        // ring face, as in the kernel.
+        if !ligandRings.isEmpty {
+            let amides = detectAmidePlanes(atoms: proteinAtoms)
+            for ligRing in ligandRings {
+                var up = BestPartner(), down = BestPartner()
+                let ligAtom = ligRing.atomIndices.first ?? 0
+                for amide in amides {
+                    let d = simd_distance(ligRing.centroid, amide.centroid)
+                    guard d >= kICAmidePiDistMin, d <= kICAmidePiDistMax else { continue }
+                    let dotN = abs(simd_dot(ligRing.normal, amide.normal))
+                    guard dotN >= kICAmidePiCosMin,
+                          lateralOffset(ligRing.centroid, ligRing.normal, amide.centroid)
+                            <= kICAmidePiOffsetMax else { continue }
+                    let score = angleGate(dotN, kICAmidePiCosMin, 1)
+                        * ramp(d - kICAmidePiDistOpt, kICAmidePiRampInner, kICAmidePiRampOuter)
+                    let above = simd_dot(amide.centroid - ligRing.centroid, ligRing.normal) >= 0
+                    if above {
+                        up.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: amide.atomIndex,
+                                 ligandPosition: ligRing.centroid,
+                                 proteinPosition: amide.centroid, distance: d)
+                    } else {
+                        down.offer(score, ligandAtomIndex: ligAtom, proteinAtomIndex: amide.atomIndex,
+                                   ligandPosition: ligRing.centroid,
+                                   proteinPosition: amide.centroid, distance: d)
+                    }
+                }
+                emitBest(.amideStack, [up, down])
             }
         }
 
-        // π-cation (always CPU — few rings)
-        for ligRing in ligandRings {
-            for (pi, protAtom) in proteinAtoms.enumerated() {
-                let protName = protAtom.name.trimmingCharacters(in: .whitespaces)
-                guard positiveResAtoms.contains(protName) || protAtom.formalCharge > 0 else { continue }
-                let d = simd_distance(ligRing.centroid, protAtom.position)
-                guard d < 5.0 else { continue }
-                let toAtom = simd_normalize(protAtom.position - ligRing.centroid)
-                if abs(simd_dot(toAtom, ligRing.normal)) > 0.6 {
-                    result.append(MolecularInteraction(
-                        id: idCounter, ligandAtomIndex: ligRing.atomIndices.first ?? 0,
-                        proteinAtomIndex: pi, type: .piCation, distance: d,
-                        ligandPosition: ligRing.centroid, proteinPosition: protAtom.position))
-                    idCounter += 1
+        // ---- Halogen bonds: ligand C-X ... protein O/N σ-hole ----
+        // Auffinger 2004, Scholfield 2013. Fluorine has no usable σ-hole and is
+        // excluded, matching the kernel (which skips elementType 0). One
+        // acceptor per halogen: the σ-hole is a single lobe along the C-X axis.
+        for (li, ligAtom) in ligandAtoms.enumerated() {
+            guard let elementType = halogenElementType(ligAtom.element), elementType != 0,
+                  let ci = bondedCarbons(of: li, atoms: ligandAtoms, bonds: ligandBonds,
+                                         positions: ligPositions).first else { continue }
+            let xPos = ligPositions[li]
+            let xToC = simd_normalize(ligPositions[ci] - xPos)
+            let optDist = halogenOptimalDistance(elementType)
+            var best = BestPartner()
+            for pi in grid.neighbors(of: xPos) where proteinIsAcceptor[pi] {
+                let pPos = proteinPositions[pi]
+                let d = simd_distance(xPos, pPos)
+                guard d >= kICHalogenDistMin, d <= kICHalogenDistMax else { continue }
+                let cosTheta = simd_dot(xToC, simd_normalize(pPos - xPos))
+                guard cosTheta <= kICHalogenCosMax else { continue }
+                let score = angleGate(cosTheta, kICHalogenCosMax, -1)
+                    * ramp(d - optDist, kICHalogenRampInner, kICHalogenRampOuter)
+                best.offer(score, ligandAtomIndex: li, proteinAtomIndex: pi,
+                           ligandPosition: xPos, proteinPosition: pPos, distance: d)
+            }
+            emitBest(.halogen, [best])
+        }
+
+        // ---- Chalcogen bonds: ligand C-S ... protein O/N σ-hole ----
+        // Beno 2015, Pascoe 2017. One acceptor per S-C σ-hole; a thioether has
+        // two C-S bonds and therefore two independent σ-holes.
+        for (li, ligAtom) in ligandAtoms.enumerated() where ligAtom.element == .S {
+            let sPos = ligPositions[li]
+            for ci in bondedCarbons(of: li, atoms: ligandAtoms, bonds: ligandBonds,
+                                    positions: ligPositions) {
+                let sToC = simd_normalize(ligPositions[ci] - sPos)
+                var best = BestPartner()
+                for pi in grid.neighbors(of: sPos) where proteinIsAcceptor[pi] {
+                    let pPos = proteinPositions[pi]
+                    let d = simd_distance(sPos, pPos)
+                    guard d >= kICChalcogenDistMin, d <= kICChalcogenDistMax else { continue }
+                    let cosTheta = simd_dot(sToC, simd_normalize(pPos - sPos))
+                    guard cosTheta <= kICChalcogenCosMax else { continue }
+                    let score = angleGate(cosTheta, kICChalcogenCosMax, -1)
+                        * ramp(d - kICChalcogenDistOpt,
+                               kICChalcogenRampInner, kICChalcogenRampOuter)
+                    best.offer(score, ligandAtomIndex: li, proteinAtomIndex: pi,
+                               ligandPosition: sPos, proteinPosition: pPos, distance: d)
                 }
+                emitBest(.chalcogen, [best])
             }
         }
-        for protRing in proteinRings {
-            for (li, ligAtom) in ligandAtoms.enumerated() {
-                guard li < ligandPositions.count else { continue }
-                guard ligAtom.formalCharge > 0 else { continue }
-                let lp = ligandPositions[li]
-                let d = simd_distance(protRing.centroid, lp)
-                guard d < 5.0 else { continue }
-                let toAtom = simd_normalize(lp - protRing.centroid)
-                if abs(simd_dot(toAtom, protRing.normal)) > 0.6 {
-                    result.append(MolecularInteraction(
-                        id: idCounter, ligandAtomIndex: li,
-                        proteinAtomIndex: protRing.atomIndices.first ?? 0,
-                        type: .piCation, distance: d,
-                        ligandPosition: lp, proteinPosition: protRing.centroid))
-                    idCounter += 1
-                }
+
+        // ---- Chalcogen bonds: protein Met/Cys S ... ligand O/N σ-hole ----
+        for hole in detectSulfurSigmaHoles(atoms: proteinAtoms) {
+            var best = BestPartner()
+            for li in ligandAtoms.indices where ligandIsAcceptor[li] {
+                let lp = ligPositions[li]
+                let d = simd_distance(lp, hole.position)
+                guard d >= kICChalcogenDistMin, d <= kICChalcogenDistMax else { continue }
+                let cosTheta = simd_dot(hole.bondedCDir, simd_normalize(lp - hole.position))
+                guard cosTheta <= kICChalcogenCosMax else { continue }
+                let score = angleGate(cosTheta, kICChalcogenCosMax, -1)
+                    * ramp(d - kICChalcogenDistOpt,
+                           kICChalcogenRampInner, kICChalcogenRampOuter)
+                best.offer(score, ligandAtomIndex: li, proteinAtomIndex: hole.atomIndex,
+                           ligandPosition: lp, proteinPosition: hole.position, distance: d)
             }
+            emitBest(.chalcogen, [best])
         }
 
         if allowedTypes.count < MolecularInteraction.InteractionType.allCases.count {
@@ -963,8 +1430,14 @@ final class InteractionDetectorGPU {
         self.pipeline = pipeline
     }
 
+    /// `IDET_FLAG_C` means "hydrophobic under Vina" (`xsIsHydrophobic`: C_H and
+    /// the halogens), not "element is carbon". The kernel's hydrophobic test
+    /// reads that one flag, so a polar carbon (bonded to N or O, Vina type
+    /// C_P) and sulfur (S_P) must not carry it — Vina scores no hydrophobic
+    /// term for either, and the detector may not draw one.
     private func atomFlags(for atom: Atom,
                            hasHBondDonor: Bool,
+                           isHydrophobic: Bool,
                            positiveResAtoms: Set<String>,
                            negativeResAtoms: Set<String>,
                            metals: Set<Element>) -> UInt32 {
@@ -973,12 +1446,9 @@ final class InteractionDetectorGPU {
         case .N:  flags |= UInt32(IDET_FLAG_N)
         case .O:  flags |= UInt32(IDET_FLAG_O)
         case .S:  flags |= UInt32(IDET_FLAG_S)
-        case .C:  flags |= UInt32(IDET_FLAG_C)
-        case .F:  flags |= UInt32(IDET_FLAG_F) | UInt32(IDET_FLAG_HALOGEN)
-        case .Cl: flags |= UInt32(IDET_FLAG_CL) | UInt32(IDET_FLAG_HALOGEN)
-        case .Br: flags |= UInt32(IDET_FLAG_BR) | UInt32(IDET_FLAG_HALOGEN)
         default:  break
         }
+        if isHydrophobic { flags |= UInt32(IDET_FLAG_C) }
         if metals.contains(atom.element) { flags |= UInt32(IDET_FLAG_METAL) }
         let name = atom.name.trimmingCharacters(in: .whitespaces)
         if positiveResAtoms.contains(name) { flags |= UInt32(IDET_FLAG_POS_RES) }
@@ -993,6 +1463,8 @@ final class InteractionDetectorGPU {
         proteinAtoms: [Atom],
         ligandHasH: [Bool],
         proteinHasH: [Bool],
+        ligandHydrophobic: [Bool],
+        proteinHydrophobic: [Bool],
         positiveResAtoms: Set<String>,
         negativeResAtoms: Set<String>,
         metals: Set<Element>
@@ -1006,6 +1478,7 @@ final class InteractionDetectorGPU {
                 position: atom.position,
                 flags: atomFlags(for: atom,
                                  hasHBondDonor: i < proteinHasH.count && proteinHasH[i],
+                                 isHydrophobic: i < proteinHydrophobic.count && proteinHydrophobic[i],
                                  positiveResAtoms: positiveResAtoms,
                                  negativeResAtoms: negativeResAtoms, metals: metals),
                 formalCharge: Int32(atom.formalCharge),
@@ -1018,6 +1491,7 @@ final class InteractionDetectorGPU {
                 position: atom.position,
                 flags: atomFlags(for: atom,
                                  hasHBondDonor: i < ligandHasH.count && ligandHasH[i],
+                                 isHydrophobic: i < ligandHydrophobic.count && ligandHydrophobic[i],
                                  positiveResAtoms: positiveResAtoms,
                                  negativeResAtoms: negativeResAtoms, metals: metals),
                 formalCharge: Int32(atom.formalCharge),

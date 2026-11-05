@@ -982,24 +982,41 @@ final class DockingEngine {
             let key = "\(atom.chainID)_\(atom.residueSeq)"
             residueAtoms[key, default: []].append(atom)
         }
-        for (_, atoms) in residueAtoms {
-            let bbC = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "C" && !$0.isHetAtom }
-            let bbO = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "O" && !$0.isHetAtom }
-            let bbN = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "N" && !$0.isHetAtom }
-            guard let c = bbC, let o = bbO, let n = bbN else { continue }
+        // Peptide link: C and O of residue i with N of residue i+1. A single residue's
+        // N, C and O are N–CA–C=O, not an amide group — taking all three from one residue
+        // spans CA and yields a plane unrelated to the peptide bond. Matches
+        // InteractionDetector.detectAmidePlanes.
+        var residuesByChain: [String: [Int: [Atom]]] = [:]
+        for atom in proteinAtoms where !atom.isHetAtom {
+            residuesByChain[atom.chainID, default: [:]][atom.residueSeq, default: []].append(atom)
+        }
+        func backboneAtom(_ atoms: [Atom], _ name: String) -> Atom? {
+            atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == name }
+        }
+        for (_, residues) in residuesByChain.sorted(by: { $0.key < $1.key }) {
+            for seq in residues.keys.sorted() {
+                // Consecutive numbering only: a gap is a chain break with no peptide bond.
+                guard let current = residues[seq], let next = residues[seq + 1],
+                      let c = backboneAtom(current, "C"),
+                      let o = backboneAtom(current, "O"),
+                      let n = backboneAtom(next, "N") else { continue }
 
-            let centroid = (c.position + o.position + n.position) / 3.0
-            let v1 = o.position - c.position
-            let v2 = n.position - c.position
-            var normal = simd_cross(v1, v2)
-            let nLen = simd_length(normal)
-            guard nLen > 1e-6 else { continue }
-            normal /= nLen
+                let centroid = (c.position + o.position + n.position) / 3.0
+                let v1 = o.position - c.position
+                let v2 = n.position - c.position
+                var normal = simd_cross(v1, v2)
+                let nLen = simd_length(normal)
+                guard nLen > 1e-6 else { continue }
+                normal /= nLen
 
-            amides.append(ProteinAmideGPU(centroid: centroid, _pad0: 0, normal: normal, _pad1: 0))
+                amides.append(ProteinAmideGPU(centroid: centroid, _pad0: 0, normal: normal, _pad1: 0))
+            }
         }
         // Sidechain amides (Asn, Gln)
-        for (_, atoms) in residueAtoms {
+        // Sorted: Swift seeds Dictionary hashing per process, so an unordered iteration
+        // builds this buffer in a different order on every launch, which changes the
+        // float accumulation order downstream and makes a seeded run irreproducible.
+        for (_, atoms) in residueAtoms.sorted(by: { $0.key < $1.key }) {
             let resName = atoms.first?.residueName.trimmingCharacters(in: .whitespaces) ?? ""
             if resName == "ASN" {
                 let cg = atoms.first { $0.name.trimmingCharacters(in: .whitespaces) == "CG" }
@@ -1046,7 +1063,7 @@ final class DockingEngine {
         }
         let allPositions = proteinAtoms.map { $0.position }
 
-        for (_, atoms) in residueAtomsSB {
+        for (_, atoms) in residueAtomsSB.sorted(by: { $0.key < $1.key }) {
             let resName = atoms.first?.residueName.trimmingCharacters(in: .whitespaces) ?? ""
 
             if resName == "ARG" {
@@ -1286,7 +1303,7 @@ final class DockingEngine {
             let key = "\(atom.chainID)_\(atom.residueSeq)"
             residueAtomsHB[key, default: []].append(atom)
         }
-        for (_, atoms) in residueAtomsHB {
+        for (_, atoms) in residueAtomsHB.sorted(by: { $0.key < $1.key }) {
             // Skip residues far from the pocket
             let resCentroid = atoms.reduce(SIMD3<Float>.zero) { $0 + $1.position } / Float(atoms.count)
             guard simd_distance_squared(resCentroid, centroid) < hbondPocketRadiusSq else { continue }
@@ -1400,29 +1417,37 @@ final class DockingEngine {
             numLigandRings: UInt32(ligRings.count),
             numProteinCations: UInt32(max(cations.count - (cations.first == .zero ? 1 : 0), 0)),
             numHalogens: UInt32(halogens.first?.halogenAtomIndex == -1 ? 0 : halogens.count),
-            // Calibrated on PDBbind v2020 refined set (4641 complexes, 5-fold CV r=-0.349)
-            wPiPi: -0.20,             // confirmed by calibration (unchanged)
-            wPiCation: -0.05,         // calibrated: was -0.50, reduced (weak signal)
-            wHalogenBond: -0.40,      // not testable in Python (kept)
-            wMetalCoord: -0.91,       // calibrated: was -0.95 (strong signal)
+            // Calibrated 2026-11-05 on PDBbind v2020 refined set (5050 complexes, CASF-2016
+            // core set held out) and validated on CASF-2016 docking power (285 targets,
+            // 22 777 decoy poses). See Benchmark/reports/drusina_calibration_2026.md.
+            //
+            // The controlling variable is the mean magnitude of the correction, not which
+            // terms are present: below ~0.15 kcal/mol it helps more often than it hurts,
+            // above ~0.2 it hurts more often than it helps. The previous set sat at 0.32;
+            // this one sits at 0.137. Terms whose near-native/decoy contrast ratio is below
+            // 1 cannot help docking at any weight of the correct sign, and are zeroed.
+            wPiPi: -0.15,             // decoy contrast 2.41; pose discrimination only
+            wPiCation: 0.0,           // contrast 0.66 < 1 — value grows with decoy RMSD
+            wHalogenBond: -0.30,      // contrast 3.57, but fires on 1.7% of complexes
+            wMetalCoord: -0.85,       // the only term significant against pKd (LOO +0.0124)
             numProteinAmides: UInt32(amides.first?.centroid == .zero && amides.count == 1 ? 0 : amides.count),
             numChalcogens: UInt32(chalcogens.first?.sulfurAtomIndex == -1 ? 0 : chalcogens.count),
-            wSaltBridge: -0.20,       // not significant on native poses (kept for docking)
-            wAmideStack: -0.15,       // not testable in Python (kept)
-            wChalcogenBond: -0.10,    // not testable in Python (kept)
+            wSaltBridge: -0.15,       // contrast 2.08 once the partial-charge fallback is gone
+            wAmideStack: -0.15,       // contrast 2.92; needs the C(i),O(i),N(i+1) plane fix
+            wChalcogenBond: 0.0,      // contrast 1.25, t 0.39, 0.04 real bonds per complex
             numSaltBridgeGroups: UInt32(sbGroups.first?.chargeSign == 0 ? 0 : sbGroups.count),
-            wCoulomb: 0.015,          // not testable in Python (kept)
-            wCHPi: -0.26,            // calibrated: was -0.04, strong boost (fires 40%)
-            wCooperativity: 0.0,
-            wTorsionStrain: 1.0,      // not testable in Python (kept)
-            minCorrection: -5.5,
-            wHBondDir: -0.32,         // calibrated: was -0.25, confirmed useful
-            wDesolvPolar: 0.0,        // zeroed by calibration (too noisy on native poses)
+            wCoulomb: 0.0,            // contrast 1.06 — carries no pose information at all
+            wCHPi: -0.12,             // was -0.26 on native-pose multiplicity; contrast 1.84
+            wCooperativity: -0.025,   // best discriminator in the function; was switched off
+            wTorsionStrain: 0.0,      // flat vs decoy RMSD (contrast 0.62), moves nothing
+            minCorrection: -5.5,      // inert backstop: hit on 0 of 22 777 CASF decoy poses
+            wHBondDir: -0.08,         // was -0.32; a bonus on a contact Vina already scores
+            wDesolvPolar: 0.0,        // contrast 0.95 — below 1, cannot help docking
             numProteinChalcogens: UInt32(protChalcogens.first?.bondedCDir == .zero ? 0 : protChalcogens.count),
             numTorsionStrains: UInt32(torsionStrains.first?.atom0 == -1 ? 0 : torsionStrains.count),
             numProteinHBondAtoms: UInt32(protHBondInfo.first?.position == .zero && protHBondInfo.count == 1 ? 0 : protHBondInfo.count),
             numLigandHBondAtoms: UInt32(ligHBondInfo.first?.atomIndex == -1 ? 0 : ligHBondInfo.count),
-            wDesolvHydrophobic: 0.0,  // zeroed by calibration (too noisy on native poses)
+            wDesolvHydrophobic: 0.0,  // contrast 0.48, r(term,RMSD) = +0.250 — mis-ranks
             _padDP0: 0)
         drusinaParamsBuffer = device.makeBuffer(
             bytes: &params,

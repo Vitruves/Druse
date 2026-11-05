@@ -238,12 +238,14 @@ final class BenchmarkRunner: XCTestCase {
         default:
             let rawAtoms = rawProtein.atoms
             let rawBonds = rawProtein.bonds
+            let metalDevice = MTLCreateSystemDefaultDevice()
             let prepared = await Task.detached { @Sendable in
                 ProteinPreparation.prepareForDocking(
                     atoms: rawAtoms, bonds: rawBonds,
                     rawPDBContent: rawPDBContent,
                     pH: 7.4,
-                    chargeMethod: Self.cfgChargeMethod
+                    chargeMethod: Self.cfgChargeMethod,
+                    device: metalDevice
                 )
             }.value
             return Molecule(

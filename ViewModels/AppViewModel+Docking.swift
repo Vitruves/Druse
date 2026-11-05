@@ -154,13 +154,15 @@ extension AppViewModel {
         log.info("[Preparation] Preparing receptor for scoring (\(proteinAtoms.count) atoms, \(hCount) H, pH \(pH), rawPDB=\(pdbContent != nil ? "\(pdbContent!.count) chars" : "nil"))...", category: .dock)
 
         let t0 = CFAbsoluteTimeGetCurrent()
+        let metalDevice = computeDevice
         let prepared = await Task.detached {
             ProteinPreparation.prepareForDocking(
                 atoms: proteinAtoms,
                 bonds: proteinBonds,
                 rawPDBContent: pdbContent,
                 pH: pH,
-                chargeMethod: chargeMethod
+                chargeMethod: chargeMethod,
+                device: metalDevice
             )
         }.value
         let elapsed = CFAbsoluteTimeGetCurrent() - t0

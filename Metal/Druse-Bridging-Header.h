@@ -5,6 +5,7 @@
 #define Druse_Bridging_Header_h
 
 #import "ShaderTypes.h"
+#import "InteractionCriteria.h"
 #include "../CppCore/druse_core.h"
 #include "../CppCore/druse_openmm.h"
 #include "../CppCore/druse_xtb.h"

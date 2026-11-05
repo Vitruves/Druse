@@ -172,6 +172,8 @@ enum DockingSettings {
         int("generations", .budget, "Generations (Monte Carlo steps) per run", \.dockingConfig.generationsPerRun, 1...10_000,
             then: manualBudget),
         int("runs", .budget, "Independent runs (restarts)", \.dockingConfig.numRuns, 1...100, then: manualBudget),
+        int("seed", .budget, "Search seed; 0 = fresh each dock, non-zero = reproducible",
+            \.dockingConfig.randomSeed, 0...2_147_483_647),
         int("live-update", .budget, "Refresh the live pose every N generations (higher = fewer GPU syncs)",
             \.dockingConfig.liveUpdateFrequency, 1...10_000),
 

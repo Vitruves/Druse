@@ -3,6 +3,7 @@
 
 #include <metal_stdlib>
 #include "ShaderTypes.h"
+#include "SafeMath.h"
 using namespace metal;
 
 // pKa GNN — per-atom pKa prediction via message-passing graph neural network.
@@ -46,13 +47,6 @@ using namespace metal;
 #define W_ACID_B0   61
 #define W_ACID_W1   62
 #define W_ACID_B1   63
-
-// GELU approximation (tanh variant, matches PyTorch)
-static inline float gelu(float x) {
-    const float c = 0.7978845608f; // sqrt(2/pi)
-    float inner = c * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + tanh(inner));
-}
 
 // Linear: out[outDim] = W[outDim, inDim] @ in[inDim] + b[outDim]
 static inline void linear(device const float *W, device const float *b,
@@ -105,7 +99,7 @@ kernel void pkaGNNInference(
 
     float h0[PKA_H], h1[PKA_H];
     linear(W(W_ENC_W0), W(W_ENC_B0), feat, h0, PKA_AF, PKA_H);
-    for (uint i = 0; i < PKA_H; i++) h0[i] = gelu(h0[i]);
+    for (uint i = 0; i < PKA_H; i++) h0[i] = safeGeluTanh(h0[i]);
     linear(W(W_ENC_W1), W(W_ENC_B1), h0, h1, PKA_H, PKA_H);
 
     // h1 is now the encoded atom representation.
@@ -171,7 +165,7 @@ kernel void pkaGNNFull(
         for (uint o = 0; o < PKA_H; o++) {
             float sum = b0[o];
             for (uint i = 0; i < PKA_AF; i++) sum += w0[o * PKA_AF + i] * feat[i];
-            tmp[o] = gelu(sum);
+            tmp[o] = safeGeluTanh(sum);
         }
         // Linear(128→128)
         device const float *w1 = W(W_ENC_W1), *b1 = W(W_ENC_B1);
@@ -215,7 +209,7 @@ kernel void pkaGNNFull(
             for (uint o = 0; o < PKA_H; o++) {
                 float sum = msg_b0[o];
                 for (uint i = 0; i < PKA_H; i++) sum += msg_w0[o * PKA_H + i] * h[src][i];
-                mt[o] = gelu(sum);
+                mt[o] = safeGeluTanh(sum);
             }
             for (uint o = 0; o < PKA_H; o++) {
                 float sum = msg_b1[o];
@@ -237,7 +231,7 @@ kernel void pkaGNNFull(
                 for (uint o = 0; o < PKA_H; o++) {
                     float sum = edge_b0[o];
                     for (uint i = 0; i < PKA_BF; i++) sum += edge_w0[o * PKA_BF + i] * bf[i];
-                    ew_tmp[o] = gelu(sum);
+                    ew_tmp[o] = safeGeluTanh(sum);
                 }
                 for (uint o = 0; o < PKA_H; o++) {
                     float sum = edge_b1[o];
@@ -293,7 +287,7 @@ kernel void pkaGNNFull(
         for (uint o = 0; o < PKA_RD; o++) {
             float sum = ib0[o];
             for (uint i = 0; i < PKA_H; i++) sum += iw0[o * PKA_H + i] * h[a][i];
-            tmp[o] = gelu(sum);
+            tmp[o] = safeGeluTanh(sum);
         }
         device const float *iw1 = W(W_ION_W1), *ib1 = W(W_ION_B1);
         float ion_logit = ib1[0];
@@ -305,7 +299,7 @@ kernel void pkaGNNFull(
         for (uint o = 0; o < PKA_RD; o++) {
             float sum = pb0[o];
             for (uint i = 0; i < PKA_H; i++) sum += pw0[o * PKA_H + i] * h[a][i];
-            tmp[o] = gelu(sum);
+            tmp[o] = safeGeluTanh(sum);
         }
         device const float *pw1 = W(W_PKA_W1), *pb1 = W(W_PKA_B1);
         float pka_val = pb1[0];
@@ -317,7 +311,7 @@ kernel void pkaGNNFull(
         for (uint o = 0; o < PKA_RD; o++) {
             float sum = ab0[o];
             for (uint i = 0; i < PKA_H; i++) sum += aw0[o * PKA_H + i] * h[a][i];
-            tmp[o] = gelu(sum);
+            tmp[o] = safeGeluTanh(sum);
         }
         device const float *aw1 = W(W_ACID_W1), *ab1 = W(W_ACID_B1);
         float acid_logit = ab1[0];

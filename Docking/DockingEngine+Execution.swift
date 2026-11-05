@@ -676,6 +676,24 @@ extension DockingEngine {
         }
         ActivityLog.shared.info("[Engine] Search method: \(resolvedSearchMethod.rawValue)", category: .dock)
 
+        // Proposal operator for the standard search loop. `.genetic` runs the real
+        // evolutionary step (elitist tournament selection + crossover + mutation across the
+        // population, `gaEvolve`); anything else that reaches this loop — parallel tempering
+        // falling through because its replica pipelines are unavailable — keeps the
+        // single-DOF Metropolis random walk (`mcPerturb`). Both proposals share the same
+        // buffer layout, scoring, local search and acceptance stages.
+        let proposalPipeline: MTLComputePipelineState = resolvedSearchMethod == .genetic
+            ? evolvePipeline
+            : mcPerturbPipeline
+        if resolvedSearchMethod == .genetic {
+            ActivityLog.shared.info(
+                "[Engine] GA operators: crossover=\(String(format: "%.2f", config.crossoverRate)), " +
+                "mutation=\(String(format: "%.2f", config.explorationMutationRate))→\(String(format: "%.2f", config.mutationRate)), " +
+                "tournament k=3, elites=\(max(popSize / 50, 1)), local search every \(max(config.localSearchFrequency, 1)) gen",
+                category: .dock
+            )
+        }
+
         let totalRuns = max(config.numRuns, 1)
         var aggregatedResults: [DockingResult] = []
         let localSearchFrequency = max(config.localSearchFrequency, 1)
@@ -1204,8 +1222,11 @@ extension DockingEngine {
         runLoop: for runIndex in 0..<totalRuns {
             guard isRunning else { break }
 
-            // Per-run random seed ensures truly independent MC trajectories (Vina-aligned).
-            gaParams.runSeed = UInt32(runIndex) &* 1000003 &+ UInt32.random(in: 0..<1_000_000)
+            // Per-run seed keeps the trajectories independent of each other (Vina-aligned).
+            // With `config.randomSeed == 0` it is drawn fresh, so runs differ between docks;
+            // a non-zero seed makes the whole search reproducible.
+            gaParams.runSeed = UInt32(runIndex) &* 1000003
+                &+ (config.randomSeed == 0 ? UInt32.random(in: 0..<1_000_000) : config.randomSeed)
             gaParamsBuffer?.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
 
             dispatchCompute(pipeline: initPopPipeline, buffers: [
@@ -1296,45 +1317,42 @@ extension DockingEngine {
                     (bestBuf, 2), (ringBuf, 3)
                 ]
                 var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
-                    (pipeline: mcPerturbPipeline, buffers: perturbBuffers)
+                    (pipeline: proposalPipeline, buffers: perturbBuffers)
                 ]
                 let doLocalSearch = step % effectiveLSFreq == 0 && !useDruseAF
                 if doLocalSearch && !localSearchIsSIMD {
                     dispatches.append((pipeline: activeLocalSearchPipeline, buffers: vinaScoreBuffers))
                 }
-                if useDruseAF, let encodePipe = druseAFEncodePipeline,
-                   let afParamsBuf = druseAFParamsBuffer,
-                   let afIntermed = druseAFIntermediateBuffer {
-                    let encodeBuffers: [(MTLBuffer, Int)] = [
-                        (offBuf, 0), (ligBuf, 1), (ringBuf, 2),
-                        (teBuf, 3), (miBuf, 4),
-                        (afParamsBuf, 5), (afIntermed, 6), (gpBuf, 7)
-                    ]
-                    dispatches.append((pipeline: encodePipe, buffers: encodeBuffers))
-                } else if useDrusina, let drusinaPipe = drusinaScorePipeline,
-                          let prb = proteinRingBuffer, let lrb = ligandRingBuffer,
-                          let pcb = proteinCationBuffer, let dpb = drusinaParamsBuffer,
-                          let pab = proteinAtomBuffer, let hib = halogenInfoBuffer,
-                          let pamb = proteinAmideBuffer, let cib = chalcogenInfoBuffer,
-                          let sbgb = saltBridgeGroupBuffer,
-                          let elecBuf = electrostaticGridBuffer,
-                          let pchBuf = proteinChalcogenBuffer,
-                          let tsBuf = torsionStrainBuffer,
-                          let lhbBuf = ligandHBondInfoBuffer,
-                          let phbBuf = proteinHBondInfoBuffer {
-                    var drusinaBuffers = vinaScoreBuffers
-                    drusinaBuffers.append(contentsOf: [
-                        (prb, 9), (lrb, 10),
-                        (pcb, 11), (dpb, 12),
-                        (pab, 13), (hib, 14),
-                        (pamb, 15), (cib, 16),
-                        (sbgb, 17),
-                        (elecBuf, 18), (pchBuf, 19), (tsBuf, 20),
-                        (lhbBuf, 21), (phbBuf, 22)
-                    ])
-                    dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
-                } else {
-                    dispatches.append((pipeline: scorePipeline, buffers: vinaScoreBuffers))
+                // Grid-based scoring joins the proposal in one encoder. DruseAF is scored
+                // separately below by `scoreDruseAF`, which owns the encode + score pair for
+                // whichever weight version is loaded; appending anything here would dispatch
+                // a grid kernel with the empty `vinaScoreBuffers` of the DruseAF path.
+                if !useDruseAF {
+                    if useDrusina, let drusinaPipe = drusinaScorePipeline,
+                       let prb = proteinRingBuffer, let lrb = ligandRingBuffer,
+                       let pcb = proteinCationBuffer, let dpb = drusinaParamsBuffer,
+                       let pab = proteinAtomBuffer, let hib = halogenInfoBuffer,
+                       let pamb = proteinAmideBuffer, let cib = chalcogenInfoBuffer,
+                       let sbgb = saltBridgeGroupBuffer,
+                       let elecBuf = electrostaticGridBuffer,
+                       let pchBuf = proteinChalcogenBuffer,
+                       let tsBuf = torsionStrainBuffer,
+                       let lhbBuf = ligandHBondInfoBuffer,
+                       let phbBuf = proteinHBondInfoBuffer {
+                        var drusinaBuffers = vinaScoreBuffers
+                        drusinaBuffers.append(contentsOf: [
+                            (prb, 9), (lrb, 10),
+                            (pcb, 11), (dpb, 12),
+                            (pab, 13), (hib, 14),
+                            (pamb, 15), (cib, 16),
+                            (sbgb, 17),
+                            (elecBuf, 18), (pchBuf, 19), (tsBuf, 20),
+                            (lhbBuf, 21), (phbBuf, 22)
+                        ])
+                        dispatches.append((pipeline: drusinaPipe, buffers: drusinaBuffers))
+                    } else {
+                        dispatches.append((pipeline: scorePipeline, buffers: vinaScoreBuffers))
+                    }
                 }
                 if !useDruseAF, let fe = flexEngine, fe.isEnabled {
                     lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
@@ -1365,22 +1383,12 @@ extension DockingEngine {
                     }
                     lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
                                                        threadGroups: tgCount, threadGroupSize: tgSize)
-                } else if useDruseAF, let scorePipe = druseAFScorePipeline,
-                          let afWeights = druseAFWeights,
-                          let afParamsBuf = druseAFParamsBuffer,
-                          let afProtPos = druseAFProtPosBuffer,
-                          let afSetup = druseAFSetupBuffer,
-                          let afIntermed = druseAFIntermediateBuffer {
+                } else if useDruseAF {
                     lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: tgCount, threadGroupSize: tgSize)
-                    let afScoreBuffers: [(MTLBuffer, Int)] = [
-                        (offBuf, 0), (afProtPos, 1),
-                        (afWeights.weightBuffer, 2), (afWeights.entryBuffer, 3),
-                        (afParamsBuf, 4), (afIntermed, 5), (afSetup, 6)
-                    ]
-                    let afTgSize = MTLSize(width: 32, height: 1, depth: 1)
-                    let afTgCount = MTLSize(width: popSize, height: 1, depth: 1)
-                    lastCmdBuf = dispatchComputeAsync(pipeline: scorePipe, buffers: afScoreBuffers,
-                                                       threadGroups: afTgCount, threadGroupSize: afTgSize)
+                    // Dispatches the encode kernel plus the v3 cross-attention or v4 PGN score
+                    // kernel according to the loaded weights. Synchronous, so the acceptance
+                    // step below sees finished energies.
+                    scoreDruseAF(buffer: offBuf, gaParamsBuffer: ringBuf, tg: tgCount, tgs: tgSize)
                     lastCmdBuf = dispatchComputeAsync(pipeline: metropolisAcceptPipeline, buffers: acceptBuffers,
                                                        threadGroups: tgCount, threadGroupSize: tgSize)
                 } else {

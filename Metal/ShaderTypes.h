@@ -689,14 +689,10 @@ struct PocketProbe {
 #define IDET_FLAG_N         (1u << 0)
 #define IDET_FLAG_O         (1u << 1)
 #define IDET_FLAG_S         (1u << 2)
-#define IDET_FLAG_C         (1u << 3)
-#define IDET_FLAG_F         (1u << 4)
-#define IDET_FLAG_CL        (1u << 5)
-#define IDET_FLAG_BR        (1u << 6)
+#define IDET_FLAG_C         (1u << 3)   // hydrophobic under Vina (C_H or halogen)
 #define IDET_FLAG_METAL     (1u << 7)   // Fe, Zn, Ca, Mg, Mn, Cu
 #define IDET_FLAG_POS_RES   (1u << 8)   // positive residue atoms (NZ, NH1, NH2, NE)
 #define IDET_FLAG_NEG_RES   (1u << 9)   // negative residue atoms (OD1, OD2, OE1, OE2)
-#define IDET_FLAG_HALOGEN   (1u << 10)  // F, Cl, or Br
 #define IDET_FLAG_HB_DONOR  (1u << 11)  // atom has at least one attached H (can donate to H-bond)
 
 // Packed atom for GPU interaction detection

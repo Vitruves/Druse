@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "DockingCommon.h"
+#include "InteractionCriteria.h"
 
 // ============================================================================
 // MARK: - Pose Scoring
@@ -237,17 +238,49 @@ inline float drusinaRamp(float x, float inner, float outer) {
     return (outer - ax) / (outer - inner);
 }
 
+/// Smooth angular gate: 0 at the criterion threshold, 1 at perfect alignment.
+/// Replaces hard `if (cos > threshold) score *= cos` tests, which put a finite
+/// step into the energy exactly at the threshold — two near-identical poses
+/// then differ by a fixed jump, which is pose-ranking noise, not physics.
+///
+/// Hand-rolled rather than `smoothstep`, which is documented as undefined for
+/// edge0 >= edge1; several criteria here run from a negative cosine threshold
+/// down to -1 (σ-hole alignment, H-bond donor linearity).
+inline float drusinaAngleGate(float cosValue, float cosThreshold, float cosIdeal) {
+    float t = clamp((cosValue - cosThreshold) / (cosIdeal - cosThreshold), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/// Lateral displacement of `other` from the axis through `origin` along `normal`.
+/// Two coplanar rings sitting side by side have a small centroid separation but
+/// a large offset, and are not stacked (Salentin 2015 caps the offset at 2 Å).
+inline float drusinaLateralOffset(float3 origin, float3 normal, float3 other) {
+    float3 delta = other - origin;
+    float axial = dot(delta, normal);
+    float lateralSq = max(dot(delta, delta) - axial * axial, 0.0f);
+    return sqrt(lateralSq);
+}
+
 /// Compute Drusina correction terms:
-///   - π-π stacking, π-cation, halogen bond, metal coordination (original)
-///   - salt bridge (group-based, Donald 2011), amide-π stacking, chalcogen bond (extended)
-///   - screened Coulomb (ε=4r), CH-π, cooperativity, torsion strain (new)
+///   - π-π stacking, π-cation, halogen bond, metal coordination
+///   - salt bridge (group-based, Donald 2011), amide-π stacking, chalcogen bond
+///   - screened Coulomb (ε=4r), CH-π, H-bond directionality, desolvation,
+///     torsion strain, cooperativity
 /// Returns total correction energy (kcal/mol, negative = favorable).
 ///
+/// Every geometric criterion comes from Metal/InteractionCriteria.h, which the
+/// interaction detectors share. Do not inline cutoffs here.
+///
 /// Design principles (Verdonk 2003, Bissantz 2010, Donald 2011):
-///   - Linear ramp functions instead of steep Gaussians for smoother GA landscape
-///   - Group-based salt bridge scoring (1 contribution per charged-group pair)
-///   - Burial-weighted salt bridges (exposed contribute little, Bissantz 2010)
-///   - Corrected optimal distances from CSD/PDB statistics
+///   - Linear ramps, not steep Gaussians, for a smooth GA landscape
+///   - Smooth angular gates, so no term steps discontinuously at a threshold
+///   - ONE contribution per interaction site. Every term below takes the best
+///     partner per site (per protein ring, per amide-accepting ring face, per
+///     halogen, per charged group, per donor...) instead of summing over all
+///     partners in range. Summing made the extended terms scale with local
+///     atom density — burial depth and backbone count — rather than with
+///     binding mode, and that density signal is uncorrelated with nativeness
+///     (Benchmark/reports/drusina_regression_analysis.md, RC1/RC3).
 inline DrusinaDecomposition computeDrusinaCorrections(
     thread float3                *positions,
     constant DockLigandAtom      *ligandAtoms,
@@ -279,16 +312,52 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     float chPiE = 0.0f, strainTermE = 0.0f, cooperativityE = 0.0f;
     float hbondDirE = 0.0f, desolvPolarE = 0.0f, desolvHydrophobicE = 0.0f;
 
-    // Pre-compute ligand centroid for spatial gating of protein partners.
-    // Protein features beyond ligandCutoff from centroid cannot interact with any
-    // ligand atom (max ligand radius ~6Å + max interaction range ~4Å = 10Å).
+    // Ligand centroid and bounding radius. The cull radius has to grow with the
+    // ligand: a fixed 10 Å centroid cutoff silently dropped valid partners for
+    // elongated ligands, whose atoms sit 6-7 Å from the centroid, making the
+    // extended terms depend on ligand size. Culling at radius + reach is exact.
     float3 ligCentroid = float3(0);
     for (uint a = 0; a < nAtoms; a++) ligCentroid += positions[a];
     ligCentroid /= float(max(nAtoms, 1u));
-    const float ligandCutoff = 10.0f;
-    const float ligandCutoffSq = ligandCutoff * ligandCutoff;
+    float ligandRadiusSq = 0.0f;
+    for (uint a = 0; a < nAtoms; a++) {
+        ligandRadiusSq = max(ligandRadiusSq, distance_squared(positions[a], ligCentroid));
+    }
+    const float cullRadius = sqrt(ligandRadiusSq) + kICMaxInteractionReach;
+    const float cullRadiusSq = cullRadius * cullRadius;
 
-    // Pre-compute ligand ring centroids and normals for reuse (π-π + amide-π)
+    // Per-ligand-atom protein contact counts, shared by the Coulomb burial
+    // scale and both desolvation terms. The protein loop is outermost so the
+    // cull test runs once per protein atom instead of once per atom pair.
+    const bool needPolarDesolv = (params.wDesolvPolar != 0.0f);
+    const bool needHydroDesolv = (params.wDesolvHydrophobic != 0.0f);
+    const bool needContacts = (params.wCoulomb != 0.0f) || needPolarDesolv || needHydroDesolv;
+    uchar contactCount[128];
+    uchar closeContactCount[128];
+    bool hbondSatisfied[128];
+    for (uint a = 0; a < nAtoms; a++) {
+        contactCount[a] = 0;
+        closeContactCount[a] = 0;
+        hbondSatisfied[a] = false;
+    }
+    if (needContacts) {
+        for (uint p = 0; p < numProteinAtoms; p++) {
+            float3 pPos = proteinAtoms[p].position;
+            if (distance_squared(ligCentroid, pPos) > cullRadiusSq) continue;
+            int pType = proteinAtoms[p].vinaType;
+            for (uint a = 0; a < nAtoms; a++) {
+                float d = distance(positions[a], pPos);
+                if (d < kICBurialContactRadius && contactCount[a] < 255) contactCount[a]++;
+                if (d < kICExposureContactRadius && closeContactCount[a] < 255) closeContactCount[a]++;
+                if (needPolarDesolv && d <= kICHBondDistMax &&
+                    xsHBondPossible(ligandAtoms[a].vinaType, pType)) {
+                    hbondSatisfied[a] = true;
+                }
+            }
+        }
+    }
+
+    // Pre-compute ligand ring centroids and normals for reuse (π-π, π-cation, amide-π)
     const uint MAX_LIG_RINGS = 8u;
     float3 ligRingCentroid[MAX_LIG_RINGS];
     float3 ligRingNormal[MAX_LIG_RINGS];
@@ -327,262 +396,257 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     }
 
     // ---- π-π stacking (ligand rings vs protein rings) ----
-    // Bissantz 2010: parallel displaced 3.4-3.6 Å, T-shaped 4.5-5.5 Å
-    // Using ramp functions for smooth landscape (Verdonk 2003)
+    // A ring has two faces and an edge girdle, so it takes at most three
+    // partners: the best face-to-face stack on each side plus the best
+    // T-shaped contact. Summing over every protein ring in range let a
+    // ring buried among aromatics collect an arbitrary number of stacks.
     for (uint lr = 0; lr < numValidLigRings; lr++) {
         float3 centroid = ligRingCentroid[lr];
         float3 norm = ligRingNormal[lr];
+        float bestFaceUp = 0.0f, bestFaceDown = 0.0f, bestEdge = 0.0f;
 
         for (uint pr = 0; pr < params.numProteinRings; pr++) {
-            if (distance_squared(ligCentroid, proteinRings[pr].centroid) > ligandCutoffSq) continue;
-            float d = distance(centroid, proteinRings[pr].centroid);
-            if (d < 3.2f || d > 5.8f) continue;
-            float dotN = abs(dot(norm, proteinRings[pr].normal));
+            float3 prCentroid = proteinRings[pr].centroid;
+            if (distance_squared(ligCentroid, prCentroid) > cullRadiusSq) continue;
+            float d = distance(centroid, prCentroid);
+            if (d < kICPiStackDistMin || d > kICPiStackEdgeDistMax) continue;
+            float3 prNormal = proteinRings[pr].normal;
+            float dotN = abs(dot(norm, prNormal));
 
-            // Face-to-face stacking (parallel, |dotN| > 0.8)
-            // Optimal 3.5 Å (Bissantz 2010 Table 2), ramp from 3.3-4.5 Å
-            if (dotN > 0.8f) {
-                float dd = d - 3.5f;
-                piPiE += params.wPiPi * dotN * drusinaRamp(dd, 0.3f, 1.0f);
-                interactionCount++;
+            // Face-to-face / parallel displaced
+            if (dotN >= kICPiStackFaceCosMin && d <= kICPiStackFaceDistMax) {
+                float offset = drusinaLateralOffset(centroid, norm, prCentroid);
+                if (offset <= kICPiStackOffsetMax) {
+                    float gate = drusinaAngleGate(dotN, kICPiStackFaceCosMin, 1.0f);
+                    float score = params.wPiPi * gate *
+                        drusinaRamp(d - kICPiStackFaceDistOpt,
+                                    kICPiStackFaceRampInner, kICPiStackFaceRampOuter);
+                    if (dot(prCentroid - centroid, norm) >= 0.0f) bestFaceUp = min(bestFaceUp, score);
+                    else                                          bestFaceDown = min(bestFaceDown, score);
+                }
             }
-            // Edge-to-face / T-shaped (perpendicular, |dotN| < 0.4)
-            // Optimal 4.8 Å, ramp from 4.2-5.5 Å (Bissantz 2010)
-            else if (dotN < 0.4f) {
-                float dd = d - 4.8f;
-                float perpFactor = 1.0f - dotN;  // stronger when more perpendicular
-                piPiE += params.wPiPi * 0.6f * perpFactor * drusinaRamp(dd, 0.4f, 1.0f);
-                interactionCount++;
+            // Edge-to-face / T-shaped
+            else if (dotN <= kICPiStackEdgeCosMax) {
+                float gate = drusinaAngleGate(dotN, kICPiStackEdgeCosMax, 0.0f);
+                float score = params.wPiPi * kICPiStackEdgeScale * gate *
+                    drusinaRamp(d - kICPiStackEdgeDistOpt,
+                                kICPiStackEdgeRampInner, kICPiStackEdgeRampOuter);
+                bestEdge = min(bestEdge, score);
             }
         }
+        if (bestFaceUp   < 0.0f) { piPiE += bestFaceUp;   interactionCount++; }
+        if (bestFaceDown < 0.0f) { piPiE += bestFaceDown; interactionCount++; }
+        if (bestEdge     < 0.0f) { piPiE += bestEdge;     interactionCount++; }
     }
 
-    // ---- π-cation: ligand ring vs protein cations ----
-    // Bissantz 2010: cation 3.4-4.0 Å above ring, perpendicular approach preferred
+    // ---- π-cation: ligand ring vs protein cations (best cation per ring face) ----
     for (uint lr = 0; lr < numValidLigRings; lr++) {
         float3 centroid = ligRingCentroid[lr];
         float3 norm = ligRingNormal[lr];
+        float bestUp = 0.0f, bestDown = 0.0f;
 
         for (uint pc = 0; pc < params.numProteinCations; pc++) {
             float3 cPos = proteinCations[pc].xyz;
-            if (distance_squared(ligCentroid, cPos) > ligandCutoffSq) continue;
+            if (distance_squared(ligCentroid, cPos) > cullRadiusSq) continue;
             float d = distance(centroid, cPos);
-            if (d > 5.5f) continue;
-            float3 toAtom = normalize(cPos - centroid);
-            float cosA = abs(dot(toAtom, norm));
-            // Require above-plane approach (cosA > 0.5 = within 60° of normal)
-            if (cosA > 0.5f) {
-                float dd = d - 3.8f;
-                piCationE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
-                interactionCount++;
-            }
+            if (d > kICPiCationDistMax) continue;
+            if (drusinaLateralOffset(centroid, norm, cPos) > kICPiCationOffsetMax) continue;
+            float cosA = abs(dot(normalize(cPos - centroid), norm));
+            if (cosA < kICPiCationCosMin) continue;
+            float score = params.wPiCation * drusinaAngleGate(cosA, kICPiCationCosMin, 1.0f) *
+                drusinaRamp(d - kICPiCationDistOpt, kICPiCationRampInner, kICPiCationRampOuter);
+            if (dot(cPos - centroid, norm) >= 0.0f) bestUp = min(bestUp, score);
+            else                                    bestDown = min(bestDown, score);
         }
+        if (bestUp   < 0.0f) { piCationE += bestUp;   interactionCount++; }
+        if (bestDown < 0.0f) { piCationE += bestDown; interactionCount++; }
     }
 
-    // ---- π-cation: protein rings vs ligand cations ----
-    for (uint a = 0; a < nAtoms; a++) {
-        if (ligandAtoms[a].formalCharge <= 0) continue;
-        for (uint pr = 0; pr < params.numProteinRings; pr++) {
-            if (distance_squared(ligCentroid, proteinRings[pr].centroid) > ligandCutoffSq) continue;
-            float d = distance(positions[a], proteinRings[pr].centroid);
-            if (d > 5.5f) continue;
-            float3 toAtom = normalize(positions[a] - proteinRings[pr].centroid);
-            float cosA = abs(dot(toAtom, proteinRings[pr].normal));
-            if (cosA > 0.5f) {
-                float dd = d - 3.8f;
-                piCationE += params.wPiCation * cosA * drusinaRamp(dd, 0.4f, 1.2f);
-                interactionCount++;
-            }
+    // ---- π-cation: protein rings vs ligand cations (best ligand cation per ring) ----
+    for (uint pr = 0; pr < params.numProteinRings; pr++) {
+        float3 prCentroid = proteinRings[pr].centroid;
+        if (distance_squared(ligCentroid, prCentroid) > cullRadiusSq) continue;
+        float3 prNormal = proteinRings[pr].normal;
+        float best = 0.0f;
+        for (uint a = 0; a < nAtoms; a++) {
+            if (ligandAtoms[a].formalCharge <= 0) continue;
+            float d = distance(positions[a], prCentroid);
+            if (d > kICPiCationDistMax) continue;
+            if (drusinaLateralOffset(prCentroid, prNormal, positions[a]) > kICPiCationOffsetMax) continue;
+            float cosA = abs(dot(normalize(positions[a] - prCentroid), prNormal));
+            if (cosA < kICPiCationCosMin) continue;
+            best = min(best, params.wPiCation * drusinaAngleGate(cosA, kICPiCationCosMin, 1.0f) *
+                drusinaRamp(d - kICPiCationDistOpt, kICPiCationRampInner, kICPiCationRampOuter));
         }
+        if (best < 0.0f) { piCationE += best; interactionCount++; }
     }
 
-    // ---- Salt bridge: group-based scoring (Donald 2011, Bissantz 2010) ----
-    // One contribution per (ligand charged atom, protein charged group) pair.
-    // Optimal N-O distance 2.8 Å (Bissantz 2010 Table 2, CSD median).
-    // Ramp: full score at 2.5-3.1 Å, fading to zero at 4.0 Å.
+    // ---- Salt bridge: one contribution per protein charged group ----
+    // Donald 2011 pairs groups, not atoms. A ligand carboxylate has two
+    // oxygens, and both used to score against the same Arg guanidinium.
     // Burial-weighted: exposed salt bridges contribute little (Bissantz 2010).
-    // Fallback: use sign of large Gasteiger partial charges when formal charge is 0
-    // (handles neutral SMILES where ionizable groups aren't protonated).
-    // Threshold 0.35 to only catch clearly ionic groups (amines ~0.3-0.4, carboxylates ~-0.4-0.5).
-    for (uint a = 0; a < nAtoms; a++) {
-        int ligCharge = ligandAtoms[a].formalCharge;
-        float chargeScale = 1.0f;  // full weight for formal charges
-        if (ligCharge == 0) {
-            float q = ligandAtoms[a].charge;
-            if (q > 0.35f) ligCharge = 1;
-            else if (q < -0.35f) ligCharge = -1;
-            else continue;
-            chargeScale = 0.5f;  // partial charge inference is less certain
+    // Fallback: sign of a large partial charge when the formal charge is 0
+    // (handles neutral SMILES where ionizable groups are not protonated).
+    for (uint g = 0; g < params.numSaltBridgeGroups; g++) {
+        float3 gCentroid = saltBridgeGroups[g].centroid;
+        if (distance_squared(ligCentroid, gCentroid) > cullRadiusSq) continue;
+        int groupSign = saltBridgeGroups[g].chargeSign;
+        float best = 0.0f;
+
+        for (uint a = 0; a < nAtoms; a++) {
+            int ligCharge = ligandAtoms[a].formalCharge;
+            float chargeScale = 1.0f;
+            if (ligCharge == 0) {
+                float q = ligandAtoms[a].charge;
+                if (q > kICSaltBridgeChargeThreshold) ligCharge = 1;
+                else if (q < -kICSaltBridgeChargeThreshold) ligCharge = -1;
+                else continue;
+                chargeScale = kICSaltBridgePartialScale;
+            }
+            if (ligCharge * groupSign >= 0) continue;  // need opposite signs
+
+            float d = distance(positions[a], gCentroid);
+            if (d > kICSaltBridgeDistMax) continue;
+            float distScore = drusinaRamp(d - kICSaltBridgeDistOpt,
+                                          kICSaltBridgeRampInner, kICSaltBridgeRampOuter);
+            best = min(best, params.wSaltBridge * distScore *
+                             saltBridgeGroups[g].burialFactor * chargeScale);
         }
-
-        for (uint g = 0; g < params.numSaltBridgeGroups; g++) {
-            if (distance_squared(ligCentroid, saltBridgeGroups[g].centroid) > ligandCutoffSq) continue;
-            // Require opposite charges
-            bool isSB = (ligCharge > 0 && saltBridgeGroups[g].chargeSign < 0) ||
-                        (ligCharge < 0 && saltBridgeGroups[g].chargeSign > 0);
-            if (!isSB) continue;
-
-            float d = distance(positions[a], saltBridgeGroups[g].centroid);
-            if (d > 4.0f) continue;
-
-            // Ramp centered at 2.8 Å (Bissantz 2010: CSD median N-O = 2.79 Å)
-            float dd = d - 2.8f;
-            float distScore = drusinaRamp(dd, 0.3f, 1.2f);
-
-            // Burial dampening (Bissantz 2010: exposed salt bridges ≈ no free energy)
-            float burial = saltBridgeGroups[g].burialFactor;
-
-            saltBridgeE += params.wSaltBridge * distScore * burial * chargeScale;
-            interactionCount++;
-        }
+        if (best < 0.0f) { saltBridgeE += best; interactionCount++; }
     }
 
-    // ---- Amide-π stacking: protein backbone amide ↔ ligand aromatic ring ----
-    // Bissantz 2010: amide-aryl distance 3.2-3.7 Å between planes
-    // Harder 2013: optimal d=3.4 Å interplanar, parallel (|dotN|>0.8)
+    // ---- Amide-π stacking: protein amide plane ↔ ligand aromatic ring ----
+    // One amide per ring face. A typical protein contributes 100-300 amide
+    // planes, nearly all backbone, so summing over them turned this term into
+    // a burial-depth readout (regression report RC3).
     for (uint lr = 0; lr < numValidLigRings; lr++) {
         float3 centroid = ligRingCentroid[lr];
         float3 norm = ligRingNormal[lr];
+        float bestUp = 0.0f, bestDown = 0.0f;
 
         for (uint am = 0; am < params.numProteinAmides; am++) {
-            if (distance_squared(ligCentroid, proteinAmides[am].centroid) > ligandCutoffSq) continue;
-            float d = distance(centroid, proteinAmides[am].centroid);
-            if (d < 3.0f || d > 5.2f) continue;
-
+            float3 amCentroid = proteinAmides[am].centroid;
+            if (distance_squared(ligCentroid, amCentroid) > cullRadiusSq) continue;
+            float d = distance(centroid, amCentroid);
+            if (d < kICAmidePiDistMin || d > kICAmidePiDistMax) continue;
             float dotN = abs(dot(norm, proteinAmides[am].normal));
+            if (dotN < kICAmidePiCosMin) continue;
+            if (drusinaLateralOffset(centroid, norm, amCentroid) > kICAmidePiOffsetMax) continue;
 
-            // Parallel stacking (Harder 2013: interplanar ≤30°, |dotN| > 0.8)
-            if (dotN > 0.8f) {
-                float dd = d - 3.6f;
-                amidePiE += params.wAmideStack * dotN * drusinaRamp(dd, 0.3f, 0.9f);
-                interactionCount++;
-            }
-            // Tilted/offset stacking (weaker, broader distance range)
-            else if (dotN > 0.6f) {
-                float dd = d - 4.0f;
-                amidePiE += params.wAmideStack * 0.4f * dotN * drusinaRamp(dd, 0.3f, 1.0f);
-                interactionCount++;
-            }
+            float score = params.wAmideStack * drusinaAngleGate(dotN, kICAmidePiCosMin, 1.0f) *
+                drusinaRamp(d - kICAmidePiDistOpt, kICAmidePiRampInner, kICAmidePiRampOuter);
+            if (dot(amCentroid - centroid, norm) >= 0.0f) bestUp = min(bestUp, score);
+            else                                          bestDown = min(bestDown, score);
         }
+        if (bestUp   < 0.0f) { amidePiE += bestUp;   interactionCount++; }
+        if (bestDown < 0.0f) { amidePiE += bestDown; interactionCount++; }
     }
 
     // ---- Halogen bonds: C-X...O/N with σ-hole angle check ----
-    // Element-specific optimal distances (Scholfield 2013, Bissantz 2010):
-    //   F: skip (too weak), Cl: 3.27 Å, Br: 3.24 Å, I: 3.17 Å
-    // C-X...A angle preferred near 160-180° (sigma-hole alignment)
+    // One acceptor per halogen: a C-X σ-hole is a single lobe along the bond
+    // axis and cannot engage two acceptors at once, but the old loop summed
+    // over every acceptor in range (e.g. both carboxylate oxygens).
+    // Fluorine has no usable σ-hole (Auffinger 2004) and is skipped.
     for (uint h = 0; h < params.numHalogens; h++) {
         int hi = halogenInfo[h].halogenAtomIndex;
         int ci = halogenInfo[h].carbonAtomIndex;
         int elemType = halogenInfo[h].elementType;
         if (hi < 0 || ci < 0 || uint(hi) >= nAtoms || uint(ci) >= nAtoms) continue;
-        if (elemType == 0) continue;  // F halogen bonds too weak — skip
+        if (elemType == 0) continue;  // F
 
-        // Element-specific optimal distance (CSD statistics, Scholfield 2013)
-        float optDist = 3.2f;
-        if      (elemType == 1) optDist = 3.27f;  // Cl
-        else if (elemType == 2) optDist = 3.24f;  // Br
-        else if (elemType == 3) optDist = 3.17f;  // I
+        float optDist = kICHalogenDistOptCl;
+        if      (elemType == 2) optDist = kICHalogenDistOptBr;
+        else if (elemType == 3) optDist = kICHalogenDistOptI;
 
         float3 halPos = positions[hi];
-        float3 carPos = positions[ci];
+        float3 xToC = normalize(positions[ci] - halPos);
+        float best = 0.0f;
 
         for (uint p = 0; p < numProteinAtoms; p++) {
-            int pType = proteinAtoms[p].vinaType;
-            bool isAcceptor = (pType == VINA_N_A || pType == VINA_N_DA ||
-                               pType == VINA_O_A || pType == VINA_O_DA);
-            if (!isAcceptor) continue;
+            float3 pPos = proteinAtoms[p].position;
+            if (distance_squared(ligCentroid, pPos) > cullRadiusSq) continue;
+            if (!xsIsAcceptor(proteinAtoms[p].vinaType)) continue;
 
-            float d = distance(halPos, proteinAtoms[p].position);
-            if (d < 2.5f || d > 4.2f) continue;
+            float d = distance(halPos, pPos);
+            if (d < kICHalogenDistMin || d > kICHalogenDistMax) continue;
 
-            // σ-hole directionality: C-X...A angle should be > 140° (cosine < -0.766)
-            float3 xToC = normalize(carPos - halPos);
-            float3 xToA = normalize(proteinAtoms[p].position - halPos);
-            float cosTheta = dot(xToC, xToA);
-            if (cosTheta < -0.766f) {
-                float dd = d - optDist;
-                float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                halogenE += params.wHalogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
-                interactionCount++;
-            }
+            float cosTheta = dot(xToC, normalize(pPos - halPos));
+            if (cosTheta > kICHalogenCosMax) continue;
+            float angleFactor = drusinaAngleGate(cosTheta, kICHalogenCosMax, -1.0f);
+            best = min(best, params.wHalogenBond * angleFactor *
+                             drusinaRamp(d - optDist, kICHalogenRampInner, kICHalogenRampOuter));
         }
+        if (best < 0.0f) { halogenE += best; interactionCount++; }
     }
 
-    // ---- Chalcogen bonds: C-S...O/N with σ-hole angle check ----
-    // Relaxed from 150° to 140° (Beno 2015, Pascoe 2017: S σ-hole valid at 140-180°)
-    // Distance 2.8-4.2 Å, optimal ~3.3 Å (Bissantz 2010). Dual σ-holes for thioethers.
+    // ---- Chalcogen bonds: ligand C-S...O/N with σ-hole angle check ----
+    // One acceptor per σ-hole. A thioether has two C-S bonds and therefore two
+    // σ-holes, which arrive as two ChalcogenBondInfo records for the same S.
     for (uint ch = 0; ch < params.numChalcogens; ch++) {
         int si = chalcogenInfo[ch].sulfurAtomIndex;
         int ci = chalcogenInfo[ch].carbonAtomIndex;
         if (si < 0 || ci < 0 || uint(si) >= nAtoms || uint(ci) >= nAtoms) continue;
         float3 sPos = positions[si];
-        float3 cPos = positions[ci];
+        float3 sToC = normalize(positions[ci] - sPos);
+        float best = 0.0f;
 
         for (uint p = 0; p < numProteinAtoms; p++) {
-            int pType = proteinAtoms[p].vinaType;
-            bool isAcceptor = (pType == VINA_N_A || pType == VINA_N_DA ||
-                               pType == VINA_O_A || pType == VINA_O_DA);
-            if (!isAcceptor) continue;
+            float3 pPos = proteinAtoms[p].position;
+            if (distance_squared(ligCentroid, pPos) > cullRadiusSq) continue;
+            if (!xsIsAcceptor(proteinAtoms[p].vinaType)) continue;
 
-            float d = distance(sPos, proteinAtoms[p].position);
-            if (d < 2.8f || d > 4.2f) continue;
+            float d = distance(sPos, pPos);
+            if (d < kICChalcogenDistMin || d > kICChalcogenDistMax) continue;
 
-            // σ-hole directionality: C-S-A angle > 140° (cos < -0.766)
-            float3 sToC = normalize(cPos - sPos);
-            float3 sToA = normalize(proteinAtoms[p].position - sPos);
-            float cosTheta = dot(sToC, sToA);
-            if (cosTheta < -0.766f) {
-                float dd = d - 3.3f;
-                float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                chalcogenE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
-                interactionCount++;
-            }
+            float cosTheta = dot(sToC, normalize(pPos - sPos));
+            if (cosTheta > kICChalcogenCosMax) continue;
+            float angleFactor = drusinaAngleGate(cosTheta, kICChalcogenCosMax, -1.0f);
+            best = min(best, params.wChalcogenBond * angleFactor *
+                             drusinaRamp(d - kICChalcogenDistOpt,
+                                         kICChalcogenRampInner, kICChalcogenRampOuter));
         }
+        if (best < 0.0f) { chalcogenE += best; interactionCount++; }
     }
 
     // ---- Protein chalcogen bonds: protein S (Met/Cys) → ligand N/O ----
-    // Bidirectional: protein sulfur σ-hole interacting with ligand acceptors
     for (uint pch = 0; pch < params.numProteinChalcogens; pch++) {
         float3 sPos = proteinChalcogens[pch].position;
-        float3 bondedCDir = proteinChalcogens[pch].bondedCDir; // direction S→C
+        if (distance_squared(ligCentroid, sPos) > cullRadiusSq) continue;
+        float3 sToC = proteinChalcogens[pch].bondedCDir;  // σ-hole lies opposite
+        float best = 0.0f;
 
         for (uint a = 0; a < nAtoms; a++) {
-            int lt = ligandAtoms[a].vinaType;
-            bool isAcceptor = (lt == VINA_N_A || lt == VINA_N_DA ||
-                               lt == VINA_O_A || lt == VINA_O_DA);
-            if (!isAcceptor) continue;
+            if (!xsIsAcceptor(ligandAtoms[a].vinaType)) continue;
 
             float d = distance(positions[a], sPos);
-            if (d < 2.8f || d > 4.2f) continue;
+            if (d < kICChalcogenDistMin || d > kICChalcogenDistMax) continue;
 
-            // σ-hole is opposite C-S bond: check S...A aligns with -bondedCDir
-            float3 sToA = normalize(positions[a] - sPos);
-            float cosTheta = dot(bondedCDir, sToA); // negative when aligned with σ-hole
-            if (cosTheta < -0.766f) {
-                float dd = d - 3.3f;
-                float angleFactor = (-cosTheta - 0.766f) / 0.234f;
-                chalcogenE += params.wChalcogenBond * angleFactor * drusinaRamp(dd, 0.3f, 0.8f);
-                interactionCount++;
-            }
+            float cosTheta = dot(sToC, normalize(positions[a] - sPos));
+            if (cosTheta > kICChalcogenCosMax) continue;
+            float angleFactor = drusinaAngleGate(cosTheta, kICChalcogenCosMax, -1.0f);
+            best = min(best, params.wChalcogenBond * angleFactor *
+                             drusinaRamp(d - kICChalcogenDistOpt,
+                                         kICChalcogenRampInner, kICChalcogenRampOuter));
         }
+        if (best < 0.0f) { chalcogenE += best; interactionCount++; }
     }
 
-    // ---- Enhanced metal coordination ----
-    // Verdonk 2003: optimal distance ~2.0-2.4 Å for N/O/S → metal.
-    // Moderate funnel: cutoff 4.5 Å, ramp out to 1.6 Å from optimal (full score 2.0-2.8 Å,
-    // fading to zero at 4.0 Å). Cap at one interaction per metal to avoid multi-counting.
+    // ---- Metal coordination (best coordinating ligand atom per metal) ----
+    // Verdonk 2003: the scoring funnel reaches further than the coordination
+    // shell so the GA has a gradient to follow into the site.
     for (uint p = 0; p < numProteinAtoms; p++) {
         if (proteinAtoms[p].vinaType != VINA_MET_D) continue;
+        float3 mPos = proteinAtoms[p].position;
+        if (distance_squared(ligCentroid, mPos) > cullRadiusSq) continue;
         float bestMetalScore = 0.0f;
         for (uint a = 0; a < nAtoms; a++) {
             int lt = ligandAtoms[a].vinaType;
             bool isCoord = (lt == VINA_N_A || lt == VINA_N_DA || lt == VINA_N_D ||
                             lt == VINA_O_A || lt == VINA_O_DA || lt == VINA_S_P);
             if (!isCoord) continue;
-            float d = distance(positions[a], proteinAtoms[p].position);
-            if (d > 4.5f) continue;
-            float dd = d - 2.4f;
-            float score = drusinaRamp(dd, 0.4f, 1.6f);
+            float d = distance(positions[a], mPos);
+            if (d > kICMetalScoreCutoff) continue;
+            float score = drusinaRamp(d - kICMetalDistOpt, kICMetalRampInner, kICMetalRampOuter);
             bestMetalScore = min(bestMetalScore, params.wMetalCoord * score);
         }
         if (bestMetalScore < 0.0f) {
@@ -592,43 +656,55 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     }
 
     // ---- Screened Coulomb (ε=4r, grid-based) ----
-    // Potential grid precomputed from protein charges: Φ(r) = Σ 332*q_p/(4*r²)
-    // E_elec = Σ q_ligand * Φ(r_ligand) via trilinear interpolation
-    // Out-of-grid atoms are skipped explicitly: trilinearInterpolate returns a quadratic
-    // penalty there (not a potential), and small penalties (< 99) used to leak in as Φ.
-    float coulombE = 0.0f;
-    float3 elecGridMin = gridParams.origin;
-    float3 elecGridMax = gridUpperBound(gridParams);
-    for (uint a = 0; a < nAtoms; a++) {
-        float3 r = positions[a];
-        if (any(r < elecGridMin) || any(r > elecGridMax)) continue;
-        float phi = trilinearInterpolate(elecGrid, r, gridParams.origin,
-                                          gridParams.spacing, gridParams.dims);
-        coulombE += ligandAtoms[a].charge * phi;
+    // Φ(r) is precomputed from protein charges over the whole box, so unlike
+    // every geometric term above it is long-ranged and rewards a pose for
+    // sitting anywhere favourable in the box (regression report RC2). Scaling
+    // each atom's contribution by its protein contact count keeps the term
+    // pocket-local: a ligand atom with no protein neighbour is screened by
+    // water, not by the protein interior (Bissantz 2010 on exposed ion pairs).
+    if (params.wCoulomb != 0.0f) {
+        float coulombE = 0.0f;
+        float3 elecGridMin = gridParams.origin;
+        float3 elecGridMax = gridUpperBound(gridParams);
+        for (uint a = 0; a < nAtoms; a++) {
+            float3 r = positions[a];
+            if (any(r < elecGridMin) || any(r > elecGridMax)) continue;
+            float burial = mix(kICCoulombBurialMinScale, 1.0f,
+                               clamp(float(contactCount[a]) / float(kICBurialPolarMinContacts),
+                                     0.0f, 1.0f));
+            float phi = trilinearInterpolate(elecGrid, r, gridParams.origin,
+                                              gridParams.spacing, gridParams.dims);
+            coulombE += ligandAtoms[a].charge * phi * burial;
+        }
+        coulombTermE = params.wCoulomb * coulombE;
     }
-    coulombTermE = params.wCoulomb * coulombE;
 
     // ---- CH-π interactions: ligand aliphatic C → protein aromatic rings ----
-    // Weaker individually (~-1 kcal/mol) but very frequent (2-5× per complex).
-    // Score C...ring centroid distance (3.5-5.0 Å) without explicit H.
-    // Tightened geometry: require approach within ~55° of ring normal (cosA > 0.55)
-    // and use cosA² to strongly favor perpendicular approach.
-    for (uint a = 0; a < nAtoms; a++) {
-        if (ligandAtoms[a].vinaType != VINA_C_H) continue;
-        if (ligandAtoms[a].flags & LIGATOM_FLAG_AROMATIC) continue;
-        float3 cPos = positions[a];
-        for (uint pr = 0; pr < params.numProteinRings; pr++) {
-            if (distance_squared(ligCentroid, proteinRings[pr].centroid) > ligandCutoffSq) continue;
-            float d = distance(cPos, proteinRings[pr].centroid);
-            if (d < 3.5f || d > 5.0f) continue;
-            float3 toC = normalize(cPos - proteinRings[pr].centroid);
-            float cosA = abs(dot(toC, proteinRings[pr].normal));
-            if (cosA > 0.55f) {  // within ~55° of ring normal
-                float dd = d - 4.0f;
-                chPiE += params.wCHPi * cosA * cosA * drusinaRamp(dd, 0.5f, 1.0f);
-                interactionCount++;
-            }
+    // One CH per ring: a ring face accepts a single CH-π contact, but the old
+    // loop let every aliphatic carbon within range of the same Phe score, so a
+    // cyclohexyl ring sitting on a Phe collected six contributions.
+    for (uint pr = 0; pr < params.numProteinRings; pr++) {
+        float3 prCentroid = proteinRings[pr].centroid;
+        if (distance_squared(ligCentroid, prCentroid) > cullRadiusSq) continue;
+        float3 prNormal = proteinRings[pr].normal;
+        float bestUp = 0.0f, bestDown = 0.0f;
+
+        for (uint a = 0; a < nAtoms; a++) {
+            if (ligandAtoms[a].vinaType != VINA_C_H) continue;
+            if (ligandAtoms[a].flags & LIGATOM_FLAG_AROMATIC) continue;
+            float3 cPos = positions[a];
+            float d = distance(cPos, prCentroid);
+            if (d < kICCHPiDistMin || d > kICCHPiDistMax) continue;
+            if (drusinaLateralOffset(prCentroid, prNormal, cPos) > kICCHPiOffsetMax) continue;
+            float cosA = abs(dot(normalize(cPos - prCentroid), prNormal));
+            if (cosA < kICCHPiCosMin) continue;
+            float score = params.wCHPi * drusinaAngleGate(cosA, kICCHPiCosMin, 1.0f) *
+                drusinaRamp(d - kICCHPiDistOpt, kICCHPiRampInner, kICCHPiRampOuter);
+            if (dot(cPos - prCentroid, prNormal) >= 0.0f) bestUp = min(bestUp, score);
+            else                                          bestDown = min(bestDown, score);
         }
+        if (bestUp   < 0.0f) { chPiE += bestUp;   interactionCount++; }
+        if (bestDown < 0.0f) { chPiE += bestDown; interactionCount++; }
     }
 
     // ---- Torsion strain: amide planarity penalty ----
@@ -656,10 +732,11 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     strainTermE = params.wTorsionStrain * strainE;
 
     // ---- H-bond directionality correction ----
-    // Bonus-only: reward well-directed H-bonds that Vina already scores by distance.
-    // Only fires on close-contact pairs (d < 3.0Å = actual H-bond distance) to avoid
-    // scoring non-H-bond contacts. Pure bonus (no penalty for bad angles) to avoid
-    // destabilizing pose ranking.
+    // Bonus-only: reward well-directed H-bonds that Vina already scores by
+    // distance. One partner per ligand donor/acceptor entry — the old loop
+    // summed over every protein partner in range, so a ligand hydroxyl facing
+    // a Ser (which contributes a donor AND an acceptor entry) plus a backbone
+    // N and O collected four directionality bonuses for one H-bond.
     // Reference: Korb 2009 (PLANTS), Verdonk 2003 (GoldScore)
     for (uint lh = 0; lh < params.numLigandHBondAtoms; lh++) {
         int li = ligandHBondInfo[lh].atomIndex;
@@ -669,23 +746,23 @@ inline DrusinaDecomposition computeDrusinaCorrections(
 
         float3 ligPos = positions[li];
         float3 ligAntPos = positions[lAnt];
+        float best = 0.0f;
 
         for (uint ph = 0; ph < params.numProteinHBondAtoms; ph++) {
-            // Spatial gating: skip protein atoms far from ligand centroid
-            if (distance_squared(ligCentroid, proteinHBondInfo[ph].position) > ligandCutoffSq) continue;
+            float3 protPos = proteinHBondInfo[ph].position;
+            if (distance_squared(ligCentroid, protPos) > cullRadiusSq) continue;
 
             bool protIsDonor = proteinHBondInfo[ph].isDonor > 0.5f;
             if (ligIsDonor == protIsDonor) continue;
 
-            float3 protPos = proteinHBondInfo[ph].position;
             float d = distance(ligPos, protPos);
-            // Tight cutoff: only actual H-bonds (< 3.2Å heavy-atom distance)
-            if (d < 1.5f || d > 3.2f) continue;
+            if (d < kICHBondDistMin || d > kICHBondDistMax) continue;
 
             float3 protAntPos = proteinHBondInfo[ph].antecedent;
 
-            // Distance factor: strongest at 2.7Å (optimal N-O), fading at 3.2Å
-            float distFactor = drusinaRamp(d - 2.7f, 0.2f, 0.5f);
+            // Distance factor: strongest at the CSD optimum, fading at DistMax
+            float distFactor = drusinaRamp(d - kICHBondDistOpt,
+                                           kICHBondRampInner, kICHBondRampOuter);
 
             // Donor angle: X-D...A, optimal 180°
             float3 donorPos, donorAntPos, acceptorPos;
@@ -694,91 +771,56 @@ inline DrusinaDecomposition computeDrusinaCorrections(
             } else {
                 donorPos = protPos; donorAntPos = protAntPos; acceptorPos = ligPos;
             }
-            float3 dToAnt = normalize(donorAntPos - donorPos);
-            float3 dToA   = normalize(acceptorPos - donorPos);
-            float cosDonor = dot(dToAnt, dToA);
-            // Score: 0 when bent (cos > -0.5), 1 when linear (cos = -1)
-            float donorAngleScore = smoothstep(-0.5f, -1.0f, cosDonor);
+            float cosDonor = dot(normalize(donorAntPos - donorPos),
+                                 normalize(acceptorPos - donorPos));
+            float donorAngleScore = drusinaAngleGate(cosDonor, kICHBondCosDonorBad, kICHBondCosDonorGood);
 
-            // Acceptor angle: D...A-Y, optimal ~120° (sp2)
+            // Acceptor angle: D...A-Y, optimal ~100° (sp2 lone pair)
             float3 accPos, accAntPos;
             if (ligIsDonor) {
                 accPos = protPos; accAntPos = protAntPos;
             } else {
                 accPos = ligPos; accAntPos = ligAntPos;
             }
-            float3 aToD   = normalize(donorPos - accPos);
-            float3 aToAnt = normalize(accAntPos - accPos);
-            float cosAcc = dot(aToD, aToAnt);
-            float accAngleScore = smoothstep(0.34f, -0.17f, cosAcc);
+            float cosAcc = dot(normalize(donorPos - accPos), normalize(accAntPos - accPos));
+            float accAngleScore = drusinaAngleGate(cosAcc, kICHBondCosAccBad, kICHBondCosAccGood);
 
             // Pure bonus: only reward good angles (no penalty)
             float angleFactor = donorAngleScore * accAngleScore;
-            if (angleFactor > 0.25f) {
-                hbondDirE += params.wHBondDir * angleFactor * distFactor;
-                interactionCount++;
-            }
+            if (angleFactor <= kICHBondAngleFactorMin) continue;
+            best = min(best, params.wHBondDir * angleFactor * distFactor);
         }
+        if (best < 0.0f) { hbondDirE += best; interactionCount++; }
     }
 
     // ---- Polar desolvation penalty ----
     // Penalize DEEPLY BURIED ligand polar atoms that lack H-bond satisfaction.
-    // Only triggers when a polar is surrounded by many protein atoms (truly buried)
-    // but has no H-bond partner. Surface-facing polars are not penalized.
+    // Surface-facing polars are not penalized.
     // Reference: HYDE scoring (Schneider 2013)
-    for (uint a = 0; a < nAtoms; a++) {
-        int lt = ligandAtoms[a].vinaType;
-        bool isPolar = (lt == VINA_N_A || lt == VINA_N_D || lt == VINA_N_DA ||
-                        lt == VINA_O_A || lt == VINA_O_D || lt == VINA_O_DA);
-        if (!isPolar) continue;
-
-        float3 lPos = positions[a];
-
-        // Count protein neighbors for burial estimate and check H-bond satisfaction
-        int nearbyCount = 0;
-        bool hbondSatisfied = false;
-        for (uint p = 0; p < numProteinAtoms; p++) {
-            float d = distance(lPos, proteinAtoms[p].position);
-            if (d < 5.0f) nearbyCount++;
-            // H-bond partner check: tight distance for actual H-bonds
-            if (d < 3.2f) {
-                int pt = proteinAtoms[p].vinaType;
-                if (xsHBondPossible(lt, pt)) {
-                    hbondSatisfied = true;
-                }
-            }
-        }
-
-        // Only penalize deeply buried unsatisfied polars (>= 12 neighbors within 5Å)
-        if (!hbondSatisfied && nearbyCount >= 12) {
-            // Burial ramp: 0 at 12 neighbors, 1.0 at 25+ neighbors
-            float burial = clamp(float(nearbyCount - 12) / 13.0f, 0.0f, 1.0f);
+    if (needPolarDesolv) {
+        for (uint a = 0; a < nAtoms; a++) {
+            int lt = ligandAtoms[a].vinaType;
+            bool isPolar = (lt == VINA_N_A || lt == VINA_N_D || lt == VINA_N_DA ||
+                            lt == VINA_O_A || lt == VINA_O_D || lt == VINA_O_DA);
+            if (!isPolar || hbondSatisfied[a]) continue;
+            int nearby = int(contactCount[a]);
+            if (nearby < kICBurialPolarMinContacts) continue;
+            float burial = clamp(float(nearby - kICBurialPolarMinContacts) /
+                                 float(kICBurialPolarFullContacts - kICBurialPolarMinContacts),
+                                 0.0f, 1.0f);
             desolvPolarE += params.wDesolvPolar * burial;
         }
     }
 
     // ---- Hydrophobic desolvation penalty ----
-    // Penalize ligand hydrophobic atoms that are fully exposed to solvent.
-    // Only triggers when a hydrophobic C has very few protein contacts (< 3 within 4.5Å),
-    // indicating the atom is dangling into solvent rather than buried in the pocket.
-    // Reference: Böhm 1994, ChemScore (Eldridge 1997)
-    for (uint a = 0; a < nAtoms; a++) {
-        if (ligandAtoms[a].vinaType != VINA_C_H) continue;
-        float3 lPos = positions[a];
-
-        int nearbyCount = 0;
-        for (uint p = 0; p < numProteinAtoms; p++) {
-            float d = distance(lPos, proteinAtoms[p].position);
-            if (d < 4.5f) {
-                nearbyCount++;
-                if (nearbyCount >= 3) break;  // no penalty, early exit
-            }
-        }
-
-        // Only penalize truly exposed atoms (< 3 protein neighbors)
-        if (nearbyCount < 3) {
-            // 0 neighbors → full penalty, 2 neighbors → 1/3 penalty
-            float exposure = 1.0f - float(nearbyCount) / 3.0f;
+    // Penalize ligand hydrophobic atoms dangling into solvent rather than
+    // buried in the pocket. Reference: Böhm 1994, ChemScore (Eldridge 1997)
+    if (needHydroDesolv) {
+        for (uint a = 0; a < nAtoms; a++) {
+            if (ligandAtoms[a].vinaType != VINA_C_H) continue;
+            int nearby = int(closeContactCount[a]);
+            if (nearby >= kICExposureMinContacts) continue;
+            float exposure = 1.0f - float(nearby) / float(kICExposureMinContacts);
             desolvHydrophobicE += params.wDesolvHydrophobic * exposure;
         }
     }
@@ -794,9 +836,9 @@ inline DrusinaDecomposition computeDrusinaCorrections(
              + chalcogenE + metalE + coulombTermE + chPiE + strainTermE
              + cooperativityE + hbondDirE + desolvPolarE + desolvHydrophobicE;
 
-    // Safety cap: Drusina corrections should remain bounded, but the cap itself
-    // is a tunable parameter because Drusina is intended to be more than a tiny
-    // post-hoc Vina correction.
+    // Absolute safety cap. The Vina-relative bound that actually governs
+    // ranking is applied by the callers, which know the pose's Vina energy
+    // (see drusinaBoundedCorrection).
     drusinaE = max(drusinaE, params.minCorrection);
 
     // Fill decomposition struct
@@ -817,6 +859,24 @@ inline DrusinaDecomposition computeDrusinaCorrections(
     decomp.total = drusinaE;
 
     return decomp;
+}
+
+/// Bound the Drusina correction against the pose's own Vina energy.
+///
+/// Two separate guards, both needed (regression report RC1):
+///   1. Steric-sanity gate — a pose Vina calls a clash may not collect
+///      interaction bonuses at all. `vinaE` must include the boundary/clash
+///      penalty, not just the normalized interaction sum.
+///   2. Relative bound — a favourable correction may not exceed a fixed
+///      fraction of the favourable Vina energy. An absolute floor cannot do
+///      this: it lets the correction outvote Vina for weakly bound poses while
+///      staying inert for strongly bound ones, which is exactly backwards.
+///      A pose with vinaE >= 0 therefore gets no bonus at all.
+inline float drusinaBoundedCorrection(float rawCorrection, float vinaE,
+                                      constant DrusinaParams &params) {
+    float gated = rawCorrection * drusinaVinaQuality(vinaE, params);
+    float relativeFloor = -kICDrusinaMaxVinaFraction * max(-vinaE, 0.0f);
+    return max(gated, relativeFloor);
 }
 
 /// Score poses with Vina grid maps + Drusina extended interaction corrections.
@@ -877,7 +937,7 @@ kernel void scorePosesDrusina(
     float normFactor = vinaRotNormalization(nRotF);
     float normalizedE = (totalIntermolecular + intraDelta) * normFactor;
 
-    // --- Drusina corrections (soft gate: only attenuates for clashing poses) ---
+    // --- Drusina corrections, bounded against this pose's Vina energy ---
     DrusinaDecomposition decomp = computeDrusinaCorrections(
         positions, ligandAtoms, nA,
         proteinRings, ligandRings, proteinCations, drusinaParams,
@@ -892,12 +952,13 @@ kernel void scorePosesDrusina(
     pose.torsionPenalty    = normalizedE - totalIntermolecular - intraDelta;
     pose.clashPenalty      = wPenalty * penalty;
 
-    // Soft gate: full contribution for vinaE < 0, attenuated for clashing poses
-    float vinaQuality = drusinaVinaQuality(normalizedE, drusinaParams);
-    float drusinaE = decomp.total * vinaQuality;
+    // The boundary penalty is part of the pose's steric sanity, so it belongs
+    // in the Vina energy the gate and the relative bound see.
+    float vinaE = normalizedE + wPenalty * penalty;
+    float drusinaE = drusinaBoundedCorrection(decomp.total, vinaE, drusinaParams);
 
     pose.drusinaCorrection = drusinaE;
-    pose.energy = normalizedE + wPenalty * penalty + drusinaE;
+    pose.energy = vinaE + drusinaE;
 }
 
 /// Apply Drusina corrections to already-scored poses (e.g., after explicit Vina rescoring).
@@ -942,10 +1003,8 @@ kernel void applyDrusinaCorrection(
         elecGrid, gridParams, proteinChalcogens, torsionStrain,
         ligandHBondInfo, proteinHBondInfo);
 
-    // Soft gate: only attenuate for clashing poses (vinaE > +2)
-    float vinaE = pose.energy;
-    float vinaQuality = drusinaVinaQuality(vinaE, drusinaParams);
-    float drusinaE = decomp.total * vinaQuality;
+    // pose.energy already carries the Vina total including the clash penalty.
+    float drusinaE = drusinaBoundedCorrection(decomp.total, pose.energy, drusinaParams);
 
     pose.drusinaCorrection = drusinaE;
     pose.energy += drusinaE;
