@@ -3,7 +3,6 @@
 
 import SwiftUI
 import Charts
-import simd
 
 /// Step 6 — analyze & export poses. Summary first, then the pose list, batch
 /// and screening results; exports and the hand-off to Lead Opt live in the
@@ -365,7 +364,7 @@ struct ResultsTabView: View {
                             index: idx,
                             result: result,
                             method: method,
-                            rmsd: rmsd(result.transformedAtomPositions, reference),
+                            rmsd: LigandMetrics.rmsd(result.transformedAtomPositions, reference),
                             isChecked: viewModel.docking.selectedPoseIndices.contains(idx),
                             isActive: activePoseIndex == idx,
                             canOptimize: canOptimize,
@@ -441,17 +440,6 @@ struct ResultsTabView: View {
     private func optimize(_ result: DockingResult) {
         guard let ligand = viewModel.docking.originalDockingLigand ?? viewModel.molecules.ligand else { return }
         viewModel.selectReferenceForOptimization(result: result, ligand: ligand)
-    }
-
-    /// Heavy-atom RMSD to the top-ranked pose (same atom order, no symmetry correction).
-    private func rmsd(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>]) -> Float? {
-        guard !a.isEmpty, a.count == b.count else { return nil }
-        var sumSq: Float = 0
-        for k in 0..<a.count {
-            let d = a[k] - b[k]
-            sumSq += simd_dot(d, d)
-        }
-        return (sumSq / Float(a.count)).squareRoot()
     }
 
     // MARK: - Batch
@@ -777,7 +765,7 @@ private struct PoseRow: View {
                     DSScoreBadge(result.displayScore(method: method), method: method)
                     Spacer(minLength: DS.Space.xs)
                     if let rmsd {
-                        Text(String(format: "%.1f Å", rmsd))
+                        Text("\(TableFormat.rmsd(rmsd)) Å")
                             .font(DS.Font.monoSmall)
                             .monospacedDigit()
                             .foregroundStyle(.secondary)

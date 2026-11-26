@@ -6,19 +6,22 @@ import SwiftUI
 // MARK: - Interaction palette
 
 extension MolecularInteraction.InteractionType {
-    /// Theme color for 2D diagrams, lists and charts (DS interaction palette, light/dark aware).
+    /// Theme color for 2D diagrams, lists and charts. Each hue matches the
+    /// type's 3D viewport line (`color`) so the 2D diagram reads like the 3D
+    /// view; the light variant is darkened for contrast on white paper, the dark
+    /// variant stays close to the viewport color.
     var themeColor: Color {
         switch self {
-        case .hbond:       DS.Color.interactionHBond
-        case .hydrophobic: DS.Color.interactionHydrophobic
-        case .saltBridge:  DS.Color.interactionSaltBridge
-        case .piStack:     DS.Color.interactionPiStack
-        case .piCation:    DS.Color.interactionPiCation
-        case .halogen:     DS.Color.interactionHalogen
-        case .metalCoord:  DS.Color.interactionMetal
-        case .chPi:        DS.Color.pocket
-        case .amideStack:  DS.Color.warning
-        case .chalcogen:   Self.chalcogenColor
+        case .hbond:       DS.dynamic(light: 0x0A78B4, dark: 0x4FD1FF)   // cyan
+        case .hydrophobic: DS.dynamic(light: 0x6E6E73, dark: 0xA8A8AE)   // gray
+        case .saltBridge:  DS.dynamic(light: 0xC85A00, dark: 0xFF9A4D)   // orange
+        case .piStack:     DS.dynamic(light: 0x8A3FD1, dark: 0xC38BFF)   // purple
+        case .piCation:    DS.dynamic(light: 0xC2257F, dark: 0xFF79C6)   // magenta
+        case .halogen:     DS.dynamic(light: 0x1E8F4A, dark: 0x4BE38A)   // green
+        case .metalCoord:  DS.dynamic(light: 0xA67C00, dark: 0xFFD43B)   // gold
+        case .chPi:        DS.dynamic(light: 0x7563A8, dark: 0xB4A2E0)   // light purple
+        case .amideStack:  DS.dynamic(light: 0xA8651C, dark: 0xF0AE6A)   // amber
+        case .chalcogen:   DS.dynamic(light: 0x6B7A00, dark: 0xD2E65A)   // yellow-green
         }
     }
 
@@ -29,7 +32,22 @@ extension MolecularInteraction.InteractionType {
         return Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z))
     }
 
-    private static let chalcogenColor = DS.dynamic(light: 0x6B7A00, dark: 0xC5D86D)
+    /// Line pattern of this interaction in the 2D diagram and its legends. Every
+    /// type gets a distinct pattern so the figure stays readable in grayscale:
+    /// polar contacts are dashed, π contacts dotted, metal coordination solid.
+    var diagramStroke: StrokeStyle {
+        let dots: [CGFloat] = [0.01, 4.2]
+        switch self {
+        case .hbond:       return StrokeStyle(lineWidth: 1.8, lineCap: .butt, dash: [5, 3])
+        case .saltBridge:  return StrokeStyle(lineWidth: 2.0, lineCap: .butt, dash: [8, 3, 2, 3])
+        case .halogen:     return StrokeStyle(lineWidth: 1.8, lineCap: .butt, dash: [9, 4])
+        case .chalcogen:   return StrokeStyle(lineWidth: 1.8, lineCap: .butt, dash: [8, 3, 2, 3, 2, 3])
+        case .metalCoord:  return StrokeStyle(lineWidth: 2.2, lineCap: .round)
+        case .piStack, .piCation, .chPi, .amideStack:
+            return StrokeStyle(lineWidth: 2.6, lineCap: .round, dash: dots)
+        case .hydrophobic: return StrokeStyle(lineWidth: 1.2, lineCap: .butt, dash: [3, 3])
+        }
+    }
 }
 
 // MARK: - Canvas legends

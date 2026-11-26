@@ -256,7 +256,7 @@ struct LigandDatabaseView: View {
 
         PanelCard("Library", icon: "books.vertical", accessory: {
             if total > 0 {
-                DSTag("\(preparedCount)/\(total) ready", tone: preparedCount > 0 ? .success : .neutral)
+                DSTag("\(preparedCount)/\(total) prepared", tone: preparedCount > 0 ? .success : .neutral)
                     .help("\(total) compounds in the library, \(preparedCount) prepared for docking")
             }
         }) {
@@ -444,16 +444,9 @@ struct LigandDatabaseView: View {
         }
     }
 
-    @ViewBuilder
     private func statusTag(_ entry: LigandEntry) -> some View {
-        if entry.preparationError != nil {
-            DSTag("Failed", tone: .danger)
-                .help(entry.preparationError ?? "")
-        } else if entry.isPrepared {
-            DSTag("Ready", tone: .success)
-        } else {
-            DSTag("Raw")
-        }
+        let status = LigandPrepStatus(entry)
+        return status.tag.help(entry.preparationError ?? status.help)
     }
 
     // MARK: - Footer

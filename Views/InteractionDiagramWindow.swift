@@ -28,7 +28,14 @@ struct InteractionDiagramWindow: View {
                     ligandSmiles: ligand.smiles,
                     poseEnergy: results[idx].displayScore(method: sm),
                     poseIndex: idx,
-                    scoringMethod: sm
+                    scoringMethod: sm,
+                    onSelectResidue: { key in
+                        guard let residue = protein.residues.firstIndex(where: {
+                            $0.sequenceNumber == key.seq && $0.chainID == key.chain && $0.name == key.name
+                        }) else { return }
+                        viewModel.selectResidues([residue], extend: false)
+                        viewModel.centerOnSelection()
+                    }
                 )
                 // Rebuild the layout whenever the ligand, pose or its contacts change.
                 .id(diagramIdentity(ligandName: ligand.name, poseIndex: idx))

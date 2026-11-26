@@ -7,12 +7,18 @@ import MetalKit
 /// Launched from App/main.swift, which routes `--headless` invocations to HeadlessRunner instead.
 struct DruseApp: App {
     @NSApplicationDelegateAdaptor(DruseAppDelegate.self) private var appDelegate
-    @State private var viewModel = AppViewModel()
+    @State private var viewModel: AppViewModel
+    /// The single DruseScript session, shown either in the main window's bottom panel or in
+    /// its own Terminal window, so scrollback, history and a running command follow it.
+    @State private var consoleSession: ConsoleSession
     @AppStorage("appTheme") private var appTheme: String = AppTheme.auto.rawValue
 
     /// Applies the CPU core limit before any work starts (headless runs apply it in HeadlessRunner).
     init() {
         AppSettings.shared.applyThreadLimits()
+        let viewModel = AppViewModel()
+        _viewModel = State(initialValue: viewModel)
+        _consoleSession = State(initialValue: ConsoleSession(viewModel: viewModel))
     }
 
     private var selectedColorScheme: ColorScheme? {
@@ -23,6 +29,7 @@ struct DruseApp: App {
         Window("Druse", id: "main") {
             ContentView()
                 .environment(viewModel)
+                .environment(consoleSession)
                 .preferredColorScheme(selectedColorScheme)
                 .onAppear {
                     appDelegate.viewModel = viewModel
@@ -36,7 +43,7 @@ struct DruseApp: App {
         .defaultSize(DS.Size.windowDefault)
         .defaultLaunchBehavior(.automatic)
         .commands {
-            DruseCommands(viewModel: viewModel)
+            DruseCommands(viewModel: viewModel, consoleSession: consoleSession)
         }
 
         Settings {
@@ -82,6 +89,18 @@ struct DruseApp: App {
                 .preferredColorScheme(selectedColorScheme)
         }
         .defaultSize(width: 1050, height: 800)
+        .windowStyle(.titleBar)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        // The DruseScript terminal, detached from the main window's bottom panel
+        Window("Druse Terminal", id: ConsoleWindow.id) {
+            ConsoleWindow()
+                .environment(consoleSession)
+                .preferredColorScheme(selectedColorScheme)
+                .frame(minWidth: 480, minHeight: 240)
+        }
+        .defaultSize(width: 900, height: 560)
         .windowStyle(.titleBar)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
@@ -185,7 +204,9 @@ struct DruseApp: App {
 
 private struct DruseCommands: Commands {
     let viewModel: AppViewModel
+    let consoleSession: ConsoleSession
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
     @FocusedValue(\.selectedStep) private var selectedStep
     @AppStorage("ui.navigatorOpen") private var showNavigator = true
     @AppStorage("ui.inspectorOpen") private var showInspector = false
@@ -250,8 +271,14 @@ private struct DruseCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.control, .command])
             Button(showInspector ? "Hide Inspector" : "Show Inspector") { showInspector.toggle() }
                 .keyboardShortcut("0", modifiers: [.option, .command])
-            panelToggle(.terminal)
-                .keyboardShortcut("`", modifiers: .control)
+            if consoleSession.isDetached {
+                Button("Close Terminal Window") { dismissWindow(id: ConsoleWindow.id) }
+                    .keyboardShortcut("`", modifiers: .control)
+            } else {
+                panelToggle(.terminal)
+                    .keyboardShortcut("`", modifiers: .control)
+            }
+            Button("Open Terminal in Separate Window") { openWindow(id: ConsoleWindow.id) }
             panelToggle(.logs)
                 .keyboardShortcut("y", modifiers: [.shift, .command])
             Divider()

@@ -8,6 +8,8 @@ import SwiftUI
 /// background, hairline dividers), resizable from their inner edge, and collapsible.
 struct ContentView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(ConsoleSession.self) private var consoleSession
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("ui.navigatorOpen") private var showNavigator = true
@@ -187,16 +189,23 @@ struct ContentView: View {
         ToolbarSpacer(.fixed, placement: .primaryAction)
 
         ToolbarItemGroup(placement: .primaryAction) {
-            Toggle(isOn: Binding(
-                get: { showConsole && bottomPanel == .terminal },
-                set: { newValue in
-                    if newValue { bottomPanel = .terminal }
-                    withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = newValue }
+            if consoleSession.isDetached {
+                Button { openWindow(id: ConsoleWindow.id) } label: {
+                    Label("Terminal", systemImage: "macwindow")
                 }
-            )) {
-                Label("Terminal", systemImage: BottomPanel.terminal.systemImage)
+                .help("Bring the Terminal window forward")
+            } else {
+                Toggle(isOn: Binding(
+                    get: { showConsole && bottomPanel == .terminal },
+                    set: { newValue in
+                        if newValue { bottomPanel = .terminal }
+                        withAnimation(DS.Motion.respecting(reduceMotion)) { showConsole = newValue }
+                    }
+                )) {
+                    Label("Terminal", systemImage: BottomPanel.terminal.systemImage)
+                }
+                .help(showConsole && bottomPanel == .terminal ? "Hide Terminal ⌃`" : "Show Terminal ⌃`")
             }
-            .help(showConsole && bottomPanel == .terminal ? "Hide Terminal ⌃`" : "Show Terminal ⌃`")
 
             Toggle(isOn: $showInspector) {
                 Label("Inspector", systemImage: "sidebar.trailing")

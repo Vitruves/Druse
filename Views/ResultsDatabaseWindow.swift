@@ -9,13 +9,19 @@ import Charts
 
 /// Secondary window: batch ligands in the sidebar, the sortable pose table in
 /// the content column and the selected pose's details in the inspector.
+///
+/// The table selection is the shared pose selection (`selectedPoseIndices`,
+/// also ticked in the Results step): one selected pose is shown in 3D and
+/// inspected, several can be overlaid or compared.
 struct ResultsDatabaseWindow: View {
     @Environment(AppViewModel.self) private var viewModel
     @Environment(\.openWindow) private var openWindow
 
-    @State private var selectedPoseIndex: Int? = nil
-    @State private var sortField: SortField = .score
-    @State private var sortAscending: Bool = true
+    @State private var sortOrder: [TableSort<PoseTableRow>] = []
+    @State private var columnCustomization: TableColumnCustomization<PoseTableRow> = TableColumnStore.load(Self.columnStoreKey)
+    private static let columnStoreKey = "ui.resultsTable.columns"
+    @State private var clusterLeadersOnly = false
+    @State private var validPosesOnly = false
     @State private var selectedBatchLigand: String? = nil
     @State private var showCorrelation: Bool = false
     @State private var showMultiPoseAnalysis: Bool = false
@@ -25,47 +31,47 @@ struct ResultsDatabaseWindow: View {
     @AppStorage("ui.resultsInspectorWidth") private var inspectorWidth = 320.0
     @State private var filterText: String = ""
 
-    enum SortField: String, CaseIterable {
-        case rank = "#"
-        case score = "Score"
-        case vdw = "vdW"
-        case hydrophobic = "Hydro"
-        case hbond = "H-bond"
-        case torsion = "Torsion"
-        case cluster = "Cluster"
-        case generation = "Gen"
-    }
-
     private var method: ScoringMethod { viewModel.docking.scoringMethod }
     private var results: [DockingResult] { viewModel.docking.dockingResults }
     private var batch: [(ligandName: String, results: [DockingResult])] { viewModel.docking.batchResults }
 
-    /// Poses in table order, paired with their index in `dockingResults` (the index every action uses).
-    private var sortedRows: [(index: Int, result: DockingResult)] {
-        let query = filterText.trimmingCharacters(in: .whitespaces).lowercased()
-        let rows = results.enumerated().map { (index: $0.offset, result: $0.element) }.filter { row in
-            guard batch.isEmpty, !query.isEmpty else { return true }
-            return "#\(row.index + 1)".contains(query) || "c\(row.result.clusterID)" == query
-        }
-        return rows.sorted { a, b in
-            let cmp: Bool
-            switch sortField {
-            case .rank:       cmp = a.index < b.index
-            case .score:      cmp = a.result.displayScore(method: method) < b.result.displayScore(method: method)
-            case .vdw:        cmp = a.result.stericEnergy < b.result.stericEnergy
-            case .hydrophobic: cmp = a.result.hydrophobicEnergy < b.result.hydrophobicEnergy
-            case .hbond:      cmp = a.result.hbondEnergy < b.result.hbondEnergy
-            case .torsion:    cmp = a.result.torsionPenalty < b.result.torsionPenalty
-            case .cluster:    cmp = a.result.clusterID < b.result.clusterID
-            case .generation: cmp = a.result.generation < b.result.generation
-            }
-            return sortAscending ? cmp : !cmp
-        }
+    private var isFiltered: Bool {
+        clusterLeadersOnly || validPosesOnly || (batch.isEmpty && !filterText.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
-    private var selectedResult: DockingResult? {
-        guard let idx = selectedPoseIndex, idx < results.count else { return nil }
-        return results[idx]
+    /// Heavy atoms of the docked ligand, for ligand efficiency.
+    private var heavyAtomCount: Int {
+        results.first?.transformedAtomPositions.count ?? 0
+    }
+
+    /// Poses in table order. A row's id is its index in `dockingResults` (the index every action uses).
+    private var tableRows: [PoseTableRow] {
+        let query = filterText.trimmingCharacters(in: .whitespaces).lowercased()
+        let reference = results.first?.transformedAtomPositions ?? []
+        let heavyAtoms = heavyAtomCount
+        let method = self.method
+        let rows = results.enumerated().compactMap { index, result -> PoseTableRow? in
+            if clusterLeadersOnly && !(result.clusterID >= 0 && result.clusterRank == 0) { return nil }
+            if validPosesOnly && result.validity?.passed != true { return nil }
+            if batch.isEmpty, !query.isEmpty,
+               !("#\(index + 1)".hasPrefix(query) || "c\(result.clusterID)" == query) { return nil }
+            let score = result.displayScore(method: method)
+            return PoseTableRow(
+                id: index,
+                result: result,
+                score: score,
+                ligandEfficiency: LigandMetrics.ligandEfficiency(score: score, method: method, heavyAtoms: heavyAtoms),
+                rmsdToBest: LigandMetrics.rmsd(result.transformedAtomPositions, reference)
+            )
+        }
+        return sortOrder.isEmpty ? rows : rows.sorted(using: sortOrder)
+    }
+
+    /// The pose shown in the inspector: the selection when it is a single pose.
+    private var inspectedIndex: Int? {
+        let selection = viewModel.docking.selectedPoseIndices
+        guard selection.count == 1, let idx = selection.first, idx < results.count else { return nil }
+        return idx
     }
 
     var body: some View {
@@ -115,7 +121,9 @@ struct ResultsDatabaseWindow: View {
         }
         .navigationSubtitle(windowSubtitle)
         .toolbar { toolbarContent }
-        .onChange(of: results.count) { _, _ in selectedPoseIndex = nil }
+        .onChange(of: columnCustomization) { _, newValue in
+            TableColumnStore.save(newValue, key: Self.columnStoreKey)
+        }
         .sheet(isPresented: $showMultiPoseAnalysis) {
             MultiPoseAnalysisSheet()
                 .environment(viewModel)
@@ -160,13 +168,26 @@ struct ResultsDatabaseWindow: View {
             .help("Correlate docking scores with experimental affinity (batch results)")
 
             Button {
-                if let idx = selectedPoseIndex { openDiagram(idx) }
+                if let idx = inspectedIndex { openDiagram(idx) }
             } label: {
                 Label("Diagram", systemImage: "point.3.connected.trianglepath.dotted")
             }
             .labelStyle(.titleAndIcon)
-            .disabled(selectedResult == nil)
+            .disabled(inspectedIndex == nil)
             .help("Open the 2D interaction diagram for the selected pose")
+
+            Menu {
+                Toggle("Cluster representatives only", isOn: $clusterLeadersOnly)
+                Toggle("PoseBusters-valid only", isOn: $validPosesOnly)
+                    .disabled(!results.contains { $0.validity != nil })
+            } label: {
+                Label("Filter",
+                      systemImage: clusterLeadersOnly || validPosesOnly
+                        ? "line.3.horizontal.decrease.circle.fill"
+                        : "line.3.horizontal.decrease.circle")
+            }
+            .disabled(results.isEmpty)
+            .help("Filter the pose table")
 
             Menu {
                 Button("Export Poses as SDF…") { viewModel.exportDockingResultsSDF() }
@@ -212,7 +233,7 @@ struct ResultsDatabaseWindow: View {
         .listStyle(.sidebar)
         .onChange(of: selectedBatchLigand) { _, name in
             guard let name, let entry = batch.first(where: { $0.ligandName == name }) else { return }
-            selectedPoseIndex = nil
+            viewModel.docking.selectedPoseIndices = []
             ResultsActions.loadBatchLigand(named: name, results: entry.results, viewModel: viewModel)
         }
     }
@@ -225,7 +246,7 @@ struct ResultsDatabaseWindow: View {
 
     private func batchLigandRow(entry: (ligandName: String, results: [DockingResult])) -> some View {
         let rank = (batch.firstIndex(where: { $0.ligandName == entry.ligandName }) ?? 0) + 1
-        let best = entry.results.first?.displayScore(method: method)
+        let best = entry.results.first
         let affinity = ligandAffinityData(for: entry.ligandName)
         return HStack(spacing: DS.Space.s) {
             Text(verbatim: "#\(rank)")
@@ -239,7 +260,17 @@ struct ResultsDatabaseWindow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 HStack(spacing: DS.Space.s) {
-                    if let best { scoreBadge(best) }
+                    if let best {
+                        DSScoreBadge(best.displayScore(method: method), method: method)
+                        if let le = LigandMetrics.ligandEfficiency(score: best.displayScore(method: method), method: method,
+                                                                   heavyAtoms: best.transformedAtomPositions.count) {
+                            Text("LE \(TableFormat.ligandEfficiency(le))")
+                                .font(DS.Font.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(DSScore.tone(ligandEfficiency: le).cellColor)
+                                .help("Ligand efficiency of the best pose (kcal/mol per heavy atom)")
+                        }
+                    }
                     Text(entry.results.count == 1 ? "1 pose" : "\(entry.results.count) poses")
                         .font(DS.Font.caption)
                         .monospacedDigit()
@@ -258,174 +289,278 @@ struct ResultsDatabaseWindow: View {
 
     // MARK: - Pose table
 
-    private enum Column {
-        static let check: CGFloat = 24
-        static let rank: CGFloat = 56   // fits "#3000"
-        static let score: CGFloat = 124 // fits "Score (kcal/mol)" plus the sort chevron
-        static let term: CGFloat = 56
-        static let cluster: CGFloat = 58
-        static let generation: CGFloat = 46
-        static let actions: CGFloat = 60
+    /// The shared pose selection; picking exactly one pose shows it in 3D.
+    private var selection: Binding<Set<Int>> {
+        Binding(
+            get: { viewModel.docking.selectedPoseIndices },
+            set: { newValue in
+                viewModel.docking.selectedPoseIndices = newValue
+                if newValue.count == 1, let idx = newValue.first { viewModel.showDockingPose(at: idx) }
+            }
+        )
     }
 
+    @ViewBuilder
     private var poseTable: some View {
-        VStack(spacing: 0) {
-            if viewModel.docking.selectedPoseIndices.count > 1 {
-                multiSelectionBar
-                Divider()
-            }
-            tableHeader
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(sortedRows.enumerated()), id: \.element.index) { position, row in
-                        poseRow(index: row.index, position: position, result: row.result)
+        let rows = tableRows
+        let method = self.method
+        let hasValidity = results.contains { $0.validity != nil }
+        let hasStrain = results.contains { $0.strainEnergy != nil }
+        let hasXTB = results.contains { $0.gfn2Energy != nil }
+        let hasConstraints = results.contains { $0.constraintPenalty > 0.01 }
+        let hasForms = results.contains { $0.formLabel != nil }
+
+        Table(of: PoseTableRow.self,
+              selection: selection,
+              sortOrder: $sortOrder,
+              columnCustomization: $columnCustomization) {
+            Group {
+                TableColumn("#", sortUsing: TableSort<PoseTableRow>("rank") { .number($0.id) }) { row in
+                    Text(verbatim: "#\(row.id + 1)")
+                        .font(DS.Font.monoSmall.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 36, ideal: 48, max: 64)
+                .customizationID("rank")
+                .disabledCustomizationBehavior(.visibility)
+
+                TableColumn(method.scoreColumnTitle, sortUsing: TableSort<PoseTableRow>("score") { .number($0.score) }) { row in
+                    TableScoreCell(value: row.score, method: method)
+                }
+                .width(min: 70, ideal: 104, max: 130)
+                .alignment(.trailing)
+                .customizationID("score")
+
+                TableColumn("LE", sortUsing: TableSort<PoseTableRow>("le") { .number($0.ligandEfficiency) }) { row in
+                    TableNumberCell(text: row.ligandEfficiency.map(TableFormat.ligandEfficiency),
+                                    tone: row.ligandEfficiency.map { DSScore.tone(ligandEfficiency: $0) },
+                                    help: "Ligand efficiency (kcal/mol per heavy atom)")
+                }
+                .width(min: 40, ideal: 50, max: 70)
+                .alignment(.trailing)
+                .customizationID("le")
+
+                TableColumn("RMSD (Å)", sortUsing: TableSort<PoseTableRow>("rmsd") { .number($0.rmsdToBest) }) { row in
+                    TableNumberCell(text: row.rmsdToBest.map(TableFormat.rmsd),
+                                    help: "Heavy-atom RMSD to pose #1 (no symmetry correction)")
+                }
+                .width(min: 50, ideal: 66, max: 90)
+                .alignment(.trailing)
+                .customizationID("rmsd")
+
+                TableColumn("Cluster", sortUsing: TableSort<PoseTableRow>("cluster") {
+                    $0.result.clusterID >= 0 ? .number($0.result.clusterID) : .missing
+                }) { row in
+                    clusterCell(row.result)
+                }
+                .width(min: 48, ideal: 60, max: 80)
+                .customizationID("cluster")
+
+                TableColumn("Rank in Cluster", sortUsing: TableSort<PoseTableRow>("clusterRank") {
+                    $0.result.clusterID >= 0 ? .number($0.result.clusterRank + 1) : .missing
+                }) { row in
+                    TableNumberCell(text: row.result.clusterID >= 0 ? "\(row.result.clusterRank + 1)" : nil)
+                }
+                .width(min: 40, ideal: 60, max: 90)
+                .alignment(.trailing)
+                .customizationID("clusterRank")
+                .defaultVisibility(.hidden)
+
+                if hasValidity {
+                    TableColumn("PB", sortUsing: TableSort<PoseTableRow>("validity") {
+                        .number($0.result.validity.map { $0.passed ? 1 : 0 })
+                    }) { row in
+                        validityCell(row.result.validity)
                     }
+                    .width(min: 28, ideal: 34, max: 48)
+                    .alignment(.center)
+                    .customizationID("validity")
                 }
             }
-        }
-        .background(Color(nsColor: .textBackgroundColor))
-    }
 
-    private var multiSelectionBar: some View {
-        HStack(spacing: DS.Space.m) {
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(DS.Color.accent)
-            Text("\(viewModel.docking.selectedPoseIndices.count) poses selected")
-                .monospacedDigit()
-            Spacer()
-            Button("Clear") { viewModel.docking.selectedPoseIndices.removeAll() }
-                .buttonStyle(.borderless)
-                .help("Untick all poses")
-            Button("Compare…") { showMultiPoseAnalysis = true }
-                .buttonStyle(.bordered)
-                .help("Pairwise RMSD and interaction fingerprints of the ticked poses")
-            Button("View Selected Poses") { viewModel.showSelectedPoses() }
-                .buttonStyle(.borderedProminent)
-                .help("Overlay the ticked poses in the 3D viewport")
-        }
-        .font(DS.Font.secondary)
-        .controlSize(.small)
-        .padding(.horizontal, DS.Space.l)
-        .padding(.vertical, DS.Space.s)
-        .background(DS.Color.accentSoft)
-    }
-
-    private var tableHeader: some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: Column.check)
-            headerButton(.rank, width: Column.rank)
-            headerButton(.score, width: Column.score, title: "Score (\(method.unitLabel))")
-            headerButton(.vdw, width: Column.term)
-            headerButton(.hydrophobic, width: Column.term)
-            headerButton(.hbond, width: Column.term)
-            headerButton(.torsion, width: Column.term)
-            headerButton(.cluster, width: Column.cluster)
-            headerButton(.generation, width: Column.generation)
-            Spacer(minLength: 0)
-            Color.clear.frame(width: Column.actions)
-        }
-        .padding(.horizontal, DS.Space.m)
-        .frame(height: DS.Size.rowHeight + 4)
-        .background(.bar)
-    }
-
-    private func headerButton(_ field: SortField, width: CGFloat, title: String? = nil) -> some View {
-        let isActive = sortField == field
-        return Button {
-            if isActive { sortAscending.toggle() } else { sortField = field; sortAscending = true }
-        } label: {
-            HStack(spacing: DS.Space.xxs) {
-                Text(title ?? field.rawValue)
-                    .lineLimit(1)
-                if isActive {
-                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                        .font(DS.Font.caption.weight(.bold))
+            if method.isAffinityScore {
+                TableColumn("Confidence", sortUsing: TableSort<PoseTableRow>("confidence") { .number($0.result.afConfidence) }) { row in
+                    TableNumberCell(text: String(format: "%.2f", row.result.afConfidence),
+                                    help: "Druse Affinity model confidence (0–1)")
+                }
+                .width(min: 56, ideal: 76, max: 100)
+                .alignment(.trailing)
+                .customizationID("confidence")
+            } else {
+                Group {
+                    energyTermColumn("vdW", id: "vdw", help: "Steric (gauss + repulsion), kcal/mol") { $0.stericEnergy }
+                    energyTermColumn("Hydrophobic", id: "hydrophobic", help: "Hydrophobic contact term, kcal/mol") { $0.hydrophobicEnergy }
+                    energyTermColumn("H-bond", id: "hbond", help: "Hydrogen-bond term, kcal/mol") { $0.hbondEnergy }
+                    energyTermColumn("Torsion", id: "torsion", help: "Torsional entropy penalty, kcal/mol") { $0.torsionPenalty }
+                    energyTermColumn("Intra+", id: "intra",
+                                     help: "Ligand intramolecular energy, box and constraint penalties and scoring corrections, kcal/mol") { $0.intraAndOtherEnergy }
+                        .defaultVisibility(.hidden)
                 }
             }
-            .font(DS.Font.secondary.weight(isActive ? .semibold : .medium))
-            .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-            .frame(width: width, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("Sort by \(field.rawValue)")
-    }
-
-    private func poseRow(index: Int, position: Int, result: DockingResult) -> some View {
-        let isSelected = selectedPoseIndex == index
-        let isChecked = viewModel.docking.selectedPoseIndices.contains(index)
-        return HStack(spacing: 0) {
-            Toggle("Select pose \(index + 1)", isOn: Binding(
-                get: { isChecked },
-                set: { _ in viewModel.togglePoseSelection(at: index) }
-            ))
-            .toggleStyle(.checkbox)
-            .labelsHidden()
-            .frame(width: Column.check, alignment: .leading)
-            .help("Select for multi-pose overlay")
-
-            Text(verbatim: "#\(index + 1)")
-                .font(DS.Font.monoSmall.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: Column.rank, alignment: .leading)
-
-            scoreBadge(result.displayScore(method: method))
-                .frame(width: Column.score, alignment: .leading)
-
-            termCell(result.stericEnergy)
-            termCell(result.hydrophobicEnergy)
-            termCell(result.hbondEnergy)
-            termCell(result.torsionPenalty)
 
             Group {
-                if result.clusterID >= 0 {
-                    // Plain text: the cluster ID is a grouping key, not a headline next to the score.
-                    Text(verbatim: "C\(result.clusterID)")
-                        .font(DS.Font.monoSmall)
-                        .foregroundStyle(.secondary)
-                        .help("Cluster \(result.clusterID) — RMSD-based binding-mode group. Poses sharing this ID occupy the same pose family (RMSD < 2.0 Å); different IDs are structurally distinct binding modes.")
-                } else {
-                    Text("—").foregroundStyle(.tertiary)
+                if hasStrain {
+                    TableColumn("Strain", sortUsing: TableSort<PoseTableRow>("strain") { .number($0.result.strainEnergy) }) { row in
+                        let strain = row.result.strainEnergy
+                        TableNumberCell(text: strain.map(TableFormat.energyTerm),
+                                        tone: strain.map { $0 > 10 ? .danger : $0 > 4 ? .warning : .neutral },
+                                        help: "MMFF94 ligand strain energy (docked − relaxed), kcal/mol")
+                    }
+                    .width(min: 44, ideal: 56, max: 80)
+                    .alignment(.trailing)
+                    .customizationID("strain")
                 }
+                if hasXTB {
+                    TableColumn("GFN2", sortUsing: TableSort<PoseTableRow>("gfn2") { .number($0.result.gfn2Energy) }) { row in
+                        TableNumberCell(text: row.result.gfn2Energy.map(TableFormat.energyTerm),
+                                        help: "GFN2-xTB energy, kcal/mol")
+                    }
+                    .width(min: 50, ideal: 64, max: 90)
+                    .alignment(.trailing)
+                    .customizationID("gfn2")
+                }
+                if hasConstraints {
+                    TableColumn("Constraint", sortUsing: TableSort<PoseTableRow>("constraint") { .number($0.result.constraintPenalty) }) { row in
+                        let penalty = row.result.constraintPenalty
+                        TableNumberCell(text: TableFormat.energyTerm(penalty),
+                                        tone: penalty > 0.01 ? .warning : .neutral,
+                                        help: "Pharmacophore constraint penalty (0 = all constraints satisfied)")
+                    }
+                    .width(min: 50, ideal: 70, max: 90)
+                    .alignment(.trailing)
+                    .customizationID("constraint")
+                }
+                if hasForms {
+                    TableColumn("Form", sortUsing: TableSort<PoseTableRow>("form") { row in
+                        row.result.formLabel.map(TableSortValue.text) ?? .missing
+                    }) { row in
+                        if let label = row.result.formLabel {
+                            Text(row.result.formPopulation.map { "\(label) · \(TableFormat.percent(Double($0)))" } ?? label)
+                                .font(DS.Font.secondary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .help("Chemical form and its Boltzmann population")
+                        } else {
+                            TableDashCell()
+                        }
+                    }
+                    .width(min: 60, ideal: 100)
+                    .customizationID("form")
+                }
+                TableColumn("Gen", sortUsing: TableSort<PoseTableRow>("generation") { .number($0.result.generation) }) { row in
+                    TableNumberCell(text: "\(row.result.generation)", help: "Search generation that produced this pose")
+                }
+                .width(min: 36, ideal: 44, max: 64)
+                .alignment(.trailing)
+                .customizationID("generation")
+                .defaultVisibility(.hidden)
             }
-            .frame(width: Column.cluster, alignment: .leading)
-
-            Text(verbatim: "\(result.generation)")
-                .font(DS.Font.monoSmall)
-                .foregroundStyle(.secondary)
-                .frame(width: Column.generation, alignment: .leading)
-
-            Spacer(minLength: 0)
-
-            HStack(spacing: DS.Space.xxs) {
-                Button { select(index) } label: { Image(systemName: "eye") }
-                    .help("Show this pose in the 3D viewport")
-                    .accessibilityLabel("Show pose \(index + 1) in 3D")
-                Button { openDiagram(index) } label: { Image(systemName: "point.3.connected.trianglepath.dotted") }
-                    .help("2D Interaction Diagram")
-                    .accessibilityLabel("Interaction diagram for pose \(index + 1)")
+        } rows: {
+            ForEach(rows) { row in
+                TableRow(row)
             }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .frame(width: Column.actions, alignment: .trailing)
         }
-        .monospacedDigit()
-        .padding(.horizontal, DS.Space.m)
-        .frame(height: DS.Size.rowHeight + 4)
-        .background(isSelected ? DS.Color.accentSoft : (position % 2 == 1 ? DS.Color.cardFill : Color.clear))
-        .contentShape(Rectangle())
-        .onTapGesture { select(index) }
+        .contextMenu(forSelectionType: Int.self) { ids in
+            poseContextMenu(ids)
+        } primaryAction: { ids in
+            // Double-click / ↩ opens the interaction diagram of one pose.
+            if ids.count == 1, let idx = ids.first { openDiagram(idx) }
+        }
+        .overlay {
+            if rows.isEmpty && !results.isEmpty {
+                DSEmptyState("No Matching Poses",
+                             systemImage: "line.3.horizontal.decrease.circle",
+                             description: "No pose passes the search and filters.") {
+                    Button("Clear Search and Filters") {
+                        filterText = ""
+                        clusterLeadersOnly = false
+                        validPosesOnly = false
+                    }
+                }
+            } else if results.isEmpty {
+                DSEmptyState("No Poses Loaded",
+                             systemImage: "list.number",
+                             description: "Pick a ligand in the sidebar to browse its poses.")
+            }
+        }
     }
 
-    private func termCell(_ value: Float) -> some View {
-        Text(String(format: "%.1f", value))
-            .font(DS.Font.monoSmall)
-            .foregroundStyle(.secondary)
-            .frame(width: Column.term, alignment: .leading)
+    private func energyTermColumn(
+        _ title: String, id: String, help: String,
+        value: @escaping @Sendable (DockingResult) -> Float
+    ) -> some TableColumnContent<PoseTableRow, TableSort<PoseTableRow>> {
+        TableColumn(title, sortUsing: TableSort<PoseTableRow>(id) { .number(value($0.result)) }) { row in
+            TableNumberCell(text: TableFormat.energyTerm(value(row.result)), help: help)
+        }
+        .width(min: 44, ideal: 60, max: 90)
+        .alignment(.trailing)
+        .customizationID(id)
+    }
+
+    /// Cluster id; the cluster representative (best pose of its binding mode) reads in full weight.
+    @ViewBuilder
+    private func clusterCell(_ result: DockingResult) -> some View {
+        if result.clusterID >= 0 {
+            let isLeader = result.clusterRank == 0
+            Text(verbatim: "C\(result.clusterID)")
+                .font(DS.Font.monoSmall.weight(isLeader ? .semibold : .regular))
+                .foregroundStyle(isLeader ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .help(isLeader
+                      ? "Representative of cluster \(result.clusterID): the best pose of this binding mode"
+                      : "Cluster \(result.clusterID), rank \(result.clusterRank + 1): poses sharing an ID occupy the same binding mode (RMSD < 2.0 Å)")
+        } else {
+            TableDashCell()
+        }
+    }
+
+    @ViewBuilder
+    private func validityCell(_ validity: PoseValidity?) -> some View {
+        if let validity {
+            Image(systemName: validity.passed ? "checkmark" : "xmark")
+                .font(DS.Font.caption.weight(.semibold))
+                .foregroundStyle(validity.passed ? DS.Color.success : DS.Color.warning)
+                .help(validity.passed ? "Passes the PoseBusters-style checks"
+                      : "Fails: " + validity.failures.joined(separator: ", "))
+                .accessibilityLabel(validity.passed ? "PoseBusters pass" : "PoseBusters fail")
+        } else {
+            TableDashCell()
+        }
+    }
+
+    /// Acts on the clicked rows (the selection when the click is inside it).
+    @ViewBuilder
+    private func poseContextMenu(_ ids: Set<Int>) -> some View {
+        let indices = ids.filter { $0 < results.count }.sorted()
+        if let idx = indices.first, indices.count == 1 {
+            Button("Show in 3D Viewport") { select(idx) }
+            Button("Interaction Diagram") { openDiagram(idx) }
+            Divider()
+            Button("Save Pose as PDB…") { viewModel.exportDockingPosePDB(at: idx) }
+                .disabled(results[idx].transformedAtomPositions.isEmpty)
+            if let ligand = viewModel.docking.originalDockingLigand ?? viewModel.molecules.ligand {
+                Button("Use as Lead-Opt Reference") {
+                    viewModel.selectReferenceForOptimization(result: results[idx], ligand: ligand)
+                }
+            }
+        } else if indices.count > 1 {
+            Button("Overlay \(indices.count) Poses in 3D") {
+                viewModel.docking.selectedPoseIndices = Set(indices)
+                viewModel.showSelectedPoses()
+            }
+            Button("Compare \(indices.count) Poses…") {
+                viewModel.docking.selectedPoseIndices = Set(indices)
+                showMultiPoseAnalysis = true
+            }
+            Divider()
+            Button("Export \(indices.count) Poses as SDF…") {
+                viewModel.docking.selectedPoseIndices = Set(indices)
+                viewModel.exportSelectedDockingPosesSDF()
+            }
+        }
     }
 
     private func select(_ index: Int) {
-        selectedPoseIndex = index
+        viewModel.docking.selectedPoseIndices = [index]
         viewModel.showDockingPose(at: index)
     }
 
@@ -438,20 +573,29 @@ struct ResultsDatabaseWindow: View {
     // MARK: - Status bar
 
     private var statusBar: some View {
-        DSWindowStatusBar {
-            Text("\(results.count) poses")
+        let shown = tableRows.count
+        let clusters = Set(results.map(\.clusterID).filter { $0 >= 0 }).count
+        let selected = viewModel.docking.selectedPoseIndices.filter { $0 < results.count }
+        return DSWindowStatusBar {
+            Text(isFiltered ? "\(shown) of \(results.count) poses" : "\(results.count) poses")
+            if clusters > 0 {
+                StatusSeparator()
+                Text(clusters == 1 ? "1 cluster" : "\(clusters) clusters")
+            }
             if let best = results.first {
-                Text("·")
-                Text(String(format: "Best %.1f %@", best.displayScore(method: method), method.unitLabel))
+                StatusSeparator()
+                Text("Best \(TableFormat.score(best.displayScore(method: method))) \(method.unitLabel)")
             }
             if !batch.isEmpty {
-                Text("·")
+                StatusSeparator()
                 Text("\(batch.count) ligands in batch")
             }
         } trailing: {
-            if let idx = selectedPoseIndex, let result = selectedResult {
-                Text(String(format: "Selected: Pose #%d (%.2f %@)",
-                            idx + 1, result.displayScore(method: method), method.unitLabel))
+            if let idx = inspectedIndex {
+                Text("Pose #\(idx + 1) · \(TableFormat.score(results[idx].displayScore(method: method))) \(method.unitLabel)")
+            } else if selected.count > 1 {
+                Text("\(selected.count) selected")
+                    .foregroundStyle(DS.Color.accent)
             }
         }
     }
@@ -460,7 +604,8 @@ struct ResultsDatabaseWindow: View {
 
     @ViewBuilder
     private var inspector: some View {
-        if let idx = selectedPoseIndex, let result = selectedResult {
+        if let idx = inspectedIndex {
+            let result = results[idx]
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.l) {
                     HStack(alignment: .firstTextBaseline, spacing: DS.Space.s) {
@@ -470,7 +615,7 @@ struct ResultsDatabaseWindow: View {
                             DSTag("C\(result.clusterID)", monospaced: true)
                         }
                         Spacer(minLength: DS.Space.xs)
-                        scoreBadge(result.displayScore(method: method))
+                        DSScoreBadge(result.displayScore(method: method), method: method)
                     }
                     energyBreakdownSection(result: result)
                     interactionsSummary
@@ -493,8 +638,8 @@ struct ResultsDatabaseWindow: View {
                 }
                 .padding(DS.Space.l)
             }
-        } else if !viewModel.sortedSelectedPoseIndices.isEmpty {
-            tickedPosesPanel
+        } else if viewModel.sortedSelectedPoseIndices.count > 1 {
+            multiSelectionPanel
         } else {
             // Inspector-sized placeholder (the large step empty state overflows a 240 pt column).
             VStack(spacing: DS.Space.s) {
@@ -504,7 +649,7 @@ struct ResultsDatabaseWindow: View {
                 Text("No Selection")
                     .font(DS.Font.sectionTitle)
                     .foregroundStyle(.secondary)
-                Text("Click a row to inspect its energy terms and contacts, or tick poses to compare them.")
+                Text("Click a pose to show it in 3D and inspect its energy terms and contacts. ⌘-click several to overlay or compare them.")
                     .font(DS.Font.secondary)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
@@ -515,16 +660,15 @@ struct ResultsDatabaseWindow: View {
         }
     }
 
-    /// Ticked poses with no row inspected: list them (best first) so the
-    /// inspector reflects the checkboxes instead of reading "No Selection".
-    private var tickedPosesPanel: some View {
+    /// Several poses selected: list them (best first) with the overlay / compare actions.
+    private var multiSelectionPanel: some View {
         let indices = viewModel.sortedSelectedPoseIndices
         return ScrollView {
             VStack(alignment: .leading, spacing: DS.Space.l) {
                 VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    Text(indices.count == 1 ? "1 Pose Ticked" : "\(indices.count) Poses Ticked")
+                    Text("\(indices.count) Poses Selected")
                         .font(DS.Font.stepTitle)
-                    Text("Click a pose to inspect it.")
+                    Text("Click a pose to inspect it on its own.")
                         .font(DS.Font.secondary)
                         .foregroundStyle(.secondary)
                 }
@@ -537,7 +681,7 @@ struct ResultsDatabaseWindow: View {
                                     .font(DS.Font.monoSmall.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                     .frame(minWidth: 36, alignment: .leading)
-                                scoreBadge(results[idx].displayScore(method: method))
+                                DSScoreBadge(results[idx].displayScore(method: method), method: method)
                                 Spacer(minLength: DS.Space.xs)
                                 if results[idx].clusterID >= 0 {
                                     Text(verbatim: "C\(results[idx].clusterID)")
@@ -558,19 +702,22 @@ struct ResultsDatabaseWindow: View {
                     }
                 }
                 .dsCard(padding: 0)
-                if indices.count > 1 {
-                    VStack(spacing: DS.Space.s) {
-                        Button { viewModel.showSelectedPoses() } label: {
-                            Label("View in 3D Viewport", systemImage: "square.stack.3d.up")
-                        }
-                        .buttonStyle(.dsPrimary)
-                        .help("Overlay the ticked poses in the 3D viewport")
-                        Button { showMultiPoseAnalysis = true } label: {
-                            Label("Compare Poses…", systemImage: "square.grid.3x3")
-                        }
-                        .buttonStyle(.dsSecondary)
-                        .help("Pairwise RMSD and interaction fingerprints of the ticked poses")
+                VStack(spacing: DS.Space.s) {
+                    Button { viewModel.showSelectedPoses() } label: {
+                        Label("Overlay in 3D Viewport", systemImage: "square.stack.3d.up")
                     }
+                    .buttonStyle(.dsPrimary)
+                    .help("Overlay the selected poses in the 3D viewport (best as primary, others as ghosts)")
+                    Button { showMultiPoseAnalysis = true } label: {
+                        Label("Compare Poses…", systemImage: "square.grid.3x3")
+                    }
+                    .buttonStyle(.dsSecondary)
+                    .help("Pairwise RMSD and interaction fingerprints of the selected poses")
+                    Button { viewModel.exportSelectedDockingPosesSDF() } label: {
+                        Label("Export Selected as SDF…", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.dsSecondary)
+                    .help("Export the selected poses as an SDF file")
                 }
             }
             .padding(DS.Space.l)
@@ -578,20 +725,30 @@ struct ResultsDatabaseWindow: View {
     }
 
     private func energyBreakdownSection(result: DockingResult) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.s) {
-            DSSectionHeader("Energy Breakdown")
+        let score = result.displayScore(method: method)
+        let le = LigandMetrics.ligandEfficiency(score: score, method: method, heavyAtoms: heavyAtomCount)
+        let rmsd = LigandMetrics.rmsd(result.transformedAtomPositions, results.first?.transformedAtomPositions ?? [])
+        return VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionHeader(method.isAffinityScore ? "Score" : "Energy Breakdown")
             Grid(alignment: .leading, horizontalSpacing: DS.Space.l, verticalSpacing: DS.Space.xs) {
                 GridRow {
                     Text(method.isAffinityScore ? "pKi" : "Total")
                         .font(DS.Font.label.weight(.medium))
-                    scoreBadge(result.displayScore(method: method))
+                    DSScoreBadge(score, method: method)
                         .gridColumnAlignment(.trailing)
                 }
-                breakdownRow("Steric (vdW)", result.stericEnergy)
-                breakdownRow("Hydrophobic", result.hydrophobicEnergy)
-                breakdownRow("H-bond", result.hbondEnergy)
-                breakdownRow("Torsion penalty", result.torsionPenalty)
-                if !method.isAffinityScore {
+                if method.isAffinityScore {
+                    GridRow {
+                        Text("Confidence").foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", result.afConfidence))
+                    }
+                    .font(DS.Font.label)
+                    .monospacedDigit()
+                } else {
+                    breakdownRow("Steric (vdW)", result.stericEnergy)
+                    breakdownRow("Hydrophobic", result.hydrophobicEnergy)
+                    breakdownRow("H-bond", result.hbondEnergy)
+                    breakdownRow("Torsion penalty", result.torsionPenalty)
                     breakdownRow("Intramolecular & other", result.intraAndOtherEnergy)
                 }
                 if let refine = result.refinementEnergy {
@@ -603,12 +760,30 @@ struct ResultsDatabaseWindow: View {
                     .monospacedDigit()
                 }
             }
-            if result.clusterID >= 0 {
-                Text("Cluster \(result.clusterID) · rank \(result.clusterRank) within cluster")
-                    .font(DS.Font.secondary)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+            Divider()
+            Grid(alignment: .leading, horizontalSpacing: DS.Space.l, verticalSpacing: DS.Space.xs) {
+                if let le {
+                    GridRow {
+                        Text("Ligand efficiency").foregroundStyle(.secondary)
+                        Text("\(TableFormat.ligandEfficiency(le)) kcal/mol/HA")
+                            .foregroundStyle(DSScore.tone(ligandEfficiency: le).cellColor)
+                    }
+                }
+                if let rmsd {
+                    GridRow {
+                        Text("RMSD to pose #1").foregroundStyle(.secondary)
+                        Text("\(TableFormat.rmsd(rmsd)) Å")
+                    }
+                }
+                if result.clusterID >= 0 {
+                    GridRow {
+                        Text("Cluster").foregroundStyle(.secondary)
+                        Text("C\(result.clusterID) · rank \(result.clusterRank + 1)")
+                    }
+                }
             }
+            .font(DS.Font.label)
+            .monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .dsCard()
@@ -944,15 +1119,6 @@ struct ResultsDatabaseWindow: View {
 
     // MARK: - Data Helpers
 
-    @ViewBuilder
-    private func scoreBadge(_ value: Float) -> some View {
-        if method.isAffinityScore {
-            DSScoreBadge(pK: value, label: method.unitLabel)
-        } else {
-            DSScoreBadge(energy: value, unit: method.unitLabel)
-        }
-    }
-
     private struct AffinityData {
         var ki: Float?      // nM
         var pKi: Float?
@@ -1067,4 +1233,13 @@ struct ResultsDatabaseWindow: View {
 
 private extension String {
     var nonEmpty: String? { isEmpty ? nil : self }
+}
+
+/// One row of the Results Database pose table; `id` is the pose's index in `dockingResults`.
+private struct PoseTableRow: Identifiable, Sendable {
+    let id: Int
+    let result: DockingResult
+    let score: Float
+    let ligandEfficiency: Float?
+    let rmsdToBest: Float?
 }

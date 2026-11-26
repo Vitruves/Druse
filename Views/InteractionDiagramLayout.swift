@@ -14,20 +14,24 @@ import SwiftUI
 // chain extends rightward. Rotated at render time so the interacting atom
 // points toward the ligand.
 
-struct SideChainAtom {
+/// Bond length (in diagram points) shared by the ligand depiction and the
+/// residue side chains, so both are drawn at the same scale.
+let kDiagramBondLength: CGFloat = 28
+
+struct SideChainAtom: Sendable {
     let name: String
     let offset: CGPoint     // local coords relative to Cα
     let element: Element
 }
 
-struct SideChainBond {
+struct SideChainBond: Sendable {
     let from: Int
     let to: Int
     let order: Int          // 1=single, 2=double (kekulized)
     let isAromatic: Bool    // true for ring bonds in PHE/TYR/HIS/TRP
 }
 
-struct SideChainTemplate {
+struct SideChainTemplate: Sendable {
     let atoms: [SideChainAtom]
     let bonds: [SideChainBond]
     let aromaticRings: [[Int]]   // atom-index sets per aromatic ring
@@ -38,7 +42,7 @@ struct SideChainTemplate {
 let sideChainTemplates: [String: SideChainTemplate] = {
     typealias A = SideChainAtom
     typealias B = SideChainBond
-    let s: CGFloat = 26  // bond length in local coords — close to ligand baseScale (30)
+    let s = kDiagramBondLength
     let h: CGFloat = s * 0.866  // sin(60°) — used for both hexagons and zigzag y-offsets
 
     var t: [String: SideChainTemplate] = [:]
@@ -373,67 +377,363 @@ private func canonRing(_ ring: [Int]) -> [Int] {
     return rot.lexicographicallyPrecedes(rev) ? rot : rev
 }
 
+/// Template key for a residue name: protonation-state and force-field
+/// variants (HID/HIE/HIP, ASH, GLH, LYN, CYX, …) share the standard template.
+func canonicalResidueName(_ name: String) -> String {
+    switch name {
+    case "HID", "HIE", "HIP", "HSD", "HSE", "HSP": "HIS"
+    case "ASH": "ASP"
+    case "GLH": "GLU"
+    case "LYN": "LYS"
+    case "CYX", "CYM": "CYS"
+    case "TYM": "TYR"
+    default: name
+    }
+}
+
 // MARK: - Side Chain Transform
 
-/// Distance from the residue bubble center at which CB (the side chain
-/// attachment point) sits — places CB just outside the bubble edge.
-let kCBAnchorDistance: CGFloat = 50
+/// Distance from the residue label center at which CB (the side chain
+/// attachment point) sits — places CB just outside the label.
+let kCBAnchorDistance: CGFloat = 40
 
-/// Extra rotation applied AFTER the centroid alignment so that CB→CG is
-/// never parallel to the bubble→ligand axis. Without this, Y-branch residues
-/// (TYR/PHE/ASP/LEU/VAL/THR/...) end up with a horizontal CB→CG bond,
-/// because for any sp2/sp3 atom with three 120°-spaced substituents the
-/// centroid of those substituents lies exactly on the CB→CG line.
-/// −30° (math, CCW) tilts the chain so CB→CG sits at +30° above the chain
-/// axis, restoring the conventional zigzag appearance.
+/// Extra rotation applied when the side chain is oriented by its centroid, so
+/// that CB→CG is never parallel to the label→ligand axis. For any sp2/sp3 atom
+/// with three 120°-spaced substituents the centroid of those substituents lies
+/// on the CB→CG line, which would otherwise draw Y-branch residues with a
+/// straight CB→CG bond. −30° restores the conventional zigzag.
 let kSideChainZigzagTilt: CGFloat = -.pi / 6
 
-/// Transform a side chain template so:
-///   - CB (atoms[0]) sits at `kCBAnchorDistance` from the bubble center
-///   - the chain extends outward toward the ligand contact
-///   - the rotation aligns the CB→(centroid of all other atoms) vector with
-///     the bubble→ligand vector. Using the centroid (not a single atom) keeps
-///     every branch of the side chain visible — Y-branches like THR/VAL/ILE
-///     no longer hide a CH3 behind the bubble.
-///
-/// Returns screen-space positions for each template atom.
+/// Transform a side chain template into diagram space so that:
+///   - CB (atoms[0]) sits at `kCBAnchorDistance` from the label center,
+///     on the label→ligand axis;
+///   - the chain extends toward the ligand. With `referenceAtom` (the atom
+///     that makes a directional contact) that atom points straight at the
+///     ligand contact; otherwise the centroid of the side chain does (with the
+///     zigzag tilt), keeping every branch visible.
 func transformSideChain(template: SideChainTemplate,
-                         bubbleCenter: CGPoint,
-                         towardLigand: CGPoint) -> [CGPoint] {
+                        bubbleCenter: CGPoint,
+                        towardLigand: CGPoint,
+                        referenceAtom: Int? = nil) -> [CGPoint] {
     guard !template.atoms.isEmpty else { return [] }
 
     let cb = template.atoms[0].offset
-
-    // Reference direction = from CB to centroid of all other side-chain atoms
-    var refX: CGFloat = 0, refY: CGFloat = 0, n: CGFloat = 0
-    for atom in template.atoms.dropFirst() {
-        refX += atom.offset.x - cb.x
-        refY += atom.offset.y - cb.y
-        n += 1
+    var refX: CGFloat = 0, refY: CGFloat = 0
+    var tilt: CGFloat = 0
+    if let ref = referenceAtom, ref > 0, ref < template.atoms.count {
+        refX = template.atoms[ref].offset.x - cb.x
+        refY = template.atoms[ref].offset.y - cb.y
+    } else {
+        for atom in template.atoms.dropFirst() {
+            refX += atom.offset.x - cb.x
+            refY += atom.offset.y - cb.y
+        }
+        tilt = kSideChainZigzagTilt
     }
-    if n > 0 { refX /= n; refY /= n }
-    if hypot(refX, refY) < 1e-3 { refX = 1; refY = 0 }
+    if hypot(refX, refY) < 1e-3 { refX = 1; refY = 0; tilt = 0 }
     let templateAngle = atan2(refY, refX)
 
-    // Direction from bubble center toward ligand contact
     let dx = towardLigand.x - bubbleCenter.x
     let dy = towardLigand.y - bubbleCenter.y
     let len = max(hypot(dx, dy), 1)
     let ux = dx / len, uy = dy / len
-    let screenAngle = atan2(uy, ux)
 
-    let rotateBy = screenAngle - templateAngle + kSideChainZigzagTilt
+    let rotateBy = atan2(uy, ux) - templateAngle + tilt
     let cosA = cos(rotateBy), sinA = sin(rotateBy)
-
-    // CB position in screen space (just outside the bubble along bubble→ligand)
     let cbX = bubbleCenter.x + ux * kCBAnchorDistance
     let cbY = bubbleCenter.y + uy * kCBAnchorDistance
 
     return template.atoms.map { atom in
         let lx = atom.offset.x - cb.x
         let ly = atom.offset.y - cb.y
-        let rx = lx * cosA - ly * sinA
-        let ry = lx * sinA + ly * cosA
-        return CGPoint(x: cbX + rx, y: cbY + ry)
+        return CGPoint(x: cbX + lx * cosA - ly * sinA,
+                       y: cbY + lx * sinA + ly * cosA)
     }
+}
+
+// MARK: - Residue placement
+//
+// Residues start at an ideal position: outward from the ligand along the local
+// surface normal at their (weighted) contact point, far enough that the side
+// chain and the interaction line fit. A force-directed relaxation then removes
+// overlaps — between residues (label + side chain atoms) and between residues
+// and the ligand — while a spring keeps each residue near its ideal spot.
+// Finally crossing connectors are untangled by swapping residue positions.
+
+/// One residue to place.
+struct DiagramPlacementInput {
+    /// Weighted ligand contact point the residue points at.
+    let anchor: CGPoint
+    /// Side chain drawn toward the ligand, or nil for a label-only residue.
+    let template: SideChainTemplate?
+    /// Template atom oriented straight at the ligand (directional contact).
+    let referenceAtom: Int?
+    /// Radius of the label disc used for collision tests.
+    let labelRadius: CGFloat
+    /// Preferred distance from the anchor to the label center.
+    let reach: CGFloat
+}
+
+/// Collision discs of a residue at `center`: the label plus every side chain atom.
+func residueFootprint(_ input: DiagramPlacementInput, center: CGPoint) -> [(p: CGPoint, r: CGFloat)] {
+    var discs: [(p: CGPoint, r: CGFloat)] = [(center, input.labelRadius)]
+    if let template = input.template, !template.atoms.isEmpty {
+        let positions = transformSideChain(template: template, bubbleCenter: center,
+                                           towardLigand: input.anchor,
+                                           referenceAtom: input.referenceAtom)
+        for (atom, p) in zip(template.atoms, positions) {
+            discs.append((p, atom.element == .C ? 10 : 13))
+        }
+    }
+    return discs
+}
+
+/// Unit vector pointing away from the ligand at `point`: a blend of the local
+/// surface normal (away from nearby atoms) and the direction from the ligand center.
+func ligandOutwardDirection(at point: CGPoint, ligand: [CGPoint], center: CGPoint) -> CGPoint {
+    var lx: CGFloat = 0, ly: CGFloat = 0, n: CGFloat = 0
+    for q in ligand where hypot(q.x - point.x, q.y - point.y) < kDiagramBondLength * 2.2 {
+        lx += q.x; ly += q.y; n += 1
+    }
+    let local = n > 0 ? unit(CGPoint(x: point.x - lx / n, y: point.y - ly / n)) : .zero
+    let global = unit(CGPoint(x: point.x - center.x, y: point.y - center.y))
+    let blended = unit(CGPoint(x: local.x + global.x * 0.6, y: local.y + global.y * 0.6))
+    if blended != .zero { return blended }
+    return global != .zero ? global : CGPoint(x: 0, y: -1)
+}
+
+/// Place every residue; returns the label centers in input order.
+func placeResidues(_ inputs: [DiagramPlacementInput], ligand: [CGPoint], ligandCenter: CGPoint) -> [CGPoint] {
+    guard !inputs.isEmpty else { return [] }
+    let ligandRadius: CGFloat = 16
+    let residueGap: CGFloat = 8
+
+    func ligandOverlap(_ discs: [(p: CGPoint, r: CGFloat)]) -> Bool {
+        discs.contains { d in ligand.contains { hypot($0.x - d.p.x, $0.y - d.p.y) < d.r + ligandRadius } }
+    }
+
+    // Ideal positions, pushed outward until the residue clears the ligand.
+    var ideal: [CGPoint] = inputs.map { input in
+        let dir = ligandOutwardDirection(at: input.anchor, ligand: ligand, center: ligandCenter)
+        var p = CGPoint(x: input.anchor.x + dir.x * input.reach, y: input.anchor.y + dir.y * input.reach)
+        var steps = 0
+        while ligandOverlap(residueFootprint(input, center: p)) && steps < 60 {
+            p.x += dir.x * 6; p.y += dir.y * 6
+            steps += 1
+        }
+        return p
+    }
+    var pos = ideal
+
+    func relax(iterations: Int) {
+        for _ in 0..<iterations {
+            let footprints = inputs.indices.map { residueFootprint(inputs[$0], center: pos[$0]) }
+            var force = Array(repeating: CGPoint.zero, count: inputs.count)
+            for i in inputs.indices {
+                force[i].x += (ideal[i].x - pos[i].x) * 0.04
+                force[i].y += (ideal[i].y - pos[i].y) * 0.04
+                for disc in footprints[i] {
+                    for q in ligand {
+                        let dx = disc.p.x - q.x, dy = disc.p.y - q.y
+                        let d = max(hypot(dx, dy), 0.01)
+                        let minD = disc.r + ligandRadius
+                        if d < minD {
+                            force[i].x += dx / d * (minD - d) * 0.5
+                            force[i].y += dy / d * (minD - d) * 0.5
+                        }
+                    }
+                }
+            }
+            for i in inputs.indices {
+                for j in (i + 1)..<inputs.count {
+                    for a in footprints[i] {
+                        for b in footprints[j] {
+                            var dx = a.p.x - b.p.x, dy = a.p.y - b.p.y
+                            var d = hypot(dx, dy)
+                            let minD = a.r + b.r + residueGap
+                            guard d < minD else { continue }
+                            if d < 0.01 { dx = CGFloat(i - j); dy = 1; d = hypot(dx, dy) }
+                            let push = (minD - d) * 0.25
+                            force[i].x += dx / d * push; force[i].y += dy / d * push
+                            force[j].x -= dx / d * push; force[j].y -= dy / d * push
+                        }
+                    }
+                }
+            }
+            var moved: CGFloat = 0
+            for i in inputs.indices {
+                let len = hypot(force[i].x, force[i].y)
+                let step = min(len, 10)
+                guard len > 1e-4 else { continue }
+                pos[i].x += force[i].x / len * step
+                pos[i].y += force[i].y / len * step
+                moved = max(moved, step)
+            }
+            if moved < 0.05 { break }
+        }
+    }
+
+    relax(iterations: 300)
+
+    // Untangle: swap residues whose anchor→label connectors cross.
+    func crossings(_ p: [CGPoint]) -> Int {
+        var count = 0
+        for i in p.indices {
+            for j in (i + 1)..<p.count
+            where segmentsIntersect(inputs[i].anchor, p[i], inputs[j].anchor, p[j]) {
+                count += 1
+            }
+        }
+        return count
+    }
+    var current = crossings(pos)
+    var pass = 0
+    while current > 0 && pass < 4 {
+        var improved = false
+        for i in pos.indices {
+            for j in (i + 1)..<pos.count
+            where segmentsIntersect(inputs[i].anchor, pos[i], inputs[j].anchor, pos[j]) {
+                var trial = pos
+                trial.swapAt(i, j)
+                let c = crossings(trial)
+                if c < current {
+                    pos = trial
+                    ideal.swapAt(i, j)
+                    current = c
+                    improved = true
+                }
+            }
+        }
+        if !improved { break }
+        relax(iterations: 120)
+        current = crossings(pos)
+        pass += 1
+    }
+    return pos
+}
+
+// MARK: - Line routing and label placement
+
+/// Point on a straight or quadratic segment at parameter `t`.
+func segmentPoint(from: CGPoint, to: CGPoint, control: CGPoint?, t: CGFloat) -> CGPoint {
+    guard let c = control else {
+        return CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+    }
+    let mt = 1 - t
+    return CGPoint(x: mt * mt * from.x + 2 * mt * t * c.x + t * t * to.x,
+                   y: mt * mt * from.y + 2 * mt * t * c.y + t * t * to.y)
+}
+
+/// Quadratic control point that bends a connector around the ligand when the
+/// straight line would cut through it, or nil when the straight line is clear.
+/// Atoms bonded to the start atom (within one bond length) are ignored — the
+/// line legitimately leaves from among them.
+func connectorBend(from: CGPoint, to: CGPoint, ligand: [CGPoint]) -> CGPoint? {
+    let obstacles = ligand.filter { hypot($0.x - from.x, $0.y - from.y) > kDiagramBondLength * 1.1 }
+    func hits(_ control: CGPoint?) -> Int {
+        var count = 0
+        for q in obstacles {
+            for k in 1..<20 {
+                let p = segmentPoint(from: from, to: to, control: control, t: CGFloat(k) / 20)
+                if hypot(p.x - q.x, p.y - q.y) < 11 { count += 1; break }
+            }
+        }
+        return count
+    }
+    var best = hits(nil)
+    guard best > 0 else { return nil }
+    let mid = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
+    let perp = unit(CGPoint(x: -(to.y - from.y), y: to.x - from.x))
+    var bestControl: CGPoint?
+    for k: CGFloat in [40, -40, 80, -80, 120, -120, 170, -170] {
+        let control = CGPoint(x: mid.x + perp.x * k, y: mid.y + perp.y * k)
+        let h = hits(control)
+        if h < best { best = h; bestControl = control }
+        if h == 0 { break }
+    }
+    return bestControl
+}
+
+/// Greedy label placement along connectors: each label takes the first
+/// candidate position (midpoint first, then sliding toward the ends and
+/// sideways) that overlaps no obstacle or previously placed label; when every
+/// candidate collides, the one with the least overlap wins.
+func placeConnectorLabels(paths: [(from: CGPoint, to: CGPoint, control: CGPoint?)],
+                          sizes: [CGSize], obstacles: [CGRect]) -> [CGPoint] {
+    var placed: [CGRect] = []
+    var result: [CGPoint] = []
+    let ts: [CGFloat] = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74]
+    for (path, size) in zip(paths, sizes) {
+        let dir = unit(CGPoint(x: path.to.x - path.from.x, y: path.to.y - path.from.y))
+        let perp = CGPoint(x: -dir.y, y: dir.x)
+        let sideOffset = max(size.width, size.height) / 2 + 3
+        var best = CGPoint.zero
+        var bestOverlap = CGFloat.greatestFiniteMagnitude
+        search: for side: CGFloat in [0, 1, -1] {
+            for t in ts {
+                let base = segmentPoint(from: path.from, to: path.to, control: path.control, t: t)
+                let c = CGPoint(x: base.x + perp.x * sideOffset * side, y: base.y + perp.y * sideOffset * side)
+                let rect = CGRect(x: c.x - size.width / 2, y: c.y - size.height / 2,
+                                  width: size.width, height: size.height)
+                var overlap: CGFloat = 0
+                for o in obstacles + placed {
+                    let i = rect.intersection(o)
+                    if !i.isNull { overlap += i.width * i.height }
+                }
+                if overlap < bestOverlap { bestOverlap = overlap; best = c }
+                if overlap == 0 { break search }
+            }
+        }
+        placed.append(CGRect(x: best.x - size.width / 2, y: best.y - size.height / 2,
+                             width: size.width, height: size.height))
+        result.append(best)
+    }
+    return result
+}
+
+// MARK: - Geometry helpers
+
+func unit(_ v: CGPoint) -> CGPoint {
+    let len = hypot(v.x, v.y)
+    return len > 1e-6 ? CGPoint(x: v.x / len, y: v.y / len) : .zero
+}
+
+func shortenSegment(from p1: CGPoint, to p2: CGPoint,
+                    fromInset: CGFloat, toInset: CGFloat) -> (CGPoint, CGPoint) {
+    let dx = p2.x - p1.x, dy = p2.y - p1.y
+    let len = hypot(dx, dy)
+    guard len > fromInset + toInset else { return (p1, p2) }
+    let ux = dx / len, uy = dy / len
+    return (CGPoint(x: p1.x + ux * fromInset, y: p1.y + uy * fromInset),
+            CGPoint(x: p2.x - ux * toInset, y: p2.y - uy * toInset))
+}
+
+/// Distance from `origin` along unit `direction` at which the ray first exits
+/// `box`. If origin is inside the box, this is the distance to the closest
+/// boundary along the direction. Returns 0 if the direction is degenerate.
+func rayBoxExitDistance(origin: CGPoint, direction: CGPoint, box: CGRect) -> CGFloat {
+    var tx = CGFloat.greatestFiniteMagnitude
+    var ty = CGFloat.greatestFiniteMagnitude
+    if direction.x > 1e-6 {
+        tx = (box.maxX - origin.x) / direction.x
+    } else if direction.x < -1e-6 {
+        tx = (box.minX - origin.x) / direction.x
+    }
+    if direction.y > 1e-6 {
+        ty = (box.maxY - origin.y) / direction.y
+    } else if direction.y < -1e-6 {
+        ty = (box.minY - origin.y) / direction.y
+    }
+    let t = min(tx, ty)
+    return t == .greatestFiniteMagnitude ? 0 : max(0, t)
+}
+
+func segmentsIntersect(_ a1: CGPoint, _ a2: CGPoint, _ b1: CGPoint, _ b2: CGPoint) -> Bool {
+    func cross(_ o: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    }
+    let d1 = cross(b1, b2, a1), d2 = cross(b1, b2, a2)
+    let d3 = cross(a1, a2, b1), d4 = cross(a1, a2, b2)
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+           ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
 }

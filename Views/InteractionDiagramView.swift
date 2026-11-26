@@ -4,11 +4,12 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// 2D Protein–Ligand Interaction Diagram (ProLig2D) with a radial schematic
-/// layout. Renders a flat skeletal depiction with the ligand centered and
-/// interacting residues arranged radially. Supports zoom/pan, hover tooltips,
-/// and PNG/PDF export. All layout and drawing live in
-/// `InteractionDiagramRenderer.swift`; this view is the SwiftUI shell.
+/// 2D Protein–Ligand Interaction Diagram with a LigPlot/PoseView-style
+/// layout: the ligand's RDKit depiction in the middle, interacting residues
+/// placed outward from their contacts with overlap and crossing resolution.
+/// Supports zoom/pan, hover (tooltip + emphasis), click-to-select in 3D, and
+/// PNG/PDF/SVG export. Layout and drawing live in `InteractionDiagramLayout.swift`
+/// and `InteractionDiagramRenderer.swift`; this view is the SwiftUI shell.
 struct InteractionDiagramView: View {
     let interactions: [MolecularInteraction]
     let ligandName: String
@@ -22,6 +23,8 @@ struct InteractionDiagramView: View {
     let poseEnergy: Float
     let poseIndex: Int
     var scoringMethod: ScoringMethod = .vina
+    /// Called when a residue is clicked (selects it in the 3D view).
+    var onSelectResidue: ((ResidueKey) -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -35,14 +38,10 @@ struct InteractionDiagramView: View {
     @State private var lastPanOffset: CGSize = .zero
     @State private var lastZoomScale: CGFloat = 1.0
 
-    @State private var exportSize: CGSize = .zero
-
-    @State private var hoveredResidue: String? = nil
+    @State private var hoveredResidue: Int?
     @State private var hoverPoint: CGPoint = .zero
-    @State private var residueScreenCenters: [(label: String, center: CGPoint,
-                                               interactions: [MolecularInteraction])] = []
 
-    private enum ExportFormat { case png, pdf }
+    private enum ExportFormat { case png, pdf, svg }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,13 +49,13 @@ struct InteractionDiagramView: View {
                 ProgressView("Generating 2D layout…")
                     .controlSize(.small)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if scene != nil {
-                diagramCanvas
+            } else if let scene {
+                diagramCanvas(scene)
+                if showLegend {
+                    legend(scene)
+                }
             } else {
                 contactListFallback
-            }
-            if showLegend {
-                legend
             }
         }
         .frame(minWidth: 650, minHeight: 550)
@@ -67,20 +66,17 @@ struct InteractionDiagramView: View {
             let recorded = ligandSmiles
             let atoms = ligandAtoms
             let bonds = ligandBonds
-            let coords = await Task.detached { () -> RDKitBridge.Coords2D? in
+            let contacts = interactions
+            let protein = proteinAtoms
+            scene = await Task.detached { () -> DiagramScene? in
                 guard let smiles = recorded.flatMap({ $0.isEmpty ? nil : $0 })
                         ?? RDKitBridge.atomsBondsToSMILES(atoms: atoms, bonds: bonds),
                       let depiction = RDKitBridge.compute2DCoords(smiles: smiles) else { return nil }
-                // Fall back to SMILES order only if the graphs cannot be matched (as before).
-                return alignDepiction(depiction, toHeavyAtoms: atoms, bonds: bonds) ?? depiction
+                // Fall back to SMILES order only if the graphs cannot be matched.
+                let aligned = alignDepiction(depiction, toHeavyAtoms: atoms, bonds: bonds)
+                return buildDiagramScene(coords: aligned ?? depiction, aligned: aligned != nil,
+                                         interactions: contacts, ligandAtoms: atoms, proteinAtoms: protein)
             }.value
-            if let coords {
-                scene = buildDiagramScene(
-                    coords: coords,
-                    interactions: interactions,
-                    ligandAtoms: ligandAtoms,
-                    proteinAtoms: proteinAtoms)
-            }
             isLoading = false
         }
     }
@@ -118,11 +114,12 @@ struct InteractionDiagramView: View {
             Menu {
                 Button("Export as PNG…") { export(.png) }
                 Button("Export as PDF…") { export(.pdf) }
+                Button("Export as SVG…") { export(.svg) }
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
             .disabled(scene == nil)
-            .help("Export the diagram (white background)")
+            .help("Export the diagram with its legend (white background)")
         }
     }
 
@@ -144,22 +141,27 @@ struct InteractionDiagramView: View {
 
     // MARK: - Diagram canvas
 
-    @ViewBuilder
-    private var diagramCanvas: some View {
+    /// Diagram space → view space: fit to the canvas, then the user's zoom/pan.
+    private func viewTransform(_ scene: DiagramScene, size: CGSize) -> CGAffineTransform {
+        let c = CGPoint(x: size.width / 2, y: size.height / 2)
+        return diagramFitTransform(bounds: scene.bounds, in: size)
+            .concatenating(CGAffineTransform(translationX: c.x + panOffset.width, y: c.y + panOffset.height)
+                .scaledBy(x: zoomScale, y: zoomScale)
+                .translatedBy(x: -c.x, y: -c.y))
+    }
+
+    private func diagramCanvas(_ scene: DiagramScene) -> some View {
         let palette = DiagramPalette.resolved(dark: colorScheme == .dark)
-        GeometryReader { geo in
-            Canvas { context, size in
-                guard let s = scene else { return }
-                var ctx = context
-                let center = CGPoint(x: size.width / 2, y: size.height / 2)
-                ctx.translateBy(x: center.x + panOffset.width, y: center.y + panOffset.height)
-                ctx.scaleBy(x: zoomScale, y: zoomScale)
-                ctx.translateBy(x: -center.x, y: -center.y)
-                let centers = drawScene(s, in: ctx, size: size, palette: palette)
-                DispatchQueue.main.async { self.residueScreenCenters = centers }
+        return GeometryReader { geo in
+            let transform = viewTransform(scene, size: geo.size)
+            Canvas { context, _ in
+                let surface = CanvasDiagramSurface(context)
+                surface.concatenate(transform)
+                drawScene(scene, on: surface, palette: palette, emphasis: hoveredResidue)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.paper)
+            .contentShape(Rectangle())
             .gesture(
                 MagnifyGesture()
                     .onChanged { value in
@@ -177,45 +179,69 @@ struct InteractionDiagramView: View {
                     .onEnded { _ in lastPanOffset = panOffset }
             )
             .onTapGesture(count: 2) { resetView() }
-            .overlay {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        switch phase {
-                        case .active(let location):
-                            hoverPoint = location
-                            hoveredResidue = findResidueAtPoint(location, in: geo.size)
-                        case .ended:
-                            hoveredResidue = nil
-                        }
-                    }
+            .onTapGesture {
+                if let index = hoveredResidue { onSelectResidue?(scene.residues[index].key) }
+            }
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoverPoint = location
+                    let p = location.applying(transform.inverted())
+                    hoveredResidue = scene.residues.lastIndex { $0.contains(p) }
+                case .ended:
+                    hoveredResidue = nil
+                }
             }
             .overlay(alignment: .topLeading) {
-                if let res = hoveredResidue {
-                    residueTooltip(res)
-                        .position(x: hoverPoint.x + 70, y: hoverPoint.y - 24)
+                if let index = hoveredResidue {
+                    residueTooltip(scene.residues[index])
+                        .fixedSize()
+                        .offset(x: min(hoverPoint.x + 16, max(geo.size.width - 240, 0)),
+                                y: max(hoverPoint.y - 12, 0))
                         .allowsHitTesting(false)
                 }
             }
-            .onChange(of: geo.size) { _, newSize in exportSize = newSize }
-            .onAppear { exportSize = geo.size }
         }
     }
 
-    private func residueTooltip(_ residue: String) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xxs) {
-            Text(residue).font(DS.Font.sectionTitle)
-            ForEach(residueInteractions(for: residue), id: \.id) { inter in
+    private func residueTooltip(_ residue: DiagramScene.Residue) -> some View {
+        let contacts = residue.interactions.sorted {
+            ($0.type.rawValue, $0.distance) < ($1.type.rawValue, $1.distance)
+        }
+        return VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.xs) {
+                Text(verbatim: "\(residue.key.name) \(residue.key.seq)").font(DS.Font.sectionTitle)
+                if !residue.key.chain.isEmpty {
+                    Text(verbatim: "chain \(residue.key.chain)")
+                        .font(DS.Font.secondary)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(contacts.prefix(10), id: \.id) { inter in
                 HStack(spacing: DS.Space.xs) {
                     Circle()
                         .fill(inter.type.themeColor)
                         .frame(width: 6, height: 6)
                     Text(inter.type.label).font(DS.Font.secondary)
+                    Text(verbatim: proteinAtoms.indices.contains(inter.proteinAtomIndex)
+                         ? proteinAtoms[inter.proteinAtomIndex].name.trimmingCharacters(in: .whitespaces) : "")
+                        .font(DS.Font.monoSmall)
+                        .foregroundStyle(.secondary)
                     Text(String(format: "%.1f Å", inter.distance))
                         .font(DS.Font.monoSmall)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
+            }
+            if contacts.count > 10 {
+                Text("+\(contacts.count - 10) more")
+                    .font(DS.Font.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            if onSelectResidue != nil {
+                Text("Click to select in 3D")
+                    .font(DS.Font.caption)
+                    .foregroundStyle(.tertiary)
             }
         }
         .padding(DS.Space.m)
@@ -309,63 +335,34 @@ struct InteractionDiagramView: View {
 
     // MARK: - Legend
 
-    /// Distinct residues in contact — atom-pair counts alone overstate hydrophobic contacts.
-    private var contactResidueCount: Int {
-        Set(interactions.compactMap { ixn -> ResidueKey? in
-            guard proteinAtoms.indices.contains(ixn.proteinAtomIndex) else { return nil }
-            let atom = proteinAtoms[ixn.proteinAtomIndex]
-            return ResidueKey(name: atom.residueName, seq: atom.residueSeq, chain: atom.chainID)
-        }).count
-    }
-
-    private var legend: some View {
-        let presentTypes = Set(interactions.map(\.type))
-        let types = MolecularInteraction.InteractionType.allCases.filter { presentTypes.contains($0) }
-        let presentHalos = halosPresent(in: interactions)
+    /// Legend of what the diagram actually draws (not every detected atom pair).
+    private func legend(_ scene: DiagramScene) -> some View {
+        let palette = DiagramPalette.resolved(dark: colorScheme == .dark)
         return VStack(alignment: .leading, spacing: DS.Space.s) {
             Divider()
             VStack(alignment: .leading, spacing: DS.Space.s) {
-                legendRow("Interactions") {
-                    ForEach(types, id: \.rawValue) { type in
-                        let count = interactions.filter { $0.type == type }.count
-                        HStack(spacing: DS.Space.xs) {
-                            interactionSymbol(type).frame(width: 24, height: 12)
-                            Text(type.label)
-                            Text("\(count)").monospacedDigit().foregroundStyle(.tertiary)
-                        }
-                    }
-                }
-                if !presentHalos.isEmpty {
-                    legendRow("Ligand atoms") {
-                        ForEach(presentHalos, id: \.label) { halo in
+                if !scene.drawnTypes.isEmpty {
+                    legendRow("Interactions") {
+                        ForEach(scene.drawnTypes, id: \.rawValue) { type in
                             HStack(spacing: DS.Space.xs) {
-                                ZStack {
-                                    Circle().fill(halo.color.opacity(0.18))
-                                    Circle().strokeBorder(halo.color.opacity(0.7), lineWidth: 1.5)
-                                }
-                                .frame(width: 12, height: 12)
-                                Text(halo.label)
+                                legendSample(.interaction(type), palette: palette)
+                                Text(type.label)
+                                Text("\(scene.drawnCount(type))").monospacedDigit().foregroundStyle(.tertiary)
                             }
                         }
                     }
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 0) {
                     legendRow("Residues") {
-                        ForEach(DiagramResidueClass.allCases, id: \.self) { cls in
+                        ForEach(scene.residueClasses, id: \.self) { cls in
                             HStack(spacing: DS.Space.xs) {
-                                RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
-                                    .fill(cls.themeColor.opacity(0.18))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: DS.Radius.xs, style: .continuous)
-                                            .strokeBorder(cls.themeColor, lineWidth: 1)
-                                    )
-                                    .frame(width: 12, height: 12)
+                                legendSample(.residueClass(cls), palette: palette)
                                 Text(cls.label)
                             }
                         }
                     }
                     Spacer(minLength: DS.Space.m)
-                    Text("\(interactions.count) contacts · \(contactResidueCount) residues")
+                    Text("\(scene.residues.count) residues · distances in Å")
                         .font(DS.Font.secondary)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
@@ -375,6 +372,15 @@ struct InteractionDiagramView: View {
             .padding(.bottom, DS.Space.m)
         }
         .background(.bar)
+    }
+
+    private func legendSample(_ item: DiagramLegendItem, palette: DiagramPalette) -> some View {
+        Canvas { context, size in
+            DiagramFigureLayout.drawSample(item, at: CGPoint(x: 0, y: size.height / 2),
+                                           on: CanvasDiagramSurface(context), palette: palette)
+        }
+        .frame(width: DiagramFigureLayout.sampleSize.width, height: DiagramFigureLayout.sampleSize.height)
+        .accessibilityHidden(true)
     }
 
     private func legendRow<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -394,73 +400,14 @@ struct InteractionDiagramView: View {
         }
     }
 
-    /// Halo entries surfaced in the legend; mirrors `pharmacophoreHalo` in the renderer.
-    private func halosPresent(in interactions: [MolecularInteraction]) -> [(label: String, color: Color)] {
-        var entries: [(label: String, color: Color)] = []
-        let types = Set(interactions.map(\.type))
-        if types.contains(.hbond) || types.contains(.halogen) {
-            entries.append((label: "H-bond donor/acceptor", color: DS.Color.interactionHBond))
-        }
-        if types.contains(.saltBridge) {
-            entries.append((label: "salt bridge", color: DS.Color.interactionSaltBridge))
-        }
-        if types.contains(.metalCoord) {
-            entries.append((label: "metal coord", color: DS.Color.interactionMetal))
-        }
-        if types.contains(.chalcogen) {
-            entries.append((label: "chalcogen", color: MolecularInteraction.InteractionType.chalcogen.themeColor))
-        }
-        return entries
-    }
-
-    @ViewBuilder
-    private func interactionSymbol(_ type: MolecularInteraction.InteractionType) -> some View {
-        let c = type.themeColor
-        Canvas { ctx, size in
-            let y = size.height / 2
-            switch type {
-            case .hbond:
-                var p = Path()
-                p.move(to: CGPoint(x: 0, y: y))
-                p.addLine(to: CGPoint(x: size.width, y: y))
-                ctx.stroke(p, with: .color(c), style: StrokeStyle(lineWidth: 2, dash: [3, 2]))
-            case .hydrophobic:
-                var p = Path()
-                p.move(to: CGPoint(x: 2, y: size.height))
-                p.addQuadCurve(to: CGPoint(x: size.width - 2, y: size.height),
-                               control: CGPoint(x: size.width / 2, y: -2))
-                ctx.stroke(p, with: .color(c), lineWidth: 2)
-            case .saltBridge:
-                for dy in [-2.0, 2.0] as [CGFloat] {
-                    var p = Path()
-                    p.move(to: CGPoint(x: 0, y: y + dy))
-                    p.addLine(to: CGPoint(x: size.width, y: y + dy))
-                    ctx.stroke(p, with: .color(c), style: StrokeStyle(lineWidth: 1.5, dash: [2, 1.4]))
-                }
-            default:
-                var p = Path()
-                p.move(to: CGPoint(x: 0, y: y))
-                p.addLine(to: CGPoint(x: size.width, y: y))
-                ctx.stroke(p, with: .color(c), lineWidth: 2)
-            }
-        }
-    }
-
     // MARK: - Export
 
-    /// Exports always use the light palette on white paper, whatever the app appearance.
+    /// Exports the figure (diagram at 1:1 plus a legend) with the light palette on
+    /// white paper, whatever the app appearance. PDF and SVG are vector.
     private func export(_ format: ExportFormat) {
         guard let s = scene else { return }
-        let size = CGSize(width: max(exportSize.width, 900), height: max(exportSize.height, 700))
         let palette = DiagramPalette.resolved(dark: false)
-        let renderer = ImageRenderer(content:
-            Canvas { context, canvasSize in
-                context.fill(Path(CGRect(origin: .zero, size: canvasSize)), with: .color(palette.paper))
-                drawScene(s, in: context, size: canvasSize, palette: palette)
-            }
-            .frame(width: size.width, height: size.height)
-            .environment(\.colorScheme, .light)
-        )
+        let layout = DiagramFigureLayout(scene: s)
 
         let panel = NSSavePanel()
         let baseName = "interaction_diagram_pose\(poseIndex + 1)"
@@ -471,19 +418,33 @@ struct InteractionDiagramView: View {
         case .pdf:
             panel.allowedContentTypes = [.pdf]
             panel.nameFieldStringValue = "\(baseName).pdf"
+        case .svg:
+            panel.allowedContentTypes = [.svg]
+            panel.nameFieldStringValue = "\(baseName).svg"
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        switch format {
-        case .png:
-            renderer.scale = 2.0
-            if let image = renderer.nsImage,
-               let tiff = image.tiffRepresentation,
-               let bitmap = NSBitmapImageRep(data: tiff),
-               let pngData = bitmap.representation(using: .png, properties: [:]) {
+        if format == .svg {
+            let surface = SVGDiagramSurface(size: layout.size)
+            drawFigure(s, layout: layout, on: surface, palette: palette)
+            try? surface.document.write(to: url, atomically: true, encoding: .utf8)
+            return
+        }
+
+        let renderer = ImageRenderer(content:
+            Canvas { context, _ in
+                drawFigure(s, layout: layout, on: CanvasDiagramSurface(context), palette: palette)
+            }
+            .frame(width: layout.size.width, height: layout.size.height)
+            .environment(\.colorScheme, .light)
+        )
+        if format == .png {
+            renderer.scale = 3.0
+            if let cgImage = renderer.cgImage,
+               let pngData = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) {
                 try? pngData.write(to: url)
             }
-        case .pdf:
+        } else {
             renderer.render { renderSize, draw in
                 var box = CGRect(origin: .zero, size: renderSize)
                 guard let pdf = CGContext(url as CFURL, mediaBox: &box, nil) else { return }
@@ -492,31 +453,6 @@ struct InteractionDiagramView: View {
                 pdf.endPDFPage()
                 pdf.closePDF()
             }
-        }
-    }
-
-    // MARK: - Hover hit-test
-
-    private func findResidueAtPoint(_ point: CGPoint, in size: CGSize) -> String? {
-        let center = CGPoint(x: size.width / 2, y: size.height / 2)
-        let px = (point.x - center.x - panOffset.width) / zoomScale + center.x
-        let py = (point.y - center.y - panOffset.height) / zoomScale + center.y
-        let transformed = CGPoint(x: px, y: py)
-        let hitRadius: CGFloat = 42.0
-        for entry in residueScreenCenters {
-            let dx = transformed.x - entry.center.x
-            let dy = transformed.y - entry.center.y
-            if dx * dx + dy * dy <= hitRadius * hitRadius { return entry.label }
-        }
-        return nil
-    }
-
-    private func residueInteractions(for residueLabel: String) -> [MolecularInteraction] {
-        interactions.filter { ixn in
-            let pIdx = ixn.proteinAtomIndex
-            guard pIdx < proteinAtoms.count else { return false }
-            let atom = proteinAtoms[pIdx]
-            return "\(atom.residueName)\(atom.residueSeq)" == residueLabel
         }
     }
 }

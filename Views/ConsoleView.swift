@@ -38,6 +38,51 @@ struct ConsoleView: View {
     }
 }
 
+// MARK: - Window
+
+/// The terminal in its own window: the same `ConsoleSession` as the bottom panel, under a
+/// header with the terminal's tools and a button moving it back to the main window. While it
+/// is open the session is marked detached, so the bottom panel never shows it at the same time;
+/// closing the window hands the session back to the panel.
+struct ConsoleWindow: View {
+    static let id = "terminal"
+
+    @Environment(ConsoleSession.self) private var session
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("ui.consoleOpen") private var showConsole = false
+    @AppStorage(BottomPanel.storageKey) private var bottomPanel = BottomPanel.terminal
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: DS.Space.m) {
+                if session.isRunning {
+                    ProgressView().controlSize(.mini)
+                        .help("A terminal command is running")
+                }
+                Spacer(minLength: DS.Space.m)
+                TerminalTools(session: session)
+                Divider().frame(height: 12)
+                BarToolButton(title: "Move to Main Window", systemImage: "rectangle.bottomhalf.inset.filled",
+                              help: "Show the terminal in the main window's bottom panel again",
+                              id: "console.attach") {
+                    bottomPanel = .terminal
+                    showConsole = true
+                    dismissWindow(id: Self.id)
+                }
+            }
+            .padding(.horizontal, DS.Space.l)
+            .frame(height: DS.Size.debugBar)
+            .background(.bar)
+            Divider()
+            if session.isDetached {
+                ConsoleView(session: session)
+            }
+        }
+        .onAppear { session.isDetached = true }
+        .onDisappear { session.isDetached = false }
+    }
+}
+
 // MARK: - Completion list
 
 /// Candidates for the word being typed: kind icon, text and the registry's one-line description

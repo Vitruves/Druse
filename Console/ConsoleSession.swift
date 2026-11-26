@@ -119,9 +119,9 @@ struct ConsoleHistorySearch: Equatable, Sendable {
 /// suggestion, the running command's live progress line and ⌃R search.
 ///
 /// The terminal only ever shows this session (commands, their output and errors); activity-log
-/// entries belong to the Logs panel. The session is created once per window, so scrollback,
-/// draft and running commands survive hiding the panel or switching to the Logs panel or to
-/// another workflow step.
+/// entries belong to the Logs panel. The session is created once for the app, so scrollback,
+/// draft and running commands survive hiding the panel, switching to the Logs panel or to
+/// another workflow step, and moving the terminal to its own window and back.
 @Observable
 @MainActor
 final class ConsoleSession: ConsoleOutput {
@@ -170,6 +170,10 @@ final class ConsoleSession: ConsoleOutput {
     private var pendingEchoes: [String] = []
 
     @ObservationIgnored private var interpreter: DruseInterpreter!
+
+    /// True while the terminal is shown in its own window (`ConsoleWindow`) instead of the
+    /// main window's bottom panel; only one terminal view shows the session at a time.
+    var isDetached = false
 
     init(viewModel: AppViewModel) {
         interpreter = DruseInterpreter(viewModel: viewModel, output: self, mode: .interactive)

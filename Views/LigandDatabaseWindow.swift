@@ -10,9 +10,8 @@ import UniformTypeIdentifiers
 struct LigandDatabaseWindow: View {
     @Environment(AppViewModel.self) var viewModel
 
-    // Selection state (shift+click multi-select)
+    // Table selection (native click / ⇧-click / ⌘-click / ⌘A)
     @State var selectedIDs: Set<UUID> = []
-    @State var lastClickedID: UUID?
 
     // Search / filter
     @State var searchText: String = ""
@@ -21,6 +20,12 @@ struct LigandDatabaseWindow: View {
 
     /// Parent compounds whose enumerated forms are folded away in the table.
     @State var collapsedParents: Set<String> = []
+
+    /// Sort columns, most significant first. Empty keeps library order.
+    @State var sortOrder: [TableSort<LigandEntry>] = []
+    /// Column order, widths and visibility (header right-click menu), persisted.
+    @State var columnCustomization: TableColumnCustomization<LigandEntry> = TableColumnStore.load(Self.columnStoreKey)
+    private static let columnStoreKey = "ui.ligandTable.columns"
 
     // Inline SMILES entry
     @State var showSMILESEntry: Bool = false
@@ -37,25 +42,6 @@ struct LigandDatabaseWindow: View {
     // Inspector column + destructive confirmation
     @State var showInspector: Bool = true
     @State var showClearAllConfirmation: Bool = false
-
-    // Sorting
-    enum SortField: String { case name, smiles, mw, logP, hbd, hba, tpsa, rotB, atoms }
-    @State var sortField: SortField? = nil
-    @State var sortAscending: Bool = true
-
-    /// Dynamic column manifest (built-in + user-imported). Persists order and
-    /// visibility via @AppStorage.
-    @State var columnState = LigandColumnState()
-
-    /// Column id currently being dragged (header → header reorder).
-    @State var draggedColumnID: String? = nil
-    /// Column id the user is hovering over while dragging — used to draw a
-    /// vertical insertion indicator on its leading edge.
-    @State var dropTargetColumnID: String? = nil
-    /// Horizontal distance the table has scrolled from its resting position —
-    /// the leading checkbox cell of every row is shifted back by this amount so
-    /// it stays pinned to the viewport's leading edge.
-    @State var tableHorizontalScroll: CGFloat = 0
 
     // Inspector: selected entry for inspection
     @State var inspectedEntry: LigandEntry?
@@ -82,9 +68,6 @@ struct LigandDatabaseWindow: View {
         let energy: Double
     }
 
-    /// Width of the sticky leading checkbox gutter (padding + checkbox + padding).
-    private let checkboxGutter: CGFloat = 40
-
     var db: LigandDatabase { viewModel.ligandDB }
 
     // Preparation state lives in the shared service (also driven by the console).
@@ -95,7 +78,9 @@ struct LigandDatabaseWindow: View {
     var batchProgress: (current: Int, total: Int) { prep.progress }
     var processingMessage: String { prep.message }
 
-    /// Filtered entries (search + Lipinski + prepared-only filters, sorted).
+    var isFiltered: Bool { !searchText.isEmpty || lipinskiFilter || showOnlyPrepared }
+
+    /// Filtered entries (search + Lipinski + prepared-only filters), in table sort order.
     var filteredEntries: [LigandEntry] {
         var entries = db.entries
         if !searchText.isEmpty {
@@ -110,30 +95,11 @@ struct LigandDatabaseWindow: View {
         if showOnlyPrepared {
             entries = entries.filter { $0.isPrepared }
         }
-        // Folded forms stay hidden unless a search is looking for them.
-        if searchText.isEmpty && !collapsedParents.isEmpty {
-            entries = entries.filter { entry in
-                entry.parentName.map { !collapsedParents.contains($0) } ?? true
-            }
-        }
-        if let field = sortField {
-            entries.sort { a, b in
-                let result: Bool
-                switch field {
-                case .name:  result = a.name.localizedCompare(b.name) == .orderedAscending
-                case .smiles: result = a.smiles < b.smiles
-                case .mw:    result = (a.descriptors?.molecularWeight ?? 0) < (b.descriptors?.molecularWeight ?? 0)
-                case .logP:  result = (a.descriptors?.logP ?? 0) < (b.descriptors?.logP ?? 0)
-                case .hbd:   result = (a.descriptors?.hbd ?? 0) < (b.descriptors?.hbd ?? 0)
-                case .hba:   result = (a.descriptors?.hba ?? 0) < (b.descriptors?.hba ?? 0)
-                case .tpsa:  result = (a.descriptors?.tpsa ?? 0) < (b.descriptors?.tpsa ?? 0)
-                case .rotB:  result = (a.descriptors?.rotatableBonds ?? 0) < (b.descriptors?.rotatableBonds ?? 0)
-                case .atoms: result = a.atoms.count < b.atoms.count
-                }
-                return sortAscending ? result : !result
-            }
-        }
-        return entries
+        guard !sortOrder.isEmpty else { return entries }
+        // Rebuild each comparator from the current data: a stored comparator
+        // captured the docking results of the moment its header was clicked.
+        let comparators = sortOrder.map { sorter($0.id, order: $0.order) }
+        return entries.sorted(using: comparators)
     }
 
     private var selectedEntries: [LigandEntry] {
@@ -233,13 +199,9 @@ struct LigandDatabaseWindow: View {
                 if selectedIDs.isEmpty, let first = filteredEntries.first {
                     selectedIDs = [first.id]
                 }
-                // Discover any user-imported columns from the loaded DB
-                columnState.discoverUserColumns(from: db.entries)
             }
-            .onChange(of: db.entries.count) { _, _ in
-                // New entries (e.g. from an import) may carry new
-                // userProperties keys — register them as columns.
-                columnState.discoverUserColumns(from: db.entries)
+            .onChange(of: columnCustomization) { _, newValue in
+                TableColumnStore.save(newValue, key: Self.columnStoreKey)
             }
             .onChange(of: selectedIDs) { _, newIDs in
                 guard newIDs.count == 1, let id = newIDs.first,
@@ -264,7 +226,7 @@ struct LigandDatabaseWindow: View {
         if db.entries.isEmpty {
             emptyState
         } else {
-            tableView
+            ligandTable
         }
     }
 
@@ -469,508 +431,318 @@ struct LigandDatabaseWindow: View {
 
     // MARK: - Table
 
-    private var tableBackground: Color { Color(nsColor: .controlBackgroundColor) }
+    /// A top-level row and the enumerated forms folded under it.
+    struct LigandTableNode: Identifiable {
+        let entry: LigandEntry
+        let forms: [LigandEntry]
+        var id: UUID { entry.id }
+    }
 
-    private var tableView: some View {
-        // 2D scrolling table: horizontal for column overflow, vertical for
-        // row overflow. Header is pinned via Section so it stays visible
-        // while rows scroll vertically and tracks the rows when they
-        // scroll horizontally. Each row owns its checkbox cell (so vertical
-        // alignment is structural); the cell is counter-offset by the
-        // horizontal scroll distance to stay pinned on the leading edge.
-        GeometryReader { geo in
-            let widths = computeColumnWidths(viewportWidth: geo.size.width - DS.Space.xl - checkboxGutter)
-            let viewportHeight = geo.size.height
-            ScrollView([.horizontal, .vertical], showsIndicators: true) {
-                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    Section {
-                        ForEach(filteredEntries) { entry in
-                            tableRow(entry, widths: widths)
-                            Divider().opacity(0.5)
-                        }
-                    } header: {
-                        tableHeaderRow(widths: widths)
-                    }
-                }
-                // Claim at least the viewport height with top alignment so
-                // short tables don't float in the middle of the viewport.
-                .frame(minHeight: viewportHeight, alignment: .topLeading)
-                .background(alignment: .topLeading) {
-                    columnSeparatorOverlay(widths: widths)
-                }
-            }
-            .onScrollGeometryChange(for: CGFloat.self) { geo in
-                // contentOffset is measured from the content origin, so a
-                // leading content inset makes the resting offset negative.
-                geo.contentOffset.x + geo.contentInsets.leading
-            } action: { _, newValue in
-                tableHorizontalScroll = newValue
+    /// Filtered, sorted entries grouped as parent → forms. A form whose parent
+    /// is filtered out (or deleted) is shown at the top level.
+    private func tableNodes(_ entries: [LigandEntry]) -> [LigandTableNode] {
+        let shownNames = Set(entries.map(\.name))
+        var forms: [String: [LigandEntry]] = [:]
+        for entry in entries {
+            if let parent = entry.parentName, parent != entry.name, shownNames.contains(parent) {
+                forms[parent, default: []].append(entry)
             }
         }
-        .background(tableBackground)
-    }
-
-    /// Row tint for selection / inspection / active / enumeration state.
-    private func rowBackground(_ entry: LigandEntry) -> Color {
-        if inspectedEntry?.id == entry.id { return DS.Color.accent.opacity(0.22) }
-        if selectedIDs.contains(entry.id) { return DS.Color.accentSoft }
-        if viewModel.activeLigandEntryID == entry.id { return DS.Color.ligand.opacity(0.08) }
-        if db.hasEnumeratedChildren(entry) { return DS.Color.controlFill }
-        if entry.isEnumerated { return DS.Color.cardFill }
-        return .clear
-    }
-
-    private func checkboxImage(isOn: Bool) -> some View {
-        Image(systemName: isOn ? "checkmark.square.fill" : "square")
-            .font(DS.Font.body)
-            .foregroundStyle(isOn ? DS.Color.accent : Color.secondary)
-    }
-
-    /// Header checkbox: select all / none of the selectable (non-parent) rows.
-    @ViewBuilder
-    private var headerCheckboxCell: some View {
-        let selectableIDs = Set(filteredEntries.lazy
-            .filter { !db.hasEnumeratedChildren($0) }
-            .map(\.id))
-        let allSelected = !selectableIDs.isEmpty && selectableIDs.isSubset(of: selectedIDs)
-
-        Button(action: toggleSelectAll) {
-            checkboxImage(isOn: allSelected)
-                .frame(width: checkboxGutter, height: DS.Size.rowHeight + DS.Space.s)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .background { stickyCellBackground(Color.clear, material: true) }
-        .offset(x: tableHorizontalScroll)
-        .zIndex(1)
-        .help("Select all / none")
-        .accessibilityLabel(allSelected ? "Deselect all" : "Select all")
-    }
-
-    /// Per-row checkbox, pinned to the leading edge during horizontal scroll.
-    @ViewBuilder
-    private func rowCheckboxCell(_ entry: LigandEntry) -> some View {
-        let isOn = selectedIDs.contains(entry.id)
-        Button {
-            if isOn { selectedIDs.remove(entry.id) } else { selectedIDs.insert(entry.id) }
-        } label: {
-            checkboxImage(isOn: isOn)
-                .frame(width: checkboxGutter, height: DS.Size.rowHeight)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .background { stickyCellBackground(rowBackground(entry), material: false) }
-        .offset(x: tableHorizontalScroll)
-        .zIndex(1)
-        .accessibilityLabel(isOn ? "Deselect \(entry.name)" : "Select \(entry.name)")
-    }
-
-    /// Opaque backing for a pinned checkbox cell so scrolled-under cells don't
-    /// show through, plus the trailing hairline separating it from the columns.
-    private func stickyCellBackground(_ tint: Color, material: Bool) -> some View {
-        ZStack {
-            tableBackground
-            if material { Rectangle().fill(.bar) }
-            tint
-        }
-        .overlay(alignment: .trailing) {
-            // Explicit 0.5 pt rule: a Divider here would default to horizontal.
-            Rectangle()
-                .fill(DS.Color.hairline)
-                .frame(width: 0.5)
+        return entries.compactMap { entry in
+            if let parent = entry.parentName, parent != entry.name, shownNames.contains(parent) { return nil }
+            return LigandTableNode(entry: entry, forms: forms[entry.name] ?? [])
         }
     }
 
-    /// Continuous vertical separator lines drawn at every column boundary,
-    /// from the top of the table to the bottom.
-    @ViewBuilder
-    private func columnSeparatorOverlay(widths: [String: CGFloat]) -> some View {
-        let gutter = checkboxGutter
-        let columns = columnState.visibleColumns
-        Canvas { context, size in
-            // Leading edge: outer padding + sticky checkbox gutter
-            var x: CGFloat = gutter + DS.Space.m
-            let lineColor = GraphicsContext.Shading.color(DS.Color.hairline)
-            for col in columns {
-                x += widths[col.id] ?? 60
-                var path = Path()
-                path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x, y: size.height))
-                context.stroke(path, with: lineColor, lineWidth: 0.5)
-            }
-        }
-        .allowsHitTesting(false)
+    /// Keys of user-imported properties, one column each.
+    private var userPropertyKeys: [String] {
+        Array(Set(db.entries.flatMap(\.userProperties.keys))).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
-    /// Compute per-column display widths for the current viewport.
-    /// - Built-in columns with a fixed `defaultWidth` use that.
-    /// - Flexible columns (SMILES) split the leftover viewport space, with a
-    ///   minimum of `minFlex`. When the total exceeds the viewport, the table
-    ///   overflows horizontally and the user can scroll.
-    private func computeColumnWidths(viewportWidth: CGFloat) -> [String: CGFloat] {
-        let cols = columnState.visibleColumns
-        var widths: [String: CGFloat] = [:]
-        var fixedTotal: CGFloat = 0
-        var flexIDs: [String] = []
-        let minFlex: CGFloat = 240
-
-        for col in cols {
-            if let w = col.kind.defaultWidth {
-                widths[col.id] = w
-                fixedTotal += w
-            } else {
-                flexIDs.append(col.id)
-            }
+    /// The comparator of column `id`, built from the current data.
+    func sorter(_ id: String, order: SortOrder = .forward) -> TableSort<LigandEntry> {
+        let best = viewModel.bestDockingResultByLigand
+        let method = viewModel.docking.scoringMethod
+        let key: @Sendable (LigandEntry) -> TableSortValue
+        switch id {
+        case "name":      key = { .text($0.name) }
+        case "status":    key = { .number(LigandPrepStatus($0).sortRank) }
+        case "smiles":    key = { .text($0.originalSMILES) }
+        case "score":     key = { .number(best[$0.name]?.displayScore(method: method)) }
+        case "le":        key = { .number(Self.ligandEfficiency($0, best: best[$0.name], method: method)) }
+        case "mw":        key = { .number($0.descriptors?.molecularWeight) }
+        case "logP":      key = { .number($0.descriptors?.logP) }
+        case "tpsa":      key = { .number($0.descriptors?.tpsa) }
+        case "hbd":       key = { .number($0.descriptors?.hbd) }
+        case "hba":       key = { .number($0.descriptors?.hba) }
+        case "rotB":      key = { .number($0.descriptors?.rotatableBonds) }
+        case "heavy":     key = { .number($0.descriptors?.heavyAtomCount) }
+        case "fsp3":      key = { .number($0.descriptors?.fractionCSP3) }
+        case "ro5":       key = { .number($0.descriptors.map { $0.lipinski ? 1 : 0 }) }
+        case "pKi":       key = { .number($0.effectivePKi) }
+        case "lle":       key = { .number(Self.lipophilicEfficiency($0)) }
+        case "pop":       key = { .number($0.populationWeight) }
+        case "deltaE":    key = { .number($0.relativeEnergy) }
+        case "conformers": key = { .number($0.conformerCount > 0 ? $0.conformerCount : nil) }
+        default:
+            // "user.<key>" — imported property, numeric when it parses.
+            let property = String(id.dropFirst("user.".count))
+            key = { .parsed($0.userProperties[property]) }
         }
-
-        if flexIDs.isEmpty { return widths }
-
-        let leftover = viewportWidth - fixedTotal
-        let perFlex = leftover / CGFloat(flexIDs.count)
-        for id in flexIDs {
-            widths[id] = max(minFlex, perFlex)
-        }
-        return widths
+        return TableSort(id, order: order, key: key)
     }
 
-    /// Header row — dynamic, driven by columnState.visibleColumns. Widths
-    /// match the row cells. Drag-and-drop reorder with a custom preview chip
-    /// and leading-edge insertion indicator while dragging. The leading cell
-    /// is the pinned select-all checkbox.
-    @ViewBuilder
-    private func tableHeaderRow(widths: [String: CGFloat]) -> some View {
-        HStack(spacing: 0) {
-            headerCheckboxCell
-            HStack(spacing: 0) {
-                ForEach(columnState.visibleColumns) { col in
-                    headerCellWithDrag(col: col, width: widths[col.id])
-                }
-            }
-            .padding(.horizontal, DS.Space.m)
-        }
-        .frame(height: DS.Size.rowHeight + DS.Space.s)
-        .background(.bar)
-        .overlay(alignment: .bottom) {
-            Divider()
-        }
+    private nonisolated static func ligandEfficiency(_ entry: LigandEntry, best: DockingResult?, method: ScoringMethod) -> Float? {
+        guard let best else { return nil }
+        let heavyAtoms = entry.descriptors?.heavyAtomCount ?? best.transformedAtomPositions.count
+        return LigandMetrics.ligandEfficiency(score: best.displayScore(method: method), method: method, heavyAtoms: heavyAtoms)
     }
 
-    /// One header cell wrapped in drag/drop modifiers. The drag preview is an
-    /// accent chip showing the column name, and the drop indicator is a 2-pt
-    /// accent bar on the leading edge of the hovered column.
-    @ViewBuilder
-    private func headerCellWithDrag(col: LigandColumn, width: CGFloat?) -> some View {
-        let isDragSource = draggedColumnID == col.id
-        let isDropTarget = dropTargetColumnID == col.id && draggedColumnID != nil && draggedColumnID != col.id
-
-        headerCell(
-            col.kind.title,
-            width: width,
-            field: col.kind.sortField,
-            alignment: col.kind.alignment
-        )
-        .opacity(isDragSource ? 0.35 : 1.0)
-        .overlay(alignment: .leading) {
-            if isDropTarget {
-                Rectangle()
-                    .fill(DS.Color.accent)
-                    .frame(width: 2)
-                    .frame(maxHeight: .infinity)
-            }
-        }
-        .contextMenu {
-            columnHeaderMenu(for: col)
-        }
-        .onDrag({
-            draggedColumnID = col.id
-            return NSItemProvider(object: col.id as NSString)
-        }, preview: {
-            Text(col.kind.title)
-                .font(DS.Font.secondary.weight(.semibold))
-                .foregroundStyle(DS.Color.accentOnFill)
-                .padding(.horizontal, DS.Space.m)
-                .padding(.vertical, DS.Space.xs)
-                .background(Capsule().fill(DS.Color.accent))
-        })
-        .onDrop(
-            of: [.text],
-            delegate: ColumnDropDelegate(
-                targetID: col.id,
-                columnState: columnState,
-                onDragEnter: { dropTargetColumnID = col.id },
-                onDragExit: { if dropTargetColumnID == col.id { dropTargetColumnID = nil } },
-                onDrop: {
-                    draggedColumnID = nil
-                    dropTargetColumnID = nil
-                }
-            )
-        )
+    private nonisolated static func lipophilicEfficiency(_ entry: LigandEntry) -> Float? {
+        guard let pK = entry.effectivePKi, let d = entry.descriptors else { return nil }
+        return LigandMetrics.lipophilicEfficiency(pK: pK, logP: d.logP)
     }
 
     @ViewBuilder
-    private func headerCell(_ title: String, width: CGFloat?, field: SortField?, alignment: Alignment = .leading) -> some View {
-        let isSorted = field != nil && sortField == field
-        // Whole cell is hit-testable so drag works on empty space inside the
-        // cell, not just on the title text. Sort fires via tap on the whole frame.
-        ZStack(alignment: alignment) {
-            Color.clear
-            HStack(spacing: DS.Space.xxs) {
-                Text(title)
-                if isSorted {
-                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                        .font(DS.Font.caption.weight(.bold))
-                        .foregroundStyle(DS.Color.accent)
+    private var ligandTable: some View {
+        let entries = filteredEntries
+        let nodes = tableNodes(entries)
+        let best = viewModel.bestDockingResultByLigand
+        let method = viewModel.docking.scoringMethod
+        // Context columns appear only when the library has that kind of data.
+        let hasDocking = db.entries.contains { best[$0.name] != nil }
+        let hasAffinity = db.entries.contains { $0.effectivePKi != nil }
+        let hasForms = db.entries.contains(where: \.isEnumerated)
+
+        Table(of: LigandEntry.self,
+              selection: $selectedIDs,
+              sortOrder: $sortOrder,
+              columnCustomization: $columnCustomization) {
+            Group {
+                TableColumn("Name", sortUsing: sorter("name")) { entry in
+                    nameCell(entry)
                 }
-            }
-            .padding(.horizontal, DS.Space.xs)
-        }
-        .font(DS.Font.caption.weight(.semibold))
-        .foregroundStyle(isSorted ? .primary : .secondary)
-        .lineLimit(1)
-        .frame(width: width, alignment: alignment)
-        .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            guard let field else { return }
-            if sortField == field {
-                sortAscending.toggle()
-            } else {
-                sortField = field
-                sortAscending = true
-            }
-        }
-        .accessibilityAddTraits(field != nil ? .isButton : [])
-        .help(field != nil ? "Sort by \(title) · drag to reorder · right-click for columns" : "Drag to reorder · right-click for columns")
-    }
+                .width(min: 140, ideal: 200)
+                .customizationID("name")
+                .disabledCustomizationBehavior(.visibility)
 
-    // MARK: - Table Row (flat — one row per entry)
-
-    @ViewBuilder
-    private func tableRow(_ entry: LigandEntry, widths: [String: CGFloat]) -> some View {
-        let isActive = viewModel.activeLigandEntryID == entry.id
-        let isExpandedParent = db.hasEnumeratedChildren(entry)
-
-        HStack(spacing: 0) {
-            rowCheckboxCell(entry)
-
-            // Dynamic columns. Vertical separators between columns are drawn
-            // by the table-level column separator overlay (not per cell).
-            HStack(spacing: 0) {
-                ForEach(columnState.visibleColumns) { col in
-                    cellView(for: col, entry: entry,
-                             width: widths[col.id],
-                             isActive: isActive, isExpandedParent: isExpandedParent)
+                TableColumn("Status", sortUsing: sorter("status")) { entry in
+                    LigandPrepStatusCell(entry: entry)
                 }
-            }
-            .padding(.horizontal, DS.Space.m)
-        }
-        .frame(height: DS.Size.rowHeight)
-        .background(rowBackground(entry))
-        .overlay(alignment: .leading) {
-            // Ligand-coloured edge marks the active docking ligand, pinned like the checkbox.
-            if isActive {
-                Rectangle()
-                    .fill(DS.Color.ligand)
-                    .frame(width: 3)
-                    .offset(x: tableHorizontalScroll)
-                    .allowsHitTesting(false)
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            // Selection update only — the .onChange(of: selectedIDs) handler
-            // is the single source of truth for inspectedEntry and conformers.
-            handleRowClick(entry.id, shiftKey: NSEvent.modifierFlags.contains(.shift),
-                           cmdKey: NSEvent.modifierFlags.contains(.command))
-        }
-        .contextMenu {
-            Button("Use for Docking") { useEntryForDocking(entry) }
-                .disabled(entry.atoms.isEmpty || isExpandedParent)
-            Button("Prepare") { prepareSingleEntry(entry) }
-                .disabled(entry.smiles.isEmpty || isProcessing)
-            Button("Edit Structure…") {
-                editingEntryID = entry.id
-                showChemDrawer = true
-            }
-            .disabled(entry.smiles.isEmpty)
-            Button("Rename") {
-                renamingEntryID = entry.id
-                renamingText = entry.name
-            }
-            Button("Copy SMILES") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(entry.originalSMILES, forType: .string)
-            }
-            Divider()
-            if entry.isEnumerated, let pn = entry.parentName {
-                Button("Delete All \(pn) Forms", role: .destructive) {
-                    db.removeWithSiblings(parentName: pn)
-                    if inspectedEntry?.parentName == pn { inspectedEntry = nil; conformers = [] }
-                    selectedIDs.subtract(db.entries.filter { $0.parentName == pn }.map(\.id))
-                }
-            }
-            Button("Delete", role: .destructive) {
-                if inspectedEntry?.id == entry.id { inspectedEntry = nil; conformers = [] }
-                db.removeWithChildren(id: entry.id)
-                selectedIDs.remove(entry.id)
-            }
-        }
-    }
+                .width(min: 80, ideal: 100, max: 130)
+                .customizationID("status")
 
-    // MARK: - Cell Dispatch
-
-    /// Render a single cell for `entry` in column `col`. Width is supplied by
-    /// the caller (computed from viewport size); the contents are switched per
-    /// kind. The Name column has the special inline-rename + form-badge behavior.
-    @ViewBuilder
-    private func cellView(
-        for col: LigandColumn,
-        entry: LigandEntry,
-        width: CGFloat?,
-        isActive: Bool,
-        isExpandedParent: Bool
-    ) -> some View {
-        let alignment = col.kind.alignment
-
-        Group {
-            switch col.kind {
-            case .name:
-                nameCell(entry, isActive: isActive, isExpandedParent: isExpandedParent)
-            case .smiles:
-                Text(entry.originalSMILES)
-                    .font(DS.Font.monoSmall)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .help(entry.originalSMILES)
-            case .popPercent:
-                if let pop = entry.populationWeight {
-                    // Whole percents above 10 % keep "100%" inside the narrow column.
-                    Text(String(format: pop >= 0.0995 ? "%.0f%%" : "%.1f%%", pop * 100))
-                        .font(DS.Font.secondary.weight(.medium))
-                        .monospacedDigit()
-                        .foregroundStyle(Self.populationTone(pop).color)
-                        .help(String(format: "Boltzmann population %.1f %% at the target pH", pop * 100))
-                } else {
-                    dashCell
-                }
-            case .deltaE:
-                if let dE = entry.relativeEnergy {
-                    // Numbers only in a numeric column; the lowest form reads 0.0 in the success tone.
-                    Text(dE < 0.01 ? "0.0" : String(format: "+%.1f", dE))
-                        .font(DS.Font.secondary)
-                        .monospacedDigit()
-                        .foregroundStyle(dE < 0.01 ? DS.Color.success : DS.Color.warning)
-                        .help(dE < 0.01 ? "Lowest-energy form"
-                              : String(format: "%.1f kcal/mol above the lowest-energy form", dE))
-                } else {
-                    dashCell
-                }
-            case .conf:
-                if entry.conformerCount > 0 {
-                    numberText("\(entry.conformerCount)")
-                } else {
-                    dashCell
-                }
-            case .mw:
-                if let d = entry.descriptors { numberText(String(format: "%.0f", d.molecularWeight)) } else { dashCell }
-            case .logP:
-                if let d = entry.descriptors { numberText(d.logPText) } else { dashCell }
-            case .hbd:
-                if let d = entry.descriptors { numberText("\(d.hbd)") } else { dashCell }
-            case .hba:
-                if let d = entry.descriptors { numberText("\(d.hba)") } else { dashCell }
-            case .tpsa:
-                if let d = entry.descriptors { numberText(String(format: "%.0f", d.tpsa)) } else { dashCell }
-            case .rotB:
-                if let d = entry.descriptors { numberText("\(d.rotatableBonds)") } else { dashCell }
-            case .lipinski:
-                if let d = entry.descriptors {
-                    Image(systemName: d.lipinski ? "checkmark" : "xmark")
-                        .font(DS.Font.caption.weight(.semibold))
-                        .foregroundStyle(d.lipinski ? DS.Color.success : DS.Color.danger)
-                        .accessibilityLabel(d.lipinski ? "Lipinski pass" : "Lipinski fail")
-                } else { dashCell }
-            case .atoms:
-                if entry.atoms.isEmpty { dashCell } else { numberText("\(entry.atoms.count)") }
-            case .userProperty(let key):
-                if let value = entry.userProperties[key], !value.isEmpty {
-                    Text(value)
+                TableColumn("SMILES", sortUsing: sorter("smiles")) { entry in
+                    Text(entry.originalSMILES)
                         .font(DS.Font.monoSmall)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .help(value)
+                        .truncationMode(.tail)
+                        .help(entry.originalSMILES)
+                }
+                .width(min: 120, ideal: 240)
+                .customizationID("smiles")
+
+                if hasDocking {
+                    TableColumn(method.scoreColumnTitle, sortUsing: sorter("score")) { entry in
+                        TableScoreCell(value: best[entry.name]?.displayScore(method: method), method: method)
+                            .help("Best docking score of this compound")
+                    }
+                    .width(min: 70, ideal: 100, max: 130)
+                    .alignment(.trailing)
+                    .customizationID("score")
+
+                    TableColumn("LE", sortUsing: sorter("le")) { entry in
+                        let le = Self.ligandEfficiency(entry, best: best[entry.name], method: method)
+                        TableNumberCell(text: le.map(TableFormat.ligandEfficiency),
+                                        tone: le.map { DSScore.tone(ligandEfficiency: $0) },
+                                        help: "Ligand efficiency of the best pose (kcal/mol per heavy atom)")
+                    }
+                    .width(min: 40, ideal: 50, max: 70)
+                    .alignment(.trailing)
+                    .customizationID("le")
+                }
+            }
+
+            Group {
+                descriptorColumn("MW", id: "mw", help: "Molecular weight (Da)") { TableFormat.mw($0.molecularWeight) }
+                descriptorColumn("cLogP", id: "logP", help: "Crippen logP") { $0.logPText }
+                descriptorColumn("TPSA", id: "tpsa", help: "Topological polar surface area (Å²)") { TableFormat.tpsa($0.tpsa) }
+                descriptorColumn("HBD", id: "hbd", help: "H-bond donors") { "\($0.hbd)" }
+                descriptorColumn("HBA", id: "hba", help: "H-bond acceptors") { "\($0.hba)" }
+                descriptorColumn("RotB", id: "rotB", help: "Rotatable bonds") { "\($0.rotatableBonds)" }
+                descriptorColumn("HA", id: "heavy", help: "Heavy atoms") { "\($0.heavyAtomCount)" }
+                descriptorColumn("Fsp3", id: "fsp3", help: "Fraction of sp3 carbons") { String(format: "%.2f", $0.fractionCSP3) }
+                    .defaultVisibility(.hidden)
+
+                TableColumn("Ro5", sortUsing: sorter("ro5")) { entry in
+                    if let d = entry.descriptors {
+                        Image(systemName: d.lipinski ? "checkmark" : "xmark")
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundStyle(d.lipinski ? DS.Color.success : DS.Color.danger)
+                            .help(d.lipinski ? "Passes Lipinski's rule of five" : "Fails Lipinski's rule of five")
+                            .accessibilityLabel(d.lipinski ? "Lipinski pass" : "Lipinski fail")
+                    } else {
+                        TableDashCell()
+                    }
+                }
+                .width(min: 32, ideal: 36, max: 48)
+                .alignment(.center)
+                .customizationID("ro5")
+            }
+
+            Group {
+                if hasAffinity {
+                    TableColumn("Exp. pKi", sortUsing: sorter("pKi")) { entry in
+                        let pK = entry.effectivePKi
+                        TableNumberCell(text: pK.map(TableFormat.pK), tone: pK.map { DSScore.tone(pK: $0) },
+                                        help: "Experimental pKi (from pKi, Ki or IC50)")
+                    }
+                    .width(min: 50, ideal: 64, max: 90)
+                    .alignment(.trailing)
+                    .customizationID("pKi")
+
+                    TableColumn("LLE", sortUsing: sorter("lle")) { entry in
+                        let lle = Self.lipophilicEfficiency(entry)
+                        TableNumberCell(text: lle.map(TableFormat.pK), tone: lle.map { DSScore.tone(lipophilicEfficiency: $0) },
+                                        help: "Lipophilic ligand efficiency: pKi − cLogP")
+                    }
+                    .width(min: 40, ideal: 50, max: 70)
+                    .alignment(.trailing)
+                    .customizationID("lle")
+                }
+
+                if hasForms {
+                    TableColumn("Pop.", sortUsing: sorter("pop")) { entry in
+                        if let pop = entry.populationWeight {
+                            Text(TableFormat.percent(pop))
+                                .font(DS.Font.secondary.weight(.medium))
+                                .monospacedDigit()
+                                .foregroundStyle(Self.populationTone(pop).color)
+                                .help(String(format: "Boltzmann population %.1f %% at the target pH", pop * 100))
+                        } else {
+                            TableDashCell()
+                        }
+                    }
+                    .width(min: 44, ideal: 52, max: 70)
+                    .alignment(.trailing)
+                    .customizationID("pop")
+
+                    TableColumn("ΔE", sortUsing: sorter("deltaE")) { entry in
+                        if let dE = entry.relativeEnergy {
+                            // The lowest form reads 0.0 in the success tone.
+                            Text(dE < 0.01 ? "0.0" : String(format: "+%.1f", dE))
+                                .font(DS.Font.secondary)
+                                .monospacedDigit()
+                                .foregroundStyle(dE < 0.01 ? DS.Color.success : DS.Color.warning)
+                                .help(dE < 0.01 ? "Lowest-energy form"
+                                      : String(format: "%.1f kcal/mol above the lowest-energy form", dE))
+                        } else {
+                            TableDashCell()
+                        }
+                    }
+                    .width(min: 40, ideal: 48, max: 70)
+                    .alignment(.trailing)
+                    .customizationID("deltaE")
+                }
+
+                TableColumn("Conf.", sortUsing: sorter("conformers")) { entry in
+                    TableNumberCell(text: entry.conformerCount > 0 ? "\(entry.conformerCount)" : nil,
+                                    help: "3D conformers generated by preparation")
+                }
+                .width(min: 36, ideal: 44, max: 60)
+                .alignment(.trailing)
+                .customizationID("conformers")
+            }
+
+            TableColumnForEach(userPropertyKeys, id: \.self) { key in
+                TableColumn(key, sortUsing: sorter("user.\(key)")) { entry in
+                    if let value = entry.userProperties[key], !value.isEmpty {
+                        Text(value)
+                            .font(DS.Font.secondary)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .help(value)
+                    } else {
+                        TableDashCell()
+                    }
+                }
+                .width(min: 50, ideal: 80)
+                .customizationID("user.\(key)")
+            }
+        } rows: {
+            ForEach(nodes) { node in
+                if node.forms.isEmpty {
+                    TableRow(node.entry)
                 } else {
-                    dashCell
+                    DisclosureTableRow(node.entry, isExpanded: formsExpanded(node.entry.name)) {
+                        ForEach(node.forms) { form in
+                            TableRow(form)
+                        }
+                    }
                 }
             }
         }
-        .padding(.horizontal, DS.Space.xs)
-        .frame(width: width, alignment: alignment)
-        .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
-        .clipped()
-    }
-
-    private func numberText(_ value: String) -> some View {
-        Text(value)
-            .font(DS.Font.secondary)
-            .monospacedDigit()
-    }
-
-    /// Em-dash placeholder used by every cell when its data is missing.
-    private var dashCell: some View {
-        Text("—").font(DS.Font.secondary).foregroundStyle(.tertiary)
-    }
-
-    /// The Name column cell: fold chevron for compounds with enumerated forms, an
-    /// indent for the forms themselves, the form-kind badge, inline rename and the
-    /// active-docking-ligand marker.
-    @ViewBuilder
-    private func nameCell(_ entry: LigandEntry, isActive: Bool, isExpandedParent: Bool) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            if isExpandedParent {
-                let isCollapsed = collapsedParents.contains(entry.name)
-                Button {
-                    withAnimation(DS.Motion.snappy) {
-                        if isCollapsed { collapsedParents.remove(entry.name) } else { collapsedParents.insert(entry.name) }
-                    }
-                } label: {
-                    Image(systemName: "chevron.right")
-                        .font(DS.Font.caption.weight(.semibold))
-                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
-                        .foregroundStyle(.secondary)
-                        .frame(width: Self.disclosureWidth, height: DS.Size.rowHeight)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(isCollapsed ? "Show the enumerated forms" : "Hide the enumerated forms")
-                .accessibilityLabel(isCollapsed ? "Show forms of \(entry.name)" : "Hide forms of \(entry.name)")
-            } else {
-                // Children sit one step in from their parent; plain compounds keep the parents' text column.
-                Color.clear.frame(width: entry.isEnumerated ? Self.disclosureWidth * 2 : Self.disclosureWidth, height: 1)
+        .contextMenu(forSelectionType: UUID.self) { ids in
+            rowContextMenu(ids)
+        } primaryAction: { ids in
+            // Double-click / ↩ on one dockable compound makes it the docking ligand.
+            guard ids.count == 1, let id = ids.first,
+                  let entry = db.entries.first(where: { $0.id == id }),
+                  !entry.atoms.isEmpty, !db.hasEnumeratedChildren(entry) else { return }
+            useEntryForDocking(entry)
+        }
+        .overlay {
+            if entries.isEmpty {
+                noMatchesState
             }
+        }
+    }
+
+    /// A trailing-aligned numeric descriptor column (em dash before preparation computes descriptors).
+    private func descriptorColumn(
+        _ title: String, id: String, help: String,
+        format: @escaping (LigandDescriptors) -> String
+    ) -> some TableColumnContent<LigandEntry, TableSort<LigandEntry>> {
+        TableColumn(title, sortUsing: sorter(id)) { entry in
+            TableNumberCell(text: entry.descriptors.map(format), help: help)
+        }
+        .width(min: 36, ideal: 48, max: 80)
+        .alignment(.trailing)
+        .customizationID(id)
+    }
+
+    /// Forms are shown by default; a search always reveals them.
+    private func formsExpanded(_ parentName: String) -> Binding<Bool> {
+        Binding(
+            get: { !searchText.isEmpty || !collapsedParents.contains(parentName) },
+            set: { expanded in
+                if expanded { collapsedParents.remove(parentName) } else { collapsedParents.insert(parentName) }
+            }
+        )
+    }
+
+    /// Name cell: form-kind badge, inline rename and the active-docking-ligand marker.
+    @ViewBuilder
+    private func nameCell(_ entry: LigandEntry) -> some View {
+        let isActive = viewModel.activeLigandEntryID == entry.id
+        HStack(spacing: DS.Space.xs) {
             if let kind = entry.formKind {
                 DSTag(kind.symbol, tint: Self.formKindColor(kind))
                     .help(kind.label)
             }
             if renamingEntryID == entry.id {
-                TextField("Name", text: $renamingText, onCommit: {
-                    commitRename(entryID: entry.id)
-                })
-                .textFieldStyle(.roundedBorder)
-                .controlSize(.small)
-                .onExitCommand { renamingEntryID = nil }
+                TextField("Name", text: $renamingText)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .onSubmit { commitRename(entryID: entry.id) }
+                    .onExitCommand { renamingEntryID = nil }
             } else {
                 Text(entry.name)
-                    .font(DS.Font.secondary.weight(isActive || isExpandedParent ? .semibold : .regular))
-                    .foregroundStyle(.primary)
+                    .font(DS.Font.secondary.weight(isActive || db.hasEnumeratedChildren(entry) ? .semibold : .regular))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .layoutPriority(1)
                     .help(entry.name)
-                    .onTapGesture(count: 2) {
-                        renamingEntryID = entry.id
-                        renamingText = entry.name
-                    }
             }
             if isActive {
                 Image(systemName: "scope")
@@ -979,48 +751,68 @@ struct LigandDatabaseWindow: View {
                     .help("Active docking ligand")
                     .accessibilityLabel("Active docking ligand")
             }
-            if entry.preparationError != nil {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(DS.Font.caption)
-                    .foregroundStyle(DS.Color.danger)
-                    .help(entry.preparationError ?? "")
-            }
         }
     }
 
-    /// Width of the fold chevron in the Name column (and of one indent step).
-    private static let disclosureWidth: CGFloat = 12
+    // MARK: - Row Context Menu
 
-    // MARK: - Column Header Context Menu
-
-    /// Right-click menu on any column header: hide this column, toggle other
-    /// hideable columns, reset to defaults.
+    /// Acts on the clicked rows (the selection when the click is inside it).
     @ViewBuilder
-    private func columnHeaderMenu(for col: LigandColumn) -> some View {
-        if col.kind.isHideable {
-            Button("Hide \"\(col.kind.title)\"") {
-                columnState.setVisible(false, id: col.id)
+    private func rowContextMenu(_ ids: Set<UUID>) -> some View {
+        let entries = db.entries.filter { ids.contains($0.id) }
+        let single = entries.count == 1 ? entries.first : nil
+        let dockable = entries.filter { $0.isPrepared && !db.hasEnumeratedChildren($0) }
+        let preparable = entries.filter { !$0.isEnumerated && !$0.smiles.isEmpty }
+
+        if !entries.isEmpty {
+            Button(dockable.count > 1 ? "Queue \(dockable.count) for Docking" : "Use for Docking") {
+                dockEntries(dockable)
             }
+            .disabled(dockable.isEmpty)
+
+            Button(preparable.count > 1 ? "Prepare \(preparable.count) Compounds" : "Prepare") {
+                runPopulateAndPrepare(entries: preparable)
+            }
+            .disabled(preparable.isEmpty || isProcessing)
+
+            Button("Enumerate Forms…") {
+                enumerationSheetEntries = preparable
+                showEnumerationSheet = true
+            }
+            .disabled(preparable.isEmpty || isProcessing)
+
             Divider()
-        }
 
-        Menu("Show / Hide Columns") {
-            ForEach(columnState.hideableColumns) { hideable in
-                Toggle(hideable.kind.title, isOn: Binding(
-                    get: { hideable.visible },
-                    set: { _ in columnState.toggleVisible(id: hideable.id) }
-                ))
+            if let entry = single {
+                Button("Edit Structure…") {
+                    editingEntryID = entry.id
+                    showChemDrawer = true
+                }
+                .disabled(entry.smiles.isEmpty)
+                Button("Rename") {
+                    renamingEntryID = entry.id
+                    renamingText = entry.name
+                }
             }
-        }
+            Button(entries.count > 1 ? "Copy \(entries.count) SMILES" : "Copy SMILES") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(entries.map(\.originalSMILES).joined(separator: "\n"), forType: .string)
+            }
 
-        Divider()
+            Divider()
 
-        Button("Reset Columns to Defaults") {
-            columnState.resetToDefaults()
+            if let entry = single, entry.isEnumerated, let parent = entry.parentName {
+                Button("Delete All \(parent) Forms", role: .destructive) {
+                    delete(Set(db.entries.filter { $0.parentName == parent }.map(\.id)))
+                }
+            }
+            Button(entries.count > 1 ? "Delete \(entries.count) Compounds" : "Delete", role: .destructive) {
+                delete(ids)
+            }
         }
     }
 
-    // MARK: - Empty State
+    // MARK: - Empty States
 
     private var emptyState: some View {
         DSEmptyState(
@@ -1053,7 +845,24 @@ struct LigandDatabaseWindow: View {
             .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(tableBackground)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    /// Shown over the table when search or filters hide every compound.
+    private var noMatchesState: some View {
+        DSEmptyState(
+            "No Matching Compounds",
+            systemImage: "line.3.horizontal.decrease.circle",
+            description: searchText.isEmpty
+                ? "No compound passes the active filters."
+                : "No compound name or SMILES contains “\(searchText)”."
+        ) {
+            Button("Clear Search and Filters") {
+                searchText = ""
+                lipinskiFilter = false
+                showOnlyPrepared = false
+            }
+        }
     }
 
     // MARK: - Status Bar
@@ -1065,23 +874,22 @@ struct LigandDatabaseWindow: View {
         let nEnumerated = entries.filter(\.isEnumerated).count
         let nConformers = entries.reduce(0) { $0 + $1.conformerCount }
         let nSelected = selectedIDs.count
-        let isFiltered = !searchText.isEmpty || lipinskiFilter || showOnlyPrepared
         let isBusy = isProcessing || isBatchProcessing || db.isProcessing
 
         DSWindowStatusBar {
             Text(isFiltered ? "\(entries.count) of \(db.count) compounds"
                  : entries.count == 1 ? "1 compound" : "\(entries.count) compounds")
             if nPrepared > 0 {
-                statusSeparator
+                StatusSeparator()
                 Label("\(nPrepared) prepared", systemImage: "checkmark.circle.fill")
                     .labelStyle(StatusLabelStyle(tint: DS.Color.success))
             }
             if nEnumerated > 0 {
-                statusSeparator
+                StatusSeparator()
                 Text("\(nEnumerated) enumerated forms")
             }
             if nConformers > 0 {
-                statusSeparator
+                StatusSeparator()
                 Text("\(nConformers) conformers")
             }
         } trailing: {
@@ -1099,14 +907,14 @@ struct LigandDatabaseWindow: View {
                         .accessibilityLabel("Cancel preparation")
                     }
                 }
-                if nSelected > 0 || viewModel.molecules.ligand != nil { statusSeparator }
+                if nSelected > 0 || viewModel.molecules.ligand != nil { StatusSeparator() }
             }
             if nSelected > 0 {
                 Text("\(nSelected) selected")
                     .foregroundStyle(DS.Color.accent)
             }
             if let lig = viewModel.molecules.ligand {
-                if nSelected > 0 { statusSeparator }
+                if nSelected > 0 { StatusSeparator() }
                 Label("Docking ligand: \(lig.name)", systemImage: "scope")
                     .labelStyle(StatusLabelStyle(tint: DS.Color.ligand))
             }
@@ -1123,80 +931,45 @@ struct LigandDatabaseWindow: View {
         return processingMessage.isEmpty ? "Working…" : processingMessage
     }
 
-    private var statusSeparator: some View {
-        Text("·").foregroundStyle(.tertiary)
-    }
-
-    // MARK: - Selection
-
-    private func handleRowClick(_ id: UUID, shiftKey: Bool, cmdKey: Bool) {
-        if shiftKey, let lastID = lastClickedID {
-            let allIDs = filteredEntries.map(\.id)
-            if let startIdx = allIDs.firstIndex(of: lastID),
-               let endIdx = allIDs.firstIndex(of: id) {
-                let range = min(startIdx, endIdx)...max(startIdx, endIdx)
-                for i in range {
-                    selectedIDs.insert(allIDs[i])
-                }
-            }
-        } else if cmdKey {
-            if selectedIDs.contains(id) {
-                selectedIDs.remove(id)
-            } else {
-                selectedIDs.insert(id)
-            }
-        } else {
-            selectedIDs = [id]
-        }
-        lastClickedID = id
-    }
-
-    private func toggleSelectAll() {
-        // Exclude grayed-out parent rows that have enumerated children — those
-        // would duplicate downstream work, and the table grays them visually.
-        let selectable = filteredEntries.filter { !db.hasEnumeratedChildren($0) }
-        let selectableIDs = Set(selectable.map(\.id))
-        if selectableIDs.isSubset(of: selectedIDs) && !selectableIDs.isEmpty {
-            selectedIDs.subtract(selectableIDs)
-        } else {
-            selectedIDs.formUnion(selectableIDs)
-        }
-    }
-
     // MARK: - Actions
 
     func deleteSelected() {
-        let toDelete = selectedIDs
-        guard !toDelete.isEmpty else { return }
+        delete(selectedIDs)
+    }
 
-        if inspectedEntry.map({ toDelete.contains($0.id) }) == true {
+    /// Removes the given compounds, clearing the inspector and selection that pointed at them.
+    func delete(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        if inspectedEntry.map({ ids.contains($0.id) }) == true {
             inspectedEntry = nil
             conformers = []
         }
         db.batchMutate { entries in
-            entries.removeAll { toDelete.contains($0.id) }
+            entries.removeAll { ids.contains($0.id) }
         }
-        let count = selectedIDs.count
-        selectedIDs.removeAll()
-        viewModel.log.info("Deleted \(count) entries", category: .molecule)
+        selectedIDs.subtract(ids)
+        viewModel.log.info("Deleted \(ids.count) entries", category: .molecule)
     }
 
     func useSelectedForDocking() {
         // Exclude parent entries that have enumerated children (would duplicate docking)
-        let selected = db.entries.filter {
+        dockEntries(db.entries.filter {
             selectedIDs.contains($0.id) && $0.isPrepared && !db.hasEnumeratedChildren($0)
-        }
-        guard !selected.isEmpty else {
+        })
+    }
+
+    /// One prepared compound becomes the docking ligand; several are queued for batch docking.
+    private func dockEntries(_ entries: [LigandEntry]) {
+        guard !entries.isEmpty else {
             viewModel.log.warn("No prepared entries in selection — prepare them first", category: .dock)
             return
         }
-
-        if selected.count == 1 {
-            useEntryForDocking(selected[0])
+        if entries.count == 1 {
+            useEntryForDocking(entries[0])
         } else {
-            viewModel.queueLigandsForBatchDocking(selected)
+            viewModel.queueLigandsForBatchDocking(entries)
         }
-        viewModel.log.success("Queued \(selected.count) entries for docking", category: .dock)
+        viewModel.log.success("Queued \(entries.count) entries for docking", category: .dock)
     }
 
     /// Basic RDKit preparation of one entry (hydrogens, MMFF94, Gasteiger charges, one conformer).
@@ -1333,22 +1106,5 @@ struct PastableTextField: NSViewRepresentable {
             return false
         }
 
-    }
-}
-
-// MARK: - Status bar label style
-
-/// Small tinted icon + secondary title, sized for `DSWindowStatusBar`.
-private struct StatusLabelStyle: LabelStyle {
-    let tint: Color
-
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            configuration.icon
-                .font(DS.Font.caption)
-                .imageScale(.small)
-                .foregroundStyle(tint)
-            configuration.title
-        }
     }
 }

@@ -91,17 +91,13 @@ extension LigandDatabaseWindow {
             }
 
             FlowLayout(spacing: DS.Space.xs, lineSpacing: DS.Space.xs) {
-                if entry.preparationError != nil {
-                    DSTag("Failed", tone: .danger, systemImage: "xmark")
-                } else if entry.isPrepared {
-                    DSTag("Prepared", tone: .success, systemImage: "checkmark")
-                } else {
-                    DSTag("Not prepared")
-                }
+                let status = LigandPrepStatus(entry)
+                DSTag(status.label, tone: status.tone, systemImage: status.systemImage)
+                    .help(status.help)
                 if entry.isEnumerated, let kind = entry.formKind {
                     DSTag(kind.label, tint: Self.formKindColor(kind))
                     if let pop = entry.populationWeight {
-                        DSTag(String(format: "%.1f%%", pop * 100), tone: Self.populationTone(pop))
+                        DSTag(TableFormat.percent(pop), tone: Self.populationTone(pop))
                             .help("Boltzmann population at the target pH")
                     }
                 }
@@ -168,9 +164,9 @@ extension LigandDatabaseWindow {
                       systemImage: d.lipinski ? "checkmark" : "exclamationmark.triangle")
             }
             DSMetricGrid(columns: 3) {
-                DSMetric("MW", value: String(format: "%.1f", d.molecularWeight), unit: "Da")
-                DSMetric("LogP", value: d.logPText)
-                DSMetric("TPSA", value: String(format: "%.0f", d.tpsa), unit: "Å²")
+                DSMetric("MW", value: TableFormat.mw(d.molecularWeight), unit: "Da")
+                DSMetric("cLogP", value: d.logPText)
+                DSMetric("TPSA", value: TableFormat.tpsa(d.tpsa), unit: "Å²")
                 DSMetric("HBD", value: "\(d.hbd)")
                 DSMetric("HBA", value: "\(d.hba)")
                 DSMetric("RotB", value: "\(d.rotatableBonds)")

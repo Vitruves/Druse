@@ -54,6 +54,8 @@ enum BottomPanel: String, CaseIterable, Sendable {
 /// never runs out of width). Live status, progress and stop live in the toolbar's `ActivityView`.
 struct StatusStripView: View {
     @Environment(AppViewModel.self) private var viewModel
+    @Environment(ConsoleSession.self) private var session
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var showPanel: Bool
     @Binding var panel: BottomPanel
@@ -62,9 +64,6 @@ struct StatusStripView: View {
     let currentStep: SidebarTab
     private let log = ActivityLog.shared
 
-    /// Created once for the window so scrollback, history, draft and a running command survive
-    /// hiding the panel, switching to the logs and changing workflow step.
-    @State private var session: ConsoleSession?
     @State private var logState = LogPanelState()
     @State private var dragStartHeight: CGFloat?
     @State private var isHoveringResize = false
@@ -85,7 +84,7 @@ struct StatusStripView: View {
         VStack(spacing: 0) {
             Divider()
             bar
-            if showPanel, let session {
+            if showPanel, panel == .logs || !session.isDetached {
                 Divider()
                 if panel == .logs {
                     logToolbar
@@ -100,9 +99,12 @@ struct StatusStripView: View {
                 .frame(height: min(Self.panelHeightRange.upperBound, max(Self.panelHeightRange.lowerBound, panelHeight)))
             }
         }
-        .onAppear {
-            if session == nil { session = ConsoleSession(viewModel: viewModel) }
-            runPendingScripts()
+        .onAppear { runPendingScripts() }
+        .onChange(of: session.isDetached) { _, detached in
+            // The terminal moved to its own window: the panel no longer has it to show.
+            if detached, showPanel, panel == .terminal {
+                withAnimation(DS.Motion.respecting(reduceMotion)) { showPanel = false }
+            }
         }
         .onChange(of: viewModel.workspace.pendingScripts) { _, _ in runPendingScripts() }
         .onChange(of: log.entries.count) { _, _ in
@@ -136,7 +138,7 @@ struct StatusStripView: View {
             }
             .fixedSize()
 
-            if session?.isRunning == true {
+            if session.isRunning {
                 ProgressView().controlSize(.mini)
                     .help("A terminal command is running")
             }
@@ -155,9 +157,13 @@ struct StatusStripView: View {
 
             counters
 
-            if showPanel, panel == .terminal, let session {
+            if showPanel, panel == .terminal, !session.isDetached {
                 Divider().frame(height: 12)
-                terminalTools(session)
+                TerminalTools(session: session)
+                toolButton("Move to Window", systemImage: "macwindow.on.rectangle",
+                           help: "Show the terminal in its own window", id: "console.detach") {
+                    openWindow(id: ConsoleWindow.id)
+                }
             }
         }
         .padding(.horizontal, DS.Space.l)
@@ -186,16 +192,20 @@ struct StatusStripView: View {
     }
 
     /// Terminal / Logs tab: selects that surface, or hides the panel when it is already shown.
+    /// While the terminal has its own window, the Terminal tab brings that window forward.
     private func tabButton(_ tab: BottomPanel) -> some View {
-        let isActive = showPanel && panel == tab
+        let inWindow = tab == .terminal && session.isDetached
+        let isActive = showPanel && panel == tab && !inWindow
         return Button {
-            if isActive {
+            if inWindow {
+                openWindow(id: ConsoleWindow.id)
+            } else if isActive {
                 withAnimation(DS.Motion.respecting(reduceMotion)) { showPanel = false }
             } else {
                 show(tab)
             }
         } label: {
-            Label(tab.title, systemImage: tab.systemImage)
+            Label(tab.title, systemImage: inWindow ? "macwindow" : tab.systemImage)
                 .labelStyle(.titleAndIcon)
                 .lineLimit(1)
                 .fixedSize()
@@ -210,7 +220,8 @@ struct StatusStripView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(isActive ? "Hide \(tab.title) \(tab.shortcut)" : "Show \(tab.title) \(tab.shortcut)")
+        .help(inWindow ? "Bring the Terminal window forward"
+              : isActive ? "Hide \(tab.title) \(tab.shortcut)" : "Show \(tab.title) \(tab.shortcut)")
         .accessibilityAddTraits(isActive ? .isSelected : [])
         .accessibilityIdentifier(tab == .terminal ? AccessibilityID.statusToggleConsole : "status_toggleLogs")
     }
@@ -239,27 +250,6 @@ struct StatusStripView: View {
         .help("\(count) \(level.rawValue.lowercased())\(count == 1 ? "" : "s") — click to show \(count == 1 ? "it" : "them") in Logs")
         .accessibilityLabel("\(count) \(level.rawValue.lowercased())\(count == 1 ? "" : "s")")
         .accessibilityHint("Shows them in the logs")
-    }
-
-    // MARK: - Terminal tools
-
-    @ViewBuilder
-    private func terminalTools(_ session: ConsoleSession) -> some View {
-        toolButton("Run Script…", systemImage: "play.rectangle", help: "Run a DruseScript file (.druse)",
-                   id: "console.runScript", action: session.chooseAndRunScript)
-            .disabled(session.isRunning)
-
-        if session.isRunning {
-            toolButton("Stop", systemImage: "stop.fill", help: "Cancel the running command ⌃C",
-                       id: "console.stop", action: session.interrupt)
-                .foregroundStyle(DS.Color.danger)
-        }
-
-        toolButton("Copy All", systemImage: "doc.on.clipboard", help: "Copy the whole terminal scrollback",
-                   id: AccessibilityID.statusCopyAll) { copyToPasteboard(session.plainTranscript) }
-
-        toolButton("Clear", systemImage: "clear", help: "Clear the terminal scrollback ⌘K",
-                   id: "console.clear", action: session.clearScrollback)
     }
 
     // MARK: - Log tools
@@ -343,18 +333,12 @@ struct StatusStripView: View {
     }
 
     private var visibleLogEntries: [LogEntry] {
-        logState.visibleEntries(log.entries, threshold: session?.logLevel ?? .debug)
+        logState.visibleEntries(log.entries, threshold: session.logLevel)
     }
 
     private func toolButton(_ title: String, systemImage: String, help: String, id: String,
                             action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .labelStyle(.iconOnly)
-        }
-        .buttonStyle(.borderless)
-        .help(help)
-        .accessibilityIdentifier(id)
+        BarToolButton(title: title, systemImage: systemImage, help: help, id: id, action: action)
     }
 
     /// Drag strip along the bar's top edge. It stays inside the bar (the Metal view above would
@@ -391,9 +375,13 @@ struct StatusStripView: View {
 
     /// Runs the scripts opened from outside the app one after another in the terminal.
     private func runPendingScripts() {
-        guard let session, !isRunningPendingScripts, !viewModel.workspace.pendingScripts.isEmpty else { return }
+        guard !isRunningPendingScripts, !viewModel.workspace.pendingScripts.isEmpty else { return }
         isRunningPendingScripts = true
-        show(.terminal)
+        if session.isDetached {
+            openWindow(id: ConsoleWindow.id)
+        } else {
+            show(.terminal)
+        }
         Task {
             while !viewModel.workspace.pendingScripts.isEmpty {
                 let url = viewModel.workspace.pendingScripts.removeFirst()
@@ -408,9 +396,52 @@ struct StatusStripView: View {
         guard !showPanel else { return }
         withAnimation(DS.Motion.respecting(reduceMotion)) { showPanel = true }
     }
+}
 
-    private func copyToPasteboard(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+func copyToPasteboard(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+}
+
+/// Icon-only borderless button of the debug bar and the Terminal window's header.
+struct BarToolButton: View {
+    let title: String
+    let systemImage: String
+    let help: String
+    let id: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityIdentifier(id)
+    }
+}
+
+/// Run Script, Stop (while a command runs), Copy All and Clear: the terminal's tools, shown in
+/// the debug bar or in the Terminal window's header.
+struct TerminalTools: View {
+    let session: ConsoleSession
+
+    var body: some View {
+        BarToolButton(title: "Run Script…", systemImage: "play.rectangle", help: "Run a DruseScript file (.druse)",
+                      id: "console.runScript", action: session.chooseAndRunScript)
+            .disabled(session.isRunning)
+
+        if session.isRunning {
+            BarToolButton(title: "Stop", systemImage: "stop.fill", help: "Cancel the running command ⌃C",
+                          id: "console.stop", action: session.interrupt)
+                .foregroundStyle(DS.Color.danger)
+        }
+
+        BarToolButton(title: "Copy All", systemImage: "doc.on.clipboard", help: "Copy the whole terminal scrollback",
+                      id: AccessibilityID.statusCopyAll) { copyToPasteboard(session.plainTranscript) }
+
+        BarToolButton(title: "Clear", systemImage: "clear", help: "Clear the terminal scrollback ⌘K",
+                      id: "console.clear", action: session.clearScrollback)
     }
 }
