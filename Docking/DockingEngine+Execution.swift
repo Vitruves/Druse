@@ -459,6 +459,7 @@ extension DockingEngine {
             )
         }
 
+        ligandAtomCount = gpuLigAtoms.count
         // Reuse ligand atom buffer if large enough, otherwise reallocate
         let ligAtomSize = gpuLigAtoms.count * MemoryLayout<DockLigandAtom>.stride
         if ligAtomSize > lastLigandAtomBufferCapacity {
@@ -893,12 +894,17 @@ extension DockingEngine {
                                     (gpBuf, 4), (teBuf, 6), (miBuf, 7), (emBuf, 8)] + pharmaBuffers
                 encode(perturbPipe, [(replicaOffBuf, 0), (replicaPopBuf, 1), (gpBuf, 3), (repParamsBuf, 4)],
                        paramsAt: 2, threads: totalPoses, groupWidth: repTgSize.width)
-                if step % effectiveLSFreq == 0 && !useDruseAF {
+                let doLocalSearch = step % effectiveLSFreq == 0 && !useDruseAF
+                if doLocalSearch {
                     let lanes = localSearchIsSIMD ? 32 : 1
                     encode(activeLocalSearchPipeline, scoreBuffers, paramsAt: 5,
                            threads: totalPoses * lanes, groupWidth: localSearchIsSIMD ? lanes : repTgSize.width)
                 }
-                encode(scorePipeline, scoreBuffers, paramsAt: 5, threads: totalPoses, groupWidth: repTgSize.width)
+                // The SIMD local search publishes the energy of the pose it leaves behind, in
+                // the expression `scorePoses` uses, so scoring again would only repeat it.
+                if !(doLocalSearch && localSearchIsSIMD) {
+                    encode(scorePipeline, scoreBuffers, paramsAt: 5, threads: totalPoses, groupWidth: repTgSize.width)
+                }
                 encode(acceptPipe, [(replicaPopBuf, 0), (replicaOffBuf, 1), (replicaBestBuf, 2), (repParamsBuf, 4)],
                        paramsAt: 3, threads: totalPoses, groupWidth: repTgSize.width)
                 if K > 1 && (step + 1).isMultiple(of: swapInterval) {
@@ -1285,8 +1291,11 @@ extension DockingEngine {
                 // Grid-based scoring joins the proposal in one encoder. DruseAF is scored
                 // separately below by `scoreDruseAF`, which owns the encode + score pair for
                 // whichever weight version is loaded; appending anything here would dispatch
-                // a grid kernel with the empty `vinaScoreBuffers` of the DruseAF path.
-                if !useDruseAF {
+                // a grid kernel with the empty `vinaScoreBuffers` of the DruseAF path. Without
+                // flexible residues the SIMD local search runs next and overwrites every score
+                // field of the pose, so a score computed here would never be read.
+                let localSearchRescores = doLocalSearch && localSearchIsSIMD && !(flexEngine?.isEnabled ?? false)
+                if !useDruseAF && !localSearchRescores {
                     if useDrusina, let drusinaPipe = drusinaScorePipeline,
                        let prb = proteinRingBuffer, let lrb = ligandRingBuffer,
                        let pcb = proteinCationBuffer, let dpb = drusinaParamsBuffer,
@@ -1501,6 +1510,7 @@ extension DockingEngine {
 
         guard gpuLigAtoms.count > 0, gpuLigAtoms.count <= 128 else { return nil }
 
+        ligandAtomCount = gpuLigAtoms.count
         ligandAtomBuffer = device.makeBuffer(
             bytes: &gpuLigAtoms,
             length: gpuLigAtoms.count * MemoryLayout<DockLigandAtom>.stride,

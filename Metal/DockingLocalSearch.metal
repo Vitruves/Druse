@@ -204,7 +204,6 @@ kernel void localSearch(
 // recovers the per-DOF scaling from the (s, y) history; the per-block trust region keeps the
 // first iterations, taken before any history exists, physically sized.
 
-constant uint  kLSMaxDOF     = 38u;    // 3 translation + 3 rotation + 32 torsions
 constant uint  kLSHistory    = 5u;     // L-BFGS correction pairs
 constant float kLSArmijoC1   = 1e-4f;  // sufficient-decrease coefficient
 constant uint  kLSMaxLineTry = 8u;     // backtracking trials per iteration
@@ -218,6 +217,29 @@ constant float kLSTrustAngle = 0.35f;  // rad, largest rotation and per-torsion 
 // under ~1280 against the ±262144 this scale represents, while the quantum of 1.2e-4 enters
 // only the search direction — every energy that is compared or reported stays in float.
 constant float kLSForceScale = 8192.0f;
+
+// Threadgroup memory is the scarce resource of this kernel: its cost per pose grows almost
+// in proportion to the bytes a threadgroup reserves, because that reservation bounds how
+// many SIMD groups the GPU keeps resident. Only per-atom state lives there, in arrays sized
+// by the kernel variant that fits the ligand. Pose-space vectors (gradient, direction,
+// L-BFGS history, torsions) are spread over the lanes' registers instead: of the at most 38
+// degrees of freedom (3 translation, 3 rotation, 32 torsions), lane L carries number L in
+// `x` and number L + 32 in `y`. Components past the pose's own count stay zero.
+
+/// Inner product of two pose-space vectors, returned on every lane.
+static inline float lsDot(float2 a, float2 b) {
+    return simd_sum(a.x * b.x + a.y * b.y);
+}
+
+/// Component `index` of a pose-space vector, returned on every lane.
+static inline float lsComponent(float2 v, uint index) {
+    return simd_broadcast(index < 32u ? v.x : v.y, ushort(index & 31u));
+}
+
+/// Wrap an angle into [-π, π).
+static inline float lsWrapAngle(float angle) {
+    return angle - 2.0f * M_PI_F * floor((angle + M_PI_F) / (2.0f * M_PI_F));
+}
 
 /// Advance a unit quaternion by an axis-angle increment.
 static inline float4 lsQuatIncrement(float4 q, float3 axisAngle) {
@@ -235,12 +257,15 @@ static inline float4 lsQuatIncrement(float4 q, float3 axisAngle) {
 
 /// Rebuild `pos` from a pose state. The rigid transform spreads over lanes; torsions are
 /// applied in order because a nested torsion's pivot moves with its parent, but each
-/// torsion's moving atoms spread over lanes.
+/// torsion's moving atoms spread over lanes. Every lane needs every torsion angle here, so
+/// the pose-space vector `torsions` (torsion t is its component 6 + t) is first published to
+/// `angles`, one entry per torsion.
 static inline void lsBuildPositions(
     threadgroup float3        *pos,
+    threadgroup float         *angles,
     float3                     translation,
     float4                     rotation,
-    threadgroup const float   *torsions,
+    float2                     torsions,
     constant DockLigandAtom   *atoms,
     uint                       nA,
     uint                       nTor,
@@ -250,12 +275,14 @@ static inline void lsBuildPositions(
 {
     for (uint a = lane; a < nA; a += 32)
         pos[a] = quatRotate(rotation, atoms[a].position) + translation;
+    if (lane >= 6u && lane < 6u + nTor) angles[lane - 6u] = torsions.x;
+    if (lane + 26u < nTor) angles[lane + 26u] = torsions.y;
     simdgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t = 0; t < nTor; t++) {
         // Every lane reads the same angle and edge, so a skipped torsion skips its barrier
         // on all lanes together.
-        float angle = torsions[t];
+        float angle = angles[t];
         TorsionEdge edge = edges[t];
         if (abs(angle) < 1e-6f || edge.movingCount <= 0) continue;
         if (edge.atom1 < 0 || uint(edge.atom1) >= nA || edge.atom2 < 0 || uint(edge.atom2) >= nA) continue;
@@ -277,6 +304,16 @@ static inline void lsBuildPositions(
     }
 }
 
+/// Energy of one configuration, split the way `scorePoses` reports it so the kernel can
+/// publish the same pose fields without a separate scoring pass.
+struct LSEnergy {
+    float total;       // (inter + intraDelta) * norm + boundary + constraint
+    float inter;       // affinity-map sum, before normalisation
+    float intraDelta;  // intramolecular energy minus the input conformer's
+    float boundary;    // wPenalty * out-of-box penalty
+    float constraint;  // pharmacophore penalty
+};
+
 /// Energy of the configuration in `pos`, in the same expression `scorePoses` uses:
 ///     (grid + intra - reference) * norm + wPenalty * outOfGrid + constraints
 /// Returned on every lane. With `wantForces`, also writes -dE/dx per atom into `force`,
@@ -285,7 +322,7 @@ static inline void lsBuildPositions(
 /// Both modes evaluate the energy through the same expressions, so a line-search probe and
 /// the gradient evaluation at the same configuration agree bit for bit. They differ only in
 /// whether forces are accumulated, which keeps the probes cheap.
-static inline float lsEnergy(
+static inline LSEnergy lsEnergy(
     threadgroup float3        *pos,
     threadgroup float3        *force,
     threadgroup atomic_int    *pairForce,
@@ -358,30 +395,34 @@ static inline float lsEnergy(
             force[a] = part + scattered / kLSForceScale;
         }
     }
-    float total = (simd_sum(laneGrid) + intra - referenceIntra) * normFactor
-                + wPenalty * simd_sum(lanePenalty);
+    LSEnergy e;
+    e.inter = simd_sum(laneGrid);
+    e.intraDelta = intra - referenceIntra;
+    e.boundary = wPenalty * simd_sum(lanePenalty);
+    e.constraint = 0.0f;
+    // The gradient projection reads forces across lanes.
+    if (wantForces) simdgroup_barrier(mem_flags::mem_threadgroup);
 
     // Constraints are few and each contributes to a single atom, so one lane walks them.
     if (pharmaParams.numConstraints > 0) {
-        if (wantForces) simdgroup_barrier(mem_flags::mem_threadgroup);
         float pen = 0.0f;
         if (lane == 0) {
             pen = wantForces
                 ? evaluateConstraintPenaltyWithGrad(pos, force, atoms, nA, pharmaConstraints, pharmaParams)
                 : evaluateConstraintPenalty(pos, atoms, nA, pharmaConstraints, pharmaParams);
         }
-        total += simd_broadcast_first(pen);
+        e.constraint = simd_broadcast_first(pen);
         if (wantForces) simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    return total;
+    e.total = (e.inter + e.intraDelta) * normFactor + e.boundary + e.constraint;
+    return e;
 }
 
-/// Project per-atom forces onto the pose degrees of freedom, writing dE/dq into `grad`
-/// (translation, rotation about the global axes, then one entry per torsion).
-static inline void lsProjectGradient(
+/// Project per-atom forces onto the pose degrees of freedom and return dE/dq as a pose-space
+/// vector (translation, rotation about the global axes, then one component per torsion).
+static inline float2 lsProjectGradient(
     threadgroup float3      *pos,
     threadgroup float3      *force,
-    threadgroup float       *grad,
     float3                   translation,
     uint                     nA,
     uint                     nTor,
@@ -397,6 +438,10 @@ static inline void lsProjectGradient(
     }
     float3 totalForce = simd_sum(laneForce);
     float3 totalTorque = simd_sum(laneTorque);
+
+    float2 grad = float2(0.0f);
+    if (lane < 3u) grad.x = -totalForce[lane];
+    else if (lane < 6u) grad.x = -totalTorque[lane - 3u];
 
     for (uint t = 0; t < nTor; t++) {
         TorsionEdge edge = edges[t];
@@ -417,65 +462,41 @@ static inline void lsProjectGradient(
                 value = -simd_sum(laneTwist);
             }
         }
-        if (lane == 0) grad[6u + t] = value;
+        uint component = 6u + t;
+        if ((component & 31u) == lane) {
+            if (component < 32u) grad.x = value;
+            else grad.y = value;
+        }
     }
-    if (lane == 0) {
-        grad[0] = -totalForce.x; grad[1] = -totalForce.y; grad[2] = -totalForce.z;
-        grad[3] = -totalTorque.x; grad[4] = -totalTorque.y; grad[5] = -totalTorque.z;
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    return grad;
 }
 
-/// Inner product of two DOF vectors, returned on every lane.
-static inline float lsDot(threadgroup const float *a, threadgroup const float *b, uint n, uint lane) {
-    float s = 0.0f;
-    for (uint i = lane; i < n; i += 32) s += a[i] * b[i];
-    return simd_sum(s);
-}
-
-/// Largest step length along `dir` that respects the per-block trust region. Computed
-/// redundantly on every lane: the vector is at most 38 entries, which is cheaper than a
-/// reduction plus a broadcast.
-static inline float lsTrustLimit(threadgroup const float *dir, uint nTor) {
-    float transNorm = length(float3(dir[0], dir[1], dir[2]));
-    float rotNorm = length(float3(dir[3], dir[4], dir[5]));
-    float torMax = 0.0f;
-    for (uint t = 0; t < nTor; t++) torMax = max(torMax, abs(dir[6u + t]));
-
-    float limit = 1.0f;
-    if (transNorm > 1e-12f) limit = min(limit, kLSTrustTrans / transNorm);
-    if (rotNorm > 1e-12f) limit = min(limit, kLSTrustAngle / rotNorm);
-    if (torMax > 1e-12f) limit = min(limit, kLSTrustAngle / torMax);
-    return limit;
-}
-
-
-/// Refine one pose per SIMD group. Dispatch `populationSize` threadgroups of 32 threads.
+/// Refine one pose with its SIMD group, against per-atom scratch arrays of `atomCapacity`
+/// entries that the calling kernel reserves.
 ///
 /// Pose state is replicated in registers rather than shared through threadgroup memory: every
 /// lane derives it from the same uniform direction and step length, so the copies stay
-/// identical by construction and no barrier is needed to publish them. Torsions live in
-/// threadgroup memory because `lsBuildPositions` indexes them dynamically; lane t owns
-/// torsion t, so each element has exactly one writer.
-kernel void localSearchAnalyticalSIMD(
-    device DockPose            *poses         [[buffer(0)]],
-    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],
-    device const half          *affinityMaps  [[buffer(2)]],
-    device const int32_t       *typeIndexLookup [[buffer(3)]],
-    constant GridParams        &gridParams    [[buffer(4)]],
-    constant GAParams          &gaParams      [[buffer(5)]],
-    constant TorsionEdge       *torsionEdges  [[buffer(6)]],
-    constant int32_t           *movingIndices [[buffer(7)]],
-    constant uint32_t          *intraPairs    [[buffer(8)]],
-    constant PharmacophoreConstraint *pharmaConstraints [[buffer(15)]],
-    constant PharmacophoreParams &pharmaParams [[buffer(16)]],
-    uint                        tgIdx         [[threadgroup_position_in_grid]],
-    uint                        lane          [[thread_index_in_threadgroup]])
+/// identical by construction and no barrier is needed to publish them.
+static inline void lsRefine(
+    device DockPose            &pose,
+    constant DockLigandAtom    *ligandAtoms,
+    device const half          *affinityMaps,
+    device const int32_t       *typeIndexLookup,
+    constant GridParams        &gridParams,
+    constant GAParams          &gaParams,
+    constant TorsionEdge       *torsionEdges,
+    constant int32_t           *movingIndices,
+    constant uint32_t          *intraPairs,
+    constant PharmacophoreConstraint *pharmaConstraints,
+    constant PharmacophoreParams &pharmaParams,
+    threadgroup float3         *tg_pos,
+    threadgroup float3         *tg_force,
+    threadgroup atomic_int     *tg_pairForce,
+    threadgroup float          *tg_angles,
+    uint                        atomCapacity,
+    uint                        lane)
 {
-    if (tgIdx >= gaParams.populationSize) return;
-
-    device DockPose &pose = poses[tgIdx];
-    uint nA = min(gaParams.numLigandAtoms, 128u);
+    uint nA = min(gaParams.numLigandAtoms, atomCapacity);
     uint nTor = min(gaParams.numTorsions, 32u);
     uint nPairs = gaParams.numIntraPairs;
     uint nDOF = 6u + nTor;
@@ -483,33 +504,29 @@ kernel void localSearchAnalyticalSIMD(
     float3 searchMax = gridParams.searchCenter + gridParams.searchHalfExtent;
     float normFactor = vinaRotNormalization(float(nTor));
 
-    threadgroup float3 tg_pos[128];
-    threadgroup float3 tg_force[128];
-    threadgroup atomic_int tg_pairForce[128 * 3];
-    threadgroup float tg_grad[kLSMaxDOF];
-    threadgroup float tg_gradNext[kLSMaxDOF];
-    threadgroup float tg_dir[kLSMaxDOF];
-    threadgroup float tg_sHist[kLSHistory][kLSMaxDOF];
-    threadgroup float tg_yHist[kLSHistory][kLSMaxDOF];
-    threadgroup float tg_torsions[32];
-    threadgroup float tg_trialTorsions[32];
+    // Which torsions this lane carries: component `lane` when it lies past the six rigid
+    // ones, and component `lane + 32`.
+    bool torsionInX = lane >= 6u && lane < nDOF;
+    bool torsionInY = lane + 32u < nDOF;
 
     float3 translation = pose.translation;
     float4 rotation = pose.rotation;
-    for (uint t = lane; t < nTor; t += 32) tg_torsions[t] = pose.torsions[t];
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    float2 torsions = float2(0.0f);
+    if (torsionInX) torsions.x = pose.torsions[lane - 6u];
+    if (torsionInY) torsions.y = pose.torsions[lane + 26u];
 
-    lsBuildPositions(tg_pos, translation, rotation, tg_torsions,
+    lsBuildPositions(tg_pos, tg_angles, translation, rotation, torsions,
                      ligandAtoms, nA, nTor, torsionEdges, movingIndices, lane);
-    float energy = lsEnergy(tg_pos, tg_force, tg_pairForce, ligandAtoms, nA,
-                            intraPairs, nPairs, affinityMaps, typeIndexLookup, gridParams,
-                            gaParams.referenceIntraEnergy, normFactor,
-                            pharmaConstraints, pharmaParams, true, lane);
-    lsProjectGradient(tg_pos, tg_force, tg_grad, translation, nA, nTor,
-                      torsionEdges, movingIndices, lane);
+    LSEnergy energy = lsEnergy(tg_pos, tg_force, tg_pairForce, ligandAtoms, nA,
+                               intraPairs, nPairs, affinityMaps, typeIndexLookup, gridParams,
+                               gaParams.referenceIntraEnergy, normFactor,
+                               pharmaConstraints, pharmaParams, true, lane);
+    float2 grad = lsProjectGradient(tg_pos, tg_force, translation, nA, nTor,
+                                    torsionEdges, movingIndices, lane);
 
-    // Every scalar below is uniform across the SIMD group, so the history scalars are
-    // register copies rather than shared state.
+    // The history scalars are uniform across the SIMD group, so every lane keeps its own copy.
+    float2 sHist[kLSHistory];
+    float2 yHist[kLSHistory];
     float rho[kLSHistory];
     float coef[kLSHistory];
     float gamma = 1.0f;
@@ -519,64 +536,68 @@ kernel void localSearchAnalyticalSIMD(
     int maxSteps = max(int(gaParams.localSearchSteps), 1);
     for (int step = 0; step < maxSteps; step++) {
         // --- Direction: L-BFGS two-loop recursion over the stored corrections ---
-        for (uint i = lane; i < nDOF; i += 32) tg_dir[i] = tg_grad[i];
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
+        float2 dir = grad;
         uint count = min(stored, kLSHistory);
         for (uint k = 0; k < count; k++) {
             uint slot = (head + kLSHistory - 1u - k) % kLSHistory;
-            float a = rho[slot] * lsDot(tg_sHist[slot], tg_dir, nDOF, lane);
+            float a = rho[slot] * lsDot(sHist[slot], dir);
             coef[slot] = a;
-            for (uint i = lane; i < nDOF; i += 32) tg_dir[i] -= a * tg_yHist[slot][i];
-            simdgroup_barrier(mem_flags::mem_threadgroup);
+            dir -= a * yHist[slot];
         }
-        if (count > 0u) {
-            for (uint i = lane; i < nDOF; i += 32) tg_dir[i] *= gamma;
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        if (count > 0u) dir *= gamma;
         for (uint k = count; k > 0u; k--) {
             uint slot = (head + kLSHistory - k) % kLSHistory;
-            float adjust = coef[slot] - rho[slot] * lsDot(tg_yHist[slot], tg_dir, nDOF, lane);
-            for (uint i = lane; i < nDOF; i += 32) tg_dir[i] += adjust * tg_sHist[slot][i];
-            simdgroup_barrier(mem_flags::mem_threadgroup);
+            float adjust = coef[slot] - rho[slot] * lsDot(yHist[slot], dir);
+            dir += adjust * sHist[slot];
         }
-        for (uint i = lane; i < nDOF; i += 32) tg_dir[i] = -tg_dir[i];
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        dir = -dir;
 
-        float slope = lsDot(tg_grad, tg_dir, nDOF, lane);
+        float slope = lsDot(grad, dir);
         if (slope >= 0.0f) {
             // The stored curvature no longer describes this basin: restart from steepest descent.
-            for (uint i = lane; i < nDOF; i += 32) tg_dir[i] = -tg_grad[i];
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            slope = -lsDot(tg_grad, tg_grad, nDOF, lane);
+            dir = -grad;
+            slope = -lsDot(grad, grad);
             stored = 0u;
             head = 0u;
             gamma = 1.0f;
         }
         if (slope > -1e-9f) break;  // gradient is numerically zero
 
-        // --- Armijo backtracking, first trial sized by the trust region ---
-        float alpha = lsTrustLimit(tg_dir, nTor);
+        // --- Armijo backtracking, first trial sized by the per-block trust region ---
+        float3 dirTranslation = float3(lsComponent(dir, 0u), lsComponent(dir, 1u), lsComponent(dir, 2u));
+        float3 dirRotation = float3(lsComponent(dir, 3u), lsComponent(dir, 4u), lsComponent(dir, 5u));
+        float laneTorsionMax = 0.0f;
+        if (torsionInX) laneTorsionMax = abs(dir.x);
+        if (torsionInY) laneTorsionMax = max(laneTorsionMax, abs(dir.y));
+        float transNorm = length(dirTranslation);
+        float rotNorm = length(dirRotation);
+        float torsionMax = simd_max(laneTorsionMax);
+        float alpha = 1.0f;
+        if (transNorm > 1e-12f) alpha = min(alpha, kLSTrustTrans / transNorm);
+        if (rotNorm > 1e-12f) alpha = min(alpha, kLSTrustAngle / rotNorm);
+        if (torsionMax > 1e-12f) alpha = min(alpha, kLSTrustAngle / torsionMax);
+
         float3 trialTranslation = translation;
         float4 trialRotation = rotation;
+        float2 trialTorsions = torsions;
         bool accepted = false;
+        // The first trial is the one usually accepted, so it accumulates forces as it goes
+        // and an accepted first trial needs no second evaluation for its gradient.
+        bool forcesCurrent = false;
         for (uint attempt = 0; attempt < kLSMaxLineTry; attempt++) {
-            trialTranslation = clamp(translation + alpha * float3(tg_dir[0], tg_dir[1], tg_dir[2]),
-                                     searchMin, searchMax);
-            trialRotation = lsQuatIncrement(rotation, alpha * float3(tg_dir[3], tg_dir[4], tg_dir[5]));
-            for (uint t = lane; t < nTor; t += 32) {
-                float value = tg_torsions[t] + alpha * tg_dir[6u + t];
-                tg_trialTorsions[t] = value - 2.0f * M_PI_F * floor((value + M_PI_F) / (2.0f * M_PI_F));
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
+            trialTranslation = clamp(translation + alpha * dirTranslation, searchMin, searchMax);
+            trialRotation = lsQuatIncrement(rotation, alpha * dirRotation);
+            if (torsionInX) trialTorsions.x = lsWrapAngle(torsions.x + alpha * dir.x);
+            if (torsionInY) trialTorsions.y = lsWrapAngle(torsions.y + alpha * dir.y);
 
-            lsBuildPositions(tg_pos, trialTranslation, trialRotation, tg_trialTorsions,
+            lsBuildPositions(tg_pos, tg_angles, trialTranslation, trialRotation, trialTorsions,
                              ligandAtoms, nA, nTor, torsionEdges, movingIndices, lane);
-            float trialEnergy = lsEnergy(tg_pos, tg_force, tg_pairForce, ligandAtoms, nA,
-                                         intraPairs, nPairs, affinityMaps, typeIndexLookup, gridParams,
-                                         gaParams.referenceIntraEnergy, normFactor,
-                                         pharmaConstraints, pharmaParams, false, lane);
-            if (trialEnergy <= energy + kLSArmijoC1 * alpha * slope) {
+            forcesCurrent = attempt == 0u;
+            LSEnergy trialEnergy = lsEnergy(tg_pos, tg_force, tg_pairForce, ligandAtoms, nA,
+                                            intraPairs, nPairs, affinityMaps, typeIndexLookup, gridParams,
+                                            gaParams.referenceIntraEnergy, normFactor,
+                                            pharmaConstraints, pharmaParams, forcesCurrent, lane);
+            if (trialEnergy.total <= energy.total + kLSArmijoC1 * alpha * slope) {
                 energy = trialEnergy;
                 accepted = true;
                 break;
@@ -585,49 +606,88 @@ kernel void localSearchAnalyticalSIMD(
         }
         if (!accepted) break;  // no sufficient decrease along this direction
 
-        // --- Record the correction pair and commit. The box clamp and the torsion wrap mean
+        // --- Commit, and form the correction pair. The box clamp and the torsion wrap mean
         // the applied change can differ from alpha * direction, and the curvature pair has to
-        // describe what was actually applied. Lane t owns torsion t here too, so writing the
-        // history and overwriting the torsion need no barrier between them. ---
-        if (lane < 3u) tg_sHist[head][lane] = trialTranslation[lane] - translation[lane];
-        else if (lane < 6u) tg_sHist[head][lane] = alpha * tg_dir[lane];
-        for (uint t = lane; t < nTor; t += 32) {
-            float delta = tg_trialTorsions[t] - tg_torsions[t];
-            tg_sHist[head][6u + t] = delta - 2.0f * M_PI_F * floor((delta + M_PI_F) / (2.0f * M_PI_F));
-            tg_torsions[t] = tg_trialTorsions[t];
-        }
+        // describe what was actually applied. ---
+        float2 applied = float2(0.0f);
+        if (lane < 3u) applied.x = trialTranslation[lane] - translation[lane];
+        else if (lane < 6u) applied.x = alpha * dir.x;
+        else if (torsionInX) applied.x = lsWrapAngle(trialTorsions.x - torsions.x);
+        if (torsionInY) applied.y = lsWrapAngle(trialTorsions.y - torsions.y);
         translation = trialTranslation;
         rotation = trialRotation;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        torsions = trialTorsions;
 
         // `tg_pos` still holds the accepted configuration — the accepted probe was the last
-        // one evaluated — so the gradient needs no rebuild.
-        lsEnergy(tg_pos, tg_force, tg_pairForce, ligandAtoms, nA,
-                 intraPairs, nPairs, affinityMaps, typeIndexLookup, gridParams,
-                 gaParams.referenceIntraEnergy, normFactor,
-                 pharmaConstraints, pharmaParams, true, lane);
-        lsProjectGradient(tg_pos, tg_force, tg_gradNext, translation, nA, nTor,
-                          torsionEdges, movingIndices, lane);
-
-        for (uint i = lane; i < nDOF; i += 32) tg_yHist[head][i] = tg_gradNext[i] - tg_grad[i];
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        float curvature = lsDot(tg_sHist[head], tg_yHist[head], nDOF, lane);
+        // one evaluated — so the gradient needs no rebuild, and no evaluation either when
+        // that probe already accumulated forces.
+        if (!forcesCurrent) {
+            lsEnergy(tg_pos, tg_force, tg_pairForce, ligandAtoms, nA,
+                     intraPairs, nPairs, affinityMaps, typeIndexLookup, gridParams,
+                     gaParams.referenceIntraEnergy, normFactor,
+                     pharmaConstraints, pharmaParams, true, lane);
+        }
+        float2 gradNext = lsProjectGradient(tg_pos, tg_force, translation, nA, nTor,
+                                            torsionEdges, movingIndices, lane);
+        float2 gradChange = gradNext - grad;
+        float curvature = lsDot(applied, gradChange);
         if (curvature > 1e-10f) {
+            sHist[head] = applied;
+            yHist[head] = gradChange;
             rho[head] = 1.0f / curvature;
-            gamma = curvature / max(lsDot(tg_yHist[head], tg_yHist[head], nDOF, lane), 1e-20f);
+            gamma = curvature / max(lsDot(gradChange, gradChange), 1e-20f);
             head = (head + 1u) % kLSHistory;
             stored = min(stored + 1u, kLSHistory);
         }
-
-        for (uint i = lane; i < nDOF; i += 32) tg_grad[i] = tg_gradNext[i];
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        grad = gradNext;
     }
 
     if (lane == 0) {
         pose.translation = translation;
         pose.rotation = rotation;
-        pose.energy = energy;
+        pose.energy = energy.total;
+        pose.stericEnergy = energy.inter;
+        pose.hydrophobicEnergy = 0.0f;
+        pose.hbondEnergy = 0.0f;
+        pose.torsionPenalty = (energy.inter + energy.intraDelta) * (normFactor - 1.0f);
+        pose.clashPenalty = energy.boundary;
+        pose.constraintPenalty = energy.constraint;
     }
-    for (uint t = lane; t < nTor; t += 32) pose.torsions[t] = tg_torsions[t];
+    if (torsionInX) pose.torsions[lane - 6u] = torsions.x;
+    if (torsionInY) pose.torsions[lane + 26u] = torsions.y;
 }
+
+/// One kernel per atom capacity, so a ligand reserves no more threadgroup memory than its
+/// size class needs. Each refines one pose per SIMD group: dispatch `populationSize`
+/// threadgroups of 32 threads. `DockingEngine` picks the smallest variant that fits.
+#define LS_SIMD_KERNEL(NAME, ATOM_CAPACITY)                                         \
+kernel void NAME(                                                                   \
+    device DockPose            *poses         [[buffer(0)]],                        \
+    constant DockLigandAtom    *ligandAtoms   [[buffer(1)]],                        \
+    device const half          *affinityMaps  [[buffer(2)]],                        \
+    device const int32_t       *typeIndexLookup [[buffer(3)]],                      \
+    constant GridParams        &gridParams    [[buffer(4)]],                        \
+    constant GAParams          &gaParams      [[buffer(5)]],                        \
+    constant TorsionEdge       *torsionEdges  [[buffer(6)]],                        \
+    constant int32_t           *movingIndices [[buffer(7)]],                        \
+    constant uint32_t          *intraPairs    [[buffer(8)]],                        \
+    constant PharmacophoreConstraint *pharmaConstraints [[buffer(15)]],             \
+    constant PharmacophoreParams &pharmaParams [[buffer(16)]],                      \
+    uint                        tgIdx         [[threadgroup_position_in_grid]],     \
+    uint                        lane          [[thread_index_in_threadgroup]])      \
+{                                                                                   \
+    if (tgIdx >= gaParams.populationSize) return;                                   \
+    threadgroup float3 tg_pos[ATOM_CAPACITY];                                       \
+    threadgroup float3 tg_force[ATOM_CAPACITY];                                     \
+    threadgroup atomic_int tg_pairForce[ATOM_CAPACITY * 3];                         \
+    threadgroup float tg_angles[32];                                                \
+    lsRefine(poses[tgIdx], ligandAtoms, affinityMaps, typeIndexLookup, gridParams,  \
+             gaParams, torsionEdges, movingIndices, intraPairs,                     \
+             pharmaConstraints, pharmaParams,                                       \
+             tg_pos, tg_force, tg_pairForce, tg_angles, ATOM_CAPACITY, lane);                \
+}
+
+LS_SIMD_KERNEL(localSearchAnalyticalSIMD32, 32)
+LS_SIMD_KERNEL(localSearchAnalyticalSIMD48, 48)
+LS_SIMD_KERNEL(localSearchAnalyticalSIMD64, 64)
+LS_SIMD_KERNEL(localSearchAnalyticalSIMD128, 128)

@@ -22,7 +22,11 @@ final class DockingEngine {
     var metropolisAcceptPipeline: MTLComputePipelineState!
     var explicitScorePipeline: MTLComputePipelineState!
     var decomposeVinaEnergyPipeline: MTLComputePipelineState!
-    var localSearchAnalyticalSIMDPipeline: MTLComputePipelineState!
+    /// SIMD local-search kernels by ascending atom capacity. Threadgroup memory drives the
+    /// kernel's cost, so a ligand runs on the smallest variant that holds it.
+    var localSearchAnalyticalSIMDPipelines: [(atomCapacity: Int, pipeline: MTLComputePipelineState)] = []
+    /// Atoms in the ligand currently loaded into `ligandAtomBuffer`.
+    var ligandAtomCount = 0
     var drusinaScorePipeline: MTLComputePipelineState?
     var drusinaCorrectionPipeline: MTLComputePipelineState?
     var drusinaDecompositionPipeline: MTLComputePipelineState?
@@ -34,7 +38,9 @@ final class DockingEngine {
 
     /// Active local search pipeline based on config.useAnalyticalGradients.
     var activeLocalSearchPipeline: MTLComputePipelineState {
-        config.useAnalyticalGradients ? localSearchAnalyticalSIMDPipeline : localSearchPipeline
+        guard config.useAnalyticalGradients else { return localSearchPipeline }
+        let fitting = localSearchAnalyticalSIMDPipelines.first { $0.atomCapacity >= ligandAtomCount }
+        return (fitting ?? localSearchAnalyticalSIMDPipelines[localSearchAnalyticalSIMDPipelines.count - 1]).pipeline
     }
 
     /// Whether active local search uses SIMD-cooperative dispatch (32 threads per threadgroup).
@@ -200,7 +206,10 @@ final class DockingEngine {
             initPopPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "initializePopulation")!)
             evolvePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "gaEvolve")!)
             localSearchPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearch")!)
-            localSearchAnalyticalSIMDPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearchAnalyticalSIMD")!)
+            localSearchAnalyticalSIMDPipelines = try [32, 48, 64, 128].map { capacity in
+                (capacity, try device.makeComputePipelineState(
+                    function: library.makeFunction(name: "localSearchAnalyticalSIMD\(capacity)")!))
+            }
             mcPerturbPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "mcPerturb")!)
             metropolisAcceptPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "metropolisAccept")!)
             explicitScorePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "scorePosesExplicit")!)
