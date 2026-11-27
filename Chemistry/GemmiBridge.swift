@@ -88,7 +88,8 @@ enum GemmiBridge {
                 isHetAtom: atom.isHetAtom,
                 occupancy: atom.occupancy > 0 ? atom.occupancy : 1.0,
                 tempFactor: atom.tempFactor,
-                altLoc: altLoc
+                altLoc: altLoc,
+                insertionCode: fixedCString(atom.insertionCode)
             ))
         }
 

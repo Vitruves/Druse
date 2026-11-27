@@ -310,6 +310,8 @@ void populate_pdb_metadata(const RWMol &mol, const Atom &atom, DruseAtom &da) {
         if (!altLoc.empty()) strncpy(da.altLoc, altLoc.c_str(), sizeof(da.altLoc) - 1);
 
         da.residueSeq = info.getResidueNumber();
+        const auto& insertion = info.getInsertionCode();
+        if (!insertion.empty() && insertion.front() != ' ') da.insertionCode[0] = insertion.front();
         da.occupancy = (float)info.getOccupancy();
         da.tempFactor = (float)info.getTempFactor();
         da.isHetAtom = info.getIsHeteroAtom();

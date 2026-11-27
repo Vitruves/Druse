@@ -99,14 +99,14 @@ inline float3 quatRotate(float4 q, float3 v) {
 
 /// Smooth quadratic penalty for atoms outside the grid (gives gradient back to GA).
 /// Uses wPenalty scaling to match Vina's linear distance penalty behavior.
-inline float outOfGridPenalty(float3 pos, float3 gridMin, float3 gridMax) {
+inline float outOfBoxPenalty(float3 pos, float3 boxMin, float3 boxMax) {
     float penalty = 0.0f;
     for (int d = 0; d < 3; d++) {
-        if (pos[d] < gridMin[d]) {
-            float dist = gridMin[d] - pos[d];
+        if (pos[d] < boxMin[d]) {
+            float dist = boxMin[d] - pos[d];
             penalty += dist * dist;
-        } else if (pos[d] > gridMax[d]) {
-            float dist = pos[d] - gridMax[d];
+        } else if (pos[d] > boxMax[d]) {
+            float dist = pos[d] - boxMax[d];
             penalty += dist * dist;
         }
     }
@@ -119,9 +119,24 @@ inline float3 gridUpperBound(constant GridParams &gp) {
     return gp.origin + float3(gp.dims - 1u) * gp.spacing;
 }
 
-/// outOfGridPenalty with its gradient d(penalty)/d(pos).
-inline float outOfGridPenaltyWithGrad(float3 pos, float3 gridMin, float3 gridMax, thread float3 &grad) {
-    float3 excess = max(pos - gridMax, float3(0.0f)) - max(gridMin - pos, float3(0.0f));
+/// The box the caller asked to search. A pose is confined to it by penalising every atom that
+/// leaves it, which is how AutoDock Vina confines one. Clamping the pose's pre-torsion
+/// reference point is not equivalent: rotating a branch moves the atoms without moving that
+/// point, so a flexible ligand could reach a neighbouring pocket a full ligand extent outside
+/// the requested box and win on score there.
+inline float3 searchBoxMin(constant GridParams &gp) { return gp.searchCenter - gp.searchHalfExtent; }
+inline float3 searchBoxMax(constant GridParams &gp) { return gp.searchCenter + gp.searchHalfExtent; }
+
+/// Whether the affinity maps can be trilinearly interpolated at `pos`. The grid is built with
+/// a ligand-extent margin around the search box, so an atom outside the grid is already deep
+/// enough outside the box for the confinement penalty to dominate its score.
+inline bool insideGrid(float3 pos, constant GridParams &gp) {
+    return all(pos >= gp.origin) && all(pos <= gridUpperBound(gp));
+}
+
+/// outOfBoxPenalty with its gradient d(penalty)/d(pos).
+inline float outOfBoxPenaltyWithGrad(float3 pos, float3 boxMin, float3 boxMax, thread float3 &grad) {
+    float3 excess = max(pos - boxMax, float3(0.0f)) - max(boxMin - pos, float3(0.0f));
     grad = 2.0f * excess;
     return dot(excess, excess);
 }
@@ -374,40 +389,6 @@ inline float vinaPairEnergyWithDeriv(int t1, int t2, float r, thread float &dEdr
     return steric + hydrophobic + hbond;
 }
 
-/// Compute intramolecular energy with gradient w.r.t. atom positions.
-/// Accumulates gradScale * dE/dpos for each atom into the gradients array
-/// (pass a negative scale to accumulate forces directly).
-/// Uses flat pair list (packed uint32_t: low 16 = atom A, high 16 = atom B).
-inline float intramolecularWithGrad(
-    thread float3         *positions,
-    thread float3         *gradients,
-    float                   gradScale,
-    constant DockLigandAtom *ligandAtoms,
-    uint                    nAtoms,
-    constant uint32_t      *intraPairs,
-    uint                    numPairs)
-{
-    float total = 0.0f;
-    for (uint p = 0; p < numPairs; p++) {
-        uint packed = intraPairs[p];
-        uint i = packed & 0xFFFFu;
-        uint j = packed >> 16u;
-        if (i >= nAtoms || j >= nAtoms) continue;
-
-        float3 diff = positions[i] - positions[j];
-        float r = length(diff);
-        if (r < 1e-6f) continue;
-
-        float dEdr;
-        total += vinaPairEnergyWithDeriv(ligandAtoms[i].vinaType, ligandAtoms[j].vinaType, r, dEdr);
-
-        float3 gradContrib = (gradScale * dEdr / r) * diff;
-        gradients[i] += gradContrib;
-        gradients[j] -= gradContrib;
-    }
-    return total;
-}
-
 /// Apply torsion rotations to atom positions (in-place on stack array).
 /// For each torsion edge: rotate all downstream atoms around the bond axis.
 inline void applyTorsions(
@@ -497,8 +478,9 @@ inline bool constraintTypeCompatible(int vinaType, uint32_t mask) {
 /// a smooth quadratic penalty if the distance exceeds the threshold.
 /// Group OR-logic: a group is satisfied if ANY member constraint has a compatible
 /// ligand atom within its distance threshold.
+template <typename PositionPtr>
 inline float evaluateConstraintPenalty(
-    thread float3               *positions,
+    PositionPtr                  positions,
     constant DockLigandAtom     *ligandAtoms,
     uint                         nAtoms,
     constant PharmacophoreConstraint *constraints,
@@ -559,9 +541,10 @@ inline float evaluateConstraintPenalty(
 
 /// Compute constraint penalty WITH per-atom force accumulation for analytical gradients.
 /// Returns the total penalty and adds forces (negative gradient) to the forces array.
+template <typename PositionPtr, typename ForcePtr>
 inline float evaluateConstraintPenaltyWithGrad(
-    thread float3               *positions,
-    thread float3               *forces,
+    PositionPtr                  positions,
+    ForcePtr                     forces,
     constant DockLigandAtom     *ligandAtoms,
     uint                         nAtoms,
     constant PharmacophoreConstraint *constraints,
@@ -655,8 +638,8 @@ inline float vinaScorePositions(
     constant uint32_t          *intraPairs = nullptr,
     uint                        numIntraPairs = 0)
 {
-    float3 gridMin = gp.origin;
-    float3 gridMax = gridUpperBound(gp);
+    float3 boxMin = searchBoxMin(gp);
+    float3 boxMax = searchBoxMax(gp);
 
     float totalIntermolecular = 0.0f;
     float penalty = 0.0f;
@@ -664,11 +647,8 @@ inline float vinaScorePositions(
     for (uint a = 0; a < nAtoms; a++) {
         float3 r = positions[a];
 
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) {
-            penalty += oopP;
-            continue;
-        }
+        penalty += outOfBoxPenalty(r, boxMin, boxMax);
+        if (!insideGrid(r, gp)) continue;
 
         totalIntermolecular += sampleTypedAffinityMap(
             affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gp
@@ -709,8 +689,8 @@ inline float evaluatePose(
     }
     applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTorsions);
 
-    float3 gridMin = gp.origin;
-    float3 gridMax = gridUpperBound(gp);
+    float3 boxMin = searchBoxMin(gp);
+    float3 boxMax = searchBoxMax(gp);
 
     float totalIntermolecular = 0.0f;
     float boundaryPenalty = 0.0f;
@@ -718,11 +698,8 @@ inline float evaluatePose(
     for (uint a = 0; a < nA; a++) {
         float3 r = positions[a];
 
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) {
-            boundaryPenalty += oopP;
-            continue;
-        }
+        boundaryPenalty += outOfBoxPenalty(r, boxMin, boxMax);
+        if (!insideGrid(r, gp)) continue;
 
         totalIntermolecular += sampleTypedAffinityMap(
             affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gp
@@ -764,19 +741,16 @@ inline float evaluatePoseConstrained(
     }
     applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTorsions);
 
-    float3 gridMin = gp.origin;
-    float3 gridMax = gridUpperBound(gp);
+    float3 boxMin = searchBoxMin(gp);
+    float3 boxMax = searchBoxMax(gp);
 
     float totalIntermolecular = 0.0f;
     float boundaryPenalty = 0.0f;
 
     for (uint a = 0; a < nA; a++) {
         float3 r = positions[a];
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) {
-            boundaryPenalty += oopP;
-            continue;
-        }
+        boundaryPenalty += outOfBoxPenalty(r, boxMin, boxMax);
+        if (!insideGrid(r, gp)) continue;
         totalIntermolecular += sampleTypedAffinityMap(
             affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gp
         );
@@ -794,110 +768,6 @@ inline float evaluatePoseConstrained(
     float nRotF = float(nTorsions);
     float normFactor = vinaRotNormalization(nRotF);
     return (totalIntermolecular + intraDelta) * normFactor + wPenalty * boundaryPenalty + constraintPen;
-}
-
-/// Evaluate pose energy and compute analytical gradients for all DOF in a single pass.
-/// The energy is identical to evaluatePoseConstrained (same transform, grid-bound penalty,
-/// intramolecular terms and constraint penalty), so accept/reject comparisons are consistent.
-///
-/// Gradients use force/torque accumulation (AutoDock Vina tree.h): for each torsion,
-/// dE/dθ = -axis · Σ cross(pos_a - pivot, F_a) over all atoms downstream of the bond
-/// (movingIndices lists every downstream atom, including those moved by child torsions).
-///
-/// Returns total energy. Fills gradT[3], gradR[3], gradTor[32].
-inline float evaluatePoseWithGradient(
-    device const DockPose   &pose,
-    constant DockLigandAtom *ligandAtoms,
-    uint                     nAtoms,
-    uint                     nTorsions,
-    constant TorsionEdge    *torsionEdges,
-    constant int32_t        *movingIndices,
-    device const half       *affinityMaps,
-    device const int32_t    *typeIndexLookup,
-    constant GridParams     &gp,
-    float                    referenceIntraEnergy,
-    constant uint32_t       *intraPairs,
-    uint                     numIntraPairs,
-    constant PharmacophoreConstraint *constraints,
-    constant PharmacophoreParams &pharmaParams,
-    thread float            *gradT,
-    thread float            *gradR,
-    thread float            *gradTor)
-{
-    uint nA = min(nAtoms, 128u);
-    uint nTor = min(nTorsions, 32u);
-
-    // --- Forward pass: transform atoms (identical to evaluatePose) ---
-    float3 positions[128];
-    for (uint a = 0; a < nA; a++) {
-        positions[a] = quatRotate(pose.rotation, ligandAtoms[a].position) + pose.translation;
-    }
-    applyTorsions(positions, nA, pose, torsionEdges, movingIndices, nTor);
-
-    // --- Energy and per-atom forces (forces[a] = -dE/dpos[a]) ---
-    float normFactor = vinaRotNormalization(float(nTor));
-    float3 gridMin = gp.origin;
-    float3 gridMax = gridUpperBound(gp);
-
-    float3 forces[128];
-    float totalIntermolecular = 0.0f;
-    float boundaryPenalty = 0.0f;
-    for (uint a = 0; a < nA; a++) {
-        float3 grad;
-        float oopP = outOfGridPenaltyWithGrad(positions[a], gridMin, gridMax, grad);
-        if (oopP > 0.0f) {
-            boundaryPenalty += oopP;
-            forces[a] = -wPenalty * grad;
-            continue;
-        }
-        totalIntermolecular += sampleTypedAffinityMapWithGrad(
-            affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, positions[a], gp, grad
-        );
-        forces[a] = -grad * normFactor;
-    }
-
-    float intraE = 0.0f;
-    if (intraPairs && numIntraPairs > 0) {
-        intraE = intramolecularWithGrad(positions, forces, -normFactor, ligandAtoms, nA, intraPairs, numIntraPairs);
-    }
-
-    float constraintPen = evaluateConstraintPenaltyWithGrad(
-        positions, forces, ligandAtoms, nA, constraints, pharmaParams);
-
-    float totalEnergy = (totalIntermolecular + intraE - referenceIntraEnergy) * normFactor
-                      + wPenalty * boundaryPenalty + constraintPen;
-
-    // --- Torsion derivatives ---
-    for (uint t = 0; t < nTor; t++) {
-        TorsionEdge edge = torsionEdges[t];
-        float3 pivot = positions[edge.atom1];
-        float3 axisVec = positions[edge.atom2] - pivot;
-        float axisLen = length(axisVec);
-        if (axisLen < 1e-6f) { gradTor[t] = 0.0f; continue; }
-        float3 torque = float3(0);
-        for (int i = 0; i < edge.movingCount; i++) {
-            int ai = movingIndices[edge.movingStart + i];
-            if (ai < 0 || uint(ai) >= nA) continue;
-            torque += cross(positions[ai] - pivot, forces[ai]);
-        }
-        gradTor[t] = -dot(torque, axisVec / axisLen);
-    }
-
-    // --- Rigid-body gradients: dE/dT = -ΣF, dE/dω = -Σ cross(pos - T, F) ---
-    float3 totalForce = float3(0);
-    float3 totalTorque = float3(0);
-    for (uint a = 0; a < nA; a++) {
-        totalForce += forces[a];
-        totalTorque += cross(positions[a] - pose.translation, forces[a]);
-    }
-    gradT[0] = -totalForce.x;
-    gradT[1] = -totalForce.y;
-    gradT[2] = -totalForce.z;
-    gradR[0] = -totalTorque.x;
-    gradR[1] = -totalTorque.y;
-    gradR[2] = -totalTorque.z;
-
-    return totalEnergy;
 }
 
 // ============================================================================

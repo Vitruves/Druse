@@ -8,9 +8,11 @@ import simd
 enum ProteinPreparation {
 
     struct ChainBreak: Sendable {
-        let chainID: String
-        let previousResidueSeq: Int
-        let nextResidueSeq: Int
+        fileprivate let previous: ResidueRecord
+        fileprivate let next: ResidueRecord
+        var chainID: String { previous.chainID }
+        var previousResidueSeq: Int { previous.residueSeq }
+        var nextResidueSeq: Int { next.residueSeq }
         let carbonNitrogenDistance: Float
         let missingResidueCount: Int
         let isCapped: Bool
@@ -81,14 +83,6 @@ enum ProteinPreparation {
     private struct ResidueKey: Hashable {
         let chainID: String
         let residueSeq: Int
-        let residueName: String
-        let isHetAtom: Bool
-    }
-
-    /// Residue identity for altloc selection; insertion codes keep e.g. 52 and 52A apart.
-    private struct AltConformerResidueKey: Hashable {
-        let chainID: String
-        let residueSeq: Int
         let insertionCode: String
         let residueName: String
         let isHetAtom: Bool
@@ -100,7 +94,8 @@ enum ProteinPreparation {
         let residueName: String
     }
 
-    private struct ResidueRecord {
+    fileprivate struct ResidueRecord: Sendable {
+        let insertionCode: String
         let chainID: String
         let residueSeq: Int
         let residueName: String
@@ -114,12 +109,12 @@ enum ProteinPreparation {
         atoms: [Atom],
         bonds: [Bond]
     ) -> (atoms: [Atom], bonds: [Bond], removedAtomCount: Int) {
-        var residueIndices: [AltConformerResidueKey: [Int]] = [:]
-        var residueOrder: [AltConformerResidueKey] = []
+        var residueIndices: [ResidueKey: [Int]] = [:]
+        var residueOrder: [ResidueKey] = []
 
         for index in atoms.indices {
             let atom = atoms[index]
-            let key = AltConformerResidueKey(
+            let key = ResidueKey(
                 chainID: atom.chainID,
                 residueSeq: atom.residueSeq,
                 insertionCode: atom.insertionCode.trimmingCharacters(in: .whitespaces),
@@ -457,13 +452,8 @@ enum ProteinPreparation {
         }
 
         var breaks: [ChainBreak] = []
-        for (chainID, residues) in residuesByChain {
-            let sortedResidues = residues.sorted { lhs, rhs in
-                if lhs.residueSeq != rhs.residueSeq {
-                    return lhs.residueSeq < rhs.residueSeq
-                }
-                return lhs.residueName < rhs.residueName
-            }
+        for (_, residues) in residuesByChain.sorted(by: { $0.key < $1.key }) {
+            let sortedResidues = residues.sorted(by: residueSortOrder)
 
             guard sortedResidues.count > 1 else { continue }
 
@@ -496,9 +486,8 @@ enum ProteinPreparation {
                         bonds: bonds
                     )
                     breaks.append(.init(
-                        chainID: chainID,
-                        previousResidueSeq: previous.residueSeq,
-                        nextResidueSeq: next.residueSeq,
+                        previous: previous,
+                        next: next,
                         carbonNitrogenDistance: distance,
                         missingResidueCount: missingResidueCount,
                         isCapped: isCapped
@@ -507,12 +496,7 @@ enum ProteinPreparation {
             }
         }
 
-        return breaks.sorted { lhs, rhs in
-            if lhs.chainID != rhs.chainID {
-                return lhs.chainID < rhs.chainID
-            }
-            return lhs.previousResidueSeq < rhs.previousResidueSeq
-        }
+        return breaks
     }
 
     // MARK: - Shared Docking Preparation
@@ -638,6 +622,7 @@ enum ProteinPreparation {
     private struct ProteinAtomIdentity: Hashable {
         let chainID: String
         let residueSeq: Int
+        let insertionCode: String
         let residueName: String
         let atomName: String
         let atomicNumber: Int
@@ -648,6 +633,7 @@ enum ProteinPreparation {
         ProteinAtomIdentity(
             chainID: atom.chainID,
             residueSeq: atom.residueSeq,
+            insertionCode: atom.insertionCode.trimmingCharacters(in: .whitespaces),
             residueName: atom.residueName,
             atomName: atom.name.trimmingCharacters(in: .whitespaces),
             atomicNumber: atom.element.rawValue,
@@ -688,6 +674,7 @@ enum ProteinPreparation {
             let key = ResidueKey(
                 chainID: atom.chainID,
                 residueSeq: atom.residueSeq,
+                insertionCode: atom.insertionCode.trimmingCharacters(in: .whitespaces),
                 residueName: atom.residueName,
                 isHetAtom: atom.isHetAtom
             )
@@ -697,6 +684,7 @@ enum ProteinPreparation {
         var records: [ResidueKey: ResidueRecord] = [:]
         for (key, indices) in residueIndices {
             records[key] = ResidueRecord(
+                insertionCode: key.insertionCode,
                 chainID: key.chainID,
                 residueSeq: key.residueSeq,
                 residueName: key.residueName,
@@ -713,6 +701,9 @@ enum ProteinPreparation {
         }
         if lhs.residueSeq != rhs.residueSeq {
             return lhs.residueSeq < rhs.residueSeq
+        }
+        if lhs.insertionCode != rhs.insertionCode {
+            return lhs.insertionCode < rhs.insertionCode
         }
         if lhs.residueName != rhs.residueName {
             return lhs.residueName < rhs.residueName
@@ -771,38 +762,13 @@ enum ProteinPreparation {
         bonds: [Bond],
         breaks: [ChainBreak]
     ) -> (atoms: [Atom], bonds: [Bond], addedResidueCount: Int) {
-        let residueRecords = buildResidueRecords(from: atoms)
         var workingAtoms = atoms
         var workingBonds = bonds
         var addedResidues = 0
 
         for chainBreak in breaks {
-            let previousResidue = residueRecords[ResidueKey(
-                chainID: chainBreak.chainID,
-                residueSeq: chainBreak.previousResidueSeq,
-                residueName: residueName(
-                    chainID: chainBreak.chainID,
-                    residueSeq: chainBreak.previousResidueSeq,
-                    from: residueRecords
-                ),
-                isHetAtom: false
-            )]
-            let nextResidue = residueRecords[ResidueKey(
-                chainID: chainBreak.chainID,
-                residueSeq: chainBreak.nextResidueSeq,
-                residueName: residueName(
-                    chainID: chainBreak.chainID,
-                    residueSeq: chainBreak.nextResidueSeq,
-                    from: residueRecords
-                ),
-                isHetAtom: false
-            )]
-
-            guard let previousResidue, let nextResidue else {
-                Task { @MainActor in ActivityLog.shared.debug("[Prep] Skipped capping chain break at \(chainBreak.chainID):\(chainBreak.previousResidueSeq)-\(chainBreak.nextResidueSeq) — residue not found", category: .prep) }
-                continue
-            }
-
+            let previousResidue = chainBreak.previous
+            let nextResidue = chainBreak.next
             if appendNMECap(
                 to: &workingAtoms,
                 bonds: &workingBonds,
@@ -823,19 +789,6 @@ enum ProteinPreparation {
         }
 
         return (workingAtoms, workingBonds, addedResidues)
-    }
-
-    private static func residueName(
-        chainID: String,
-        residueSeq: Int,
-        from residueRecords: [ResidueKey: ResidueRecord]
-    ) -> String {
-        residueRecords.keys.first {
-            $0.chainID == chainID &&
-            $0.residueSeq == residueSeq &&
-            !$0.isHetAtom &&
-            standardResidueNames.contains($0.residueName.uppercased())
-        }?.residueName ?? ""
     }
 
     private static func appendNMECap(
@@ -874,7 +827,8 @@ enum ProteinPreparation {
             residueName: "NME",
             residueSeq: residue.residueSeq,
             chainID: residue.chainID,
-            isHetAtom: true
+            isHetAtom: true,
+            insertionCode: residue.insertionCode
         ))
         bonds.append(Bond(id: bonds.count, atomIndex1: carbonIndex, atomIndex2: nitrogenIndex, order: .single))
 
@@ -888,7 +842,8 @@ enum ProteinPreparation {
             residueName: "NME",
             residueSeq: residue.residueSeq,
             chainID: residue.chainID,
-            isHetAtom: true
+            isHetAtom: true,
+            insertionCode: residue.insertionCode
         ))
         bonds.append(Bond(id: bonds.count, atomIndex1: nitrogenIndex, atomIndex2: methylIndex, order: .single))
 
@@ -935,7 +890,8 @@ enum ProteinPreparation {
             residueName: "ACE",
             residueSeq: residue.residueSeq,
             chainID: residue.chainID,
-            isHetAtom: true
+            isHetAtom: true,
+            insertionCode: residue.insertionCode
         ))
         bonds.append(Bond(id: bonds.count, atomIndex1: carbonylCarbonIndex, atomIndex2: nitrogenIndex, order: .single))
 
@@ -948,7 +904,8 @@ enum ProteinPreparation {
             residueName: "ACE",
             residueSeq: residue.residueSeq,
             chainID: residue.chainID,
-            isHetAtom: true
+            isHetAtom: true,
+            insertionCode: residue.insertionCode
         ))
         bonds.append(Bond(id: bonds.count, atomIndex1: carbonylCarbonIndex, atomIndex2: oxygenIndex, order: .double))
 
@@ -961,7 +918,8 @@ enum ProteinPreparation {
             residueName: "ACE",
             residueSeq: residue.residueSeq,
             chainID: residue.chainID,
-            isHetAtom: true
+            isHetAtom: true,
+            insertionCode: residue.insertionCode
         ))
         bonds.append(Bond(id: bonds.count, atomIndex1: carbonylCarbonIndex, atomIndex2: methylIndex, order: .single))
 
@@ -1045,7 +1003,8 @@ enum ProteinPreparation {
                 isHetAtom: atom.isHetAtom,
                 occupancy: atom.occupancy,
                 tempFactor: atom.tempFactor,
-                altLoc: atom.altLoc
+                altLoc: atom.altLoc,
+                insertionCode: atom.insertionCode
             )
             remappedAtoms.append(atom)
         }

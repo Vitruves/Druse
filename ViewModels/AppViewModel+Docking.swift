@@ -406,7 +406,7 @@ extension AppViewModel {
 
             log.info("  Original ligand: \(origLig.name), \(origLig.atoms.count) atoms, \(origLig.bonds.count) bonds", category: .dock)
 
-            engine.onPoseUpdate = { [weak self] result, interactions in
+            engine.onPoseUpdate = renderer == nil ? nil : { [weak self] result, interactions in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     // Each run restarts its population, so keep the best across runs.
@@ -567,6 +567,8 @@ extension AppViewModel {
             docking.dockingPosesEvaluated = evaluatedPoses
 
             if let best = docking.dockingResults.first {
+                docking.dockingBestEnergy = best.energy
+                docking.dockingBestPKi = docking.scoringMethod.isAffinityScore ? best.stericEnergy : nil
                 applyDockingPose(best, originalLigand: origLig)
 
                 if molecules.protein != nil {
@@ -958,6 +960,7 @@ extension AppViewModel {
         log.info("Refining top \(topN) docking poses with OpenMM pocket minimization...", category: .dock)
         // Charges are folded while the hydrogens still sit at their input coordinates; poses carry heavy atoms only.
         let heavyAtoms = OpenMMPocketRefiner.unitedAtomHeavyAtoms(originalLigand.atoms)
+        let receptor = refiner.prepareReceptor(protein.atoms, center: pocket.center, halfExtent: pocket.size)
         for index in 0..<topN {
             let result = refinedResults[index]
             var ligandAtoms = heavyAtoms
@@ -965,12 +968,7 @@ extension AppViewModel {
                 ligandAtoms[atomIndex].position = result.transformedAtomPositions[atomIndex]
             }
 
-            if let refined = await refiner.refine(
-                proteinAtoms: protein.atoms,
-                ligandAtoms: ligandAtoms,
-                pocketCenter: pocket.center,
-                pocketHalfExtent: pocket.size
-            ) {
+            if let refined = await refiner.refine(receptor: receptor, heavyLigandAtoms: ligandAtoms) {
                 // A diverged minimization returns NaN energies/coordinates; keeping them would
                 // corrupt the displayed receptor and crash its next preparation.
                 guard refined.interactionEnergyKcal.isFinite,

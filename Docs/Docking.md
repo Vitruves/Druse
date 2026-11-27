@@ -152,7 +152,8 @@ Three kernels implement it, in `DockingLocalSearch.metal`:
 - The trajectory length is `remc-steps` (default 200) — not `generations`, and REMC runs a single pass rather than `runs` restarts.
 - Perturbation step sizes scale with `sqrt(T_k / T_min)`. Above a scale of 1.5, torsion moves become full uniform resamples instead of local perturbations.
 - Acceptance uses each replica's own temperature.
-- Every `remc-swap` steps (default 5), adjacent replica pairs attempt a swap with probability `min(1, exp((β_i − β_j)(E_i − E_j)))` evaluated on each replica's best pose, where β = 1/T. Swaps use a checkerboard parity (even steps swap even pairs, odd steps odd pairs) so no pair races another, and a successful swap exchanges the two replicas' whole populations.
+- Scheduled local minimizations run on every replica before Metropolis acceptance. The live best pose and final ranking consider walkers at every temperature.
+- Every `remc-swap` steps (default 5), walkers at adjacent temperatures independently attempt a swap with probability `min(1, exp((β_i − β_j)(E_i − E_j)))`, using the two walkers' current energies and β = 1/T. Successive exchange rounds alternate between even and odd pairs. With two replicas, the single pair attempts an exchange every round. A nonzero `seed` reproduces the Monte Carlo proposals and exchanges.
 - The same two-phase exploration/annealing schedule as the GA path applies within the trajectory.
 
 ```
@@ -232,12 +233,12 @@ Before any search, the receptor is baked into half-precision grid maps on the GP
 | Kernel | Map | Definition |
 |---|---|---|
 | `computeVinaAffinityMaps` | One affinity map per ligand XS type actually present | Full Vina pairwise potential summed over protein atoms within 8 Å, clamped to ±100. This is what the search scores against. |
-| `computeStericGrid` | Steric | `wGauss1·exp(−(d/0.5)²) + wGauss2·exp(−((d−3)/2)²) + wRepulsion·d²` for d < 0, with d = distance − (R_protein + R_probe), R_probe = 1.8 Å |
-| `computeHydrophobicGrid` | Hydrophobic | Hydrophobic protein atoms only; 1.0 below d = 0.5, 0 above d = 1.5, linear between, weighted by `wHydrophobic` |
-| `computeHBondGrid` | H-bond | Donor/acceptor protein atoms only; 1.0 below d = −0.7, 0 above d = 0, linear between, weighted by `wHBond` |
-| `computeElectrostaticGrid` | Screened Coulomb potential | Φ(r) = Σ 332·q_p / (4r²) (distance-dependent dielectric ε = 4r), cut off at 12 Å, r clamped to 0.8 Å, clamped to ±50. Used by Drusina. |
+| `computeReceptorGrids` | Steric | `wGauss1·exp(−(d/0.5)²) + wGauss2·exp(−((d−3)/2)²) + wRepulsion·d²` for d < 0, with d = distance − (R_protein + R_probe), R_probe = 1.5 Å |
+| `computeReceptorGrids` | Hydrophobic | Hydrophobic protein atoms only; 1.0 below d = 0.5, 0 above d = 1.5, linear between, weighted by `wHydrophobic` |
+| `computeReceptorGrids` | H-bond | Donor/acceptor protein atoms only; 1.0 below d = −0.7, 0 above d = 0, linear between, weighted by `wHBond` |
+| `computeReceptorGrids` | Screened Coulomb potential | Φ(r) = Σ 332·q_p / (4r²) (distance-dependent dielectric ε = 4r), cut off at 12 Å, r clamped to 0.8 Å, clamped to ±50. Used by Drusina. |
 
-The affinity-map tiling loads protein atoms into threadgroup memory in a structure-of-arrays layout to avoid bank conflicts.
+The four receptor maps share one distance calculation per atom and grid node. Map construction excludes atoms outside the grid bounds expanded by the longest interaction cutoff and one grid spacing. Explicit pose scoring still uses the full receptor.
 
 ## Pharmacophore constraints
 
@@ -325,7 +326,7 @@ results batch top=50
 
 ## Output selection
 
-Every search path ends with the same Vina-style output selection, documented in full in [Analysis.md](Analysis.md): poses more than 3.0 kcal/mol above the best are discarded, the remainder are greedy leader-clustered at 2.0 Å heavy-atom RMSD, poses within 1.0 Å of a better pose in the same cluster are dropped as duplicates, and at most 20 binding modes are reported. The top `rerank-clusters` cluster representatives are then rescored against explicit receptor atoms, with `rerank-variants` jittered seeds each refined for `rerank-steps` local-search steps.
+With rigid-receptor Vina scoring and explicit reranking enabled, Metal scores the final walkers against receptor atoms before selecting representatives for refinement. The engine refines the best `rerank-clusters` representatives on the grid, scores their variants explicitly, and pools them with the original walkers. It applies the 3.0 kcal/mol energy window to these final scores, clusters at 2.0 Å heavy-atom RMSD, drops duplicates within 1.0 Å of a better member of the same cluster, and keeps at most 20 binding modes. Setting `rerank-clusters=0` selects modes directly from the search scores. See [Analysis.md](Analysis.md).
 
 ## Settings reference
 

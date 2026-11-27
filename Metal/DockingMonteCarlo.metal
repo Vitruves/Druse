@@ -144,13 +144,13 @@ kernel void scorePosesBatched(
         positions[a] = quatRotate(pose.rotation, myAtoms[a].position) + pose.translation;
     applyTorsions(positions, nA, pose, myEdges, myMoving, nTor);
 
-    float3 gridMin = gridParams.origin;
-    float3 gridMax = gridUpperBound(gridParams);
+    float3 boxMin = searchBoxMin(gridParams);
+    float3 boxMax = searchBoxMax(gridParams);
     float totalE = 0.0f, penalty = 0.0f;
 
     for (uint a = 0; a < nA; a++) {
-        float oopP = outOfGridPenalty(positions[a], gridMin, gridMax);
-        if (oopP > 0.0f) { penalty += oopP; continue; }
+        penalty += outOfBoxPenalty(positions[a], boxMin, boxMax);
+        if (!insideGrid(positions[a], gridParams)) continue;
         totalE += sampleTypedAffinityMap(affinityMaps, typeIndexLookup, myAtoms[a].vinaType, positions[a], gridParams);
     }
 
@@ -248,7 +248,7 @@ kernel void mcPerturbReplica(
     float Tmin = repParams.temperatures[0];
     float tempScale = sqrt(max(T / max(Tmin, 0.01f), 1.0f));
 
-    uint seed = tid * 314159u + repParams.swapGeneration * 271828u + replicaIdx * 999983u + 42u;
+    uint seed = tid * 314159u + gaParams.generation * 271828u + gaParams.runSeed * 999983u + 42u;
     device const DockPose &src = current[tid];
     device DockPose &dst = perturbed[tid];
 
@@ -341,7 +341,7 @@ kernel void metropolisAcceptReplica(
             accept = true;
         } else {
             float acceptance = exp((cur.energy - cand.energy) / T);
-            uint seed = tid * 92837111u + repParams.swapGeneration * 689287499u + replicaIdx * 456789u + 17u;
+            uint seed = tid * 92837111u + gaParams.generation * 689287499u + gaParams.runSeed * 1299827u + 17u;
             accept = gpuRandom(seed, 0) < min(acceptance, 1.0f);
         }
     }
@@ -358,56 +358,27 @@ kernel void metropolisAcceptReplica(
 }
 
 /// Replica exchange swap kernel.
-/// Dispatched with one thread per adjacent replica pair.
-/// Uses checkerboard pattern: even generations swap pairs (0,1),(2,3),...
-/// odd generations swap pairs (1,2),(3,4),... to avoid race conditions.
+/// Each thread exchanges one pair of walkers on adjacent temperatures.
 kernel void replicaSwap(
     device DockPose            *population  [[buffer(0)]],
     device DockPose            *best        [[buffer(1)]],
     constant ReplicaParams     &repParams   [[buffer(2)]],
+    constant GAParams          &gaParams    [[buffer(3)]],
     uint                        tid         [[thread_position_in_grid]])
 {
-    // Guard the unsigned subtraction (numReplicas == 0 would wrap) and the temperatures[] bound.
     uint numReplicas = min(repParams.numReplicas, MAX_REPLICAS);
-    if (numReplicas < 2u) return;
-    uint numPairs = numReplicas - 1u;
-    if (tid >= numPairs) return;
-
-    // Checkerboard: even gen swaps even pairs, odd gen swaps odd pairs
-    uint parity = repParams.swapGeneration & 1u;
-    if ((tid & 1u) != parity) return;
-
-    uint replicaI = tid;
-    uint replicaJ = tid + 1u;
-
-    // Find the best (lowest energy) pose in each replica
-    uint startI = replicaI * repParams.populationPerReplica;
-    uint startJ = replicaJ * repParams.populationPerReplica;
-    uint ppReplica = repParams.populationPerReplica;
-
-    float bestEI = 1e10f;
-    uint bestIdxI = startI;
-    for (uint k = 0; k < ppReplica; k++) {
-        float e = population[startI + k].energy;
-        if (isfinite(e) && e < bestEI) {
-            bestEI = e;
-            bestIdxI = startI + k;
-        }
-    }
-
-    float bestEJ = 1e10f;
-    uint bestIdxJ = startJ;
-    for (uint k = 0; k < ppReplica; k++) {
-        float e = population[startJ + k].energy;
-        if (isfinite(e) && e < bestEJ) {
-            bestEJ = e;
-            bestIdxJ = startJ + k;
-        }
-    }
-
-    // Skip if either replica has no valid poses
-    if (!isfinite(bestEI) || !isfinite(bestEJ)) return;
-    if (bestEI >= 1e9f || bestEJ >= 1e9f) return;
+    uint walkers = repParams.populationPerReplica;
+    if (numReplicas < 2u || walkers == 0u) return;
+    uint round = gaParams.generation / max(repParams.swapInterval, 1u);
+    uint parity = numReplicas == 2u ? 0u : (round & 1u);
+    uint replicaI = 2u * (tid / walkers) + parity;
+    uint replicaJ = replicaI + 1u;
+    if (replicaJ >= numReplicas) return;
+    uint cold = replicaI * walkers + tid % walkers;
+    uint hot = cold + walkers;
+    float coldEnergy = population[cold].energy;
+    float hotEnergy = population[hot].energy;
+    if (!isfinite(coldEnergy) || !isfinite(hotEnergy) || coldEnergy >= 1e9f || hotEnergy >= 1e9f) return;
 
     float Ti = max(repParams.temperatures[replicaI], 1e-4f);
     float Tj = max(repParams.temperatures[replicaJ], 1e-4f);
@@ -415,22 +386,18 @@ kernel void replicaSwap(
     float betaJ = 1.0f / Tj;
 
     // Metropolis swap criterion: P = min(1, exp((βi - βj)(Ei - Ej)))
-    float delta = (betaI - betaJ) * (bestEI - bestEJ);
+    float delta = (betaI - betaJ) * (coldEnergy - hotEnergy);
     float P = min(1.0f, exp(delta));
 
-    uint seed = tid * 482711u + repParams.swapGeneration * 937373u + 777u;
+    uint seed = tid * 482711u + gaParams.generation * 937373u + gaParams.runSeed * 1299827u + 777u;
     float r = gpuRandom(seed, 0);
 
     if (r < P) {
-        // Swap entire replica populations by exchanging all poses
-        for (uint k = 0; k < ppReplica; k++) {
-            DockPose tmp = population[startI + k];
-            population[startI + k] = population[startJ + k];
-            population[startJ + k] = tmp;
-
-            DockPose tmpBest = best[startI + k];
-            best[startI + k] = best[startJ + k];
-            best[startJ + k] = tmpBest;
-        }
+        DockPose tmp = population[cold];
+        population[cold] = population[hot];
+        population[hot] = tmp;
+        tmp = best[cold];
+        best[cold] = best[hot];
+        best[hot] = tmp;
     }
 }

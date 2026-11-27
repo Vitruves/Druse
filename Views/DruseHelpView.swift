@@ -387,7 +387,7 @@ private let helpSections: [HelpSection] = [
                      "A warp-level parallel variant where 32 GPU threads collaborate on a single pose's gradient computation. Significantly faster for poses with many degrees of freedom."),
             HelpItem.subtitle("Parallel Tempering (REMC)"),
             HelpItem("Replica Exchange Monte Carlo",
-                     "Used for flexible ligands (7–10 rotatable bonds). Maintains 8 replicas at temperatures from 0.6 to 4.0 kcal/mol. Hot replicas explore broadly; cold replicas refine. Replicas exchange configurations every 5 generations using the Metropolis criterion. 200 MC steps per replica before extraction."),
+                     "Used for flexible ligands (7–10 rotatable bonds). Maintains 8 replicas at temperatures from 0.6 to 4.0 kcal/mol. Hot replicas explore more broadly. Every replica refines its poses on the local search schedule. Replicas attempt exchanges every 5 generations and run 200 MC steps by default."),
             HelpItem.subtitle("Fragment-Based Docking"),
             HelpItem("Beam Search with Growth",
                      "For highly flexible ligands (>10 rotatable bonds), the ligand is decomposed into rigid fragments. The anchor fragment is placed first (256 initial samples), then remaining fragments are grown one at a time. At each growth step, torsion angles are sampled at 10° resolution (36 samples per bond), and a beam of width 32 (configurable 4–256) partial poses survives to the next step. Beam width controls diversity vs speed."),

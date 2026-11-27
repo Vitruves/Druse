@@ -65,9 +65,9 @@ extension DockingEngine {
         return positions
     }
 
-    func extractBestPose(from buffer: MTLBuffer? = nil, ligandAtoms: [Atom], centroid: SIMD3<Float>, maxPoses: Int? = nil, scoringMethod: ScoringMethod = .vina) -> DockingResult? {
+    func extractBestPose(from buffer: MTLBuffer? = nil, ligandAtoms: [Atom], centroid: SIMD3<Float>, maxPoses: Int) -> DockingResult? {
         guard let buffer = buffer ?? populationBuffer else { return nil }
-        let poseCount = min(maxPoses ?? Int.max, buffer.length / MemoryLayout<DockPose>.stride)
+        let poseCount = min(maxPoses, buffer.length / MemoryLayout<DockPose>.stride)
         guard poseCount > 0 else { return nil }
         let poses = buffer.contents().bindMemory(to: DockPose.self, capacity: poseCount)
 
@@ -108,12 +108,10 @@ extension DockingEngine {
         ligandAtoms: [Atom],
         centroid: SIMD3<Float>,
         idOffset: Int = 0,
-        sortByEnergy: Bool = true,
-        maxPoses: Int? = nil,
-        scoringMethod: ScoringMethod = .vina
+        maxPoses: Int
     ) -> [DockingResult] {
         guard let buffer = buffer ?? populationBuffer else { return [] }
-        let poseCount = min(maxPoses ?? Int.max, buffer.length / MemoryLayout<DockPose>.stride)
+        let poseCount = min(maxPoses, buffer.length / MemoryLayout<DockPose>.stride)
         guard poseCount > 0 else { return [] }
         let poses = buffer.contents().bindMemory(to: DockPose.self, capacity: poseCount)
 
@@ -146,7 +144,7 @@ extension DockingEngine {
 
             results.append(r)
         }
-        return sortByEnergy ? results.sorted { $0.energy < $1.energy } : results
+        return results
     }
 
     // MARK: - Output Selection & RMSD Clustering
@@ -177,7 +175,7 @@ extension DockingEngine {
 
     /// Poses whose score lies within the output energy window of the best one.
     static func withinOutputEnergyWindow(_ results: [DockingResult], scoringMethod: ScoringMethod) -> [DockingResult] {
-        guard let best = results.map(\.energy).min() else { return [] }
+        guard let best = results.lazy.map(\.energy).min() else { return [] }
         let cutoff = best + outputEnergyWindow(for: scoringMethod)
         return results.filter { $0.energy <= cutoff }
     }
@@ -263,10 +261,9 @@ extension DockingEngine {
         }.value
     }
 
-    private nonisolated static func leaderClusters(_ results: [DockingResult]) -> [DockingResult] {
+    nonisolated static func leaderClusters(_ results: [DockingResult]) -> [DockingResult] {
         let sorted = results.sorted { $0.energy < $1.energy }
         let positions = sorted.map(\.transformedAtomPositions)
-        let duplicateSumSq = { (atomCount: Int) in outputDuplicateRMSD * outputDuplicateRMSD * Float(atomCount) }
 
         var out: [DockingResult] = []
         out.reserveCapacity(sorted.count)
@@ -280,21 +277,24 @@ extension DockingEngine {
             out.append(leaderResult)
 
             let candidates = Array(unassigned.dropFirst())
-            let within = withinRMSDFlags(
+            let clusterLimit = clusterRMSD * clusterRMSD * Float(positions[leader].count)
+            let duplicateLimit = outputDuplicateRMSD * outputDuplicateRMSD * Float(positions[leader].count)
+            let distances = leaderSquaredDistances(
                 leader: positions[leader], candidates: candidates,
-                positions: positions, threshold: clusterRMSD
+                positions: positions, limit: clusterLimit
             )
 
             var kept = [leader]
             var remaining: [Int] = []
             remaining.reserveCapacity(candidates.count)
             for (c, j) in candidates.enumerated() {
-                guard within[c] else {
+                guard distances[c] < clusterLimit else {
                     remaining.append(j)
                     continue
                 }
-                let maxSumSq = duplicateSumSq(positions[j].count)
-                if kept.contains(where: { isWithinRMSD(positions[$0], positions[j], maxSumSq: maxSumSq) }) {
+                if distances[c] < duplicateLimit || kept.dropFirst().contains(where: {
+                    squaredDistanceSum(positions[$0], positions[j], limit: duplicateLimit) < duplicateLimit
+                }) {
                     continue
                 }
                 var member = sorted[j]
@@ -309,43 +309,42 @@ extension DockingEngine {
         return out.sorted { $0.energy < $1.energy }
     }
 
-    /// For each candidate pose, whether its RMSD to `leader` is below `threshold`.
+    /// Per-candidate squared-distance sums, exact below the cluster limit.
     /// Parallelised across worker threads for large candidate sets.
-    private nonisolated static func withinRMSDFlags(
+    private nonisolated static func leaderSquaredDistances(
         leader: [SIMD3<Float>],
         candidates: [Int],
         positions: [[SIMD3<Float>]],
-        threshold: Float
-    ) -> [Bool] {
-        let maxSumSq = threshold * threshold * Float(leader.count)
-        var flags = [Bool](repeating: false, count: candidates.count)
+        limit: Float
+    ) -> [Float] {
+        var distances = [Float](repeating: .infinity, count: candidates.count)
         if candidates.count >= 2048 {
-            flags.withUnsafeMutableBufferPointer { buf in
+            distances.withUnsafeMutableBufferPointer { buf in
                 nonisolated(unsafe) let out = buf
                 CPUBudget.concurrentPerform(iterations: candidates.count) { c in
-                    out[c] = isWithinRMSD(leader, positions[candidates[c]], maxSumSq: maxSumSq)
+                    out[c] = squaredDistanceSum(leader, positions[candidates[c]], limit: limit)
                 }
             }
         } else {
             for c in candidates.indices {
-                flags[c] = isWithinRMSD(leader, positions[candidates[c]], maxSumSq: maxSumSq)
+                distances[c] = squaredDistanceSum(leader, positions[candidates[c]], limit: limit)
             }
         }
-        return flags
+        return distances
     }
 
-    /// RMSD(a, b) < threshold, expressed as Σ|a_i - b_i|² < threshold² · N, with early exit.
+    /// Accumulates Σ|a_i - b_i|² until the limit is reached.
     /// Poses with mismatched or empty atom lists never cluster together.
-    private nonisolated static func isWithinRMSD(
-        _ a: [SIMD3<Float>], _ b: [SIMD3<Float>], maxSumSq: Float
-    ) -> Bool {
-        guard a.count == b.count, !a.isEmpty else { return false }
+    private nonisolated static func squaredDistanceSum(
+        _ a: [SIMD3<Float>], _ b: [SIMD3<Float>], limit: Float
+    ) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return .infinity }
         var sum: Float = 0
         for i in 0..<a.count {
             sum += simd_distance_squared(a[i], b[i])
-            if sum >= maxSumSq { return false }
+            if sum >= limit { break }
         }
-        return true
+        return sum
     }
 
     // MARK: - Docking Diagnostics

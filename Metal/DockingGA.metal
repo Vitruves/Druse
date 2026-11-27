@@ -74,18 +74,15 @@ kernel void scoreBatchRigidPoses(
     float totalHydrophobic = 0.0f;
     float totalHBond = 0.0f;
     float penalty = 0.0f;
-    float3 gridMin = gridParams.origin;
-    float3 gridMax = gridUpperBound(gridParams);
+    float3 boxMin = searchBoxMin(gridParams);
+    float3 boxMax = searchBoxMax(gridParams);
 
     for (uint a = 0; a < nAtoms; a++) {
         DockLigandAtom atom = ligandAtoms[ligand.atomStart + a];
         float3 r = quatRotate(pose.rotation, atom.position) + pose.translation;
 
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) {
-            penalty += oopP;
-            continue;
-        }
+        penalty += outOfBoxPenalty(r, boxMin, boxMax);
+        if (!insideGrid(r, gridParams)) continue;
 
         totalSteric += trilinearInterpolate(stericGrid, r, gridParams.origin,
                                             gridParams.spacing, gridParams.dims);
@@ -129,9 +126,9 @@ kernel void initializePopulation(
     float3 center = gridParams.searchCenter;
     float3 halfExtent = gridParams.searchHalfExtent;
 
-    float3 searchSize = halfExtent * 2.0f;
-    float minDim = min(searchSize.x, min(searchSize.y, searchSize.z));
-    float focusSpread = min(minDim * 0.65f, 14.0f);
+    // The signed random offset below uses a radius, so scale a half-extent.
+    float minHalfExtent = min(halfExtent.x, min(halfExtent.y, halfExtent.z));
+    float focusSpread = min(minHalfExtent * 0.65f, 14.0f);
 
     // --- Translation: 40% focused near center, 60% full box ---
     // Tuned for broader pocket coverage (see docking_tuning.md).

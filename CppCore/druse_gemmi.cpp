@@ -176,6 +176,7 @@ DruseMoleculeResult* druse_parse_structure(const char* content) {
                     copy_fixed(out.residueName, residue.name);
                     copy_fixed(out.chainID, chain.name.empty() ? "A" : chain.name);
                     out.residueSeq = residue_sequence_number(residue);
+                    if (residue.seqid.icode != ' ') out.insertionCode[0] = residue.seqid.icode;
                     out.occupancy = atom.occ;
                     out.tempFactor = atom.b_iso;
                     if (atom.altloc != '\0') {

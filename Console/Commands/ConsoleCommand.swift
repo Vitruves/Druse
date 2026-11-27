@@ -372,8 +372,11 @@ enum ConsoleBinder {
         case .path:
             return .url(resolvePath(text, relativeTo: baseDirectory))
         case .vec3:
-            let parts = text.split(separator: ",").map { Float($0.trimmingCharacters(in: .whitespaces)) }
-            guard parts.count == 3, let x = parts[0], let y = parts[1], let z = parts[2] else {
+            let parts = text.split(separator: ",", omittingEmptySubsequences: false)
+            guard parts.count == 3,
+                  let x = Float(parts[0].trimmingCharacters(in: .whitespaces)), x.isFinite,
+                  let y = Float(parts[1].trimmingCharacters(in: .whitespaces)), y.isFinite,
+                  let z = Float(parts[2].trimmingCharacters(in: .whitespaces)), z.isFinite else {
                 throw ConsoleError("\(name) expects x,y,z (three numbers, no spaces), got '\(text)'", at: word.location)
             }
             return .vec3(SIMD3(x, y, z))

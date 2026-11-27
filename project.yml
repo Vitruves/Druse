@@ -124,14 +124,8 @@ targets:
     sources:
       - path: Tests
       - path: Benchmark
-        excludes:
-          - "*.py"
-          - "*.txt"
-          - "*.json"
-          - "data/**"
-          - "manifests/**"
-          - "results/**"
-          - "reports/**"
+        includes:
+          - "*.swift"
     dependencies:
       - target: Druse
     settings:

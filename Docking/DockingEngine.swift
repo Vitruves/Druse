@@ -12,11 +12,8 @@ final class DockingEngine {
     let device: MTLDevice
     private(set) var commandQueue: MTLCommandQueue
 
-    var stericGridPipeline: MTLComputePipelineState!
-    var hydrophobicGridPipeline: MTLComputePipelineState!
-    var hbondGridPipeline: MTLComputePipelineState!
+    var receptorGridPipeline: MTLComputePipelineState!
     var vinaAffinityGridPipeline: MTLComputePipelineState!
-    var electrostaticGridPipeline: MTLComputePipelineState?
     var scorePipeline: MTLComputePipelineState!
     var initPopPipeline: MTLComputePipelineState!
     var evolvePipeline: MTLComputePipelineState!
@@ -25,7 +22,6 @@ final class DockingEngine {
     var metropolisAcceptPipeline: MTLComputePipelineState!
     var explicitScorePipeline: MTLComputePipelineState!
     var decomposeVinaEnergyPipeline: MTLComputePipelineState!
-    var localSearchAnalyticalPipeline: MTLComputePipelineState!
     var localSearchAnalyticalSIMDPipeline: MTLComputePipelineState!
     var drusinaScorePipeline: MTLComputePipelineState?
     var drusinaCorrectionPipeline: MTLComputePipelineState?
@@ -35,7 +31,6 @@ final class DockingEngine {
     var mcPerturbReplicaPipeline: MTLComputePipelineState?
     var metropolisAcceptReplicaPipeline: MTLComputePipelineState?
     var replicaSwapPipeline: MTLComputePipelineState?
-    var replicaParamsBuffer: MTLBuffer?
 
     /// Active local search pipeline based on config.useAnalyticalGradients.
     var activeLocalSearchPipeline: MTLComputePipelineState {
@@ -192,25 +187,19 @@ final class DockingEngine {
             print("[DockingEngine] Failed to create command queue")
             return nil
         }
-        guard let library = device.makeDefaultLibrary() else {
+        guard let library = try? device.makeDefaultLibrary(bundle: Bundle(for: DockingEngine.self)) else {
             print("[DockingEngine] Failed to create default Metal library")
             return nil
         }
         self.commandQueue = queue
 
         do {
-            stericGridPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "computeStericGrid")!)
-            hydrophobicGridPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "computeHydrophobicGrid")!)
-            hbondGridPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "computeHBondGrid")!)
+            receptorGridPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "computeReceptorGrids")!)
             vinaAffinityGridPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "computeVinaAffinityMaps")!)
-            if let elecFunc = library.makeFunction(name: "computeElectrostaticGrid") {
-                electrostaticGridPipeline = try device.makeComputePipelineState(function: elecFunc)
-            }
             scorePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "scorePoses")!)
             initPopPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "initializePopulation")!)
             evolvePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "gaEvolve")!)
             localSearchPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearch")!)
-            localSearchAnalyticalPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearchAnalytical")!)
             localSearchAnalyticalSIMDPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "localSearchAnalyticalSIMD")!)
             mcPerturbPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "mcPerturb")!)
             metropolisAcceptPipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "metropolisAccept")!)
@@ -511,6 +500,11 @@ final class DockingEngine {
         proteinStructure = protein
         let heavyAtoms = protein.atoms.filter { $0.element != .H }
         self.proteinAtoms = heavyAtoms
+        gridParamsBuffer = nil
+        guard !heavyAtoms.isEmpty else {
+            ActivityLog.shared.error("[Engine] Docking maps need at least one receptor heavy atom", category: .dock)
+            return
+        }
 
         let hydrogensPresent = protein.atoms.count != heavyAtoms.count
         let gpuAtoms = protein.atoms.enumerated().compactMap { atomIndex, atom -> GridProteinAtom? in
@@ -542,16 +536,22 @@ final class DockingEngine {
 
         let activeVinaTypes = Array(Set(requiredVinaTypes.filter { $0 >= 0 && $0 <= maxSupportedVinaType })).sorted()
 
-        let gridMapCount: UInt64 = activeVinaTypes.isEmpty ? 3 : UInt64(3 + activeVinaTypes.count)
+        let gridMapCount = UInt64(4 + max(activeVinaTypes.count, 1))
 
         let searchPadding: Float = 0.0  // pocket.size already includes 4A padding from BindingSite
         let gridPadding: Float = 3.0
         let ligandMargin = ligandExtent ?? SIMD3<Float>(repeating: 4.0)
         let searchCenter = pocket.center
-        // Ensure search box half-extent is at least ligandMargin + padding (so the ligand fits)
-        let minHalfExtent = ligandMargin + SIMD3<Float>(repeating: 2.0)
-        let rawSearchHalfExtent = pocket.size + SIMD3<Float>(repeating: searchPadding)
-        let searchHalfExtent = max(rawSearchHalfExtent, minHalfExtent)
+        // The centroid search region is the requested box, deliberately not widened by the
+        // ligand size. Widening it let a large ligand drift its centroid a full ligand extent
+        // outside the box and settle in a neighbouring pocket, whose poses then outscored the
+        // real one (a 24 Å box around a 31-heavy-atom ligand searched a 35 Å box and ranked a
+        // pose 18 Å off centre first). The ligand's reach is handled by the grid instead,
+        // which is padded by the ligand extent below so that a pose whose centroid sits on the
+        // box face still samples real affinities out to its furthest atom. The floor only
+        // keeps the clamp well formed for a degenerate zero-size box.
+        let searchHalfExtent = max(pocket.size + SIMD3<Float>(repeating: searchPadding),
+                                   SIMD3<Float>(repeating: 1.0))
         let gridHalfExtent = searchHalfExtent + ligandMargin + SIMD3<Float>(repeating: gridPadding)
         let boxMin = searchCenter - gridHalfExtent
         let boxMax = searchCenter + gridHalfExtent
@@ -619,12 +619,13 @@ final class DockingEngine {
 
         var proteinGPUAtoms = gpuAtoms
         proteinAtomBuffer = device.makeBuffer(bytes: &proteinGPUAtoms, length: proteinGPUAtoms.count * MemoryLayout<GridProteinAtom>.stride, options: .storageModeShared)
-        gridParamsBuffer = device.makeBuffer(bytes: &gridParams, length: MemoryLayout<GridParams>.stride, options: .storageModeShared)
+        let paramsBuf = device.makeBuffer(bytes: &gridParams, length: MemoryLayout<GridParams>.stride, options: .storageModeShared)
 
         let gridByteSize = Int(totalPoints) * MemoryLayout<UInt16>.stride
         stericGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
         hydrophobicGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
         hbondGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
+        electrostaticGridBuffer = device.makeBuffer(length: gridByteSize, options: .storageModeShared)
 
         if stericGridBuffer == nil || hydrophobicGridBuffer == nil || hbondGridBuffer == nil {
             ActivityLog.shared.error("[Engine] Grid buffer allocation failed: \(gridByteSize) bytes per map (\(totalPoints) points)", category: .dock)
@@ -668,65 +669,60 @@ final class DockingEngine {
         let tgSize = MTLSize(width: gridThreads, height: 1, depth: 1)
         let tgCount = MTLSize(width: (Int(totalPoints) + gridThreads - 1) / gridThreads, height: 1, depth: 1)
 
-        guard let stericBuf = stericGridBuffer,
-              let hydroBuf = hydrophobicGridBuffer,
-              let hbondBuf = hbondGridBuffer,
-              let stericPipe = stericGridPipeline,
-              let hydroPipe = hydrophobicGridPipeline,
-              let hbondPipe = hbondGridPipeline,
-              let protAtomBuf = proteinAtomBuffer,
-              let gParamsBuf = gridParamsBuffer else { return }
-
-        func dispatchGridKernel(_ pipeline: MTLComputePipelineState, _ gridBuf: MTLBuffer,
-                                threadGroups tg: MTLSize, label: String) {
-            guard let cb = commandQueue.makeCommandBuffer(),
-                  let enc = cb.makeComputeCommandEncoder() else { return }
-            enc.setComputePipelineState(pipeline)
-            enc.setBuffer(gridBuf, offset: 0, index: 0)
-            enc.setBuffer(protAtomBuf, offset: 0, index: 1)
-            enc.setBuffer(gParamsBuf, offset: 0, index: 2)
-            enc.dispatchThreadgroups(tg, threadsPerThreadgroup: tgSize)
-            enc.endEncoding()
-            cb.commit()
-            cb.waitUntilCompleted()
-            if cb.status == .error {
-                ActivityLog.shared.error("[Engine] Grid \(label) GPU error: \(cb.error?.localizedDescription ?? "unknown")", category: .dock)
-            }
+        guard let stericBuf = stericGridBuffer, let hydroBuf = hydrophobicGridBuffer,
+              let hbondBuf = hbondGridBuffer, let electrostaticBuf = electrostaticGridBuffer,
+              let protAtomBuf = proteinAtomBuffer, let paramsBuf,
+              let affinityBuf = vinaAffinityGridBuffer, vinaTypeIndexBuffer != nil,
+              activeVinaTypes.isEmpty || vinaAffinityTypeBuffer != nil,
+              let command = commandQueue.makeCommandBuffer(),
+              let encoder = command.makeComputeCommandEncoder() else {
+            ActivityLog.shared.error("[Engine] Could not allocate docking maps or encode their computation", category: .dock)
+            return
         }
-
-        dispatchGridKernel(stericPipe, stericBuf, threadGroups: tgCount, label: "steric")
-        dispatchGridKernel(hydroPipe, hydroBuf, threadGroups: tgCount, label: "hydrophobic")
-        dispatchGridKernel(hbondPipe, hbondBuf, threadGroups: tgCount, label: "hbond")
-
-        // Electrostatic potential grid (for Drusina Coulomb term)
-        let elecGridSize = Int(totalPoints) * MemoryLayout<UInt16>.stride
-        electrostaticGridBuffer = device.makeBuffer(length: elecGridSize, options: .storageModeShared)
-        if let elecBuf = electrostaticGridBuffer, let elecPipe = electrostaticGridPipeline {
-            dispatchGridKernel(elecPipe, elecBuf, threadGroups: tgCount, label: "electrostatic")
+        let upperNode = boxMin + SIMD3(Float(nx - 1), Float(ny - 1), Float(nz - 1)) * effectiveSpacing
+        let cutoff = SIMD3<Float>(repeating: 12 + effectiveSpacing)
+        let lower = boxMin - cutoff
+        let upper = upperNode + cutoff
+        var nearby = gpuAtoms.filter { atom in
+            let position = atom.position
+            return position.x >= lower.x && position.y >= lower.y && position.z >= lower.z
+                && position.x <= upper.x && position.y <= upper.y && position.z <= upper.z
         }
-
-        if let affinityBuf = vinaAffinityGridBuffer,
-           let affinityTypes = vinaAffinityTypeBuffer {
-            let affinityEntryCount = Int(totalPoints) * activeVinaTypes.count
-            let affinityTGCount = MTLSize(
-                width: (affinityEntryCount + gridThreads - 1) / gridThreads,
-                height: 1, depth: 1
-            )
-            guard let cb = commandQueue.makeCommandBuffer(),
-                  let enc = cb.makeComputeCommandEncoder() else { return }
-            enc.setComputePipelineState(vinaAffinityGridPipeline)
-            enc.setBuffer(affinityBuf, offset: 0, index: 0)
-            enc.setBuffer(protAtomBuf, offset: 0, index: 1)
-            enc.setBuffer(gParamsBuf, offset: 0, index: 2)
-            enc.setBuffer(affinityTypes, offset: 0, index: 3)
-            enc.dispatchThreadgroups(affinityTGCount, threadsPerThreadgroup: tgSize)
-            enc.endEncoding()
-            cb.commit()
-            cb.waitUntilCompleted()
-            if cb.status == .error {
-                ActivityLog.shared.error("[Engine] Affinity grid GPU error: \(cb.error?.localizedDescription ?? "unknown")", category: .dock)
-            }
+        var mapAtoms = protAtomBuf
+        var mapParams = gridParams
+        if nearby.isEmpty {
+            mapParams.numProteinAtoms = 0
+        } else if nearby.count < gpuAtoms.count,
+                  let compact = device.makeBuffer(bytes: &nearby, length: nearby.count * MemoryLayout<GridProteinAtom>.stride,
+                                                  options: .storageModeShared) {
+            mapAtoms = compact
+            mapParams.numProteinAtoms = UInt32(nearby.count)
         }
+        encoder.setComputePipelineState(receptorGridPipeline)
+        encoder.setBuffer(stericBuf, offset: 0, index: 0)
+        encoder.setBuffer(mapAtoms, offset: 0, index: 1)
+        encoder.setBytes(&mapParams, length: MemoryLayout<GridParams>.stride, index: 2)
+        encoder.setBuffer(hydroBuf, offset: 0, index: 3)
+        encoder.setBuffer(hbondBuf, offset: 0, index: 4)
+        encoder.setBuffer(electrostaticBuf, offset: 0, index: 5)
+        encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+
+        if let affinityTypes = vinaAffinityTypeBuffer {
+            let entries = Int(totalPoints) * activeVinaTypes.count
+            let groups = MTLSize(width: (entries + gridThreads - 1) / gridThreads, height: 1, depth: 1)
+            encoder.setComputePipelineState(vinaAffinityGridPipeline)
+            encoder.setBuffer(affinityBuf, offset: 0, index: 0)
+            encoder.setBuffer(affinityTypes, offset: 0, index: 3)
+            encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: tgSize)
+        }
+        encoder.endEncoding()
+        command.commit()
+        command.waitUntilCompleted()
+        guard command.status == .completed else {
+            ActivityLog.shared.error("[Engine] Docking grid GPU error: \(command.error?.localizedDescription ?? "unknown")", category: .dock)
+            return
+        }
+        gridParamsBuffer = paramsBuf
     }
 
     func gridSnapshot() -> DockingGridSnapshot? {
@@ -810,7 +806,9 @@ final class DockingEngine {
         }
         // No dummy padding here: BatchedGAAccelerator pads the flattened arrays itself and
         // uses torsionEdges.count as the ligand's rotatable-bond count (Vina Nrot normalization).
-        let pairList = Self.intramolecularPairList(atomCount: gpuAtoms.count, bonds: prepared.heavyBonds)
+        let pairList = Self.intramolecularPairList(
+            atomCount: gpuAtoms.count, bonds: prepared.heavyBonds,
+            torsionEdges: torsionEdges, movingIndices: movingIndices)
 
         let refIntraE = intramolecularReferenceEnergy(ligandAtoms: gpuAtoms, pairList: pairList)
         let ligRad = max(sqrt(gpuAtoms.map { simd_length_squared($0.position) }.reduce(0, +) / Float(max(gpuAtoms.count, 1))), 1.0)
@@ -823,11 +821,34 @@ final class DockingEngine {
         )
     }
 
-    /// Packed (lo | hi << 16) list of ligand atom pairs scored by the intramolecular term:
-    /// every pair except 1-2 and 1-3 neighbours. Shared by the single-ligand, batched and
-    /// debug scoring paths so all of them score the same pair set.
-    nonisolated static func intramolecularPairList(atomCount: Int, bonds: [Bond]) -> [UInt32] {
+    /// Packed (lo | hi << 16) list of ligand atom pairs scored by the intramolecular term.
+    /// A pair is kept only when its distance can actually change: both ends outside each
+    /// other's 1-2 and 1-3 neighbourhood, and the two atoms moved by different subsets of the
+    /// rotatable bonds. Two atoms of one rigid fragment hold a fixed distance in every pose,
+    /// so their pair energy is a constant that cancels against `referenceIntraEnergy`.
+    /// Scoring them changed no result and cost the dominant share of every energy evaluation,
+    /// the term being O(atoms²) — for a rigid ligand it was the entire list.
+    /// Shared by the single-ligand, batched and debug scoring paths so all of them score the
+    /// same pair set.
+    nonisolated static func intramolecularPairList(
+        atomCount: Int,
+        bonds: [Bond],
+        torsionEdges: [TorsionEdge],
+        movingIndices: [Int32]
+    ) -> [UInt32] {
         guard atomCount > 1 else { return [] }
+        // Which rotatable bonds move each atom. The kernels apply at most 32 torsions, so
+        // atoms moved only by a later one stay fixed relative to the root, as mask 0 says.
+        var torsionMask = [UInt32](repeating: 0, count: atomCount)
+        for (t, edge) in torsionEdges.enumerated() where t < 32 {
+            let start = Int(edge.movingStart)
+            let count = Int(edge.movingCount)
+            guard start >= 0, count > 0, start + count <= movingIndices.count else { continue }
+            for k in start..<(start + count) {
+                let a = Int(movingIndices[k])
+                if a >= 0, a < atomCount { torsionMask[a] |= 1 << UInt32(t) }
+            }
+        }
         var adj: [[Int]] = Array(repeating: [], count: atomCount)
         for bond in bonds {
             let a = bond.atomIndex1, b = bond.atomIndex2
@@ -848,6 +869,7 @@ final class DockingEngine {
         pairList.reserveCapacity(atomCount * (atomCount - 1) / 2)
         for i in 0..<atomCount {
             for j in (i + 1)..<atomCount {
+                guard torsionMask[i] != torsionMask[j] else { continue }
                 let packed = UInt32(i) | (UInt32(j) << 16)
                 if !excluded.contains(packed) { pairList.append(packed) }
             }
@@ -2143,7 +2165,7 @@ final class DockingEngine {
         numProteinAtoms: Int
     ) -> VRAMEstimate {
         let totalPoints = Int(UInt64(gridDims.x) * UInt64(gridDims.y) * UInt64(gridDims.z))
-        let gridMapCount = 3 + numAffinityTypes
+        let gridMapCount = 4 + max(numAffinityTypes, 1)
         let gridBytes = totalPoints * MemoryLayout<UInt16>.stride * gridMapCount
 
         let poseStride = 304
@@ -2246,7 +2268,7 @@ final class DockingEngine {
             bonds: ligand.bonds,
             includeTerminator: false
         )
-        if let tree = RDKitBridge.buildTorsionTreeMolBlock(molBlock), !tree.isEmpty {
+        if let tree = RDKitBridge.buildTorsionTreeMolBlock(molBlock) {
             return tree
         }
 
@@ -2256,7 +2278,7 @@ final class DockingEngine {
                 ? ligand.title : nil)
 
         if let smi = smilesSource, !smi.isEmpty,
-           let tree = RDKitBridge.buildTorsionTree(smiles: smi), !tree.isEmpty {
+           let tree = RDKitBridge.buildTorsionTree(smiles: smi) {
             return tree
         }
         return buildGraphTorsionTree(atomCount: ligand.heavyAtomCount, bonds: heavyBonds, atoms: ligand.atoms.filter { $0.element != .H })

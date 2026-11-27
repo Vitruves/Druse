@@ -29,6 +29,7 @@ typedef struct {
     float tempFactor;
     char altLoc[4];
     bool isHetAtom;
+    char insertionCode[2];
 } DruseAtom;
 
 typedef struct {

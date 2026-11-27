@@ -533,7 +533,7 @@ struct ReplicaParams {
     uint32_t    numReplicas;            // K temperature replicas (max 16)
     uint32_t    populationPerReplica;   // poses per replica
     uint32_t    totalPoses;             // numReplicas * populationPerReplica
-    uint32_t    swapGeneration;         // current generation (for swap timing)
+    uint32_t    swapInterval;
     float       temperatures[MAX_REPLICAS]; // T_1 < T_2 < ... < T_K (kcal/mol)
 };
 

@@ -108,6 +108,25 @@ final class DruseScriptParserTests: XCTestCase {
         ])
     }
 
+    func testAssignmentWithSpaceOnlyBeforeEqualsAndQuotedValue() {
+        XCTAssertEqual(statements("set x =\"a b\""), [
+            .assignment(name: "x", value: ScriptWord(text: "a b", isQuoted: true, location: loc(1, 8)), location: loc(1, 1)),
+        ])
+        XCTAssertNotNil(syntaxError("echo =\"a b\""))
+    }
+
+    func testVectorRequiresThreeFiniteComponents() throws {
+        func vector(_ text: String) throws -> ConsoleValue {
+            try ConsoleBinder.convert(ScriptWord(text: text, isQuoted: false, location: loc(1, 1)),
+                                      as: .vec3, name: "center", baseDirectory: FileManager.default.temporaryDirectory)
+        }
+        guard case .vec3(let center) = try vector("-1.5, 0,2e1") else { return XCTFail("expected a vector") }
+        XCTAssertEqual(center, SIMD3(-1.5, 0, 20))
+        for invalid in [",1,2,3", "1,,2,3", "1,2,3,", "1,nan,3", "1,2,inf", "1e99,2,3"] {
+            XCTAssertThrowsError(try vector(invalid), invalid)
+        }
+    }
+
     func testUnquotedSMILESStaysPositional() {
         XCTAssertEqual(statements("ligand smiles CC(=O)O name=acid"), [
             .command(ScriptCommand(
@@ -268,6 +287,23 @@ final class DruseScriptParserTests: XCTestCase {
         let completer = completer(directory: directory)
         XCTAssertEqual(completer.completions(for: "load li").map(\.text), ["ligand.sdf "])
         XCTAssertEqual(completer.completions(for: "load su").map(\.text), ["\"sub dir/"])
+    }
+
+    @MainActor
+    func testCompletedPathsRoundTripThroughParser() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let folder = "sub\tfolder"
+        let filename = "a\"b\\c\nfile"
+        let nested = directory.appendingPathComponent(folder)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data().write(to: nested.appendingPathComponent(filename))
+
+        let completer = completer(directory: directory)
+        let partial = "load su"
+        let folderLine = try XCTUnwrap(completer.completions(for: partial).first).applied(to: partial)
+        let fileLine = try XCTUnwrap(completer.completions(for: folderLine).first).applied(to: folderLine)
+        XCTAssertEqual(commands(fileLine).first?.arguments.map(\.text), [folder + "/" + filename])
     }
 
     @MainActor

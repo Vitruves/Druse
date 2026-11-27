@@ -11,6 +11,138 @@ import MetalKit
 /// with tuned-down GA parameters for fast execution while still validating correctness.
 final class PipelineTests: DockingTestCase {
 
+    func testPopulationStartsInsideTranslatedSearchBox() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let library = try device.makeDefaultLibrary(bundle: Bundle(for: DockingEngine.self))
+        let kernel = try XCTUnwrap(library.makeFunction(name: "initializePopulation"))
+        let pipeline = try device.makeComputePipelineState(function: kernel)
+        var grid = GridParams()
+        grid.searchCenter = SIMD3(31, -23, 11)
+        grid.searchHalfExtent = SIMD3(5, 7, 11)
+        var params = GAParams()
+        params.populationSize = 256
+        params.runSeed = 7
+        let count = Int(params.populationSize)
+        let buffer = try XCTUnwrap(device.makeBuffer(length: count * MemoryLayout<DockPose>.stride, options: .storageModeShared))
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(buffer, offset: 0, index: 0)
+        encoder.setBytes(&grid, length: MemoryLayout<GridParams>.stride, index: 1)
+        encoder.setBytes(&params, length: MemoryLayout<GAParams>.stride, index: 2)
+        encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        encoder.endEncoding()
+        command.commit()
+        command.waitUntilCompleted()
+        XCTAssertNil(command.error)
+        let poses = buffer.contents().assumingMemoryBound(to: DockPose.self)
+        for index in 0..<count {
+            let delta = simd_abs(poses[index].translation - grid.searchCenter)
+            XCTAssertLessThanOrEqual(simd_reduce_max(delta - grid.searchHalfExtent), 0)
+        }
+    }
+
+    func testReceptorGridsRespectAtomTypesAndDistanceCutoffs() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let library = try device.makeDefaultLibrary(bundle: Bundle(for: DockingEngine.self))
+        let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "computeReceptorGrids")))
+        var carbon = GridProteinAtom()
+        carbon.vdwRadius = 1.5
+        carbon.charge = 0.1
+        carbon.vinaType = Int32(VINA_C_H.rawValue)
+        var oxygen = carbon
+        oxygen.vinaType = Int32(VINA_O_A.rawValue)
+        var distant = carbon
+        distant.position = SIMD3(repeating: 200)
+        let atoms = [carbon] + Array(repeating: distant, count: 127) + [oxygen]
+        var params = GridParams()
+        params.dims = SIMD3(14, 1, 1)
+        params.spacing = 1
+        params.totalPoints = params.dims.x
+        params.numProteinAtoms = UInt32(atoms.count)
+        let outputs = try (0..<4).map { _ in try XCTUnwrap(device.makeBuffer(length: Int(params.totalPoints) * 2, options: .storageModeShared)) }
+        let receptor = try XCTUnwrap(device.makeBuffer(bytes: atoms, length: atoms.count * MemoryLayout<GridProteinAtom>.stride))
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(receptor, offset: 0, index: 1)
+        encoder.setBytes(&params, length: MemoryLayout<GridParams>.stride, index: 2)
+        for (output, slot) in zip(outputs, [0, 3, 4, 5]) { encoder.setBuffer(output, offset: 0, index: slot) }
+        encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        encoder.endEncoding()
+        command.commit()
+        command.waitUntilCompleted()
+        XCTAssertNil(command.error)
+        for index in 0..<Int(params.totalPoints) {
+            let radius = Float(index)
+            let gap = max(radius, 0.1) - 3
+            let near = 2 * gap, far = (gap - 3) / 2, overlap = min(gap, 0)
+            let steric: Float = -0.035579 * exp(-near * near) - 0.005156 * exp(-far * far) + 0.840245 * overlap * overlap
+            let expected: [Float] = [
+                radius <= 8 ? 2 * steric : 0,
+                radius <= 8 ? -0.035069 * min(1, max(0, 1.5 - gap)) : 0,
+                radius <= 8 ? -0.587439 * min(1, max(0, -gap / 0.7)) : 0,
+                radius <= 12 ? 16.6 / pow(max(radius, 0.8), 2) : 0,
+            ]
+            for (output, value) in zip(outputs, expected) {
+                let actual = output.contents().assumingMemoryBound(to: Float16.self)[index]
+                XCTAssertEqual(Float(actual), value, accuracy: max(1e-6, abs(value) * 0.001))
+            }
+        }
+    }
+
+    func testReplicaExchangeUsesEachWalkersEnergyAndAlternatesRounds() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let library = try device.makeDefaultLibrary(bundle: Bundle(for: DockingEngine.self))
+        let pipeline = try device.makeComputePipelineState(function: XCTUnwrap(library.makeFunction(name: "replicaSwap")))
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let energies: [Float] = [10000, 0, 0, 10000, 0, 0]
+        let poses = energies.enumerated().map { index, energy in
+            var pose = DockPose()
+            pose.generation = Int32(index)
+            pose.energy = energy
+            return pose
+        }
+        let bytes = poses.count * MemoryLayout<DockPose>.stride
+        let current = try XCTUnwrap(device.makeBuffer(bytes: poses, length: bytes, options: .storageModeShared))
+        let best = try XCTUnwrap(device.makeBuffer(bytes: poses, length: bytes, options: .storageModeShared))
+        var replicas = ReplicaParams()
+        replicas.numReplicas = 3
+        replicas.populationPerReplica = 2
+        replicas.totalPoses = 6
+        replicas.temperatures.0 = 1
+        replicas.temperatures.1 = 2
+        replicas.temperatures.2 = 3
+        replicas.swapInterval = 4
+        func exchange(generation: UInt32, expected: [Int32]) throws {
+            var params = GAParams()
+            params.generation = generation
+            let command = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(command.makeComputeCommandEncoder())
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(current, offset: 0, index: 0)
+            encoder.setBuffer(best, offset: 0, index: 1)
+            encoder.setBytes(&replicas, length: MemoryLayout<ReplicaParams>.stride, index: 2)
+            encoder.setBytes(&params, length: MemoryLayout<GAParams>.stride, index: 3)
+            let threads = MTLSize(width: 2, height: 1, depth: 1)
+            encoder.dispatchThreads(threads, threadsPerThreadgroup: threads)
+            encoder.endEncoding()
+            command.commit()
+            command.waitUntilCompleted()
+            XCTAssertNil(command.error)
+            for buffer in [current, best] {
+                let output = buffer.contents().assumingMemoryBound(to: DockPose.self)
+                XCTAssertEqual(poses.indices.map { output[$0].generation }, expected)
+            }
+        }
+        try exchange(generation: 3, expected: [2, 1, 0, 3, 4, 5])
+        try exchange(generation: 7, expected: [2, 1, 4, 5, 0, 3])
+    }
+
     // MARK: - GA Docking: Core Validation
 
     /// Full GA pipeline with aspirin — validates results are non-empty, finite, sorted,
@@ -83,6 +215,8 @@ final class PipelineTests: DockingTestCase {
             ligandSmiles: "c1ccccc1", ligandName: "Benzene")
 
         var config = DockingConfig()
+        config.explicitRerankTopClusters = 1
+        config.randomSeed = 19
         config.searchMethod = .parallelTempering
         config.populationSize = 32
         config.generationsPerRun = 30
@@ -95,9 +229,14 @@ final class PipelineTests: DockingTestCase {
         let results = await engine.runDocking(
             ligand: ligand, pocket: pocket, config: config, scoringMethod: .vina)
 
-        XCTAssertFalse(results.isEmpty, "REMC should produce results")
+        let best = try XCTUnwrap(results.first)
+        XCTAssertGreaterThan(Set(results.map(\.clusterID)).count, 1)
+        XCTAssertEqual(results.map(\.energy), results.map(\.energy).sorted())
         for r in results {
-            XCTAssertTrue(r.energy.isFinite, "REMC energy not finite: \(r.energy)")
+            XCTAssertLessThanOrEqual(r.energy - best.energy, DockingEngine.outputEnergyRangeKcal + 1e-5)
+            // Rigid benzene has no rotatable bonds. Every mode, including those outside
+            // the refinement budget, must carry the explicit intermolecular score.
+            XCTAssertEqual(r.energy, r.stericEnergy + r.hydrophobicEnergy + r.hbondEnergy, accuracy: 1e-4)
         }
     }
 

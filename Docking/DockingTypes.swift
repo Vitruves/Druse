@@ -51,7 +51,7 @@ struct DockingConfig: Sendable {
     var explicitRerankLocalSearchSteps: Int = 20 // short second-pass refinement on rerank seeds
 
     // Local search (Vina-like basin hopping: refine every MC step by default)
-    var localSearchFrequency: Int = 3   // every N generations
+    var localSearchFrequency: Int = 1   // every N generations
     var localSearchSteps: Int = 20      // gradient descent steps per refinement
     var liveUpdateFrequency: Int = 10   // visual update every N generations (higher = fewer GPU syncs = faster)
 
@@ -86,7 +86,7 @@ struct DockingConfig: Sendable {
     var explorationTranslationStep: Float = 5.0  // wider initial translation (vs 2.0 during refinement)
     var explorationRotationStep: Float = 0.8     // wider initial rotation (vs 0.3)
     var explorationMutationRate: Float = 0.35    // higher mutation during exploration (raised from 0.25)
-    var explorationLocalSearchFrequency: Int = 3  // during exploration, LS every 3rd gen
+    var explorationLocalSearchFrequency: Int = 1  // basin hopping needs the minimisation every step
 
     // Post-docking refinement
     var gfn2Refinement: GFN2RefinementConfig = GFN2RefinementConfig()
@@ -284,8 +284,12 @@ struct ParallelTemperingConfig: Sendable {
     var maxTemperature: Float = 4.0
     /// Attempt replica swaps every N generations.
     var swapInterval: Int = 5
-    /// MC steps per replica before result extraction.
-    var stepsPerReplica: Int = 200
+    /// MC steps per replica before result extraction. Each step is a perturbation followed by
+    /// an L-BFGS minimisation, and it is chain depth — not walker count — that decides whether
+    /// a walker reaches its basin: on a 30-complex redocking panel, raising this from 120 to
+    /// 2000 moved top-1 RMSD < 2 Å from 14/60 to 24/60, while costing 3.5× the time rather
+    /// than 16× because a converged walker exits its line search immediately.
+    var stepsPerReplica: Int = 2000
 }
 
 // MARK: - VRAM Estimation

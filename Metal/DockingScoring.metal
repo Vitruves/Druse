@@ -35,8 +35,8 @@ kernel void scorePoses(
 
     transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
 
-    float3 gridMin = gridParams.origin;
-    float3 gridMax = gridUpperBound(gridParams);
+    float3 boxMin = searchBoxMin(gridParams);
+    float3 boxMax = searchBoxMax(gridParams);
 
     float totalIntermolecular = 0.0f;
     float penalty = 0.0f;
@@ -44,11 +44,8 @@ kernel void scorePoses(
     for (uint a = 0; a < nA; a++) {
         float3 r = positions[a];
 
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) {
-            penalty += oopP;
-            continue;
-        }
+        penalty += outOfBoxPenalty(r, boxMin, boxMax);
+        if (!insideGrid(r, gridParams)) continue;
         totalIntermolecular += sampleTypedAffinityMap(
             affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gridParams
         );
@@ -109,8 +106,8 @@ kernel void scorePosesExplicit(
     float3 positions[128];
     transformAtoms(positions, ligandAtoms, nAtoms, pose, torsionEdges, movingIndices, nTorsions);
 
-    float3 gridMin = gridParams.origin;
-    float3 gridMax = gridUpperBound(gridParams);
+    float3 boxMin = searchBoxMin(gridParams);
+    float3 boxMax = searchBoxMax(gridParams);
 
     float totalSteric = 0.0f;
     float totalHydrophobic = 0.0f;
@@ -120,11 +117,7 @@ kernel void scorePosesExplicit(
     for (uint a = 0; a < nAtoms; a++) {
         float3 r = positions[a];
 
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) {
-            penalty += oopP;
-            continue;
-        }
+        penalty += outOfBoxPenalty(r, boxMin, boxMax);
 
         // SIMD-cooperative: distribute protein atoms across lanes, reduce with simd_sum
         float laneSteric = 0.0f;
@@ -918,15 +911,15 @@ kernel void scorePosesDrusina(
     transformAtoms(positions, ligandAtoms, nA, pose, torsionEdges, movingIndices, nTorsions);
 
     // --- Base Vina scoring from grid maps ---
-    float3 gridMin = gridParams.origin;
-    float3 gridMax = gridUpperBound(gridParams);
+    float3 boxMin = searchBoxMin(gridParams);
+    float3 boxMax = searchBoxMax(gridParams);
     float totalIntermolecular = 0.0f;
     float penalty = 0.0f;
 
     for (uint a = 0; a < nA; a++) {
         float3 r = positions[a];
-        float oopP = outOfGridPenalty(r, gridMin, gridMax);
-        if (oopP > 0.0f) { penalty += oopP; continue; }
+        penalty += outOfBoxPenalty(r, boxMin, boxMax);
+        if (!insideGrid(r, gridParams)) continue;
         totalIntermolecular += sampleTypedAffinityMap(
             affinityMaps, typeIndexLookup, ligandAtoms[a].vinaType, r, gridParams);
     }

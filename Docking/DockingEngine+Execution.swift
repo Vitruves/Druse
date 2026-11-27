@@ -163,8 +163,9 @@ extension DockingEngine {
         buffer: MTLBuffer,
         gridParamsBuffer: MTLBuffer,
         gaParamsBuffer: MTLBuffer,
-        populationSize: Int
-    ) {
+        populationSize: Int,
+        finishAfterStop: Bool = false
+    ) -> Bool {
         let simdWidth = explicitScorePipeline.threadExecutionWidth
         let totalThreads = max(populationSize, 1) * simdWidth
         let tgSize = MTLSize(width: simdWidth, height: 1, depth: 1)
@@ -176,8 +177,8 @@ extension DockingEngine {
             (intraPairsBuffer!, 7)
         ]
         buffers.append(contentsOf: pharmacophoreBindings())
-        dispatchCompute(pipeline: explicitScorePipeline, buffers: buffers,
-                        threadGroups: tgCount, threadGroupSize: tgSize)
+        return dispatchCompute(pipeline: explicitScorePipeline, buffers: buffers,
+                        threadGroups: tgCount, threadGroupSize: tgSize, finishAfterStop: finishAfterStop)
     }
 
     /// Decompose Vina intermolecular energy into steric/hydrophobic/hbond via explicit
@@ -185,6 +186,7 @@ extension DockingEngine {
     /// left untouched so rankings are not affected.
     func decomposeVinaEnergy(
         buffer: MTLBuffer,
+        gaParamsBuffer: MTLBuffer?,
         populationSize: Int
     ) {
         guard let ligBuf = ligandAtomBuffer,
@@ -238,9 +240,10 @@ extension DockingEngine {
         _ results: [DockingResult],
         scoringMethod: ScoringMethod,
         ligandAtoms: [Atom],
-        centroid: SIMD3<Float>
-    ) -> [DockingResult] {
-        guard config.explicitRerankTopClusters > 0,
+        centroid: SIMD3<Float>,
+        explicitlyScoredPopulation: [DockingResult]?
+    ) async -> [DockingResult] {
+        guard isRunning, config.explicitRerankTopClusters > 0,
               proteinAtomBuffer != nil,
               let gridParamsBuffer,
               let gaParamsBuffer,
@@ -248,7 +251,6 @@ extension DockingEngine {
             return results
         }
 
-        let grouped = Dictionary(grouping: results, by: \.clusterID)
         let leaders = results
             .filter { $0.clusterRank == 0 }
             .sorted { $0.energy < $1.energy }
@@ -318,21 +320,27 @@ extension DockingEngine {
                 tgs: tgSize
             )
         } else {
-            scorePopulationExplicit(
+            guard scorePopulationExplicit(
                 buffer: repBuffer,
                 gridParamsBuffer: gridParamsBuffer,
                 gaParamsBuffer: rerankGABuffer,
                 populationSize: representativePoses.count
-            )
+            ) else { return results }
         }
 
         let rescoredLeaders = extractAllResults(
             from: repBuffer,
             ligandAtoms: ligandAtoms,
             centroid: centroid,
-            idOffset: 0,
-            sortByEnergy: false
+            idOffset: explicitlyScoredPopulation?.count ?? 0,
+            maxPoses: representativePoses.count
         )
+        if let explicitlyScoredPopulation {
+            // Keep the original minima too: optimizing on the grid can worsen the explicit
+            // energy. Select modes from the final geometries on a single energy scale.
+            let candidates = explicitlyScoredPopulation + rescoredLeaders
+            return await clusterPoses(Self.withinOutputEnergyWindow(candidates, scoringMethod: scoringMethod))
+        }
         guard rescoredLeaders.count == representativePoses.count else { return results }
 
         var representativeByCluster: [Int: DockingResult] = [:]
@@ -346,6 +354,7 @@ extension DockingEngine {
             }
         }
 
+        let grouped = Dictionary(grouping: results, by: \.clusterID)
         let sortedClusterIDs = leaders
             .map(\.clusterID)
             .sorted {
@@ -494,7 +503,9 @@ extension DockingEngine {
         }
 
         // Build flat pair list for intramolecular energy
-        let pairList = Self.intramolecularPairList(atomCount: gpuLigAtoms.count, bonds: heavyBonds)
+        let pairList = Self.intramolecularPairList(
+            atomCount: gpuLigAtoms.count, bonds: heavyBonds,
+            torsionEdges: torsionEdges, movingIndices: movingIndices)
         // The GPU buffer needs at least one element; numIntraPairs (below) keeps the real count.
         var pairStorage = pairList.isEmpty ? [UInt32(0)] : pairList
 
@@ -584,14 +595,6 @@ extension DockingEngine {
             offspringBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
             bestPopulationBuffer = device.makeBuffer(length: poseSize, options: .storageModeShared)
             lastPopulationBufferCapacity = poseSize
-        }
-
-        if let bestBuf = bestPopulationBuffer {
-            let totalPoseSlots = bestBuf.length / MemoryLayout<DockPose>.stride
-            let ptr = bestBuf.contents().bindMemory(to: DockPose.self, capacity: totalPoseSlots)
-            for i in 0..<totalPoseSlots {
-                ptr[i].energy = .infinity
-            }
         }
 
         var gaParams = GAParams(
@@ -703,27 +706,22 @@ extension DockingEngine {
         // rereferencedToBestPoseIntra); live poses use the same reference so the
         // "best so far" readout matches the final ranking.
         let usesBestPoseReference = scoringMethod == .vina && !(flexEngine?.isEnabled ?? false)
-        func publishLiveBest(_ best: DockingResult, interactions: [MolecularInteraction]) {
-            let shown = usesBestPoseReference
-                ? bestPoseReferenceShift(
-                    best, ligandAtoms: gpuLigAtoms, pairList: pairList,
-                    inputReferenceIntra: referenceIntraEnergy, numTorsions: numTorsions
-                  )?.applied(to: best) ?? best
-                : best
-            onPoseUpdate?(shown, interactions)
-        }
-
-        func emitLiveUpdate(generation: Int) {
-            if let best = extractBestPose(from: bestPopulationBuffer, ligandAtoms: heavyAtoms, centroid: centroid) {
+        func emitLiveUpdate(generation: Int, buffer: MTLBuffer?, count: Int) {
+            if let best = extractBestPose(from: buffer, ligandAtoms: heavyAtoms, centroid: centroid, maxPoses: count) {
                 bestEnergy = min(bestEnergy, best.energy)
-                let interactions = InteractionDetector.detect(
-                    ligandAtoms: heavyAtoms,
-                    ligandPositions: best.transformedAtomPositions,
-                    proteinAtoms: proteinAtoms,
-                    ligandBonds: heavyBonds,
-                    scoringMethod: scoringMethod
-                )
-                publishLiveBest(best, interactions: interactions)
+                if let onPoseUpdate {
+                    let interactions = InteractionDetector.detect(
+                        ligandAtoms: heavyAtoms, ligandPositions: best.transformedAtomPositions,
+                        proteinAtoms: proteinAtoms, ligandBonds: heavyBonds, scoringMethod: scoringMethod
+                    )
+                    let shown = usesBestPoseReference
+                        ? bestPoseReferenceShift(
+                            best, ligandAtoms: gpuLigAtoms, pairList: pairList,
+                            inputReferenceIntra: referenceIntraEnergy, numTorsions: numTorsions
+                          )?.applied(to: best) ?? best
+                        : best
+                    onPoseUpdate(shown, interactions)
+                }
             }
             onGenerationComplete?(generation, bestEnergy)
         }
@@ -742,6 +740,20 @@ extension DockingEngine {
             ActivityLog.shared.error("[Engine] Critical buffer nil — cannot start GA. pop=\(populationBuffer != nil) grid=\(gridParamsBuffer != nil) ligand=\(ligandAtomBuffer != nil) torsion=\(torsionEdgeBuffer != nil) moving=\(movingIndicesBuffer != nil) exclusion=\(intraPairsBuffer != nil) ga=\(gaParamsBuffer != nil)", category: .dock)
             isRunning = false
             return []
+        }
+        let useExplicitOutput = usesBestPoseReference && config.explicitRerankTopClusters > 0 && proteinAtomBuffer != nil
+        var outputScoringFailed = false
+        func finishVinaScores(_ buffer: MTLBuffer, params: MTLBuffer, count: Int) {
+            if useExplicitOutput {
+                // On cancellation the saved walkers remain reportable. Finish scoring those
+                // poses on the same scale as populations from earlier runs.
+                if !scorePopulationExplicit(buffer: buffer, gridParamsBuffer: gpBuf, gaParamsBuffer: params,
+                                            populationSize: count, finishAfterStop: true) {
+                    outputScoringFailed = true
+                }
+            } else {
+                decomposeVinaEnergy(buffer: buffer, gaParamsBuffer: params, populationSize: count)
+            }
         }
         let affinityBuf = vinaAffinityGridBuffer
         let typeIdxBuf = vinaTypeIndexBuffer
@@ -769,6 +781,7 @@ extension DockingEngine {
 
             var repGAParams = gaParams
             repGAParams.populationSize = UInt32(totalPoses)
+            repGAParams.runSeed = config.randomSeed == 0 ? UInt32.random(in: 0...UInt32.max) : config.randomSeed
             guard let replicaPopBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared),
                   let replicaOffBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared),
                   let replicaBestBuf = device.makeBuffer(length: totalPoseSize, options: .storageModeShared),
@@ -788,7 +801,8 @@ extension DockingEngine {
             repParams.numReplicas = UInt32(K)
             repParams.populationPerReplica = UInt32(popPerReplica)
             repParams.totalPoses = UInt32(totalPoses)
-            repParams.swapGeneration = 0
+            let swapInterval = max(config.replicaExchange.swapInterval, 1)
+            repParams.swapInterval = UInt32(swapInterval)
             let tMin = config.replicaExchange.minTemperature
             let tMax = config.replicaExchange.maxTemperature
             withUnsafeMutablePointer(to: &repParams.temperatures) { ptr in
@@ -802,10 +816,10 @@ extension DockingEngine {
                     }
                 }
             }
-            replicaParamsBuffer = device.makeBuffer(bytes: &repParams, length: MemoryLayout<ReplicaParams>.stride, options: .storageModeShared)
-
-            let repGAParamsRing = (0..<3).compactMap { _ in
-                device.makeBuffer(length: MemoryLayout<GAParams>.stride, options: .storageModeShared)
+            guard let repParamsBuf = device.makeBuffer(bytes: &repParams, length: MemoryLayout<ReplicaParams>.stride, options: .storageModeShared) else {
+                ActivityLog.shared.error("[Engine] Could not allocate REMC temperature ladder", category: .dock)
+                isRunning = false
+                return []
             }
 
             let repTgSize = MTLSize(width: min(totalPoses, 256), height: 1, depth: 1)
@@ -831,7 +845,6 @@ extension DockingEngine {
                 category: .dock
             )
 
-            let swapInterval = max(config.replicaExchange.swapInterval, 1)
             let stepsPerReplica = config.replicaExchange.stepsPerReplica
             var lastCmdBuf: (any MTLCommandBuffer)?
             let explorationCutoff = Int(Float(stepsPerReplica) * config.explorationPhaseRatio)
@@ -862,83 +875,46 @@ extension DockingEngine {
                     ? max(config.explorationLocalSearchFrequency, 1)
                     : localSearchFrequency
 
-                repParams.swapGeneration = UInt32(step)
-                replicaParamsBuffer?.contents().copyMemory(from: &repParams, byteCount: MemoryLayout<ReplicaParams>.stride)
-
-                let ringBuf = repGAParamsRing[step % 3]
-                ringBuf.contents().copyMemory(from: &repGAParams, byteCount: MemoryLayout<GAParams>.stride)
-
-                guard let repParamsBuf = replicaParamsBuffer else { break }
-
-                let perturbBuffers: [(MTLBuffer, Int)] = [
-                    (replicaOffBuf, 0), (replicaPopBuf, 1),
-                    (ringBuf, 2), (gpBuf, 3), (repParamsBuf, 4)
-                ]
-                let scoreBuffers: [(MTLBuffer, Int)] = [
-                    (replicaOffBuf, 0), (ligBuf, 1),
-                    (afBuf, 2), (tiBuf, 3),
-                    (gpBuf, 4), (ringBuf, 5),
-                    (teBuf, 6), (miBuf, 7),
-                    (emBuf, 8)
-                ] + pharmaBuffers
-                let acceptBuffers: [(MTLBuffer, Int)] = [
-                    (replicaPopBuf, 0), (replicaOffBuf, 1),
-                    (replicaBestBuf, 2), (ringBuf, 3), (repParamsBuf, 4)
-                ]
-
-                let doLS = step % effectiveLSFreq == 0 && !useDruseAF
-
-                var dispatches: [(pipeline: MTLComputePipelineState, buffers: [(MTLBuffer, Int)])] = [
-                    (pipeline: perturbPipe, buffers: perturbBuffers),
-                    (pipeline: scorePipeline, buffers: scoreBuffers)
-                ]
-
-                if doLS && !localSearchIsSIMD {
-                    dispatches.insert((pipeline: activeLocalSearchPipeline, buffers: scoreBuffers), at: 1)
+                guard let command = commandQueue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
+                    if let lastCmdBuf { await lastCmdBuf.completed() }
+                    ActivityLog.shared.error("[Engine] Could not encode REMC generation", category: .dock)
+                    isRunning = false
+                    return []
                 }
-
-                dispatches.append((pipeline: acceptPipe, buffers: acceptBuffers))
-
-                if doLS && localSearchIsSIMD {
-                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: repTgCount, threadGroupSize: repTgSize)
-                    let loTempPoses = popPerReplica
-                    let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
-                    let simdTgCount = MTLSize(width: loTempPoses, height: 1, depth: 1)
-                    lastCmdBuf = dispatchComputeAsync(pipeline: activeLocalSearchPipeline, buffers: scoreBuffers,
-                                                       threadGroups: simdTgCount, threadGroupSize: simdTgSize)
-                } else {
-                    lastCmdBuf = dispatchBatchAsync(dispatches, threadGroups: repTgCount, threadGroupSize: repTgSize)
+                func encode(_ pipeline: MTLComputePipelineState, _ buffers: [(MTLBuffer, Int)],
+                            paramsAt index: Int, threads: Int, groupWidth: Int) {
+                    encoder.setComputePipelineState(pipeline)
+                    for (buffer, slot) in buffers { encoder.setBuffer(buffer, offset: 0, index: slot) }
+                    encoder.setBytes(&repGAParams, length: MemoryLayout<GAParams>.stride, index: index)
+                    encoder.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1),
+                                            threadsPerThreadgroup: MTLSize(width: groupWidth, height: 1, depth: 1))
                 }
-
-                if step % swapInterval == 0 && step > 0 {
-                    if let buf = lastCmdBuf {
-                        await buf.completed()
-                        lastCmdBuf = nil
-                    }
-                    let swapTgCount = MTLSize(width: max(K - 1, 1), height: 1, depth: 1)
-                    let swapTgSize = MTLSize(width: max(K - 1, 1), height: 1, depth: 1)
-                    lastCmdBuf = dispatchComputeAsync(pipeline: swapPipe, buffers: [
-                        (replicaPopBuf, 0), (replicaBestBuf, 1), (repParamsBuf, 2)
-                    ], threadGroups: swapTgCount, threadGroupSize: swapTgSize)
+                let scoreBuffers = [(replicaOffBuf, 0), (ligBuf, 1), (afBuf, 2), (tiBuf, 3),
+                                    (gpBuf, 4), (teBuf, 6), (miBuf, 7), (emBuf, 8)] + pharmaBuffers
+                encode(perturbPipe, [(replicaOffBuf, 0), (replicaPopBuf, 1), (gpBuf, 3), (repParamsBuf, 4)],
+                       paramsAt: 2, threads: totalPoses, groupWidth: repTgSize.width)
+                if step % effectiveLSFreq == 0 && !useDruseAF {
+                    let lanes = localSearchIsSIMD ? 32 : 1
+                    encode(activeLocalSearchPipeline, scoreBuffers, paramsAt: 5,
+                           threads: totalPoses * lanes, groupWidth: localSearchIsSIMD ? lanes : repTgSize.width)
                 }
+                encode(scorePipeline, scoreBuffers, paramsAt: 5, threads: totalPoses, groupWidth: repTgSize.width)
+                encode(acceptPipe, [(replicaPopBuf, 0), (replicaOffBuf, 1), (replicaBestBuf, 2), (repParamsBuf, 4)],
+                       paramsAt: 3, threads: totalPoses, groupWidth: repTgSize.width)
+                if K > 1 && (step + 1).isMultiple(of: swapInterval) {
+                    encode(swapPipe, [(replicaPopBuf, 0), (replicaBestBuf, 1), (repParamsBuf, 2)],
+                           paramsAt: 3, threads: (K / 2) * popPerReplica, groupWidth: repTgSize.width)
+                }
+                encoder.endEncoding()
+                command.commit()
+                lastCmdBuf = command
 
                 if step % liveUpdateFrequency == 0 || step == stepsPerReplica - 1 {
                     if let buf = lastCmdBuf {
                         await buf.completed()
                         lastCmdBuf = nil
                     }
-                    if let best = extractBestPose(from: replicaBestBuf, ligandAtoms: heavyAtoms, centroid: centroid, maxPoses: popPerReplica) {
-                        bestEnergy = min(bestEnergy, best.energy)
-                        let interactions = InteractionDetector.detect(
-                            ligandAtoms: heavyAtoms,
-                            ligandPositions: best.transformedAtomPositions,
-                            proteinAtoms: proteinAtoms,
-                            ligandBonds: heavyBonds,
-                            scoringMethod: scoringMethod
-                        )
-                        publishLiveBest(best, interactions: interactions)
-                    }
-                    onGenerationComplete?(step, bestEnergy)
+                    emitLiveUpdate(generation: step, buffer: replicaBestBuf, count: totalPoses)
                 }
                 await Task.yield()
             }
@@ -947,15 +923,13 @@ extension DockingEngine {
                 await buf.completed()
             }
 
-            decomposeVinaEnergy(buffer: replicaBestBuf, populationSize: totalPoses)
+            finishVinaScores(replicaBestBuf, params: initGABuf, count: totalPoses)
 
             aggregatedResults = extractAllResults(
                 from: replicaBestBuf,
                 ligandAtoms: heavyAtoms,
                 centroid: centroid,
-                idOffset: 0,
-                maxPoses: totalPoses,
-                scoringMethod: scoringMethod
+                maxPoses: totalPoses
             )
 
             ActivityLog.shared.info("[Engine] REMC completed: \(aggregatedResults.count) poses extracted from \(K) replicas", category: .dock)
@@ -1024,14 +998,14 @@ extension DockingEngine {
             let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
             scorePIGNet2(buffer: bestBuf, gaParamsBuffer: gaBuf, tg: pigTgCount, tgs: pigTgSize)
         } else {
-            decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+            finishVinaScores(bestBuf, params: gaBuf, count: popSize)
         }
 
         aggregatedResults = extractAllResults(
             from: bestBuf,
             ligandAtoms: heavyAtoms,
             centroid: centroid,
-            scoringMethod: scoringMethod
+            maxPoses: popSize
         )
         ActivityLog.shared.info("[Engine] Fragment-based docking complete: \(aggregatedResults.count) poses extracted", category: .dock)
 
@@ -1057,7 +1031,7 @@ extension DockingEngine {
             guard let self = self else { return }
             self.copyPoseBuffer(from: popBuf, to: bestBuf, poseCount: popSize)
             self.currentGeneration = step
-            emitLiveUpdate(generation: step)
+            emitLiveUpdate(generation: step, buffer: bestBuf, count: popSize)
         }
 
         if useAFv4 {
@@ -1176,42 +1150,27 @@ extension DockingEngine {
         // the diffusion clamp only runs inside the denoise loop. Re-clamp here, and reject
         // poses that drifted far enough outside the box that re-clamping would distort
         // their geometry into the wall.
-        do {
-            let popPtr = popBuf.contents().bindMemory(to: DockPose.self, capacity: popSize)
-            let center = gridParams.searchCenter
-            let halfExt = gridParams.searchHalfExtent
-            let cMin = center - halfExt
-            let cMax = center + halfExt
-            let maxDriftAng: Float = 1.5
-            var rejected = 0
-            for i in 0..<popSize {
-                let t = popPtr[i].translation
-                let outside = simd_max(simd_abs(t - center) - halfExt, .zero)
-                let driftMag = outside.x + outside.y + outside.z
-                if driftMag > maxDriftAng {
-                    popPtr[i].energy = .infinity
-                    rejected += 1
-                } else {
-                    popPtr[i].translation = simd_clamp(t, cMin, cMax)
-                }
-            }
-            if rejected > 0 {
-                ActivityLog.shared.info("[Engine] Diffusion: rejected \(rejected)/\(popSize) poses that drifted >\(String(format: "%.1f", maxDriftAng)) Å outside the search box", category: .dock)
-            }
+        let poses = popBuf.contents().bindMemory(to: DockPose.self, capacity: popSize)
+        let acceptedCount = DiffusionDockingEngine.compactFinalPoses(
+            UnsafeMutableBufferPointer(start: poses, count: popSize),
+            center: gridParams.searchCenter, halfExtent: gridParams.searchHalfExtent, maxDrift: 1.5
+        )
+        if acceptedCount < popSize {
+            ActivityLog.shared.info("[Engine] Diffusion: rejected \(popSize - acceptedCount)/\(popSize) poses with non-finite translations or excessive drift", category: .dock)
         }
 
         // The denoising kernel zeroes pose.energy at the end of every step (intended for
         // mid-loop "needs rescoring" marker). Score one more time so extraction sees real
         // energies. scoreDruseAF dispatches v3 or v4 internally based on useAFv4.
-        scoreDruseAF(buffer: popBuf, gaParamsBuffer: gaBuf, tg: tgCount, tgs: tgSize)
-        copyPoseBuffer(from: popBuf, to: bestBuf, poseCount: popSize)
-
-        aggregatedResults = extractAllResults(
-            from: bestBuf,
-            ligandAtoms: heavyAtoms,
-            centroid: centroid,
-            scoringMethod: scoringMethod
-        )
+        if acceptedCount > 0 {
+            var finalGA = gaParams
+            finalGA.populationSize = UInt32(acceptedCount)
+            gaBuf.contents().copyMemory(from: &finalGA, byteCount: MemoryLayout<GAParams>.stride)
+            let groups = MTLSize(width: (acceptedCount + tgSize.width - 1) / tgSize.width, height: 1, depth: 1)
+            scoreDruseAF(buffer: popBuf, gaParamsBuffer: gaBuf, tg: groups, tgs: tgSize)
+            gaBuf.contents().copyMemory(from: &gaParams, byteCount: MemoryLayout<GAParams>.stride)
+            aggregatedResults = extractAllResults(from: popBuf, ligandAtoms: heavyAtoms, centroid: centroid, maxPoses: acceptedCount)
+        }
         ActivityLog.shared.info("[Engine] Diffusion-guided docking complete: \(aggregatedResults.count) poses extracted", category: .dock)
 
         } else {
@@ -1256,13 +1215,13 @@ extension DockingEngine {
                         await buf.completed()
                         lastCmdBuf = nil
                     }
-                    decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+                    finishVinaScores(bestBuf, params: gaBuf, count: popSize)
                     aggregatedResults.append(contentsOf: extractAllResults(
                         from: bestBuf,
                         ligandAtoms: heavyAtoms,
                         centroid: centroid,
                         idOffset: aggregatedResults.count,
-                        scoringMethod: scoringMethod
+                        maxPoses: popSize
                     ))
                     break runLoop
                 }
@@ -1414,7 +1373,7 @@ extension DockingEngine {
                         await buf.completed()
                         lastCmdBuf = nil
                     }
-                    emitLiveUpdate(generation: globalGeneration)
+                    emitLiveUpdate(generation: globalGeneration, buffer: bestBuf, count: popSize)
                 }
 
                 await Task.yield()
@@ -1430,7 +1389,7 @@ extension DockingEngine {
                 let pigTgCount = MTLSize(width: popSize, height: 1, depth: 1)
                 scorePIGNet2(buffer: bestBuf, gaParamsBuffer: gaBuf, tg: pigTgCount, tgs: pigTgSize)
             } else {
-                decomposeVinaEnergy(buffer: bestBuf, populationSize: popSize)
+                finishVinaScores(bestBuf, params: gaBuf, count: popSize)
             }
 
             aggregatedResults.append(contentsOf: extractAllResults(
@@ -1438,7 +1397,7 @@ extension DockingEngine {
                 ligandAtoms: heavyAtoms,
                 centroid: centroid,
                 idOffset: aggregatedResults.count,
-                scoringMethod: scoringMethod
+                maxPoses: popSize
             ))
         }
 
@@ -1447,21 +1406,27 @@ extension DockingEngine {
         // Vina-style output selection: only poses within the energy window of the best are
         // clustered and reported (duplicates are dropped during clustering). Cluster
         // representatives are then explicitly rescored/reranked below.
+        if outputScoringFailed {
+            isRunning = false
+            return []
+        }
         lastEvaluatedPoseCount = aggregatedResults.count
         let clustered = await clusterPoses(
             Self.withinOutputEnergyWindow(aggregatedResults, scoringMethod: scoringMethod)
         )
-        ActivityLog.shared.info(
-            "[Engine] Output selection: \(clustered.count)/\(aggregatedResults.count) final poses kept " +
-            "(within \(Self.outputEnergyRangeKcal) kcal/mol of best, duplicates < \(Self.outputDuplicateRMSD) Å dropped, ≤ \(Self.outputMaxClusters) modes), " +
-            "\(Set(clustered.map(\.clusterID)).count) clusters",
-            category: .dock
-        )
-        var reranked = rerankClusterRepresentativesExplicit(
+        var reranked = await rerankClusterRepresentativesExplicit(
             clustered,
             scoringMethod: scoringMethod,
             ligandAtoms: heavyAtoms,
-            centroid: centroid
+            centroid: centroid,
+            explicitlyScoredPopulation: useExplicitOutput ? aggregatedResults : nil
+        )
+
+        ActivityLog.shared.info(
+            "[Engine] Output selection: \(reranked.count)/\(aggregatedResults.count) final poses kept " +
+            "(within \(Self.outputEnergyRangeKcal) kcal/mol of best, duplicates < \(Self.outputDuplicateRMSD) Å dropped, ≤ \(Self.outputMaxClusters) modes), " +
+            "\(Set(reranked.map(\.clusterID)).count) clusters",
+            category: .dock
         )
 
         if usesBestPoseReference {
@@ -1573,7 +1538,9 @@ extension DockingEngine {
             options: .storageModeShared
         )
 
-        let rrPairList = Self.intramolecularPairList(atomCount: gpuLigAtoms.count, bonds: heavyBonds)
+        let rrPairList = Self.intramolecularPairList(
+            atomCount: gpuLigAtoms.count, bonds: heavyBonds,
+            torsionEdges: torsionEdges, movingIndices: movingIndices)
         var rrPairStorage = rrPairList.isEmpty ? [UInt32(0)] : rrPairList
         intraPairsBuffer = device.makeBuffer(
             bytes: &rrPairStorage,
@@ -1654,10 +1621,10 @@ extension DockingEngine {
         let wasRunning = isRunning
         isRunning = true
         scorePopulation(buffer: populationBuffer!, tg: tgCount, tgs: tgSize)
-        decomposeVinaEnergy(buffer: populationBuffer!, populationSize: 1)
+        decomposeVinaEnergy(buffer: populationBuffer!, gaParamsBuffer: gaParamsBuffer, populationSize: 1)
         isRunning = wasRunning
 
-        return extractBestPose(ligandAtoms: heavyAtoms, centroid: centroid)
+        return extractBestPose(ligandAtoms: heavyAtoms, centroid: centroid, maxPoses: 1)
     }
 
     // MARK: - GPU Dispatch Helpers
@@ -1698,7 +1665,7 @@ extension DockingEngine {
         let effectiveTg: MTLSize
         let effectiveTgs: MTLSize
         if localSearchIsSIMD {
-            let popSize = tg.width * tgs.width
+            let popSize = Int(gaBuf.contents().assumingMemoryBound(to: GAParams.self).pointee.populationSize)
             effectiveTgs = MTLSize(width: 32, height: 1, depth: 1)
             effectiveTg = MTLSize(width: popSize, height: 1, depth: 1)
         } else {
@@ -1782,6 +1749,7 @@ extension DockingEngine {
             return
         }
 
+        let popSize = Int(gaParamsBuffer.contents().assumingMemoryBound(to: GAParams.self).pointee.populationSize)
         if useAFv4 {
             // === v4 PGN scoring ===
             guard let v4Score = afv4ScorePipeline,
@@ -1799,7 +1767,6 @@ extension DockingEngine {
             ], threadGroups: tg, threadGroupSize: tgs)
 
             // v4 Score: 1 threadgroup per pose, 64 threads per group (one per ligand atom)
-            let popSize = Int(tg.width * tgs.width)
             let scoreTgSize = MTLSize(width: 64, height: 1, depth: 1)
             let scoreTgCount = MTLSize(width: popSize, height: 1, depth: 1)
             dispatchCompute(pipeline: v4Score, buffers: [
@@ -1819,7 +1786,6 @@ extension DockingEngine {
                 (teBuf, 3), (miBuf, 4),
                 (afParams, 5), (afIntermed, 6), (gpBuf, 7)
             ], threadGroups: tg, threadGroupSize: tgs)
-            let popSize = Int(tg.width * tgs.width)
             let simdTgSize = MTLSize(width: 32, height: 1, depth: 1)
             let simdTgCount = MTLSize(width: popSize, height: 1, depth: 1)
             dispatchCompute(pipeline: scorePipe, buffers: [
@@ -1881,20 +1847,22 @@ extension DockingEngine {
         ], threadGroups: pigTgCount, threadGroupSize: pigTgSize)
     }
 
+    @discardableResult
     func dispatchCompute(
         pipeline: MTLComputePipelineState,
         buffers: [(MTLBuffer, Int)],
-        threadGroups: MTLSize, threadGroupSize: MTLSize
-    ) {
-        guard isRunning else { return }
+        threadGroups: MTLSize, threadGroupSize: MTLSize,
+        finishAfterStop: Bool = false
+    ) -> Bool {
+        guard isRunning || finishAfterStop else { return false }
         guard threadGroups.width > 0, threadGroups.height > 0, threadGroups.depth > 0,
               threadGroupSize.width > 0, threadGroupSize.height > 0, threadGroupSize.depth > 0
         else {
             ActivityLog.shared.warn("[Engine] Skipped dispatch: zero threadGroups=\(threadGroups.width)×\(threadGroups.height)×\(threadGroups.depth) or threadGroupSize=\(threadGroupSize.width)×\(threadGroupSize.height)×\(threadGroupSize.depth)", category: .dock)
-            return
+            return false
         }
         guard let cmdBuf = commandQueue.makeCommandBuffer(),
-              let enc = cmdBuf.makeComputeCommandEncoder() else { return }
+              let enc = cmdBuf.makeComputeCommandEncoder() else { return false }
         enc.setComputePipelineState(pipeline)
         for (buf, idx) in buffers { enc.setBuffer(buf, offset: 0, index: idx) }
         enc.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
@@ -1905,7 +1873,9 @@ extension DockingEngine {
             let err = cmdBuf.error?.localizedDescription ?? "unknown"
             ActivityLog.shared.error("[Engine] GPU command buffer error: \(err)", category: .dock)
             isRunning = false
+            return false
         }
+        return true
     }
 
     @discardableResult

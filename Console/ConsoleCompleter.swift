@@ -216,8 +216,9 @@ struct ConsoleCompleter {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directoryURL.path) else { return [] }
 
         let showHidden = namePrefix.hasPrefix(".")
+        let prefix = namePrefix.lowercased()
         let matches = names
-            .filter { (showHidden || !$0.hasPrefix(".")) && $0.lowercased().hasPrefix(namePrefix.lowercased()) }
+            .filter { (showHidden || !$0.hasPrefix(".")) && $0.lowercased().hasPrefix(prefix) }
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
             .prefix(Self.maxPathCandidates)
 
@@ -225,13 +226,17 @@ struct ConsoleCompleter {
             var isDirectory: ObjCBool = false
             FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent(name).path, isDirectory: &isDirectory)
             let path = typedDirectory + name
-            let needsQuotes = word.isQuoted || path.contains { " ;#\"\\=".contains($0) }
-            let text: String
-            if isDirectory.boolValue {
-                text = (needsQuotes ? "\"" : "") + path + "/"
-            } else {
-                text = needsQuotes ? "\"\(path)\" " : path + " "
+            let needsQuotes = word.isQuoted || path.contains { " \t\n;#\"\\=".contains($0) }
+            var text = path
+            if needsQuotes {
+                let escaped = path.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                    .replacingOccurrences(of: "\t", with: "\\t")
+                    .replacingOccurrences(of: "\n", with: "\\n")
+                text = "\"" + escaped
+                if !isDirectory.boolValue { text += "\"" }
             }
+            text += isDirectory.boolValue ? "/" : " "
             return ConsoleCompletion(text: text, display: name + (isDirectory.boolValue ? "/" : ""), kind: .path,
                                      summary: isDirectory.boolValue ? "folder" : "file", range: word.range)
         }
@@ -268,16 +273,19 @@ private struct CompletionContext {
 
         while index < line.endIndex {
             let c = line[index]
-            if var word = current, word.inQuote {
+            if current?.inQuote == true {
                 if c == "\"" {
-                    word.inQuote = false
+                    current?.inQuote = false
                 } else if c == "\\", line.index(after: index) < line.endIndex {
                     index = line.index(after: index)
-                    word.text.append(line[index])
+                    switch line[index] {
+                    case "t": current?.text.append("\t")
+                    case "n": current?.text.append("\n")
+                    default: current?.text.append(line[index])
+                    }
                 } else {
-                    word.text.append(c)
+                    current?.text.append(c)
                 }
-                current = word
             } else if c == " " || c == "\t" || c == "\n" || c == "\r" {
                 finish(at: index)
                 if c == "\n" || c == "\r" { words.removeAll() }

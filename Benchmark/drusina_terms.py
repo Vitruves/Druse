@@ -10,7 +10,7 @@ conformations (crystal pose, decoy poses) can be rescored cheaply.
 Ground truth for every functional form in this file:
   * Metal/DockingScoring.metal     lines 233-820  (computeDrusinaCorrections)
   * Metal/DockingCommon.h          drusinaVinaQuality, vina pair terms
-  * Metal/DockingGridMaps.metal    computeElectrostaticGrid (screened Coulomb)
+  * Metal/DockingGridMaps.metal    computeReceptorGrids (screened Coulomb)
   * Docking/DockingEngine.swift    prepareDrusinaBuffers (feature detection),
                                    vinaProteinAtomType, computeBurialFactor
 
@@ -37,7 +37,7 @@ DEVIATIONS = """
    (`scorePoses`). Difference is interpolation noise, typically < 0.1 kcal/mol.
 2. The screened-Coulomb term is evaluated as a direct double sum
    phi = sum_p 332 q_p / (4 r^2)  over protein atoms with r <= 12 A (the same
-   12 A cutoff and the same 0.8 A singularity clamp as computeElectrostaticGrid),
+   12 A cutoff and the same 0.8 A singularity clamp as computeReceptorGrids),
    then clamped per ligand atom to [-50, +50] to mirror the half-precision grid
    clamp. It is NOT read through a trilinear grid interpolation.
 3. Protein partial charges in the app come from the preparation-stage charge
@@ -1445,7 +1445,7 @@ def raw_terms(pf: ProteinFeatures, lt: LigandTopology, lig_pos: np.ndarray,
             raw[6] += float(np.sum(best[fired]))
             icount += int(fired.sum()); counts['metal_coord'] = int(fired.sum())
 
-    # ---- screened Coulomb (direct sum form of computeElectrostaticGrid) ----
+    # ---- screened Coulomb (direct sum form of the receptor electrostatic map) ----
     qp = pf.charge
     nzq = np.abs(qp) > 1e-6
     if nzq.any():

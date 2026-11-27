@@ -998,7 +998,8 @@ enum RDKitBridge {
                 isHetAtom: hasResidueMetadata ? da.isHetAtom : true,
                 occupancy: da.occupancy > 0 ? da.occupancy : 1.0,
                 tempFactor: da.tempFactor,
-                altLoc: altLoc
+                altLoc: altLoc,
+                insertionCode: fixedCString(da.insertionCode)
             ))
         }
 

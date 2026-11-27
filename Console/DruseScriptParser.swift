@@ -202,17 +202,20 @@ private struct RawStatement {
 
 /// Splits source into statements of tokens, handling quotes, comments, `;` and line continuations.
 private struct Lexer {
-    private let chars: [Character]
-    private var index = 0
+    private let source: String
+    private var index: String.Index
     private var line = 1
     private var column = 1
     /// Source text of the statement being lexed (comments dropped, continuations folded to a space).
     private var text = ""
 
-    init(_ source: String) { chars = Array(source) }
+    init(_ source: String) {
+        self.source = source
+        index = source.startIndex
+    }
 
     private var here: ScriptLocation { ScriptLocation(line: line, column: column) }
-    private var current: Character? { index < chars.count ? chars[index] : nil }
+    private var current: Character? { index < source.endIndex ? source[index] : nil }
 
     private static func isNewline(_ c: Character) -> Bool { c == "\n" || c == "\r" || c == "\r\n" }
     private static func isBlank(_ c: Character) -> Bool { c == " " || c == "\t" }
@@ -220,7 +223,7 @@ private struct Lexer {
     /// Moves past the current character without recording it.
     private mutating func skip() {
         guard let c = current else { return }
-        index += 1
+        source.formIndex(after: &index)
         if Self.isNewline(c) { line += 1; column = 1 } else { column += 1 }
     }
 
@@ -318,7 +321,7 @@ private struct Lexer {
             word.append(c)
             advance()
         }
-        guard current == "\"" else {
+        guard current == "\"", word != "=" else {
             return .word(ScriptWord(text: word, isQuoted: false, location: start))
         }
         guard word.hasSuffix("="), word.firstIndex(of: "=") == word.index(before: word.endIndex) else {

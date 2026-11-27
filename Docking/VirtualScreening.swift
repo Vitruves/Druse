@@ -1080,17 +1080,8 @@ final class OpenMMPocketRefiner {
         pocketCenter: SIMD3<Float>,
         pocketHalfExtent: SIMD3<Float>
     ) async -> RefinementResult? {
-        let heavyProteinAtoms = Self.unitedAtomHeavyAtoms(proteinAtoms)
-        let heavyLigandAtoms = Self.unitedAtomHeavyAtoms(ligandAtoms)
-        guard !heavyProteinAtoms.isEmpty, !heavyLigandAtoms.isEmpty else { return nil }
-
-        return await refineNative(
-            heavyProteinAtoms: heavyProteinAtoms,
-            heavyLigandAtoms: heavyLigandAtoms,
-            proteinAtoms: proteinAtoms,
-            pocketCenter: pocketCenter,
-            pocketHalfExtent: pocketHalfExtent
-        )
+        let receptor = prepareReceptor(proteinAtoms, center: pocketCenter, halfExtent: pocketHalfExtent)
+        return await refine(receptor: receptor, heavyLigandAtoms: Self.unitedAtomHeavyAtoms(ligandAtoms))
     }
 
     /// The heavy atoms of `atoms`, in order, as united atoms: each carries the partial charges of the
@@ -1129,13 +1120,14 @@ final class OpenMMPocketRefiner {
 
     // MARK: - Native C++ OpenMM Refinement
 
-    private func refineNative(
-        heavyProteinAtoms: [Atom],
-        heavyLigandAtoms: [Atom],
-        proteinAtoms: [Atom],
-        pocketCenter: SIMD3<Float>,
-        pocketHalfExtent: SIMD3<Float>
-    ) async -> RefinementResult? {
+    struct PreparedReceptor {
+        let atoms: [DruseOpenMMAtom]
+        let bonds: [DruseOpenMMBond]
+    }
+
+    func prepareReceptor(_ atoms: [Atom], center pocketCenter: SIMD3<Float>,
+                         halfExtent pocketHalfExtent: SIMD3<Float>) -> PreparedReceptor {
+        let heavyProteinAtoms = Self.unitedAtomHeavyAtoms(atoms)
         let pocketRadius = max(pocketHalfExtent.x, max(pocketHalfExtent.y, pocketHalfExtent.z)) + 4.0
         let pocketRadiusSq = pocketRadius * pocketRadius
 
@@ -1162,17 +1154,17 @@ final class OpenMMPocketRefiner {
         }
 
         var cBonds: [DruseOpenMMBond] = []
-        // Estimate bonds from distance (< 1.9 Å between bonded heavy atoms)
         let bondCutoffSq: Float = 1.9 * 1.9
-        for i in 0..<heavyProteinAtoms.count {
-            for j in (i+1)..<heavyProteinAtoms.count {
-                let ai = heavyProteinAtoms[i]
+        // The bond rule only considers the same chain and residue numbers at most one apart.
+        var residueIndices: [String: [Int: [Int]]] = [:]
+        for (i, atom) in heavyProteinAtoms.enumerated() {
+            residueIndices[atom.chainID, default: [:]][atom.residueSeq, default: []].append(i)
+        }
+        for (i, ai) in heavyProteinAtoms.enumerated() {
+            guard let chain = residueIndices[ai.chainID] else { continue }
+            let candidates = ((ai.residueSeq - 1)...(ai.residueSeq + 1)).flatMap { chain[$0] ?? [] }
+            for j in candidates.sorted() where j > i {
                 let aj = heavyProteinAtoms[j]
-                // Only bond atoms in the same residue or adjacent backbone
-                let sameResidue = ai.residueSeq == aj.residueSeq && ai.chainID == aj.chainID
-                let adjacent = abs(ai.residueSeq - aj.residueSeq) <= 1 && ai.chainID == aj.chainID
-                guard sameResidue || adjacent else { continue }
-
                 let dSq = simd_distance_squared(ai.position, aj.position)
                 if dSq < bondCutoffSq && dSq > 0.5 * 0.5 {
                     let lengthNm = sqrtf(dSq) / 10.0  // Å → nm
@@ -1184,6 +1176,12 @@ final class OpenMMPocketRefiner {
                 }
             }
         }
+
+        return PreparedReceptor(atoms: cAtoms, bonds: cBonds)
+    }
+
+    func refine(receptor: PreparedReceptor, heavyLigandAtoms: [Atom]) async -> RefinementResult? {
+        guard !receptor.atoms.isEmpty, !heavyLigandAtoms.isEmpty else { return nil }
 
         // Build ligand site array (positions already in nm for OpenMM)
         var cLigands: [DruseOpenMMLigandSite] = []
@@ -1199,8 +1197,8 @@ final class OpenMMPocketRefiner {
         }
 
         // Call C++ OpenMM on background thread
-        let atomArray = cAtoms
-        let bondArray = cBonds
+        let atomArray = receptor.atoms
+        let bondArray = receptor.bonds
         let ligandArray = cLigands
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {

@@ -9,6 +9,61 @@ import simd
 /// Validates RDKit bridge, parsers, protein preparation, protonation, fragments, and config.
 final class CoreTests: XCTestCase {
 
+    func testDiffusionFinalPopulationExcludesDriftBeforeRescoring() {
+        let translations: [SIMD3<Float>] = [
+            SIMD3(.nan, 0, 0), SIMD3(1, 0, 0), SIMD3(3, 3, 0), SIMD3(-3.5, 0, 0), SIMD3(0, .infinity, 0)
+        ]
+        var poses = translations.enumerated().map { index, translation in
+            var pose = DockPose()
+            pose.translation = translation
+            pose.energy = Float(index)
+            return pose
+        }
+        let count = poses.withUnsafeMutableBufferPointer {
+            DiffusionDockingEngine.compactFinalPoses($0, center: .zero, halfExtent: SIMD3(repeating: 2), maxDrift: 1.5)
+        }
+        XCTAssertEqual(poses.prefix(count).map(\.energy), [1, 3])
+        XCTAssertEqual(poses.prefix(count).map(\.translation), [SIMD3(1, 0, 0), SIMD3(-2, 0, 0)])
+    }
+
+    func testLeaderClusteringKeepsThresholdsAndRejectsMemberDuplicates() {
+        let offsets: [Float] = [0, 0.99, 1, 1.9, 2]
+        let poses = offsets.enumerated().map { index, offset in
+            DockingResult(id: index, pose: DockPoseSwift(translation: .zero, rotation: simd_quatf(), torsions: []),
+                          energy: Float(index), stericEnergy: 0, hydrophobicEnergy: 0, hbondEnergy: 0,
+                          torsionPenalty: 0, generation: 0, transformedAtomPositions: [SIMD3(offset, 0, 0)])
+        }
+        let selected = DockingEngine.leaderClusters(poses.reversed())
+        XCTAssertEqual(selected.map(\.id), [0, 2, 4])
+        XCTAssertEqual(selected.map(\.clusterID), [0, 0, 1])
+        XCTAssertEqual(selected.map(\.clusterRank), [0, 1, 0])
+    }
+
+    func testOpenMMReceptorBondsRespectChainResidueDistanceAndOrder() {
+        let sites: [(Int, String, Float)] = [
+            (4, "A", 0), (4, "B", 1), (6, "A", 1.5), (5, "A", 1),
+            (4, "A", 0.5), (4, "A", 1.9), (3, "A", -1)
+        ]
+        let atoms = sites.enumerated().map { index, site in
+            Atom(id: index, element: .C, position: SIMD3(site.2, 0, 0),
+                 name: "C", residueSeq: site.0, chainID: site.1)
+        }
+        let receptor = OpenMMPocketRefiner.shared.prepareReceptor(atoms, center: .zero, halfExtent: .one)
+        var expected: [[Int]] = []
+        for i in atoms.indices {
+            for j in atoms.indices where j > i && atoms[i].chainID == atoms[j].chainID
+                && abs(atoms[i].residueSeq - atoms[j].residueSeq) <= 1 {
+                let distance = simd_distance(atoms[i].position, atoms[j].position)
+                if distance > 0.5 && distance < 1.9 { expected.append([i, j]) }
+            }
+        }
+        XCTAssertEqual(receptor.bonds.map { [Int($0.atom1), Int($0.atom2)] }, expected)
+        for bond in receptor.bonds {
+            let length = simd_distance(atoms[Int(bond.atom1)].position, atoms[Int(bond.atom2)].position)
+            XCTAssertEqual(bond.lengthNm, length / 10, accuracy: 1e-6)
+        }
+    }
+
     // MARK: - RDKit Bridge
 
     func testSmilesToMolecule() {
@@ -347,6 +402,42 @@ final class CoreTests: XCTestCase {
 
     // MARK: - Protein Preparation
 
+    func testTorsionsMoveHeavyAtomsBeyondTheAxis() throws {
+        for smiles in ["CCC", "[H]C([H])([H])C([H])([H])C([H])([H])[H]"] {
+            XCTAssertTrue(try XCTUnwrap(RDKitBridge.buildTorsionTree(smiles: smiles)).isEmpty)
+        }
+        let butane = try XCTUnwrap(RDKitBridge.buildTorsionTree(smiles: "CCCC"))
+        XCTAssertEqual(butane.count, 1)
+        let centralBond = try XCTUnwrap(butane.first)
+        XCTAssertEqual(Set([centralBond.atom1, centralBond.atom2]), [1, 2])
+        XCTAssertEqual(centralBond.movingAtoms.count, 2)
+    }
+
+    func testChainBreakCappingPreservesInsertionCodesFromPDB() throws {
+        let pdb = """
+        ATOM      1  N   ALA A  52       0.000   0.000   0.000  1.00 10.00           N
+        ATOM      2  C   ALA A  52       2.400   0.000   0.000  1.00 10.00           C
+        ATOM      3  N   ALA A  52A      7.000   0.000   0.000  1.00 10.00           N
+        ATOM      4  C   ALA A  52A      9.400   0.000   0.000  1.00 10.00           C
+        ATOM      5  N   GLY A  53      10.700   0.000   0.000  1.00 10.00           N
+        END
+        """
+        let parsed = try XCTUnwrap(PDBParser.parse(pdb).protein)
+        XCTAssertEqual(parsed.atoms.map(\.insertionCode), ["", "", "A", "A", ""])
+        let clean = ProteinPreparation.cleanupStructure(atoms: parsed.atoms, bonds: parsed.bonds)
+        XCTAssertEqual(clean.report.chainBreaks.count, 1)
+        XCTAssertEqual(clean.report.chainBreaks.first?.isCapped, true)
+        XCTAssertEqual(clean.report.addedCappingResidues, 2)
+        XCTAssertEqual(clean.atoms.filter { $0.residueName == "ACE" }.map(\.insertionCode), ["A", "A", "A"])
+        let nme = try XCTUnwrap(clean.atoms.firstIndex { $0.residueName == "NME" && $0.name == "N" })
+        let ace = try XCTUnwrap(clean.atoms.firstIndex { $0.residueName == "ACE" && $0.name == "C" })
+        func bonded(_ i: Int, _ j: Int) -> Bool {
+            clean.bonds.contains { ($0.atomIndex1 == i && $0.atomIndex2 == j) || ($0.atomIndex2 == i && $0.atomIndex1 == j) }
+        }
+        XCTAssertTrue(bonded(1, nme))
+        XCTAssertTrue(bonded(2, ace))
+    }
+
     func testProteinPreparation() {
         // Chain break detection (C-N gap > 1.8 Å)
         let atoms = [
@@ -435,6 +526,26 @@ final class CoreTests: XCTestCase {
     }
 
     // MARK: - Protonation
+
+    func testEquivalentProtonationSitesUseStablePairOrder() {
+        let sites = [1, 2].map { residue in
+            Atom(id: residue, element: .N, position: SIMD3(Float(residue * 3), 0, 0),
+                 name: "NZ", residueName: "LYS", residueSeq: residue, chainID: "A")
+        }
+        // Bury the two equivalent sites enough to activate their Coulomb term.
+        let environment = (0..<160).map { i in
+            Atom(id: i + 3, element: .C, position: SIMD3(Float(i % 8), Float(i / 8 % 5), Float(i / 40 + 2)),
+                 name: "CB", residueName: "ALA", residueSeq: i + 3, chainID: "B")
+        }
+        for order in [sites, Array(sites.reversed())] {
+            let lysines = Protonation.predictResidueStates(atoms: order + environment)
+                .filter { $0.residueName == "LYS" }
+            XCTAssertEqual(lysines.map(\.residueSeq), [1, 2])
+            guard lysines.count == 2 else { return }
+            XCTAssertLessThan(lysines[0].chargeContribution, 0)
+            XCTAssertEqual(lysines[1].chargeContribution, 0)
+        }
+    }
 
     func testProtonation() {
         // Scoring charge assignment at pH 7.4

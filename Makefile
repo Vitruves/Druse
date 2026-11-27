@@ -47,7 +47,7 @@ eval: app ## Run DruseScript commands without a window: make eval CMD="cmd; cmd"
 	"$(APP)/Contents/MacOS/Druse" --headless --eval "$(CMD)"
 
 test: core project ## Run the unit tests (opens a GUI window)
-	xcodebuild -project Druse.xcodeproj -scheme DruseTests -derivedDataPath $(DERIVED) test
+	xcodebuild -project Druse.xcodeproj -scheme Druse -derivedDataPath $(DERIVED) -only-testing:DruseTests test
 
 dmg: ## Build a Release app and package a portable DMG into build/
 	$(MAKE) app CONFIG=Release

@@ -23,7 +23,7 @@ static std::unordered_set<int> bfs_from_excluding(
         int cur = q.front(); q.pop();
         for (const auto *bond : mol.atomBonds(mol.getAtomWithIdx(cur))) {
             int nbr = bond->getOtherAtomIdx(cur);
-            if (nbr == excludeAtom) continue;
+            if (nbr == excludeAtom || mol.getAtomWithIdx(nbr)->getAtomicNum() == 1) continue;
             if (visited.count(nbr)) continue;
             visited.insert(nbr);
             q.push(nbr);
@@ -88,6 +88,8 @@ static DruseTorsionTree* build_torsion_tree_for_mol(ROMol &mol) {
 
         auto fwd = bfs_from_excluding(mol, a2, a1);
         auto bwd = bfs_from_excluding(mol, a1, a2);
+        // Rotating only the axis atom leaves every scored heavy atom in place.
+        if (fwd.size() < 2 || bwd.size() < 2) continue;
 
         RotBond rb;
         if (fwd.size() <= bwd.size()) {
@@ -196,7 +198,6 @@ DruseTorsionTree* druse_build_torsion_tree(const char *smiles) {
         std::unique_ptr<RWMol> mol(SmilesToMol(smiles));
         if (!mol) return nullptr;
 
-        MolOps::addHs(*mol);
         MolOps::findSSSR(*mol);
         return build_torsion_tree_for_mol(*mol);
     } catch (...) {
@@ -211,7 +212,6 @@ DruseTorsionTree* druse_build_torsion_tree_molblock(const char *molBlock) {
         std::unique_ptr<RWMol> mol(MolBlockToMol(std::string(molBlock), true, false, false));
         if (!mol) return nullptr;
 
-        MolOps::addHs(*mol);
         MolOps::findSSSR(*mol);
         return build_torsion_tree_for_mol(*mol);
     } catch (...) {

@@ -414,6 +414,10 @@ enum Protonation {
             }
         }
 
+        // Equal model pKa values are tie-broken by the pair order. Use residue order
+        // before assigning pair contributions so repeated preparations agree.
+        snapshots.sort(by: residueOrder)
+
         // Precompute per-snapshot residue indices and numVolume (avoids redundant O(N) scans).
         var snapshotResidueIndicesCache: [Int: [Int]] = [:]
         var snapshotNumVolumeCache: [Int: Int] = [:]
@@ -489,7 +493,7 @@ enum Protonation {
         var predictions: [ResiduePrediction] = []
         predictions.reserveCapacity(snapshots.count)
 
-        for snapshot in snapshots.sorted(by: residueOrder) {
+        for snapshot in snapshots {
             let residueIndices = residueIndices(for: snapshot.key, residues: residues)
             let burial = desolvationContribution(
                 for: snapshot.center,

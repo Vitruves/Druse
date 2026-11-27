@@ -83,6 +83,25 @@ struct DiffusionSchedule: Sendable {
 /// Requires DruseAF weights to be loaded. Falls back to GA search if unavailable.
 @MainActor
 final class DiffusionDockingEngine {
+    nonisolated static func compactFinalPoses(
+        _ poses: UnsafeMutableBufferPointer<DockPose>, center: SIMD3<Float>, halfExtent: SIMD3<Float>,
+        maxDrift: Float
+    ) -> Int {
+        let lower = center - halfExtent
+        let upper = center + halfExtent
+        var count = 0
+        for index in poses.indices {
+            let translation = poses[index].translation
+            guard translation.x.isFinite, translation.y.isFinite, translation.z.isFinite else { continue }
+            let outside = simd_max(simd_abs(translation - center) - halfExtent, .zero)
+            guard outside.x + outside.y + outside.z <= maxDrift else { continue }
+            if count != index { poses[count] = poses[index] }
+            poses[count].translation = simd_clamp(translation, lower, upper)
+            count += 1
+        }
+        return count
+    }
+
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
 
