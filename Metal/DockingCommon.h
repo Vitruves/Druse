@@ -174,32 +174,61 @@ inline bool xsTypeSupported(int xsType) {
     return xsType >= VINA_C_H && xsType <= VINA_MET_D;
 }
 
-inline float xsRadius(int xsType) {
-    return xsTypeSupported(xsType) ? kVinaXSRadii[xsType] : 0.0f;
+// Which properties each XS type carries. The pair energy consults these once per type and
+// then bit-tests, instead of walking a comparison chain per property per pair — the pair
+// loop is the hottest loop in the local search.
+constant uint kXSHydrophobic = 1u;
+constant uint kXSDonor       = 2u;
+constant uint kXSAcceptor    = 4u;
+
+constant uint kVinaXSFlags[19] = {
+    kXSHydrophobic,            // C_H
+    0u,                        // C_P
+    0u,                        // N_P
+    kXSDonor,                  // N_D
+    kXSAcceptor,               // N_A
+    kXSDonor | kXSAcceptor,    // N_DA
+    0u,                        // O_P
+    kXSDonor,                  // O_D
+    kXSAcceptor,               // O_A
+    kXSDonor | kXSAcceptor,    // O_DA
+    0u,                        // S_P
+    0u,                        // P_P
+    kXSHydrophobic,            // F_H
+    kXSHydrophobic,            // Cl_H
+    kXSHydrophobic,            // Br_H
+    kXSHydrophobic,            // I_H
+    0u,                        // Si
+    0u,                        // At
+    kXSDonor                   // MET_D
+};
+
+/// Property flags of an XS type, zero for a type outside the supported range.
+inline uint xsFlags(int xsType) {
+    return xsTypeSupported(xsType) ? kVinaXSFlags[xsType] : 0u;
 }
 
 inline bool xsIsHydrophobic(int xsType) {
-    return xsType == VINA_C_H || xsType == VINA_F_H || xsType == VINA_Cl_H ||
-           xsType == VINA_Br_H || xsType == VINA_I_H;
+    return (xsFlags(xsType) & kXSHydrophobic) != 0u;
 }
 
 inline bool xsIsAcceptor(int xsType) {
-    return xsType == VINA_N_A || xsType == VINA_N_DA ||
-           xsType == VINA_O_A || xsType == VINA_O_DA;
+    return (xsFlags(xsType) & kXSAcceptor) != 0u;
 }
 
 inline bool xsIsDonor(int xsType) {
-    return xsType == VINA_N_D || xsType == VINA_N_DA ||
-           xsType == VINA_O_D || xsType == VINA_O_DA ||
-           xsType == VINA_MET_D;
+    return (xsFlags(xsType) & kXSDonor) != 0u;
+}
+
+/// True when one type donates and the other accepts. Takes the flag words so a caller that
+/// already holds them does not fetch them again.
+inline bool xsHBondPossibleFlags(uint f1, uint f2) {
+    return ((f1 & kXSDonor) != 0u && (f2 & kXSAcceptor) != 0u)
+        || ((f2 & kXSDonor) != 0u && (f1 & kXSAcceptor) != 0u);
 }
 
 inline bool xsHBondPossible(int t1, int t2) {
-    return (xsIsDonor(t1) && xsIsAcceptor(t2)) || (xsIsDonor(t2) && xsIsAcceptor(t1));
-}
-
-inline float optimalDistanceXS(int t1, int t2) {
-    return xsRadius(t1) + xsRadius(t2);
+    return xsHBondPossibleFlags(xsFlags(t1), xsFlags(t2));
 }
 
 /// AutoDock-Vina conf-independent rotatable-bond normalization.
@@ -222,7 +251,9 @@ inline VinaTerms vinaPairEnergyDecomposed(int probeType, int proteinType, float 
         return t;
     }
 
-    float d = r - optimalDistanceXS(probeType, proteinType);
+    uint f1 = kVinaXSFlags[probeType];
+    uint f2 = kVinaXSFlags[proteinType];
+    float d = r - (kVinaXSRadii[probeType] + kVinaXSRadii[proteinType]);
 
     float dOverHalf = d * 2.0f;
     t.steric += wGauss1 * exp(-(dOverHalf * dOverHalf));
@@ -233,10 +264,10 @@ inline VinaTerms vinaPairEnergyDecomposed(int probeType, int proteinType, float 
     if (d < 0.0f) {
         t.steric += wRepulsion * d * d;
     }
-    if (xsIsHydrophobic(probeType) && xsIsHydrophobic(proteinType)) {
+    if ((f1 & f2 & kXSHydrophobic) != 0u) {
         t.hydrophobic = wHydrophobic * slopeStep(1.5f, 0.5f, d);
     }
-    if (xsHBondPossible(probeType, proteinType)) {
+    if (xsHBondPossibleFlags(f1, f2)) {
         t.hbond = wHBond * slopeStep(0.0f, -0.7f, d);
     }
     t.total = t.steric + t.hydrophobic + t.hbond;
@@ -353,7 +384,9 @@ inline float vinaPairEnergyWithDeriv(int t1, int t2, float r, thread float &dEdr
     dEdr = 0.0f;
     if (!xsTypeSupported(t1) || !xsTypeSupported(t2) || r >= 8.0f) return 0.0f;
 
-    float d = r - optimalDistanceXS(t1, t2);
+    uint f1 = kVinaXSFlags[t1];
+    uint f2 = kVinaXSFlags[t2];
+    float d = r - (kVinaXSRadii[t1] + kVinaXSRadii[t2]);
     float steric = 0.0f;
 
     // Gauss1: w1 * exp(-(d/0.5)²)
@@ -375,13 +408,13 @@ inline float vinaPairEnergyWithDeriv(int t1, int t2, float r, thread float &dEdr
     }
 
     float hydrophobic = 0.0f;
-    if (xsIsHydrophobic(t1) && xsIsHydrophobic(t2)) {
+    if ((f1 & f2 & kXSHydrophobic) != 0u) {
         hydrophobic = wHydrophobic * slopeStep(1.5f, 0.5f, d);
         dEdr += wHydrophobic * slopeStepDeriv(1.5f, 0.5f, d);
     }
 
     float hbond = 0.0f;
-    if (xsHBondPossible(t1, t2)) {
+    if (xsHBondPossibleFlags(f1, f2)) {
         hbond = wHBond * slopeStep(0.0f, -0.7f, d);
         dEdr += wHBond * slopeStepDeriv(0.0f, -0.7f, d);
     }
